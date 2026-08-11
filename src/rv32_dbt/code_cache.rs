@@ -17,7 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use super::block::{CompiledBlock, DbtBlockMode};
+use super::block::{DbtBlockMode, TranslatedBlock};
 use super::executable::ExecutableMapping;
 use super::{DbtFault, DbtFaultKind};
 
@@ -113,7 +113,7 @@ impl DirectDbtCodeCache {
     pub(crate) fn publish(
         &mut self,
         key: DbtCacheKey,
-        block: &CompiledBlock,
+        block: &TranslatedBlock<'_>,
     ) -> Result<DbtCacheHandle, DbtFault> {
         if block.mode() != DbtBlockMode::Fast {
             return Err(Self::fault(
@@ -274,39 +274,32 @@ fn ranges_overlap(lhs_start: usize, lhs_end: usize, rhs_start: usize, rhs_end: u
 #[cfg(test)]
 mod tests {
     use super::{DbtCacheKey, DirectDbtCodeCache};
-    use crate::rv32_dbt::block::{CompiledBlock, DbtBlockInput, DbtBlockMode};
+    use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, TranslatedBlock};
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
 
     const PAGE_BYTES: usize = 4096;
 
-    fn block(pc: u32, code: Vec<u8>) -> CompiledBlock {
+    fn block(pc: u32, code: &[u8]) -> TranslatedBlock<'_> {
         let word = addi(1, 1, 1);
-        let input = DbtBlockInput::new(
-            pc,
-            vec![Rv32ResolvedInstruction::Valid {
-                word,
-                instruction: decode_product_word(word).unwrap(),
-            }],
-            DbtBlockMode::Fast,
-        )
-        .unwrap();
-        CompiledBlock::new(&input, code).unwrap()
+        let slots = [Rv32ResolvedInstruction::Valid {
+            word,
+            instruction: decode_product_word(word).unwrap(),
+        }];
+        let input = DbtBlockInput::new(pc, &slots, DbtBlockMode::Fast).unwrap();
+        TranslatedBlock::new(&input, code).unwrap()
     }
 
-    fn bounded_block(pc: u32) -> CompiledBlock {
+    fn bounded_block(pc: u32) -> TranslatedBlock<'static> {
         let word = addi(1, 1, 1);
         let slot = Rv32ResolvedInstruction::Valid {
             word,
             instruction: decode_product_word(word).unwrap(),
         };
-        let input = DbtBlockInput::new(
-            pc,
-            vec![slot, slot],
-            DbtBlockMode::Bounded { max_attempts: 1 },
-        )
-        .unwrap();
-        CompiledBlock::new(&input, vec![0xc3]).unwrap()
+        let slots = [slot, slot];
+        let input =
+            DbtBlockInput::new(pc, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
+        TranslatedBlock::new(&input, &[0xc3]).unwrap()
     }
 
     #[test]
@@ -315,7 +308,7 @@ mod tests {
         let key = DbtCacheKey::new(0x1000, 7);
 
         assert!(cache.lookup(key).is_none());
-        let handle = cache.publish(key, &block(0x1000, vec![0xc3])).unwrap();
+        let handle = cache.publish(key, &block(0x1000, &[0xc3])).unwrap();
 
         assert_eq!(cache.lookup(key), Some(handle));
         assert!(cache.lookup(DbtCacheKey::new(0x1000, 8)).is_none());
@@ -332,9 +325,11 @@ mod tests {
         let second = DbtCacheKey::new(4, 0);
         let wrapping = DbtCacheKey::new(8, 0);
 
-        cache.publish(first, &block(0, vec![0x90; 1024])).unwrap();
-        cache.publish(second, &block(4, vec![0x90; 3000])).unwrap();
-        cache.publish(wrapping, &block(8, vec![0x90; 512])).unwrap();
+        cache.publish(first, &block(0, &vec![0x90; 1024])).unwrap();
+        cache.publish(second, &block(4, &vec![0x90; 3000])).unwrap();
+        cache
+            .publish(wrapping, &block(8, &vec![0x90; 512]))
+            .unwrap();
 
         assert!(cache.lookup(first).is_none());
         assert!(cache.lookup(second).is_some());
@@ -349,10 +344,10 @@ mod tests {
         let second = DbtCacheKey::new(8, 0);
         let third = DbtCacheKey::new(16, 0);
 
-        let first_handle = cache.publish(first, &block(0, vec![0xc3])).unwrap();
-        cache.publish(second, &block(8, vec![0xc3])).unwrap();
+        let first_handle = cache.publish(first, &block(0, &[0xc3])).unwrap();
+        cache.publish(second, &block(8, &[0xc3])).unwrap();
         assert_eq!(cache.lookup(first), Some(first_handle));
-        cache.publish(third, &block(16, vec![0xc3])).unwrap();
+        cache.publish(third, &block(16, &[0xc3])).unwrap();
 
         assert!(cache.lookup(first).is_some());
         assert!(cache.lookup(second).is_none());
@@ -364,7 +359,7 @@ mod tests {
     fn invalidation_revokes_handles_without_releasing_fixed_storage() {
         let mut cache = DirectDbtCodeCache::new(2, PAGE_BYTES).unwrap();
         let key = DbtCacheKey::new(0, 0);
-        let handle = cache.publish(key, &block(0, vec![0xc3])).unwrap();
+        let handle = cache.publish(key, &block(0, &[0xc3])).unwrap();
         let metadata_bytes = cache.metadata_bytes();
 
         assert!(cache.entry_address(handle).is_some());
@@ -392,7 +387,7 @@ mod tests {
         );
         assert_eq!(
             cache
-                .publish(DbtCacheKey::new(4, 0), &block(0, vec![0xc3]))
+                .publish(DbtCacheKey::new(4, 0), &block(0, &[0xc3]))
                 .unwrap_err()
                 .kind(),
             DbtFaultKind::Translation
@@ -401,7 +396,7 @@ mod tests {
             cache
                 .publish(
                     DbtCacheKey::new(0, 0),
-                    &block(0, vec![0x90; PAGE_BYTES + 1]),
+                    &block(0, &vec![0x90; PAGE_BYTES + 1]),
                 )
                 .unwrap_err()
                 .kind(),
@@ -415,7 +410,7 @@ mod tests {
         let mut first = DirectDbtCodeCache::new(1, PAGE_BYTES).unwrap();
         let mut second = DirectDbtCodeCache::new(1, PAGE_BYTES).unwrap();
 
-        first.publish(key, &block(0x1000, vec![0xc3])).unwrap();
+        first.publish(key, &block(0x1000, &[0xc3])).unwrap();
 
         assert!(first.lookup(key).is_some());
         assert!(second.lookup(key).is_none());
