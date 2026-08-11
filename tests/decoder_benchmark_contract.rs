@@ -34,11 +34,38 @@ fn decoder_candidates_exclude_retired_architectures() {
             "rv32-cached",
             "rv32-predecoded",
             "rv32-dbt-direct",
+            "rv32-dbt-cached",
             "native-rust",
         ],
     );
     assert!(BenchmarkCandidate::Rv32DirectDbt.supports(BenchmarkWorkload::Compute32));
     assert!(!BenchmarkCandidate::Rv32DirectDbt.supports(BenchmarkWorkload::BranchMix));
+    assert!(BenchmarkCandidate::Rv32CachedDbt.supports(BenchmarkWorkload::Compute32));
+    assert!(!BenchmarkCandidate::Rv32CachedDbt.supports(BenchmarkWorkload::BranchMix));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn cached_dbt_uses_the_common_compute32_contract() {
+    let mut prepared = PreparedBenchmark::new(
+        BenchmarkCandidate::Rv32CachedDbt,
+        BenchmarkWorkload::Compute32,
+        17,
+    )
+    .unwrap();
+
+    prepared.execute().unwrap().validate_checksum().unwrap();
+    let warm = prepared.execute().unwrap();
+
+    warm.validate_checksum().unwrap();
+    assert_eq!(warm.candidate, BenchmarkCandidate::Rv32CachedDbt);
+    assert_eq!(warm.translation_bytes, 0);
+    assert!(warm.cache_hits > 0);
+    assert_eq!(warm.cache_misses, 0);
+    assert_eq!(warm.translations, 0);
+    assert_eq!(warm.publications, 0);
+    assert_eq!(warm.executable_reserved_bytes, 64 * 1024);
+    assert!(warm.metadata_bytes > 0);
 }
 
 #[cfg(target_arch = "x86_64")]
