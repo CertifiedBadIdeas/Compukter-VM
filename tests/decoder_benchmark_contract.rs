@@ -19,7 +19,7 @@
 
 use compukter_vm::benchmarks::{
     native_checksum, BenchmarkCandidate, BenchmarkWorkload, DecoderBenchmarkImplementation,
-    DecoderBenchmarkScenario, PreparedDecoderBenchmark,
+    DecoderBenchmarkScenario, PreparedBenchmark, PreparedDecoderBenchmark,
 };
 
 #[test]
@@ -33,9 +33,35 @@ fn decoder_candidates_exclude_retired_architectures() {
             "rv32-direct",
             "rv32-cached",
             "rv32-predecoded",
+            "rv32-dbt-direct",
             "native-rust",
         ],
     );
+    assert!(BenchmarkCandidate::Rv32DirectDbt.supports(BenchmarkWorkload::Compute32));
+    assert!(!BenchmarkCandidate::Rv32DirectDbt.supports(BenchmarkWorkload::BranchMix));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn direct_dbt_uses_the_common_compute32_contract() {
+    let mut prepared = PreparedBenchmark::new(
+        BenchmarkCandidate::Rv32DirectDbt,
+        BenchmarkWorkload::Compute32,
+        17,
+    )
+    .unwrap();
+    let observation = prepared.execute().unwrap();
+
+    observation.validate_checksum().unwrap();
+    assert_eq!(observation.candidate, BenchmarkCandidate::Rv32DirectDbt);
+    assert_eq!(observation.workload, BenchmarkWorkload::Compute32);
+
+    assert!(PreparedBenchmark::new(
+        BenchmarkCandidate::Rv32DirectDbt,
+        BenchmarkWorkload::BranchMix,
+        17,
+    )
+    .is_err());
 }
 
 #[test]

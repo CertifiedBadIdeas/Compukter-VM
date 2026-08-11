@@ -227,11 +227,15 @@ fn measure_workload(
     iterations: u32,
     sample_count: usize,
 ) -> Result<Vec<BenchmarkTiming>, String> {
-    let candidates = BenchmarkCandidate::all();
+    let candidates = BenchmarkCandidate::all()
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.supports(workload))
+        .collect::<Vec<_>>();
 
     // Populate host instruction/page caches without retaining guest state.
-    for candidate in candidates {
-        let mut warmup = PreparedBenchmark::new(*candidate, workload, iterations.min(100))?;
+    for &candidate in &candidates {
+        let mut warmup = PreparedBenchmark::new(candidate, workload, iterations.min(100))?;
         warmup.execute()?.validate_checksum()?;
     }
 
