@@ -19,6 +19,8 @@
 
 mod address_space;
 mod csr;
+#[cfg(target_arch = "x86_64")]
+mod dbt;
 mod elf;
 mod hart;
 mod machine;
@@ -33,3 +35,19 @@ pub use machine::{
     Rv32MachineExecutionError, Rv32MachineOutcome, Rv32TranslationLookupUnit, Rv32TranslationStats,
 };
 pub use platform::{CONTROL_BASE, DEBUG_BASE, STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rv32DbtStats {
+    pub translations: u64,
+    pub publications: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub native_dispatches: u64,
+    pub typed_slow_exits: u64,
+    pub lowered_load_sites: u64,
+    pub lowered_store_sites: u64,
+    pub emitted_bytes: u64,
+    pub reserved_bytes: usize,
+    pub metadata_bytes: usize,
+}

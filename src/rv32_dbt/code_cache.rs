@@ -59,6 +59,8 @@ struct CacheEntry {
     offset: usize,
     length: usize,
     instruction_count: u32,
+    lowered_load_sites: u32,
+    lowered_store_sites: u32,
     last_used: u64,
     serial: u64,
 }
@@ -165,6 +167,8 @@ impl DirectDbtCodeCache {
             offset,
             length: block.code().len(),
             instruction_count: block.instruction_count(),
+            lowered_load_sites: block.lowered_load_sites(),
+            lowered_store_sites: block.lowered_store_sites(),
             last_used: self.clock,
             serial,
         };
@@ -194,6 +198,22 @@ impl DirectDbtCodeCache {
             .get(handle.set as usize)?
             .get(handle.way as usize)?;
         (entry.valid && entry.serial == handle.serial).then_some(entry.instruction_count)
+    }
+
+    pub(crate) fn lowered_load_sites(&self, handle: DbtCacheHandle) -> Option<u32> {
+        let entry = self
+            .sets
+            .get(handle.set as usize)?
+            .get(handle.way as usize)?;
+        (entry.valid && entry.serial == handle.serial).then_some(entry.lowered_load_sites)
+    }
+
+    pub(crate) fn lowered_store_sites(&self, handle: DbtCacheHandle) -> Option<u32> {
+        let entry = self
+            .sets
+            .get(handle.set as usize)?
+            .get(handle.way as usize)?;
+        (entry.valid && entry.serial == handle.serial).then_some(entry.lowered_store_sites)
     }
 
     pub(crate) fn invalidate_all(&mut self) {
