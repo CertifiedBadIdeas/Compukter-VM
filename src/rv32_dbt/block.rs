@@ -79,11 +79,18 @@ pub(crate) struct TranslatedBlock<'a> {
     start_pc: u32,
     instruction_count: u32,
     mode: DbtBlockMode,
+    lowered_load_sites: u32,
+    lowered_store_sites: u32,
     code: &'a [u8],
 }
 
 impl<'a> TranslatedBlock<'a> {
-    pub(crate) fn new(input: &DbtBlockInput<'_>, code: &'a [u8]) -> Result<Self, String> {
+    pub(crate) fn new(
+        input: &DbtBlockInput<'_>,
+        code: &'a [u8],
+        lowered_load_sites: u32,
+        lowered_store_sites: u32,
+    ) -> Result<Self, String> {
         if code.is_empty() {
             return Err("RV32 DBT compiled block cannot be empty".to_string());
         }
@@ -91,6 +98,8 @@ impl<'a> TranslatedBlock<'a> {
             start_pc: input.start_pc(),
             instruction_count: input.slots().len() as u32,
             mode: input.mode(),
+            lowered_load_sites,
+            lowered_store_sites,
             code,
         })
     }
@@ -105,6 +114,14 @@ impl<'a> TranslatedBlock<'a> {
 
     pub(crate) fn mode(&self) -> DbtBlockMode {
         self.mode
+    }
+
+    pub(crate) fn lowered_load_sites(&self) -> u32 {
+        self.lowered_load_sites
+    }
+
+    pub(crate) fn lowered_store_sites(&self) -> u32 {
+        self.lowered_store_sites
     }
 
     pub(crate) fn code(&self) -> &[u8] {
@@ -153,11 +170,13 @@ mod tests {
         let input =
             DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
         let code = [0xc3];
-        let block = TranslatedBlock::new(&input, &code).unwrap();
+        let block = TranslatedBlock::new(&input, &code, 3, 2).unwrap();
 
         assert_eq!(block.start_pc(), 0x1000);
         assert_eq!(block.instruction_count(), 2);
         assert_eq!(block.mode(), DbtBlockMode::Bounded { max_attempts: 1 });
+        assert_eq!(block.lowered_load_sites(), 3);
+        assert_eq!(block.lowered_store_sites(), 2);
         assert_eq!(block.code(), &[0xc3]);
     }
 }

@@ -287,7 +287,7 @@ mod tests {
             instruction: decode_product_word(word).unwrap(),
         }];
         let input = DbtBlockInput::new(pc, &slots, DbtBlockMode::Fast).unwrap();
-        TranslatedBlock::new(&input, code).unwrap()
+        TranslatedBlock::new(&input, code, 0, 0).unwrap()
     }
 
     fn bounded_block(pc: u32) -> TranslatedBlock<'static> {
@@ -299,7 +299,7 @@ mod tests {
         let slots = [slot, slot];
         let input =
             DbtBlockInput::new(pc, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
-        TranslatedBlock::new(&input, &[0xc3]).unwrap()
+        TranslatedBlock::new(&input, &[0xc3], 0, 0).unwrap()
     }
 
     #[test]
