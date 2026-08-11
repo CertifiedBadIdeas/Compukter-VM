@@ -38,6 +38,9 @@ const PRODUCT_RAM_BYTES: usize = 16 * 1024;
 const PRODUCT_CACHE_SETS: usize = 64;
 const PRODUCT_BLOCK_CACHE_SETS: usize = 32;
 const PRODUCT_BLOCK_MAX_INSTRUCTIONS: usize = 8;
+const PRODUCT_DBT_CACHE_SETS: usize = 32;
+const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = 8;
+const PRODUCT_DBT_CODE_BYTES: usize = 64 * 1024;
 
 struct CountingAllocator;
 
@@ -78,15 +81,19 @@ enum Candidate {
     Cached,
     Predecoded,
     BlockCached,
+    DirectDbt,
+    CachedDbt,
 }
 
 impl Candidate {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::Native,
         Self::Qemu,
         Self::Cached,
         Self::Predecoded,
         Self::BlockCached,
+        Self::DirectDbt,
+        Self::CachedDbt,
     ];
 
     fn name(self) -> &'static str {
@@ -96,6 +103,8 @@ impl Candidate {
             Self::Cached => "rv32-cached",
             Self::Predecoded => "rv32-predecoded",
             Self::BlockCached => "rv32-block-cached",
+            Self::DirectDbt => "rv32-direct-dbt",
+            Self::CachedDbt => "rv32-cached-dbt",
         }
     }
 }
@@ -114,6 +123,14 @@ struct ProductDetails {
     cache_evictions: Option<u64>,
     blocks_built: Option<u64>,
     decoded_slots_built: Option<u64>,
+    dbt_translations: Option<u64>,
+    dbt_publications: Option<u64>,
+    dbt_native_dispatches: Option<u64>,
+    dbt_typed_slow_exits: Option<u64>,
+    dbt_lowered_load_sites: Option<u64>,
+    dbt_lowered_store_sites: Option<u64>,
+    dbt_emitted_bytes: Option<u64>,
+    dbt_reserved_bytes: Option<u64>,
     translation_bytes: usize,
     executable_bytes: usize,
     steady_allocations: u64,
@@ -199,6 +216,25 @@ fn run() -> Result<(), String> {
             max_instructions: PRODUCT_BLOCK_MAX_INSTRUCTIONS,
         },
     )?;
+    let direct_dbt_batch = calibrate_product(
+        &linker,
+        &source_root,
+        &build_dir,
+        Rv32ExecutionBackendConfig::DirectDbt {
+            max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+            code_bytes: PRODUCT_DBT_CODE_BYTES,
+        },
+    )?;
+    let cached_dbt_batch = calibrate_product(
+        &linker,
+        &source_root,
+        &build_dir,
+        Rv32ExecutionBackendConfig::CachedDbt {
+            sets: PRODUCT_DBT_CACHE_SETS,
+            max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+            code_bytes: PRODUCT_DBT_CODE_BYTES,
+        },
+    )?;
 
     let qemu_elf = link_platform(&linker, &source_root, &build_dir, "qemu", qemu_batch)?;
     let cached_elf = link_platform(&linker, &source_root, &build_dir, "product", cached_batch)?;
@@ -216,6 +252,20 @@ fn run() -> Result<(), String> {
         "product",
         block_cached_batch,
     )?;
+    let direct_dbt_elf = link_platform(
+        &linker,
+        &source_root,
+        &build_dir,
+        "product",
+        direct_dbt_batch,
+    )?;
+    let cached_dbt_elf = link_platform(
+        &linker,
+        &source_root,
+        &build_dir,
+        "product",
+        cached_dbt_batch,
+    )?;
 
     let batches = [
         native_batch,
@@ -223,6 +273,8 @@ fn run() -> Result<(), String> {
         cached_batch,
         predecoded_batch,
         block_cached_batch,
+        direct_dbt_batch,
+        cached_dbt_batch,
     ];
     let mut measurements = Candidate::ALL
         .into_iter()
@@ -237,7 +289,7 @@ fn run() -> Result<(), String> {
 
     let qemu_timeout = duration_from_nanos(c_comparison_timeout_nanos(qemu_target))?;
     for sample in 0..samples {
-        for candidate_index in benchmark_rotating_order::<5>(0, sample) {
+        for candidate_index in benchmark_rotating_order::<7>(0, sample) {
             let measurement = &mut measurements[candidate_index];
             let (elapsed, details) = match measurement.candidate {
                 Candidate::Native => (
@@ -266,6 +318,23 @@ fn run() -> Result<(), String> {
                     Rv32ExecutionBackendConfig::BlockCached {
                         sets: PRODUCT_BLOCK_CACHE_SETS,
                         max_instructions: PRODUCT_BLOCK_MAX_INSTRUCTIONS,
+                    },
+                )?,
+                Candidate::DirectDbt => run_product(
+                    &direct_dbt_elf,
+                    measurement.batch,
+                    Rv32ExecutionBackendConfig::DirectDbt {
+                        max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+                        code_bytes: PRODUCT_DBT_CODE_BYTES,
+                    },
+                )?,
+                Candidate::CachedDbt => run_product(
+                    &cached_dbt_elf,
+                    measurement.batch,
+                    Rv32ExecutionBackendConfig::CachedDbt {
+                        sets: PRODUCT_DBT_CACHE_SETS,
+                        max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+                        code_bytes: PRODUCT_DBT_CODE_BYTES,
                     },
                 )?,
             };
@@ -307,7 +376,15 @@ fn run() -> Result<(), String> {
         sha256_file(&block_cached_elf)?
     );
     println!(
-        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes"
+        "direct-dbt-calibrated-sha256\t{}",
+        sha256_file(&direct_dbt_elf)?
+    );
+    println!(
+        "cached-dbt-calibrated-sha256\t{}",
+        sha256_file(&cached_dbt_elf)?
+    );
+    println!(
+        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_typed_slow_exits\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes"
     );
 
     let normalized = measurements
@@ -330,9 +407,11 @@ fn run() -> Result<(), String> {
         let text_bytes = match measurement.candidate {
             Candidate::Native => manifest_value(&manifest, "native-text-bytes")?.to_string(),
             Candidate::Qemu => manifest_value(&manifest, "qemu-text-bytes")?.to_string(),
-            Candidate::Cached | Candidate::Predecoded | Candidate::BlockCached => {
-                measurement.details.executable_bytes.to_string()
-            }
+            Candidate::Cached
+            | Candidate::Predecoded
+            | Candidate::BlockCached
+            | Candidate::DirectDbt
+            | Candidate::CachedDbt => measurement.details.executable_bytes.to_string(),
         };
         let mode = match measurement.candidate {
             Candidate::Native => "clang-O3-native-lto",
@@ -340,9 +419,19 @@ fn run() -> Result<(), String> {
             Candidate::Cached => "product-machine-cached",
             Candidate::Predecoded => "product-machine-predecoded",
             Candidate::BlockCached => "product-machine-block-cached",
+            Candidate::DirectDbt => "product-machine-direct-dbt",
+            Candidate::CachedDbt => "product-machine-cached-dbt",
         };
+        let product_candidate = matches!(
+            measurement.candidate,
+            Candidate::Cached
+                | Candidate::Predecoded
+                | Candidate::BlockCached
+                | Candidate::DirectDbt
+                | Candidate::CachedDbt
+        );
         println!(
-            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             measurement.candidate.name(),
             mode,
             ITERATIONS,
@@ -361,20 +450,28 @@ fn run() -> Result<(), String> {
             } else {
                 "-".to_string()
             },
-            option_u64(matches!(measurement.candidate, Candidate::Cached | Candidate::Predecoded | Candidate::BlockCached).then_some(measurement.details.retired_instructions)),
+            option_u64(product_candidate.then_some(measurement.details.retired_instructions)),
             measurement.details.lookup_unit.unwrap_or("-"),
             option_u64(measurement.details.cache_hits),
             option_u64(measurement.details.cache_misses),
             option_u64(measurement.details.cache_evictions),
             option_u64(measurement.details.blocks_built),
             option_u64(measurement.details.decoded_slots_built),
-            if matches!(measurement.candidate, Candidate::Cached | Candidate::Predecoded | Candidate::BlockCached) {
+            if product_candidate {
                 measurement.details.translation_bytes.to_string()
             } else {
                 "-".to_string()
             },
-            option_u64(matches!(measurement.candidate, Candidate::Cached | Candidate::Predecoded | Candidate::BlockCached).then_some(measurement.details.steady_allocations)),
-            option_u64(matches!(measurement.candidate, Candidate::Cached | Candidate::Predecoded | Candidate::BlockCached).then_some(measurement.details.steady_allocated_bytes)),
+            option_u64(measurement.details.dbt_translations),
+            option_u64(measurement.details.dbt_publications),
+            option_u64(measurement.details.dbt_native_dispatches),
+            option_u64(measurement.details.dbt_typed_slow_exits),
+            option_u64(measurement.details.dbt_lowered_load_sites),
+            option_u64(measurement.details.dbt_lowered_store_sites),
+            option_u64(measurement.details.dbt_emitted_bytes),
+            option_u64(measurement.details.dbt_reserved_bytes),
+            option_u64(product_candidate.then_some(measurement.details.steady_allocations)),
+            option_u64(product_candidate.then_some(measurement.details.steady_allocated_bytes)),
         );
     }
     Ok(())
@@ -565,6 +662,7 @@ fn run_product(
         ));
     }
     let stats = machine.translation_stats();
+    let dbt = machine.dbt_stats();
     Ok((
         elapsed,
         ProductDetails {
@@ -575,6 +673,14 @@ fn run_product(
             cache_evictions: stats.map(|value| value.evictions),
             blocks_built: stats.map(|value| value.blocks_built),
             decoded_slots_built: stats.map(|value| value.decoded_slots_built),
+            dbt_translations: dbt.map(|value| value.translations),
+            dbt_publications: dbt.map(|value| value.publications),
+            dbt_native_dispatches: dbt.map(|value| value.native_dispatches),
+            dbt_typed_slow_exits: dbt.map(|value| value.typed_slow_exits),
+            dbt_lowered_load_sites: dbt.map(|value| value.lowered_load_sites),
+            dbt_lowered_store_sites: dbt.map(|value| value.lowered_store_sites),
+            dbt_emitted_bytes: dbt.map(|value| value.emitted_bytes),
+            dbt_reserved_bytes: dbt.map(|value| value.reserved_bytes as u64),
             translation_bytes: machine.translation_bytes(),
             executable_bytes: machine.executable_bytes(),
             steady_allocations,
