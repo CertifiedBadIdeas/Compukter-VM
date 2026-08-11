@@ -33,9 +33,13 @@ fn all_vm_backends_use_identical_strict_elf() {
         let cached = image.prepare(ProductMachineBackend::Cached).unwrap();
         let predecoded = image.prepare(ProductMachineBackend::Predecoded).unwrap();
         let block_cached = image.prepare(ProductMachineBackend::BlockCached).unwrap();
+        let direct_dbt = image.prepare(ProductMachineBackend::DirectDbt).unwrap();
+        let cached_dbt = image.prepare(ProductMachineBackend::CachedDbt).unwrap();
 
         assert_eq!(cached.image_fingerprint(), predecoded.image_fingerprint());
         assert_eq!(cached.image_fingerprint(), block_cached.image_fingerprint());
+        assert_eq!(cached.image_fingerprint(), direct_dbt.image_fingerprint());
+        assert_eq!(cached.image_fingerprint(), cached_dbt.image_fingerprint());
         assert_eq!(&image.elf_bytes()[..4], b"\x7fELF");
         assert_eq!(image.elf_bytes()[4], 1, "ELFCLASS32");
         assert_eq!(image.elf_bytes()[5], 1, "ELFDATA2LSB");
@@ -101,6 +105,20 @@ fn product_observation_reports_backend_owned_storage() {
     assert!(block_stats.blocks_built > 0);
     assert!(block_stats.decoded_slots_built >= block_stats.blocks_built);
     assert!(block_cached.translation_bytes > 0);
+
+    for backend in [
+        ProductMachineBackend::DirectDbt,
+        ProductMachineBackend::CachedDbt,
+    ] {
+        let mut prepared =
+            PreparedProductMachine::new(backend, ProductMachineWorkload::PacketRing, 8).unwrap();
+        let observation = prepared.execute().unwrap();
+        let stats = observation.translation_stats.unwrap();
+        assert_eq!(stats.lookup_unit, Rv32TranslationLookupUnit::Block);
+        assert!(stats.blocks_built > 0);
+        assert!(stats.decoded_slots_built >= stats.blocks_built);
+        assert!(observation.translation_bytes > 64 * 1024);
+    }
 }
 
 #[test]
@@ -111,6 +129,8 @@ fn product_sampling_order_is_interleaved_and_percentiles_are_stable() {
             ProductMachineBackend::Cached,
             ProductMachineBackend::Predecoded,
             ProductMachineBackend::BlockCached,
+            ProductMachineBackend::DirectDbt,
+            ProductMachineBackend::CachedDbt,
         ]
     );
     assert_eq!(
@@ -118,6 +138,8 @@ fn product_sampling_order_is_interleaved_and_percentiles_are_stable() {
         [
             ProductMachineBackend::Predecoded,
             ProductMachineBackend::BlockCached,
+            ProductMachineBackend::DirectDbt,
+            ProductMachineBackend::CachedDbt,
             ProductMachineBackend::Cached,
         ]
     );
@@ -152,13 +174,21 @@ fn product_timing_math_is_normalized_and_rotated() {
         ProductExecutionCandidate::BlockCached.name(),
         "rv32-block-cached"
     );
+    assert_eq!(
+        ProductExecutionCandidate::DirectDbt.name(),
+        "rv32-direct-dbt"
+    );
+    assert_eq!(
+        ProductExecutionCandidate::CachedDbt.name(),
+        "rv32-cached-dbt"
+    );
 }
 
 #[test]
 fn resident_report_header_remains_stable() {
     assert_eq!(
         PRODUCT_RESIDENT_REPORT_HEADER,
-        "backend\tpopulation\tconstruction_median_ns\tconstruction_p95_ns\tresident_live_bytes\tpeak_construction_bytes\tlive_bytes_per_machine\taggregate_ram_bytes\telf_bytes\texecutable_bytes\trw_initialized_bytes\tram_bytes\tdebug_limit\tcache_sets\tblock_cache_sets\tblock_max_instructions"
+        "backend\tpopulation\tconstruction_median_ns\tconstruction_p95_ns\tresident_live_bytes\tpeak_construction_bytes\tlive_bytes_per_machine\taggregate_ram_bytes\telf_bytes\texecutable_bytes\trw_initialized_bytes\tram_bytes\tdebug_limit\tcache_sets\tblock_cache_sets\tblock_max_instructions\tdbt_cache_sets\tdbt_max_instructions\tdbt_code_bytes"
     );
     assert_eq!(
         PRODUCT_ACTIVE_REPORT_HEADER,
