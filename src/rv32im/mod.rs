@@ -188,6 +188,14 @@ impl Rv32imCpu {
 
     #[allow(
         dead_code,
+        reason = "the direct DBT context consumes normalized reservation state in a later issue #498 task"
+    )]
+    pub(crate) fn reservation_address(&self) -> Option<u32> {
+        self.state.reservation.map(Rv32Reservation::address)
+    }
+
+    #[allow(
+        dead_code,
         reason = "the first generated RV32 block mutates canonical state in a later slice"
     )]
     pub(crate) fn architectural_state(&self) -> &Rv32ArchitecturalState {

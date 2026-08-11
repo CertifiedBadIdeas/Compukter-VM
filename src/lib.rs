@@ -20,6 +20,7 @@
 pub mod benchmarks;
 pub mod bus;
 pub mod memory;
+mod rv32_dbt;
 mod rv32_jit;
 pub mod rv32_machine;
 pub mod rv32im;
