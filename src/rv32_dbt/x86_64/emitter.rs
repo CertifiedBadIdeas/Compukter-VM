@@ -141,8 +141,12 @@ pub(crate) struct Label(u32);
 pub(crate) enum EmitError {
     #[error("x86_64 emitter capacity must be positive")]
     InvalidCapacity,
+    #[error("x86_64 emitter control capacity must be positive")]
+    InvalidControlCapacity,
     #[error("x86_64 emitter exceeded its {limit}-byte capacity")]
     Capacity { limit: usize },
+    #[error("x86_64 emitter exceeded its {limit}-entry control capacity")]
+    ControlCapacity { limit: usize },
     #[error("x86_64 label {label} was not bound")]
     UnboundLabel { label: u32 },
     #[error("x86_64 label {label} was bound more than once")]
@@ -165,18 +169,23 @@ pub(crate) struct X64Emitter {
     capacity: usize,
     labels: Vec<Option<usize>>,
     fixups: Vec<Fixup>,
+    control_capacity: usize,
 }
 
 impl X64Emitter {
-    pub(crate) fn new(capacity: usize) -> Result<Self, EmitError> {
+    pub(crate) fn new(capacity: usize, control_capacity: usize) -> Result<Self, EmitError> {
         if capacity == 0 {
             return Err(EmitError::InvalidCapacity);
+        }
+        if control_capacity == 0 {
+            return Err(EmitError::InvalidControlCapacity);
         }
         Ok(Self {
             bytes: Vec::with_capacity(capacity),
             capacity,
-            labels: Vec::new(),
-            fixups: Vec::new(),
+            labels: Vec::with_capacity(control_capacity),
+            fixups: Vec::with_capacity(control_capacity),
+            control_capacity,
         })
     }
 
@@ -184,10 +193,30 @@ impl X64Emitter {
         &self.bytes
     }
 
-    pub(crate) fn new_label(&mut self) -> Label {
+    pub(crate) fn reset(&mut self) {
+        self.bytes.clear();
+        self.labels.clear();
+        self.fixups.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_capacities(&self) -> (usize, usize, usize) {
+        (
+            self.bytes.capacity(),
+            self.labels.capacity(),
+            self.fixups.capacity(),
+        )
+    }
+
+    pub(crate) fn new_label(&mut self) -> Result<Label, EmitError> {
+        if self.labels.len() == self.control_capacity {
+            return Err(EmitError::ControlCapacity {
+                limit: self.control_capacity,
+            });
+        }
         let label = Label(self.labels.len() as u32);
         self.labels.push(None);
-        label
+        Ok(label)
     }
 
     pub(crate) fn bind(&mut self, label: Label) -> Result<(), EmitError> {
@@ -201,7 +230,7 @@ impl X64Emitter {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Result<Vec<u8>, EmitError> {
+    pub(crate) fn finish(&mut self) -> Result<&[u8], EmitError> {
         for fixup in &self.fixups {
             let target = self
                 .labels
@@ -215,7 +244,7 @@ impl X64Emitter {
             self.bytes[fixup.displacement_offset..fixup.displacement_offset + 4]
                 .copy_from_slice(&displacement.to_le_bytes());
         }
-        Ok(self.bytes)
+        Ok(&self.bytes)
     }
 
     pub(crate) fn push(&mut self, register: Gpr) -> Result<(), EmitError> {
@@ -506,6 +535,11 @@ impl X64Emitter {
             return Err(EmitError::InvalidOperand("unknown label"));
         }
         self.with_rollback(|out| {
+            if out.fixups.len() == out.control_capacity {
+                return Err(EmitError::ControlCapacity {
+                    limit: out.control_capacity,
+                });
+            }
             out.emit_bytes(opcode)?;
             let displacement_offset = out.bytes.len();
             out.emit_bytes(&[0; 4])?;
@@ -610,9 +644,26 @@ mod tests {
     use super::{Condition, EmitError, Gpr, Mem, Scale, X64Emitter};
 
     #[test]
+    fn reset_reuses_every_bounded_buffer() {
+        let mut out = X64Emitter::new(128, 16).unwrap();
+        let done = out.new_label().unwrap();
+        out.jmp(done).unwrap();
+        out.bind(done).unwrap();
+        out.ret().unwrap();
+        assert_eq!(out.finish().unwrap(), &[0xe9, 0, 0, 0, 0, 0xc3]);
+
+        let capacities = out.buffer_capacities();
+        out.reset();
+        out.mov_r32_imm32(Gpr::Rax, 7).unwrap();
+        out.ret().unwrap();
+        assert_eq!(out.finish().unwrap(), &[0xb8, 7, 0, 0, 0, 0xc3]);
+        assert_eq!(out.buffer_capacities(), capacities);
+    }
+
+    #[test]
     fn encodes_high_register_memory_and_forward_branch() {
-        let mut out = X64Emitter::new(128).unwrap();
-        let done = out.new_label();
+        let mut out = X64Emitter::new(128, 16).unwrap();
+        let done = out.new_label().unwrap();
         out.mov_r32_m32(Gpr::R8, Mem::base_disp(Gpr::R15, 12))
             .unwrap();
         out.test_r32_r32(Gpr::R8, Gpr::R8).unwrap();
@@ -632,8 +683,8 @@ mod tests {
 
     #[test]
     fn unresolved_label_is_rejected() {
-        let mut out = X64Emitter::new(32).unwrap();
-        let label = out.new_label();
+        let mut out = X64Emitter::new(32, 16).unwrap();
+        let label = out.new_label().unwrap();
         out.jmp(label).unwrap();
 
         assert!(matches!(
@@ -644,7 +695,7 @@ mod tests {
 
     #[test]
     fn capacity_is_checked_before_mutation() {
-        let mut out = X64Emitter::new(1).unwrap();
+        let mut out = X64Emitter::new(1, 16).unwrap();
         out.ret().unwrap();
 
         assert_eq!(out.bytes(), &[0xc3]);
@@ -654,7 +705,7 @@ mod tests {
 
     #[test]
     fn encodes_extended_sib_and_signed_disp8() {
-        let mut out = X64Emitter::new(16).unwrap();
+        let mut out = X64Emitter::new(16, 16).unwrap();
         out.mov_r32_m32(
             Gpr::R9,
             Mem::base_index_disp(Gpr::R12, Gpr::R10, Scale::Four, -16),
@@ -666,7 +717,7 @@ mod tests {
 
     #[test]
     fn emits_rex_for_sil_byte_register() {
-        let mut out = X64Emitter::new(16).unwrap();
+        let mut out = X64Emitter::new(16, 16).unwrap();
         out.mov_m8_r8(Mem::base_disp(Gpr::Rax, 0), Gpr::Rsi)
             .unwrap();
 
@@ -675,8 +726,8 @@ mod tests {
 
     #[test]
     fn patches_backward_branch() {
-        let mut out = X64Emitter::new(16).unwrap();
-        let loop_head = out.new_label();
+        let mut out = X64Emitter::new(16, 16).unwrap();
+        let loop_head = out.new_label().unwrap();
         out.bind(loop_head).unwrap();
         out.ret().unwrap();
         out.jmp(loop_head).unwrap();
@@ -686,8 +737,8 @@ mod tests {
 
     #[test]
     fn duplicate_label_and_invalid_sib_are_rejected_without_output() {
-        let mut out = X64Emitter::new(16).unwrap();
-        let label = out.new_label();
+        let mut out = X64Emitter::new(16, 16).unwrap();
+        let label = out.new_label().unwrap();
         out.bind(label).unwrap();
         assert_eq!(out.bind(label), Err(EmitError::DuplicateLabel { label: 0 }));
         assert_eq!(
@@ -702,7 +753,7 @@ mod tests {
 
     #[test]
     fn encodes_move_stack_and_addressing_surface() {
-        let mut out = X64Emitter::new(128).unwrap();
+        let mut out = X64Emitter::new(128, 16).unwrap();
         out.push(Gpr::Rax).unwrap();
         out.push(Gpr::R12).unwrap();
         out.pop(Gpr::R12).unwrap();
@@ -736,7 +787,7 @@ mod tests {
 
     #[test]
     fn encodes_arithmetic_shift_condition_and_multiply_surface() {
-        let mut out = X64Emitter::new(128).unwrap();
+        let mut out = X64Emitter::new(128, 16).unwrap();
         out.add_r32_r32(Gpr::Rax, Gpr::Rcx).unwrap();
         out.sub_r32_r32(Gpr::R8, Gpr::R9).unwrap();
         out.and_r32_r32(Gpr::Rbx, Gpr::Rdx).unwrap();

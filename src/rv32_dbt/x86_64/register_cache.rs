@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn x0_is_materialized_but_never_resident_or_dirty() {
         let mut cache = RegisterCache::new();
-        let mut out = X64Emitter::new(128).unwrap();
+        let mut out = X64Emitter::new(128, 16).unwrap();
 
         assert_eq!(cache.read(0, &[], &[], &mut out).unwrap(), Gpr::Rax);
         assert_eq!(cache.write(0, &[], &[], &mut out).unwrap(), None);
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn first_read_loads_once_and_dirty_flush_writes_once() {
         let mut cache = RegisterCache::new();
-        let mut out = X64Emitter::new(128).unwrap();
+        let mut out = X64Emitter::new(128, 16).unwrap();
 
         let host = cache.read(3, &[], &[], &mut out).unwrap();
         assert_eq!(cache.read(3, &[], &[], &mut out).unwrap(), host);
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn overwrite_allocates_without_loading_old_value() {
         let mut cache = RegisterCache::new();
-        let mut out = X64Emitter::new(128).unwrap();
+        let mut out = X64Emitter::new(128, 16).unwrap();
 
         assert_eq!(cache.write(7, &[], &[], &mut out).unwrap(), Some(Gpr::Rbx));
 
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn ninth_guest_evicts_no_future_use_then_farthest_next_use() {
         let mut cache = RegisterCache::new();
-        let mut out = X64Emitter::new(512).unwrap();
+        let mut out = X64Emitter::new(512, 16).unwrap();
         for guest in 1..=8 {
             cache.read(guest, &[], &[], &mut out).unwrap();
         }
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn dirty_eviction_writes_canonical_state_before_reusing_host() {
         let mut cache = RegisterCache::new();
-        let mut out = X64Emitter::new(512).unwrap();
+        let mut out = X64Emitter::new(512, 16).unwrap();
         for guest in 1..=8 {
             cache.read(guest, &[], &[], &mut out).unwrap();
         }

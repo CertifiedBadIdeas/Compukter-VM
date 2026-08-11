@@ -24,7 +24,7 @@ use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
 use crate::rv32_dbt::code_cache::{DbtCacheKey, DirectDbtCodeCache};
 use crate::rv32_dbt::executable::ExecutableScratch;
-use crate::rv32_dbt::x86_64::lower::lower_block;
+use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
 use crate::rv32im::{
     decode_product_word, fill_decoded_block, DecodedInstruction, Rv32ResolvedInstruction, Rv32imCpu,
 };
@@ -52,6 +52,7 @@ pub struct PreparedDirectDbtCompute32 {
     result_register: u8,
     memory: MachineMemory,
     scratch: ExecutableScratch,
+    workspace: DbtTranslationWorkspace,
     decoded: Vec<Rv32ResolvedInstruction>,
 }
 
@@ -74,6 +75,8 @@ impl PreparedDirectDbtCompute32 {
             result_register: image.result_register,
             memory,
             scratch: ExecutableScratch::new(EXECUTABLE_BYTES).map_err(|error| error.to_string())?,
+            workspace: DbtTranslationWorkspace::new(EXECUTABLE_BYTES, MAX_BLOCK_INSTRUCTIONS)
+                .map_err(|error| error.to_string())?,
             decoded: Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS),
         })
     }
@@ -110,9 +113,11 @@ impl PreparedDirectDbtCompute32 {
             .map_err(|error| error.to_string())?;
 
             let translation_started = Instant::now();
-            let input = DbtBlockInput::new(cpu.pc(), self.decoded.clone(), DbtBlockMode::Fast)?;
-            let compiled =
-                lower_block(&input, EXECUTABLE_BYTES).map_err(|error| error.to_string())?;
+            let input = DbtBlockInput::new(cpu.pc(), &self.decoded, DbtBlockMode::Fast)?;
+            let compiled = self
+                .workspace
+                .lower(&input)
+                .map_err(|error| error.to_string())?;
             translation_nanos += translation_started.elapsed().as_nanos();
             translated_bytes = translated_bytes.saturating_add(compiled.code().len() as u64);
 
@@ -241,6 +246,7 @@ pub struct PreparedCachedDbtCompute32 {
     result_register: u8,
     memory: MachineMemory,
     cache: DirectDbtCodeCache,
+    workspace: DbtTranslationWorkspace,
     decoded: Vec<Rv32ResolvedInstruction>,
 }
 
@@ -263,6 +269,8 @@ impl PreparedCachedDbtCompute32 {
             result_register: image.result_register,
             memory,
             cache: DirectDbtCodeCache::new(CACHE_SETS, EXECUTABLE_BYTES)
+                .map_err(|error| error.to_string())?,
+            workspace: DbtTranslationWorkspace::new(EXECUTABLE_BYTES, MAX_BLOCK_INSTRUCTIONS)
                 .map_err(|error| error.to_string())?,
             decoded: Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS),
         })
@@ -307,9 +315,11 @@ impl PreparedCachedDbtCompute32 {
                 .map_err(|error| error.to_string())?;
 
                 let translation_started = Instant::now();
-                let input = DbtBlockInput::new(cpu.pc(), self.decoded.clone(), DbtBlockMode::Fast)?;
-                let compiled =
-                    lower_block(&input, EXECUTABLE_BYTES).map_err(|error| error.to_string())?;
+                let input = DbtBlockInput::new(cpu.pc(), &self.decoded, DbtBlockMode::Fast)?;
+                let compiled = self
+                    .workspace
+                    .lower(&input)
+                    .map_err(|error| error.to_string())?;
                 translation_nanos += translation_started.elapsed().as_nanos();
                 translations += 1;
                 translated_bytes = translated_bytes.saturating_add(compiled.code().len() as u64);

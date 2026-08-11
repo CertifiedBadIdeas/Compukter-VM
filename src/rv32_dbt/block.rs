@@ -30,17 +30,17 @@ pub(crate) enum DbtBlockMode {
     Bounded { max_attempts: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DbtBlockInput {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DbtBlockInput<'a> {
     start_pc: u32,
-    slots: Vec<Rv32ResolvedInstruction>,
+    slots: &'a [Rv32ResolvedInstruction],
     mode: DbtBlockMode,
 }
 
-impl DbtBlockInput {
+impl<'a> DbtBlockInput<'a> {
     pub(crate) fn new(
         start_pc: u32,
-        slots: Vec<Rv32ResolvedInstruction>,
+        slots: &'a [Rv32ResolvedInstruction],
         mode: DbtBlockMode,
     ) -> Result<Self, String> {
         if slots.is_empty() {
@@ -66,7 +66,7 @@ impl DbtBlockInput {
     }
 
     pub(crate) fn slots(&self) -> &[Rv32ResolvedInstruction] {
-        &self.slots
+        self.slots
     }
 
     pub(crate) fn mode(&self) -> DbtBlockMode {
@@ -74,16 +74,16 @@ impl DbtBlockInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompiledBlock {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranslatedBlock<'a> {
     start_pc: u32,
     instruction_count: u32,
     mode: DbtBlockMode,
-    code: Vec<u8>,
+    code: &'a [u8],
 }
 
-impl CompiledBlock {
-    pub(crate) fn new(input: &DbtBlockInput, code: Vec<u8>) -> Result<Self, String> {
+impl<'a> TranslatedBlock<'a> {
+    pub(crate) fn new(input: &DbtBlockInput<'_>, code: &'a [u8]) -> Result<Self, String> {
         if code.is_empty() {
             return Err("RV32 DBT compiled block cannot be empty".to_string());
         }
@@ -108,13 +108,13 @@ impl CompiledBlock {
     }
 
     pub(crate) fn code(&self) -> &[u8] {
-        &self.code
+        self.code
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CompiledBlock, DbtBlockInput, DbtBlockMode};
+    use super::{DbtBlockInput, DbtBlockMode, TranslatedBlock};
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
 
     fn slot() -> Rv32ResolvedInstruction {
@@ -126,31 +126,34 @@ mod tests {
     }
 
     #[test]
-    fn block_input_rejects_empty_and_invalid_bounded_modes() {
-        assert!(DbtBlockInput::new(0x1000, Vec::new(), DbtBlockMode::Fast).is_err());
-        assert!(DbtBlockInput::new(
-            0x1000,
-            vec![slot()],
-            DbtBlockMode::Bounded { max_attempts: 0 },
-        )
-        .is_err());
-        assert!(DbtBlockInput::new(
-            0x1000,
-            vec![slot()],
-            DbtBlockMode::Bounded { max_attempts: 1 },
-        )
-        .is_err());
+    fn block_input_borrows_the_callers_slots() {
+        let slots = [slot(), slot()];
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Fast).unwrap();
+
+        assert!(std::ptr::eq(input.slots().as_ptr(), slots.as_ptr()));
     }
 
     #[test]
-    fn compiled_block_keeps_cache_independent_metadata() {
-        let input = DbtBlockInput::new(
-            0x1000,
-            vec![slot(), slot()],
-            DbtBlockMode::Bounded { max_attempts: 1 },
-        )
-        .unwrap();
-        let block = CompiledBlock::new(&input, vec![0xc3]).unwrap();
+    fn block_input_rejects_empty_and_invalid_bounded_modes() {
+        assert!(DbtBlockInput::new(0x1000, &[], DbtBlockMode::Fast).is_err());
+        let one_slot = [slot()];
+        assert!(
+            DbtBlockInput::new(0x1000, &one_slot, DbtBlockMode::Bounded { max_attempts: 0 },)
+                .is_err()
+        );
+        assert!(
+            DbtBlockInput::new(0x1000, &one_slot, DbtBlockMode::Bounded { max_attempts: 1 },)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn translated_block_keeps_cache_independent_metadata() {
+        let slots = [slot(), slot()];
+        let input =
+            DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
+        let code = [0xc3];
+        let block = TranslatedBlock::new(&input, &code).unwrap();
 
         assert_eq!(block.start_pc(), 0x1000);
         assert_eq!(block.instruction_count(), 2);
