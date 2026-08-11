@@ -46,6 +46,14 @@ impl Rv32Reservation {
         Self { address }
     }
 
+    #[allow(
+        dead_code,
+        reason = "the direct DBT context consumes normalized reservation state in a later issue #498 task"
+    )]
+    pub(crate) fn address(self) -> u32 {
+        self.address
+    }
+
     pub(crate) fn matches(self, address: u32) -> bool {
         self.address == address
     }
@@ -82,5 +90,15 @@ pub(crate) fn apply_atomic(operation: AtomicOp, old: u32, operand: u32) -> u32 {
         }
         AtomicOp::MinU => old.min(operand),
         AtomicOp::MaxU => old.max(operand),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Rv32Reservation;
+
+    #[test]
+    fn reservation_exposes_a_normalized_address_for_dbt_contexts() {
+        assert_eq!(Rv32Reservation::new(0x1234).address(), 0x1234);
     }
 }
