@@ -46,6 +46,7 @@ struct Resident {
     dirty: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct RegisterCache {
     entries: [Option<Resident>; HOST_POOL.len()],
 }

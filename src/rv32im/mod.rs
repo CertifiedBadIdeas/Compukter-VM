@@ -39,8 +39,8 @@ pub(crate) use decode::{
     decode as decode_product_word, decode_eager_reference, CsrOperation, CsrSource,
     DecodedInstruction,
 };
-use decode::{Branch, Load, Store};
-pub(crate) use decode::{ImmOp, Op};
+pub(crate) use decode::{Branch, ImmOp, Op};
+use decode::{Load, Store};
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

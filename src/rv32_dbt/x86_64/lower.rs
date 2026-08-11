@@ -28,32 +28,91 @@ use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{CompiledBlock, DbtBlockInput, DbtBlockMode};
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 use crate::rv32im::{
-    DecodedInstruction, ImmOp, Op, Rv32ArchitecturalState, Rv32ResolvedInstruction,
+    Branch, DecodedInstruction, ImmOp, Op, Rv32ArchitecturalState, Rv32ResolvedInstruction,
 };
 
 pub(crate) fn lower_block(
     input: &DbtBlockInput,
     code_capacity: usize,
 ) -> Result<CompiledBlock, DbtFault> {
-    if input.mode() != DbtBlockMode::Fast {
-        return Err(fault(
-            DbtFaultKind::Translation,
-            input.start_pc(),
-            None,
-            "bounded lowering is introduced with exact budget control",
-        ));
-    }
     let mut out = X64Emitter::new(code_capacity)
         .map_err(|error| emit_fault(input.start_pc(), None, error))?;
     emit_prologue(&mut out).map_err(|error| emit_fault(input.start_pc(), None, error))?;
     let mut cache = RegisterCache::new();
     let mut terminal = None;
+    let mut emitted_terminal = false;
+    let bounded_limit = match input.mode() {
+        DbtBlockMode::Fast => None,
+        DbtBlockMode::Bounded { max_attempts } => Some(max_attempts as usize),
+    };
     for (index, slot) in input.slots().iter().copied().enumerate() {
         let pc = input.start_pc().wrapping_add(index as u32 * 4);
+        if bounded_limit == Some(index) {
+            emit_exit(
+                &mut cache,
+                &mut out,
+                DbtExitTag::BudgetExhausted,
+                pc,
+                index as u32,
+                0,
+                0,
+            )
+            .map_err(|error| emit_fault(pc, None, error))?;
+            emitted_terminal = true;
+            break;
+        }
         let Rv32ResolvedInstruction::Valid { word, instruction } = slot else {
             terminal = Some((pc, 0, index as u32 + 1));
             break;
         };
+        let attempted = index as u32 + 1;
+        match instruction {
+            DecodedInstruction::Branch {
+                kind,
+                rs1,
+                rs2,
+                offset,
+            } => {
+                emit_branch(
+                    kind,
+                    rs1,
+                    rs2,
+                    offset,
+                    pc,
+                    word,
+                    attempted,
+                    &input.slots()[index + 1..],
+                    &mut cache,
+                    &mut out,
+                )
+                .map_err(|error| emit_fault(pc, Some(word), error))?;
+                emitted_terminal = true;
+                break;
+            }
+            DecodedInstruction::Jal { rd, offset } => {
+                emit_jal(rd, offset, pc, word, attempted, &mut cache, &mut out)
+                    .map_err(|error| emit_fault(pc, Some(word), error))?;
+                emitted_terminal = true;
+                break;
+            }
+            DecodedInstruction::Jalr { rd, rs1, immediate } => {
+                emit_jalr(
+                    rd,
+                    rs1,
+                    immediate,
+                    pc,
+                    word,
+                    attempted,
+                    &input.slots()[index + 1..],
+                    &mut cache,
+                    &mut out,
+                )
+                .map_err(|error| emit_fault(pc, Some(word), error))?;
+                emitted_terminal = true;
+                break;
+            }
+            _ => {}
+        }
         if !lower_instruction(
             instruction,
             pc,
@@ -67,37 +126,167 @@ pub(crate) fn lower_block(
             break;
         }
     }
-    if let Some((pc, word, attempted)) = terminal {
-        emit_exit(
-            &mut cache,
-            &mut out,
-            DbtExitTag::SlowInstruction,
-            pc,
-            attempted,
-            pc,
-            word,
-        )
-        .map_err(|error| emit_fault(pc, Some(word), error))?;
-    } else {
-        let next_pc = input
-            .start_pc()
-            .wrapping_add(input.slots().len() as u32 * 4);
-        emit_exit(
-            &mut cache,
-            &mut out,
-            DbtExitTag::Completed,
-            next_pc,
-            input.slots().len() as u32,
-            0,
-            0,
-        )
-        .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+    if !emitted_terminal {
+        if let Some((pc, word, attempted)) = terminal {
+            emit_exit(
+                &mut cache,
+                &mut out,
+                DbtExitTag::SlowInstruction,
+                pc,
+                attempted,
+                pc,
+                word,
+            )
+            .map_err(|error| emit_fault(pc, Some(word), error))?;
+        } else {
+            let next_pc = input
+                .start_pc()
+                .wrapping_add(input.slots().len() as u32 * 4);
+            emit_exit(
+                &mut cache,
+                &mut out,
+                DbtExitTag::Completed,
+                next_pc,
+                input.slots().len() as u32,
+                0,
+                0,
+            )
+            .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+        }
     }
     let code = out
         .finish()
         .map_err(|error| emit_fault(input.start_pc(), None, error))?;
     CompiledBlock::new(input, code)
         .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_branch(
+    kind: Branch,
+    rs1: usize,
+    rs2: usize,
+    offset: i32,
+    pc: u32,
+    word: u32,
+    attempted: u32,
+    remaining: &[Rv32ResolvedInstruction],
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let lhs = cache.read(rs1, remaining, &[], out)?;
+    let rhs = cache.read(rs2, remaining, &[lhs], out)?;
+    out.cmp_r32_r32(lhs, rhs)?;
+    let taken = out.new_label();
+    let condition = match kind {
+        Branch::Eq => Condition::Equal,
+        Branch::Ne => Condition::NotEqual,
+        Branch::Lt => Condition::Less,
+        Branch::Ge => Condition::GreaterEqual,
+        Branch::Ltu => Condition::Below,
+        Branch::Geu => Condition::AboveEqual,
+    };
+    out.jcc(condition, taken)?;
+    let mut fallthrough_cache = cache.clone();
+    emit_exit(
+        &mut fallthrough_cache,
+        out,
+        DbtExitTag::Completed,
+        pc.wrapping_add(4),
+        attempted,
+        0,
+        0,
+    )?;
+    out.bind(taken)?;
+    let target = pc.wrapping_add_signed(offset);
+    let mut taken_cache = cache.clone();
+    if target & 3 == 0 {
+        emit_exit(
+            &mut taken_cache,
+            out,
+            DbtExitTag::Completed,
+            target,
+            attempted,
+            0,
+            0,
+        )
+    } else {
+        emit_exit(
+            &mut taken_cache,
+            out,
+            DbtExitTag::SlowInstruction,
+            pc,
+            attempted,
+            pc,
+            word,
+        )
+    }
+}
+
+fn emit_jal(
+    rd: usize,
+    offset: i32,
+    pc: u32,
+    word: u32,
+    attempted: u32,
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let target = pc.wrapping_add_signed(offset);
+    if target & 3 != 0 {
+        return emit_exit(
+            cache,
+            out,
+            DbtExitTag::SlowInstruction,
+            pc,
+            attempted,
+            pc,
+            word,
+        );
+    }
+    if let Some(dst) = cache.write(rd, &[], &[], out)? {
+        out.mov_r32_imm32(dst, pc.wrapping_add(4))?;
+    }
+    emit_exit(cache, out, DbtExitTag::Completed, target, attempted, 0, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_jalr(
+    rd: usize,
+    rs1: usize,
+    immediate: i32,
+    pc: u32,
+    word: u32,
+    attempted: u32,
+    remaining: &[Rv32ResolvedInstruction],
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let base = cache.read(rs1, remaining, &[], out)?;
+    out.mov_r32_r32(Gpr::Rax, base)?;
+    out.add_r32_imm32(Gpr::Rax, immediate)?;
+    out.and_r32_imm32(Gpr::Rax, -2)?;
+    out.mov_r32_r32(Gpr::Rcx, Gpr::Rax)?;
+    out.and_r32_imm32(Gpr::Rcx, 3)?;
+    out.test_r32_r32(Gpr::Rcx, Gpr::Rcx)?;
+    let aligned = out.new_label();
+    out.jcc(Condition::Equal, aligned)?;
+    let mut misaligned_cache = cache.clone();
+    emit_exit(
+        &mut misaligned_cache,
+        out,
+        DbtExitTag::SlowInstruction,
+        pc,
+        attempted,
+        pc,
+        word,
+    )?;
+    out.bind(aligned)?;
+    if let Some(dst) = cache.write(rd, remaining, &[base], out)? {
+        out.mov_r32_imm32(dst, pc.wrapping_add(4))?;
+    }
+    out.mov_r32_r32(Gpr::Rdx, Gpr::Rax)?;
+    emit_exit_dynamic(cache, out, DbtExitTag::Completed, Gpr::Rdx, attempted, 0, 0)
 }
 
 fn emit_prologue(out: &mut X64Emitter) -> Result<(), EmitError> {
@@ -335,6 +524,70 @@ fn emit_exit(
         DbtContext::EXIT_OFFSET + DbtExitRecord::ACCESS_SIZE_OFFSET,
         0,
     )?;
+    emit_epilogue(out, tag)
+}
+
+fn emit_exit_dynamic(
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+    tag: DbtExitTag,
+    next_pc: Gpr,
+    attempted: u32,
+    instruction_pc: u32,
+    instruction_word: u32,
+) -> Result<(), EmitError> {
+    if next_pc == Gpr::Rax {
+        return Err(EmitError::InvalidOperand(
+            "dynamic DBT exit PC cannot use RAX scratch",
+        ));
+    }
+    cache.flush(out)?;
+    write_u32(out, Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0)?;
+    out.mov_m32_r32(
+        Mem::base_disp(Gpr::R14, Rv32ArchitecturalState::PC_OFFSET as i32),
+        next_pc,
+    )?;
+    out.mov_m32_r32(
+        Mem::base_disp(
+            Gpr::R15,
+            (DbtContext::EXIT_OFFSET + DbtExitRecord::NEXT_PC_OFFSET) as i32,
+        ),
+        next_pc,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::ATTEMPTED_OFFSET,
+        attempted,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::INSTRUCTION_PC_OFFSET,
+        instruction_pc,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::INSTRUCTION_WORD_OFFSET,
+        instruction_word,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::ADDRESS_OFFSET,
+        0,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::ACCESS_SIZE_OFFSET,
+        0,
+    )?;
+    emit_epilogue(out, tag)
+}
+
+fn emit_epilogue(out: &mut X64Emitter, tag: DbtExitTag) -> Result<(), EmitError> {
     for register in [Gpr::R15, Gpr::R14, Gpr::R13, Gpr::R12, Gpr::Rbp, Gpr::Rbx] {
         out.pop(register)?;
     }
@@ -370,11 +623,56 @@ mod tests {
     use crate::rv32im::{
         decode_product_word,
         encoding::{
-            add, addi, and, andi, auipc, fence, fence_i, lui, or, ori, sll, slli, slt, slti, sltiu,
-            sltu, sra, srai, srl, srli, sub, xor, xori,
+            add, addi, and, andi, auipc, beq, bge, bgeu, blt, bltu, bne, fence, fence_i, jal, jalr,
+            lui, or, ori, sll, slli, slt, slti, sltiu, sltu, sra, srai, srl, srli, sub, xor, xori,
         },
         Rv32ResolvedInstruction, Rv32imCpu,
     };
+
+    fn input(start_pc: u32, words: &[u32], mode: DbtBlockMode) -> DbtBlockInput {
+        DbtBlockInput::new(
+            start_pc,
+            words
+                .iter()
+                .copied()
+                .map(|word| Rv32ResolvedInstruction::Valid {
+                    word,
+                    instruction: decode_product_word(word).unwrap(),
+                })
+                .collect(),
+            mode,
+        )
+        .unwrap()
+    }
+
+    fn execute(
+        input: &DbtBlockInput,
+        registers: &[(usize, u32)],
+    ) -> (Rv32imCpu, DbtExitTag, DbtExitRecord, Vec<u8>) {
+        let compiled = lower_block(input, 64 * 1024).unwrap();
+        let code = compiled.code().to_vec();
+        let mut scratch = ExecutableScratch::new(64 * 1024).unwrap();
+        scratch.publish(&code).unwrap();
+        let mut cpu = Rv32imCpu::new(input.start_pc());
+        for &(register, value) in registers {
+            cpu.set_register(register, value).unwrap();
+        }
+        let mut context = DbtContext {
+            state: cpu.architectural_state_mut(),
+            ram_base: std::ptr::null_mut(),
+            ram_len: 0,
+            page_permissions: std::ptr::null(),
+            page_count: 0,
+            remaining_budget: input.slots().len() as u32,
+            reservation_valid: 0,
+            reservation_address: 0,
+            exit: DbtExitRecord::default(),
+        };
+        let entry: DbtEntry = unsafe { std::mem::transmute(scratch.entry_address().unwrap()) };
+        let tag = DbtExitTag::try_from(unsafe { entry(&mut context) }).unwrap();
+        let exit = context.exit;
+        (cpu, tag, exit, code)
+    }
 
     #[test]
     fn generated_rv32i_arithmetic_matches_canonical_execution() {
@@ -507,5 +805,135 @@ mod tests {
         assert_eq!(context.exit.attempted, 2);
         assert_eq!(context.exit.instruction_pc, start_pc + 4);
         assert_eq!(context.exit.instruction_word, fence_i());
+    }
+
+    #[test]
+    fn every_branch_condition_selects_taken_and_fallthrough_pc() {
+        type BranchEncoder = fn(u8, u8, i32) -> u32;
+        let cases: [(BranchEncoder, (u32, u32), (u32, u32)); 6] = [
+            (beq, (5, 5), (5, 6)),
+            (bne, (5, 6), (5, 5)),
+            (blt, (u32::MAX, 0), (0, u32::MAX)),
+            (bge, (0, u32::MAX), (u32::MAX, 0)),
+            (bltu, (0, u32::MAX), (u32::MAX, 0)),
+            (bgeu, (u32::MAX, 0), (0, u32::MAX)),
+        ];
+        for (encode, taken, not_taken) in cases {
+            let word = encode(1, 2, 8);
+            let block = input(0x3000, &[word], DbtBlockMode::Fast);
+
+            let (cpu, tag, exit, _) = execute(&block, &[(1, taken.0), (2, taken.1)]);
+            assert_eq!(tag, DbtExitTag::Completed);
+            assert_eq!(cpu.pc(), 0x3008);
+            assert_eq!(exit.next_pc, 0x3008);
+            assert_eq!(exit.attempted, 1);
+
+            let (cpu, tag, exit, _) = execute(&block, &[(1, not_taken.0), (2, not_taken.1)]);
+            assert_eq!(tag, DbtExitTag::Completed);
+            assert_eq!(cpu.pc(), 0x3004);
+            assert_eq!(exit.next_pc, 0x3004);
+            assert_eq!(exit.attempted, 1);
+        }
+    }
+
+    #[test]
+    fn jal_and_jalr_commit_links_and_targets_but_misalignment_exits_slow() {
+        let jal_block = input(0x4000, &[jal(5, 12)], DbtBlockMode::Fast);
+        let (cpu, tag, exit, _) = execute(&jal_block, &[]);
+        assert_eq!(tag, DbtExitTag::Completed);
+        assert_eq!(cpu.register(5), 0x4004);
+        assert_eq!(cpu.pc(), 0x400c);
+        assert_eq!(exit.attempted, 1);
+
+        let jalr_block = input(0x5000, &[jalr(6, 1, 5)], DbtBlockMode::Fast);
+        let (cpu, tag, _, _) = execute(&jalr_block, &[(1, 0x6000)]);
+        assert_eq!(tag, DbtExitTag::Completed);
+        assert_eq!(cpu.register(6), 0x5004);
+        assert_eq!(cpu.pc(), 0x6004);
+
+        let misaligned_jal = input(0x7000, &[jal(7, 2)], DbtBlockMode::Fast);
+        let (cpu, tag, exit, _) = execute(&misaligned_jal, &[(7, 0xaaaa_5555)]);
+        assert_eq!(tag, DbtExitTag::SlowInstruction);
+        assert_eq!(cpu.register(7), 0xaaaa_5555);
+        assert_eq!(cpu.pc(), 0x7000);
+        assert_eq!(exit.instruction_pc, 0x7000);
+
+        let misaligned_jalr = input(0x8000, &[jalr(8, 1, 0)], DbtBlockMode::Fast);
+        let (cpu, tag, _, _) = execute(&misaligned_jalr, &[(1, 0x9003), (8, 0x1234)]);
+        assert_eq!(tag, DbtExitTag::SlowInstruction);
+        assert_eq!(cpu.register(8), 0x1234);
+        assert_eq!(cpu.pc(), 0x8000);
+    }
+
+    #[test]
+    fn final_branch_counts_the_native_prefix_and_itself() {
+        let words = [addi(3, 3, 1), bne(1, 2, 8)];
+        let block = input(0xa000, &words, DbtBlockMode::Fast);
+
+        let (cpu, tag, exit, _) = execute(&block, &[(1, 1), (2, 2), (3, 9)]);
+
+        assert_eq!(tag, DbtExitTag::Completed);
+        assert_eq!(cpu.register(3), 10);
+        assert_eq!(cpu.pc(), 0xa00c);
+        assert_eq!(exit.attempted, 2);
+    }
+
+    #[test]
+    fn every_bounded_prefix_stops_after_exactly_its_limit() {
+        for length in 2_u8..=16 {
+            let words = (1..=length)
+                .map(|register| addi(register, register, 1))
+                .collect::<Vec<_>>();
+            for limit in 1_u32..u32::from(length) {
+                let block = input(
+                    0xb000,
+                    &words,
+                    DbtBlockMode::Bounded {
+                        max_attempts: limit,
+                    },
+                );
+                let initial = (1..=length)
+                    .map(|register| (register as usize, 100 + u32::from(register)))
+                    .collect::<Vec<_>>();
+
+                let (cpu, tag, exit, _) = execute(&block, &initial);
+
+                assert_eq!(tag, DbtExitTag::BudgetExhausted);
+                assert_eq!(cpu.pc(), 0xb000 + limit * 4);
+                assert_eq!(exit.attempted, limit);
+                for register in 1..=length {
+                    let expected = 100 + u32::from(register) + u32::from(register <= limit as u8);
+                    assert_eq!(cpu.register(register as usize), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn control_at_budget_edge_wins_and_slow_instruction_beyond_edge_is_untouched() {
+        let branch_words = [addi(3, 3, 1), bne(1, 2, 8), addi(4, 4, 1)];
+        let branch_block = input(
+            0xc000,
+            &branch_words,
+            DbtBlockMode::Bounded { max_attempts: 2 },
+        );
+        let (cpu, tag, exit, _) = execute(&branch_block, &[(1, 1), (2, 2), (3, 9), (4, 20)]);
+        assert_eq!(tag, DbtExitTag::Completed);
+        assert_eq!(exit.attempted, 2);
+        assert_eq!(cpu.pc(), 0xc00c);
+        assert_eq!(cpu.register(3), 10);
+        assert_eq!(cpu.register(4), 20);
+
+        let slow_words = [addi(3, 3, 1), fence_i()];
+        let slow_block = input(
+            0xd000,
+            &slow_words,
+            DbtBlockMode::Bounded { max_attempts: 1 },
+        );
+        let (cpu, tag, exit, _) = execute(&slow_block, &[(3, 9)]);
+        assert_eq!(tag, DbtExitTag::BudgetExhausted);
+        assert_eq!(exit.attempted, 1);
+        assert_eq!(cpu.pc(), 0xd004);
+        assert_eq!(cpu.register(3), 10);
     }
 }
