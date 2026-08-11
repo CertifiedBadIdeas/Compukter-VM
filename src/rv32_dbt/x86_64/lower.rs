@@ -349,6 +349,9 @@ fn lower_instruction(
         {
             lower_register(op, rd, rs1, rs2, remaining, cache, out)?
         }
+        DecodedInstruction::Register { op, rd, rs1, rs2 } => {
+            lower_rv32m(op, rd, rs1, rs2, remaining, cache, out)?
+        }
         DecodedInstruction::Fence => {}
         _ => return Ok(false),
     }
@@ -474,6 +477,144 @@ fn emit_cl_shift(op: Op, dst: Gpr, out: &mut X64Emitter) -> Result<(), EmitError
         Op::Sra => out.sar_r32_cl(dst),
         _ => Err(EmitError::InvalidOperand("non-shift RV32 operation")),
     }
+}
+
+fn lower_rv32m(
+    op: Op,
+    rd: usize,
+    rs1: usize,
+    rs2: usize,
+    remaining: &[Rv32ResolvedInstruction],
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    if rd == 0 {
+        return Ok(());
+    }
+    if matches!(op, Op::Mul | Op::Mulh | Op::Mulhsu | Op::Mulhu) && (rs1 == 0 || rs2 == 0) {
+        return write_rv32m_constant(rd, 0, remaining, cache, out);
+    }
+    if matches!(op, Op::Div | Op::Divu) && rs2 == 0 {
+        return write_rv32m_constant(rd, u32::MAX, remaining, cache, out);
+    }
+    if matches!(op, Op::Rem | Op::Remu) && rs2 == 0 {
+        if rs1 == 0 {
+            return write_rv32m_constant(rd, 0, remaining, cache, out);
+        }
+        let lhs = cache.read(rs1, remaining, &[], out)?;
+        let dst = cache.write(rd, remaining, &[lhs], out)?.unwrap();
+        if dst != lhs {
+            out.mov_r32_r32(dst, lhs)?;
+        }
+        return Ok(());
+    }
+    if matches!(op, Op::Div | Op::Divu | Op::Rem | Op::Remu) && rs1 == 0 {
+        return write_rv32m_constant(rd, 0, remaining, cache, out);
+    }
+
+    let lhs = cache.read(rs1, remaining, &[], out)?;
+    let rhs = cache.read(rs2, remaining, &[lhs], out)?;
+    let dst = cache.write(rd, remaining, &[lhs, rhs], out)?.unwrap();
+    match op {
+        Op::Mul => {
+            out.mov_r32_r32(Gpr::Rax, lhs)?;
+            out.imul_r32_r32(Gpr::Rax, rhs)?;
+        }
+        Op::Mulh => {
+            out.mov_r32_r32(Gpr::Rax, lhs)?;
+            out.imul_r32(rhs)?;
+            out.mov_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+        }
+        Op::Mulhu => {
+            out.mov_r32_r32(Gpr::Rax, lhs)?;
+            out.mul_r32(rhs)?;
+            out.mov_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+        }
+        Op::Mulhsu => {
+            out.mov_r32_r32(Gpr::Rcx, lhs)?;
+            out.mov_r32_r32(Gpr::Rax, lhs)?;
+            out.mul_r32(rhs)?;
+            out.test_r32_r32(Gpr::Rcx, Gpr::Rcx)?;
+            let nonnegative = out.new_label();
+            out.jcc(Condition::GreaterEqual, nonnegative)?;
+            out.sub_r32_r32(Gpr::Rdx, rhs)?;
+            out.bind(nonnegative)?;
+            out.mov_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+        }
+        Op::Div | Op::Rem => emit_signed_division(op, lhs, rhs, out)?,
+        Op::Divu | Op::Remu => emit_unsigned_division(op, lhs, rhs, out)?,
+        _ => return Err(EmitError::InvalidOperand("non-RV32M operation")),
+    }
+    if dst != Gpr::Rax {
+        out.mov_r32_r32(dst, Gpr::Rax)?;
+    }
+    Ok(())
+}
+
+fn write_rv32m_constant(
+    rd: usize,
+    value: u32,
+    remaining: &[Rv32ResolvedInstruction],
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let dst = cache.write(rd, remaining, &[], out)?.unwrap();
+    out.mov_r32_imm32(dst, value)
+}
+
+fn emit_unsigned_division(
+    op: Op,
+    lhs: Gpr,
+    rhs: Gpr,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    out.test_r32_r32(rhs, rhs)?;
+    let nonzero = out.new_label();
+    let done = out.new_label();
+    out.jcc(Condition::NotEqual, nonzero)?;
+    if op == Op::Divu {
+        out.mov_r32_imm32(Gpr::Rax, u32::MAX)?;
+    } else {
+        out.mov_r32_r32(Gpr::Rax, lhs)?;
+    }
+    out.jmp(done)?;
+    out.bind(nonzero)?;
+    out.xor_r32_r32(Gpr::Rdx, Gpr::Rdx)?;
+    out.mov_r32_r32(Gpr::Rax, lhs)?;
+    out.div_r32(rhs)?;
+    if op == Op::Remu {
+        out.mov_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+    }
+    out.bind(done)
+}
+
+fn emit_signed_division(op: Op, lhs: Gpr, rhs: Gpr, out: &mut X64Emitter) -> Result<(), EmitError> {
+    out.test_r32_r32(rhs, rhs)?;
+    let nonzero = out.new_label();
+    let regular = out.new_label();
+    let done = out.new_label();
+    out.jcc(Condition::NotEqual, nonzero)?;
+    if op == Op::Div {
+        out.mov_r32_imm32(Gpr::Rax, u32::MAX)?;
+    } else {
+        out.mov_r32_r32(Gpr::Rax, lhs)?;
+    }
+    out.jmp(done)?;
+    out.bind(nonzero)?;
+    out.cmp_r32_imm32(lhs, i32::MIN)?;
+    out.jcc(Condition::NotEqual, regular)?;
+    out.cmp_r32_imm32(rhs, -1)?;
+    out.jcc(Condition::NotEqual, regular)?;
+    out.mov_r32_imm32(Gpr::Rax, if op == Op::Div { i32::MIN as u32 } else { 0 })?;
+    out.jmp(done)?;
+    out.bind(regular)?;
+    out.mov_r32_r32(Gpr::Rax, lhs)?;
+    out.cdq()?;
+    out.idiv_r32(rhs)?;
+    if op == Op::Rem {
+        out.mov_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+    }
+    out.bind(done)
 }
 
 fn emit_exit(
@@ -623,8 +764,9 @@ mod tests {
     use crate::rv32im::{
         decode_product_word,
         encoding::{
-            add, addi, and, andi, auipc, beq, bge, bgeu, blt, bltu, bne, fence, fence_i, jal, jalr,
-            lui, or, ori, sll, slli, slt, slti, sltiu, sltu, sra, srai, srl, srli, sub, xor, xori,
+            add, addi, and, andi, auipc, beq, bge, bgeu, blt, bltu, bne, div, divu, fence, fence_i,
+            jal, jalr, lui, mul, mulh, mulhsu, mulhu, or, ori, rem, remu, sll, slli, slt, slti,
+            sltiu, sltu, sra, srai, srl, srli, sub, xor, xori,
         },
         Rv32ResolvedInstruction, Rv32imCpu,
     };
@@ -935,5 +1077,64 @@ mod tests {
         assert_eq!(exit.attempted, 1);
         assert_eq!(cpu.pc(), 0xd004);
         assert_eq!(cpu.register(3), 10);
+    }
+
+    #[test]
+    fn every_rv32m_operation_matches_canonical_corner_and_random_pairs() {
+        type Rv32mEncoder = fn(u8, u8, u8) -> u32;
+        let operations: [Rv32mEncoder; 8] = [mul, mulh, mulhsu, mulhu, div, divu, rem, remu];
+        let mut pairs = vec![
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (u32::MAX, 0),
+            (u32::MAX, 1),
+            (i32::MIN as u32, u32::MAX),
+            (i32::MIN as u32, 1),
+            (i32::MAX as u32, u32::MAX),
+            (i32::MAX as u32, i32::MIN as u32),
+        ];
+        let mut random = 0x7a31_d09f_u32;
+        for _ in 0..64 {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            let lhs = random;
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            pairs.push((lhs, random));
+        }
+
+        for encode in operations {
+            for &(lhs, rhs) in &pairs {
+                let word = encode(3, 1, 2);
+                let block = input(0xe000, &[word], DbtBlockMode::Fast);
+                let (actual, tag, exit, _) =
+                    execute(&block, &[(1, lhs), (2, rhs), (3, 0xfeed_face)]);
+                let mut expected = Rv32imCpu::new(0xe000);
+                expected.set_register(1, lhs).unwrap();
+                expected.set_register(2, rhs).unwrap();
+                expected.set_register(3, 0xfeed_face).unwrap();
+                let mut bus = MachineMemory::zeroed(4).unwrap();
+                expected
+                    .execute_decoded(&mut bus, 0xe000, decode_product_word(word).unwrap())
+                    .unwrap();
+
+                assert_eq!(
+                    tag,
+                    DbtExitTag::Completed,
+                    "word={word:#010x} lhs={lhs:#010x} rhs={rhs:#010x}"
+                );
+                assert_eq!(exit.attempted, 1);
+                assert_eq!(actual.pc(), expected.pc());
+                assert_eq!(
+                    actual.register(3),
+                    expected.register(3),
+                    "word={word:#010x} lhs={lhs:#010x} rhs={rhs:#010x}"
+                );
+            }
+        }
     }
 }
