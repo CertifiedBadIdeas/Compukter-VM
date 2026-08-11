@@ -38,8 +38,11 @@ pub const PRODUCT_RAM_BYTES: usize = 16 * 1024;
 pub const PRODUCT_CACHE_SETS: usize = 64;
 pub const PRODUCT_BLOCK_CACHE_SETS: usize = 32;
 pub const PRODUCT_BLOCK_MAX_INSTRUCTIONS: usize = 8;
+pub const PRODUCT_DBT_CACHE_SETS: usize = 32;
+pub const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = 8;
+pub const PRODUCT_DBT_CODE_BYTES: usize = 64 * 1024;
 pub const PRODUCT_DEBUG_LIMIT: usize = 0;
-pub const PRODUCT_RESIDENT_REPORT_HEADER: &str = "backend\tpopulation\tconstruction_median_ns\tconstruction_p95_ns\tresident_live_bytes\tpeak_construction_bytes\tlive_bytes_per_machine\taggregate_ram_bytes\telf_bytes\texecutable_bytes\trw_initialized_bytes\tram_bytes\tdebug_limit\tcache_sets\tblock_cache_sets\tblock_max_instructions";
+pub const PRODUCT_RESIDENT_REPORT_HEADER: &str = "backend\tpopulation\tconstruction_median_ns\tconstruction_p95_ns\tresident_live_bytes\tpeak_construction_bytes\tlive_bytes_per_machine\taggregate_ram_bytes\telf_bytes\texecutable_bytes\trw_initialized_bytes\tram_bytes\tdebug_limit\tcache_sets\tblock_cache_sets\tblock_max_instructions\tdbt_cache_sets\tdbt_max_instructions\tdbt_code_bytes";
 pub const PRODUCT_ACTIVE_REPORT_HEADER: &str = "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +51,8 @@ pub enum ProductExecutionCandidate {
     Cached,
     Predecoded,
     BlockCached,
+    DirectDbt,
+    CachedDbt,
 }
 
 impl ProductExecutionCandidate {
@@ -57,6 +62,8 @@ impl ProductExecutionCandidate {
             Self::Cached,
             Self::Predecoded,
             Self::BlockCached,
+            Self::DirectDbt,
+            Self::CachedDbt,
         ]
     }
 
@@ -66,6 +73,8 @@ impl ProductExecutionCandidate {
             Self::Cached => "rv32-cached",
             Self::Predecoded => "rv32-predecoded",
             Self::BlockCached => "rv32-block-cached",
+            Self::DirectDbt => "rv32-direct-dbt",
+            Self::CachedDbt => "rv32-cached-dbt",
         }
     }
 }
@@ -256,11 +265,19 @@ pub enum ProductMachineBackend {
     Cached,
     Predecoded,
     BlockCached,
+    DirectDbt,
+    CachedDbt,
 }
 
 impl ProductMachineBackend {
     pub const fn all() -> &'static [Self] {
-        &[Self::Cached, Self::Predecoded, Self::BlockCached]
+        &[
+            Self::Cached,
+            Self::Predecoded,
+            Self::BlockCached,
+            Self::DirectDbt,
+            Self::CachedDbt,
+        ]
     }
 
     pub const fn name(self) -> &'static str {
@@ -268,6 +285,8 @@ impl ProductMachineBackend {
             Self::Cached => "cached",
             Self::Predecoded => "predecoded",
             Self::BlockCached => "block-cached",
+            Self::DirectDbt => "direct-dbt",
+            Self::CachedDbt => "cached-dbt",
         }
     }
 
@@ -281,6 +300,15 @@ impl ProductMachineBackend {
                 sets: PRODUCT_BLOCK_CACHE_SETS,
                 max_instructions: PRODUCT_BLOCK_MAX_INSTRUCTIONS,
             },
+            Self::DirectDbt => Rv32ExecutionBackendConfig::DirectDbt {
+                max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+                code_bytes: PRODUCT_DBT_CODE_BYTES,
+            },
+            Self::CachedDbt => Rv32ExecutionBackendConfig::CachedDbt {
+                sets: PRODUCT_DBT_CACHE_SETS,
+                max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+                code_bytes: PRODUCT_DBT_CODE_BYTES,
+            },
         }
     }
 }
@@ -288,9 +316,9 @@ impl ProductMachineBackend {
 pub fn product_backend_order(
     group_index: usize,
     sample_index: usize,
-) -> [ProductMachineBackend; 3] {
+) -> [ProductMachineBackend; 5] {
     let all = ProductMachineBackend::all();
-    benchmark_rotating_order::<3>(group_index, sample_index).map(|index| all[index])
+    benchmark_rotating_order::<5>(group_index, sample_index).map(|index| all[index])
 }
 
 pub fn product_percentile(sorted_values: &[u128], percentile: usize) -> u128 {

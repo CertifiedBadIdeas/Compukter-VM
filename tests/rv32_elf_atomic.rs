@@ -37,6 +37,15 @@ fn stock_toolchain_rv32ima_elf_executes_atomics_and_fences() {
             sets: 32,
             max_instructions: 8,
         },
+        Rv32ExecutionBackendConfig::DirectDbt {
+            max_instructions: 8,
+            code_bytes: 64 * 1024,
+        },
+        Rv32ExecutionBackendConfig::CachedDbt {
+            sets: 32,
+            max_instructions: 8,
+            code_bytes: 64 * 1024,
+        },
     ] {
         let config = Rv32MachineConfig {
             ram_size: 64 * 1024,
