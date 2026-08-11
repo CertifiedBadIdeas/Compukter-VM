@@ -30,13 +30,13 @@ impl BenchmarkTiming {
 }
 
 pub const fn timing_report_header() -> &'static str {
-    "workload\tcandidate\titerations\tchecksum\tcold_ns\twarm_median_ns\twarm_p95_ns\tnanos_per_iteration\tretired\tfetch_bytes\tdata_read_bytes\tdata_written_bytes\tmmio_reads\tmmio_writes\tcpu_state_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native"
+    "workload\tcandidate\titerations\tchecksum\tcold_ns\twarm_median_ns\twarm_p95_ns\tnanos_per_iteration\tretired\tfetch_bytes\tdata_read_bytes\tdata_written_bytes\tmmio_reads\tmmio_writes\tcpu_state_bytes\ttranslation_bytes\tcache_hits\tcache_misses\ttranslations\tpublications\texecutable_reserved_bytes\tmetadata_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native"
 }
 
 pub fn format_timing_sample(sample: &BenchmarkTiming) -> String {
     let observation = &sample.observation;
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
         observation.workload.name(),
         observation.candidate.name(),
         observation.iterations,
@@ -53,6 +53,12 @@ pub fn format_timing_sample(sample: &BenchmarkTiming) -> String {
         observation.mmio.stores,
         observation.cpu_state_bytes,
         observation.translation_bytes,
+        observation.cache_hits,
+        observation.cache_misses,
+        observation.translations,
+        observation.publications,
+        observation.executable_reserved_bytes,
+        observation.metadata_bytes,
         sample.steady_allocations,
         sample.steady_allocated_bytes,
         sample.vs_native,

@@ -66,6 +66,12 @@ impl Prepared {
             mmio: IsaTraffic::default(),
             cpu_state_bytes: 0,
             translation_bytes: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            translations: 0,
+            publications: 0,
+            executable_reserved_bytes: 0,
+            metadata_bytes: 0,
         };
         observation.validate_checksum()?;
         Ok(observation)

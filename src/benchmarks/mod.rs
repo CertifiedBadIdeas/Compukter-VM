@@ -33,7 +33,10 @@ pub use c_comparison::{
     parse_c_comparison_result,
 };
 #[cfg(target_arch = "x86_64")]
-pub use dbt_compute::{DirectDbtComputeObservation, PreparedDirectDbtCompute32};
+pub use dbt_compute::{
+    CachedDbtComputeObservation, DirectDbtComputeObservation, PreparedCachedDbtCompute32,
+    PreparedDirectDbtCompute32,
+};
 pub use decoder::{
     DecoderBenchmarkImplementation, DecoderBenchmarkObservation, DecoderBenchmarkScenario,
     PreparedDecoderBenchmark,
@@ -62,6 +65,7 @@ pub enum BenchmarkCandidate {
     Rv32Cached,
     Rv32Predecoded,
     Rv32DirectDbt,
+    Rv32CachedDbt,
     NativeRust,
 }
 
@@ -74,6 +78,7 @@ impl BenchmarkCandidate {
                 Self::Rv32Cached,
                 Self::Rv32Predecoded,
                 Self::Rv32DirectDbt,
+                Self::Rv32CachedDbt,
                 Self::NativeRust,
             ]
         }
@@ -95,6 +100,7 @@ impl BenchmarkCandidate {
             Self::Rv32Cached => "rv32-cached",
             Self::Rv32Predecoded => "rv32-predecoded",
             Self::Rv32DirectDbt => "rv32-dbt-direct",
+            Self::Rv32CachedDbt => "rv32-dbt-cached",
             Self::NativeRust => "native-rust",
         }
     }
@@ -105,7 +111,7 @@ impl BenchmarkCandidate {
 
     pub const fn supports(self, workload: BenchmarkWorkload) -> bool {
         match self {
-            Self::Rv32DirectDbt => {
+            Self::Rv32DirectDbt | Self::Rv32CachedDbt => {
                 cfg!(target_arch = "x86_64") && matches!(workload, BenchmarkWorkload::Compute32)
             }
             Self::RvsimRv32im
@@ -153,6 +159,12 @@ pub struct BenchmarkObservation {
     pub mmio: BenchmarkTraffic,
     pub cpu_state_bytes: usize,
     pub translation_bytes: usize,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub translations: u64,
+    pub publications: u64,
+    pub executable_reserved_bytes: usize,
+    pub metadata_bytes: usize,
 }
 
 impl BenchmarkObservation {
@@ -181,6 +193,8 @@ enum PreparedCandidate {
     Rv32(rv32::Prepared),
     #[cfg(target_arch = "x86_64")]
     DirectDbtCompute(dbt_compute::PreparedDirectDbtCompute32),
+    #[cfg(target_arch = "x86_64")]
+    CachedDbtCompute(dbt_compute::PreparedCachedDbtCompute32),
 }
 
 impl PreparedBenchmark {
@@ -217,6 +231,25 @@ impl PreparedBenchmark {
                     return Err("rv32-dbt-direct requires x86_64".to_string());
                 }
             }
+            BenchmarkCandidate::Rv32CachedDbt => {
+                if !candidate.supports(workload) {
+                    return Err(format!(
+                        "candidate {} does not support workload {}",
+                        candidate.name(),
+                        workload.name()
+                    ));
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    PreparedCandidate::CachedDbtCompute(
+                        dbt_compute::PreparedCachedDbtCompute32::new(iterations)?,
+                    )
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    return Err("rv32-dbt-cached requires x86_64".to_string());
+                }
+            }
             BenchmarkCandidate::RvsimRv32im => {
                 return Err("rvsim is a correctness reference, not a benchmark candidate".into())
             }
@@ -243,6 +276,35 @@ impl PreparedBenchmark {
                     mmio: BenchmarkTraffic::default(),
                     cpu_state_bytes: crate::rv32im::Rv32imCpu::cpu_state_bytes(),
                     translation_bytes: observation.translated_bytes as usize,
+                    cache_hits: 0,
+                    cache_misses: 0,
+                    translations: observation.dispatches,
+                    publications: observation.dispatches,
+                    executable_reserved_bytes: observation.reserved_bytes,
+                    metadata_bytes: 0,
+                })
+            }
+            #[cfg(target_arch = "x86_64")]
+            PreparedCandidate::CachedDbtCompute(prepared) => {
+                let observation = prepared.execute()?;
+                Ok(BenchmarkObservation {
+                    candidate: BenchmarkCandidate::Rv32CachedDbt,
+                    workload: BenchmarkWorkload::Compute32,
+                    iterations: prepared.iterations(),
+                    checksum: observation.checksum,
+                    retired_instructions: observation.attempted_instructions.saturating_sub(1),
+                    yields: 0,
+                    instruction_fetch: BenchmarkTraffic::default(),
+                    data_ram: BenchmarkTraffic::default(),
+                    mmio: BenchmarkTraffic::default(),
+                    cpu_state_bytes: crate::rv32im::Rv32imCpu::cpu_state_bytes(),
+                    translation_bytes: observation.translated_bytes as usize,
+                    cache_hits: observation.cache_hits,
+                    cache_misses: observation.cache_misses,
+                    translations: observation.translations,
+                    publications: observation.publications,
+                    executable_reserved_bytes: observation.reserved_bytes,
+                    metadata_bytes: observation.metadata_bytes,
                 })
             }
         }
