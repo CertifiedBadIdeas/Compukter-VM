@@ -17,12 +17,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use super::{decode_product_word, DecodedInstruction, Rv32ResolvedInstruction};
+use super::{fill_decoded_block, validate_block_max_instructions, Rv32ResolvedInstruction};
 use crate::memory::{MemoryBus, MemoryFault};
 
 const WAYS_PER_SET: usize = 2;
-const PAGE_BYTES: u32 = 4096;
-const MAX_BLOCK_INSTRUCTIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rv32BlockCacheStats {
@@ -79,11 +77,7 @@ impl BoundedDecodedBlockCache {
                 "RV32 decoded block cache set count {set_count} is not a positive power of two"
             ));
         }
-        if !(1..=MAX_BLOCK_INSTRUCTIONS).contains(&max_instructions) {
-            return Err(format!(
-                "RV32 decoded block cache maximum instruction count {max_instructions} is outside 1..={MAX_BLOCK_INSTRUCTIONS}"
-            ));
-        }
+        validate_block_max_instructions(max_instructions)?;
         Ok(Self {
             sets: (0..set_count)
                 .map(|_| BlockCacheSet::new(max_instructions))
@@ -110,55 +104,27 @@ impl BoundedDecodedBlockCache {
         }
 
         self.stats.misses = self.stats.misses.saturating_add(1);
-        let page_end = (start_pc & !(PAGE_BYTES - 1))
-            .checked_add(PAGE_BYTES)
-            .unwrap_or(u32::MAX);
-        let block_end = executable_end.min(page_end);
-        if start_pc
-            .checked_add(4)
-            .is_none_or(|instruction_end| instruction_end > block_end)
-        {
-            return Err(MemoryFault::at(
-                start_pc,
-                format!(
-                    "RV32 instruction at {start_pc:#010x} crosses decoded block boundary {block_end:#010x}"
-                ),
-            ));
-        }
-
-        let first = resolve_slot(start_pc, bus)?;
         let set = &mut self.sets[set_index];
-        let way_index = match set.ways.iter().position(|way| !way.valid) {
-            Some(empty) => empty,
-            None => {
-                let victim = set.next_victim;
-                set.next_victim ^= 1;
-                self.stats.evictions = self.stats.evictions.saturating_add(1);
-                victim
-            }
-        };
+        let way_index = set
+            .ways
+            .iter()
+            .position(|way| !way.valid)
+            .unwrap_or(set.next_victim);
+        let replaces_valid = set.ways[way_index].valid;
         let way = &mut set.ways[way_index];
+        fill_decoded_block(
+            start_pc,
+            executable_end,
+            self.max_instructions,
+            bus,
+            &mut way.slots,
+        )?;
+        if replaces_valid {
+            set.next_victim ^= 1;
+            self.stats.evictions = self.stats.evictions.saturating_add(1);
+        }
         way.start_pc = start_pc;
         way.valid = true;
-        way.slots.clear();
-        way.slots.push(first);
-
-        let mut next_pc = start_pc.wrapping_add(4);
-        while way.slots.len() < self.max_instructions
-            && !ends_basic_block(*way.slots.last().unwrap())
-        {
-            if next_pc
-                .checked_add(4)
-                .is_none_or(|instruction_end| instruction_end > block_end)
-            {
-                break;
-            }
-            match resolve_slot(next_pc, bus) {
-                Ok(slot) => way.slots.push(slot),
-                Err(_) => break,
-            }
-            next_pc = next_pc.wrapping_add(4);
-        }
 
         self.stats.blocks_built = self.stats.blocks_built.saturating_add(1);
         self.stats.decoded_slots_built = self
@@ -183,42 +149,14 @@ impl BoundedDecodedBlockCache {
     }
 }
 
-fn resolve_slot(
-    instruction_pc: u32,
-    bus: &dyn MemoryBus,
-) -> Result<Rv32ResolvedInstruction, MemoryFault> {
-    let word = bus.load_i32(instruction_pc)? as u32;
-    Ok(match decode_product_word(word) {
-        Ok(instruction) => Rv32ResolvedInstruction::Valid { word, instruction },
-        Err(_) => Rv32ResolvedInstruction::Invalid { word },
-    })
-}
-
-pub(crate) const fn ends_basic_block(slot: Rv32ResolvedInstruction) -> bool {
-    matches!(
-        slot,
-        Rv32ResolvedInstruction::Invalid { .. }
-            | Rv32ResolvedInstruction::Valid {
-                instruction: DecodedInstruction::Jal { .. }
-                    | DecodedInstruction::Jalr { .. }
-                    | DecodedInstruction::Branch { .. }
-                    | DecodedInstruction::Ecall
-                    | DecodedInstruction::Ebreak
-                    | DecodedInstruction::Mret
-                    | DecodedInstruction::FenceI,
-                ..
-            }
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ends_basic_block, BoundedDecodedBlockCache, Rv32BlockCacheStats};
+    use super::{BoundedDecodedBlockCache, Rv32BlockCacheStats};
     use crate::memory::MachineMemory;
     use crate::rv32im::encoding::{
         addi, beq, csrrw, ebreak, ecall, fence, fence_i, jal, jalr, lr_w, lw, mret, sw,
     };
-    use crate::rv32im::Rv32ResolvedInstruction;
+    use crate::rv32im::{ends_basic_block, Rv32ResolvedInstruction};
 
     fn memory(words: &[u32]) -> MachineMemory {
         let mut memory = MachineMemory::zeroed(words.len().max(1) * 4).unwrap();
