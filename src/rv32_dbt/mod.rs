@@ -24,6 +24,8 @@
 
 pub(crate) mod abi;
 pub(crate) mod block;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86_64;
 
 use std::fmt::{Display, Formatter};
 
