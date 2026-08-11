@@ -101,6 +101,15 @@ fn assert_steady_state_trap_entry_and_return_allocate_nothing() {
             sets: 32,
             max_instructions: 8,
         },
+        Rv32ExecutionBackendConfig::DirectDbt {
+            max_instructions: 8,
+            code_bytes: 4096,
+        },
+        Rv32ExecutionBackendConfig::CachedDbt {
+            sets: 32,
+            max_instructions: 8,
+            code_bytes: 4096,
+        },
     ] {
         let mut machine = Rv32Machine::from_elf(
             &elf,
@@ -160,6 +169,15 @@ fn assert_steady_state_atomic_increment_loop_allocates_nothing() {
         Rv32ExecutionBackendConfig::BlockCached {
             sets: 32,
             max_instructions: 8,
+        },
+        Rv32ExecutionBackendConfig::DirectDbt {
+            max_instructions: 8,
+            code_bytes: 4096,
+        },
+        Rv32ExecutionBackendConfig::CachedDbt {
+            sets: 32,
+            max_instructions: 8,
+            code_bytes: 4096,
         },
     ] {
         let mut machine = Rv32Machine::from_elf(

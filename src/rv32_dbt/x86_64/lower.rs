@@ -87,7 +87,10 @@ impl DbtTranslationWorkspace {
                 break;
             }
             let Rv32ResolvedInstruction::Valid { word, instruction } = slot else {
-                terminal = Some((pc, 0, index as u32 + 1));
+                let Rv32ResolvedInstruction::Invalid { word } = slot else {
+                    unreachable!()
+                };
+                terminal = Some((pc, word, index as u32 + 1));
                 break;
             };
             let attempted = index as u32 + 1;
@@ -233,6 +236,10 @@ impl DbtTranslationWorkspace {
     #[cfg(test)]
     fn buffer_capacities(&self) -> (usize, usize, usize) {
         self.emitter.buffer_capacities()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.emitter.retained_bytes()
     }
 }
 

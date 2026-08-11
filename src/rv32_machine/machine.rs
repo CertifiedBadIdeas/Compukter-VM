@@ -17,16 +17,26 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#[cfg(target_arch = "x86_64")]
+use super::dbt::{PreparedDbtBlock, Rv32DbtExecution, Rv32DbtPolicy};
 use super::hart::{Rv32HartStep, Rv32MachineHart};
 use super::platform::{self, ControlDevice, DebugDevice};
-use super::{Rv32AddressSpace, Rv32AddressSpaceError, Rv32ElfError, Rv32ElfLoader};
+use super::{Rv32AddressSpace, Rv32AddressSpaceError, Rv32DbtStats, Rv32ElfError, Rv32ElfLoader};
 use crate::bus::{MachineBus, MmioDeviceId};
-use crate::memory::MemoryFault;
+use crate::memory::{MemoryBus, MemoryFault};
+#[cfg(target_arch = "x86_64")]
+use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
+#[cfg(target_arch = "x86_64")]
+use crate::rv32_dbt::block::DbtBlockMode;
+#[cfg(target_arch = "x86_64")]
+use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 use crate::rv32_jit::abi::JitEntry;
 use crate::rv32_jit::arena::{CompiledBlockId, ExecutableCodeArena};
 use crate::rv32_jit::block::JitBlockInput;
 use crate::rv32_jit::cranelift::CraneliftBackend;
 use crate::rv32_jit::planner::{JitPlanner, JitPlannerConfig};
+#[cfg(target_arch = "x86_64")]
+use crate::rv32im::{decode_product_word, fill_decoded_block, DecodedInstruction, Load, Store};
 use crate::rv32im::{
     ends_basic_block, BoundedCachedRv32imProgram, BoundedDecodedBlockCache, PredecodedRv32imImage,
     Rv32ResolvedInstruction, Rv32imCacheStats,
@@ -43,6 +53,15 @@ pub enum Rv32ExecutionBackendConfig {
     BlockCached {
         sets: usize,
         max_instructions: usize,
+    },
+    DirectDbt {
+        max_instructions: usize,
+        code_bytes: usize,
+    },
+    CachedDbt {
+        sets: usize,
+        max_instructions: usize,
+        code_bytes: usize,
     },
     Jit {
         sets: usize,
@@ -224,6 +243,39 @@ enum Rv32ExecutionBackend {
     Predecoded(PredecodedRv32imImage),
     BlockCached(BoundedDecodedBlockCache),
     Jit(Rv32JitExecution),
+    #[cfg(target_arch = "x86_64")]
+    Dbt(Rv32DbtExecution),
+}
+
+enum Rv32DbtBackendBuild {
+    Direct,
+    Cached { sets: usize },
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_dbt_backend(
+    build: Rv32DbtBackendBuild,
+    max_instructions: usize,
+    code_bytes: usize,
+) -> Result<Rv32ExecutionBackend, Rv32MachineBuildError> {
+    let policy = match build {
+        Rv32DbtBackendBuild::Direct => Rv32DbtPolicy::Direct,
+        Rv32DbtBackendBuild::Cached { sets } => Rv32DbtPolicy::Cached { sets },
+    };
+    Rv32DbtExecution::new(policy, max_instructions, code_bytes)
+        .map(Rv32ExecutionBackend::Dbt)
+        .map_err(|error| Rv32MachineBuildError::Backend(error.to_string()))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn build_dbt_backend(
+    _build: Rv32DbtBackendBuild,
+    _max_instructions: usize,
+    _code_bytes: usize,
+) -> Result<Rv32ExecutionBackend, Rv32MachineBuildError> {
+    Err(Rv32MachineBuildError::Backend(
+        "RV32 direct DBT is unavailable on non-x86_64 hosts".to_string(),
+    ))
 }
 
 pub struct Rv32Machine {
@@ -274,6 +326,19 @@ impl Rv32Machine {
                 )
                 .map_err(Rv32MachineBuildError::Backend)?,
             ),
+            Rv32ExecutionBackendConfig::DirectDbt {
+                max_instructions,
+                code_bytes,
+            } => build_dbt_backend(Rv32DbtBackendBuild::Direct, max_instructions, code_bytes)?,
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets,
+                max_instructions,
+                code_bytes,
+            } => build_dbt_backend(
+                Rv32DbtBackendBuild::Cached { sets },
+                max_instructions,
+                code_bytes,
+            )?,
         };
         let (entry_point, ram, page_permissions, executable_ranges) = image.into_parts();
         let mut bus = MachineBus::new(ram.len())?;
@@ -307,6 +372,8 @@ impl Rv32Machine {
         match self.execution {
             Rv32ExecutionBackend::BlockCached(_) => self.run_block_cached(instruction_budget),
             Rv32ExecutionBackend::Jit(_) => self.run_jit(instruction_budget),
+            #[cfg(target_arch = "x86_64")]
+            Rv32ExecutionBackend::Dbt(_) => self.run_dbt(instruction_budget),
             Rv32ExecutionBackend::Cached(_) | Rv32ExecutionBackend::Predecoded(_) => {
                 self.run_single_instruction(instruction_budget)
             }
@@ -381,6 +448,10 @@ impl Rv32Machine {
                     }
                     Rv32ExecutionBackend::Jit(_) => {
                         unreachable!("JIT backend uses the explicit JIT execution loop")
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    Rv32ExecutionBackend::Dbt(_) => {
+                        unreachable!("DBT backend uses the explicit DBT execution loop")
                     }
                 };
                 match resolved {
@@ -589,6 +660,242 @@ impl Rv32Machine {
         })
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn run_dbt(
+        &mut self,
+        instruction_budget: u64,
+    ) -> Result<Rv32MachineOutcome, Rv32MachineExecutionError> {
+        let retired_before = self.hart.retired_instructions();
+        if let Some(outcome) = self.terminal_outcome(retired_before) {
+            return Ok(outcome);
+        }
+        let mut attempted = 0_u64;
+        while attempted < instruction_budget {
+            let instruction_pc = self.hart.pc();
+            if !instruction_pc.is_multiple_of(4) {
+                attempted += 1;
+                self.hart
+                    .take_instruction_address_misaligned(instruction_pc);
+            } else if self.executable_range_end(instruction_pc).is_none() {
+                attempted += 1;
+                self.hart.take_instruction_access_fault(instruction_pc);
+            } else {
+                let executable_end = self
+                    .executable_range_end(instruction_pc)
+                    .expect("executable PC has an owning ELF range");
+                let remaining = instruction_budget - attempted;
+                let cached = {
+                    let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
+                        unreachable!("DBT loop requires the DBT backend")
+                    };
+                    execution.lookup(instruction_pc, DbtBlockMode::Fast)
+                };
+                let prepared = if cached
+                    .is_some_and(|prepared| u64::from(prepared.instruction_count()) <= remaining)
+                {
+                    cached.unwrap()
+                } else {
+                    let fill_result = {
+                        let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
+                            unreachable!("DBT loop requires the DBT backend")
+                        };
+                        fill_decoded_block(
+                            instruction_pc,
+                            executable_end,
+                            execution.max_instructions(),
+                            &self.address_space,
+                            execution.decoded_slots_mut(),
+                        )
+                    };
+                    if let Err(error) = fill_result {
+                        attempted += 1;
+                        self.hart.take_instruction_access_fault(
+                            error.address().unwrap_or(instruction_pc),
+                        );
+                        if let Some(outcome) = self.terminal_outcome(retired_before) {
+                            return Ok(outcome);
+                        }
+                        continue;
+                    }
+                    let mode = {
+                        let Rv32ExecutionBackend::Dbt(execution) = &self.execution else {
+                            unreachable!("DBT loop requires the DBT backend")
+                        };
+                        if execution.decoded_slots().len() as u64 <= remaining {
+                            DbtBlockMode::Fast
+                        } else {
+                            DbtBlockMode::Bounded {
+                                max_attempts: remaining as u32,
+                            }
+                        }
+                    };
+                    let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
+                        unreachable!("DBT loop requires the DBT backend")
+                    };
+                    execution.translate(instruction_pc, mode).map_err(|error| {
+                        Rv32MachineExecutionError {
+                            pc: instruction_pc,
+                            retired_total: self.hart.retired_instructions(),
+                            message: error.to_string(),
+                        }
+                    })?
+                };
+
+                let (tag, exit, reservation_valid, reservation_address) = {
+                    let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
+                        unreachable!("DBT loop requires the DBT backend")
+                    };
+                    execute_prepared_dbt(
+                        &mut self.hart,
+                        &mut self.address_space,
+                        execution,
+                        prepared,
+                        remaining,
+                    )
+                    .map_err(|error| Rv32MachineExecutionError {
+                        pc: instruction_pc,
+                        retired_total: self.hart.retired_instructions(),
+                        message: error.to_string(),
+                    })?
+                };
+                if exit.attempted == 0
+                    || exit.attempted > prepared.instruction_count()
+                    || u64::from(exit.attempted) > remaining
+                    || exit.next_pc != self.hart.pc()
+                {
+                    return Err(self.execution_error(
+                        instruction_pc,
+                        format!(
+                            "invalid DBT exit {:?}: attempted {}, block {}, remaining {}, next PC {:#010x}, hart PC {:#010x}",
+                            tag,
+                            exit.attempted,
+                            prepared.instruction_count(),
+                            remaining,
+                            exit.next_pc,
+                            self.hart.pc(),
+                        ),
+                    ));
+                }
+
+                attempted = attempted.saturating_add(u64::from(exit.attempted));
+                match tag {
+                    DbtExitTag::Completed | DbtExitTag::BudgetExhausted => {
+                        if tag == DbtExitTag::BudgetExhausted
+                            && u64::from(exit.attempted) != remaining
+                        {
+                            return Err(self.execution_error(
+                                instruction_pc,
+                                "DBT budget exit did not consume the exact remaining budget"
+                                    .to_string(),
+                            ));
+                        }
+                        self.hart
+                            .commit_dbt_prefix(
+                                exit.attempted,
+                                reservation_valid,
+                                reservation_address,
+                            )
+                            .map_err(|message| {
+                                self.execution_error(instruction_pc, message.to_string())
+                            })?;
+                    }
+                    DbtExitTag::SlowInstruction | DbtExitTag::MemoryAccess => {
+                        let prefix = exit.attempted - 1;
+                        if exit.instruction_pc != self.hart.pc() {
+                            return Err(self.execution_error(
+                                instruction_pc,
+                                format!(
+                                    "DBT typed exit PC {:#010x} disagrees with hart PC {:#010x}",
+                                    exit.instruction_pc,
+                                    self.hart.pc(),
+                                ),
+                            ));
+                        }
+                        self.hart
+                            .commit_dbt_prefix(prefix, reservation_valid, reservation_address)
+                            .map_err(|message| {
+                                self.execution_error(instruction_pc, message.to_string())
+                            })?;
+                        let word =
+                            self.address_space
+                                .load_i32(exit.instruction_pc)
+                                .map_err(|error| {
+                                    self.execution_error(instruction_pc, error.to_string())
+                                })? as u32;
+                        if word != exit.instruction_word {
+                            return Err(self.execution_error(
+                                instruction_pc,
+                                format!(
+                                    "DBT typed exit word {:#010x} disagrees with memory word {word:#010x}",
+                                    exit.instruction_word,
+                                ),
+                            ));
+                        }
+                        let resolved = match decode_product_word(word) {
+                            Ok(instruction) => {
+                                if tag == DbtExitTag::MemoryAccess {
+                                    validate_memory_exit(&self.hart, instruction, exit).map_err(
+                                        |message| {
+                                            self.execution_error(
+                                                instruction_pc,
+                                                message.to_string(),
+                                            )
+                                        },
+                                    )?;
+                                } else if exit.address != 0 || exit.access_size != 0 {
+                                    return Err(self.execution_error(
+                                        instruction_pc,
+                                        "DBT slow-instruction exit carried memory metadata"
+                                            .to_string(),
+                                    ));
+                                }
+                                Rv32ResolvedInstruction::Valid { word, instruction }
+                            }
+                            Err(_) => Rv32ResolvedInstruction::Invalid { word },
+                        };
+                        let invalidate_code = matches!(
+                            resolved,
+                            Rv32ResolvedInstruction::Valid {
+                                instruction: DecodedInstruction::FenceI,
+                                ..
+                            }
+                        );
+                        execute_slot(
+                            &mut self.hart,
+                            &mut self.address_space,
+                            exit.instruction_pc,
+                            resolved,
+                        );
+                        if invalidate_code {
+                            let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
+                                unreachable!("DBT loop requires the DBT backend")
+                            };
+                            execution.invalidate_all();
+                        }
+                    }
+                }
+            }
+            if let Some(outcome) = self.terminal_outcome(retired_before) {
+                return Ok(outcome);
+            }
+        }
+        Ok(Rv32MachineOutcome::BudgetExhausted {
+            retired_delta: self
+                .hart
+                .retired_instructions()
+                .saturating_sub(retired_before),
+            retired_total: self.hart.retired_instructions(),
+        })
+    }
+
+    pub fn dbt_stats(&self) -> Option<Rv32DbtStats> {
+        #[cfg(target_arch = "x86_64")]
+        if let Rv32ExecutionBackend::Dbt(execution) = &self.execution {
+            return Some(execution.stats());
+        }
+        None
+    }
+
     pub fn debug_bytes(&self) -> &[u8] {
         self.address_space
             .bus()
@@ -615,6 +922,8 @@ impl Rv32Machine {
             Rv32ExecutionBackend::Predecoded(_)
             | Rv32ExecutionBackend::BlockCached(_)
             | Rv32ExecutionBackend::Jit(_) => None,
+            #[cfg(target_arch = "x86_64")]
+            Rv32ExecutionBackend::Dbt(_) => None,
         }
     }
 
@@ -654,6 +963,18 @@ impl Rv32Machine {
                     decoded_slots_built: stats.decoded_slots_built,
                 })
             }
+            #[cfg(target_arch = "x86_64")]
+            Rv32ExecutionBackend::Dbt(execution) => {
+                let stats = execution.stats();
+                Some(Rv32TranslationStats {
+                    lookup_unit: Rv32TranslationLookupUnit::Block,
+                    hits: stats.hits,
+                    misses: stats.misses,
+                    evictions: stats.evictions,
+                    blocks_built: stats.translations,
+                    decoded_slots_built: stats.decoded_slots_built,
+                })
+            }
         }
     }
 
@@ -669,6 +990,8 @@ impl Rv32Machine {
             Rv32ExecutionBackend::Jit(execution) => {
                 execution.cache.retained_bytes() + execution.arena.reserved_bytes()
             }
+            #[cfg(target_arch = "x86_64")]
+            Rv32ExecutionBackend::Dbt(execution) => execution.retained_bytes(),
         }
     }
 
@@ -724,6 +1047,101 @@ impl Rv32Machine {
             message,
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn execute_prepared_dbt(
+    hart: &mut Rv32MachineHart,
+    address_space: &mut Rv32AddressSpace,
+    execution: &mut Rv32DbtExecution,
+    prepared: PreparedDbtBlock,
+    remaining_budget: u64,
+) -> Result<(DbtExitTag, DbtExitRecord, u32, u32), DbtFault> {
+    let (state, reservation_valid, reservation_address) = hart.dbt_state();
+    let view = address_space.direct_ram_view();
+    let ram_len = u32::try_from(view.len()).map_err(|_| {
+        DbtFault::new(
+            DbtFaultKind::AbiInvariant,
+            0,
+            None,
+            "RV32 RAM length exceeds the DBT ABI",
+        )
+    })?;
+    let page_count = u32::try_from(view.page_count()).map_err(|_| {
+        DbtFault::new(
+            DbtFaultKind::AbiInvariant,
+            0,
+            None,
+            "RV32 permission page count exceeds the DBT ABI",
+        )
+    })?;
+    let mut context = DbtContext {
+        state,
+        ram_base: view.base(),
+        ram_len,
+        page_permissions: view.page_permissions(),
+        page_count,
+        remaining_budget: remaining_budget.min(u64::from(u32::MAX)) as u32,
+        reservation_valid,
+        reservation_address,
+        exit: DbtExitRecord::default(),
+    };
+    let tag = unsafe { execution.execute(prepared, &mut context) }?;
+    Ok((
+        tag,
+        context.exit,
+        context.reservation_valid,
+        context.reservation_address,
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn validate_memory_exit(
+    hart: &Rv32MachineHart,
+    instruction: DecodedInstruction,
+    exit: DbtExitRecord,
+) -> Result<(), String> {
+    let (base, immediate, width) = match instruction {
+        DecodedInstruction::Load {
+            kind,
+            rs1,
+            immediate,
+            ..
+        } => {
+            let width = match kind {
+                Load::Byte | Load::ByteU => 1,
+                Load::Half | Load::HalfU => 2,
+                Load::Word => 4,
+            };
+            (hart.register(rs1), immediate, width)
+        }
+        DecodedInstruction::Store {
+            kind,
+            rs1,
+            immediate,
+            ..
+        } => {
+            let width = match kind {
+                Store::Byte => 1,
+                Store::Half => 2,
+                Store::Word => 4,
+            };
+            (hart.register(rs1), immediate, width)
+        }
+        _ => {
+            return Err(
+                "DBT memory exit does not identify an RV32 load or store instruction".to_string(),
+            )
+        }
+    };
+    let address = base.wrapping_add(immediate as u32);
+    if exit.address != address || exit.access_size != width {
+        return Err(format!(
+            "DBT memory exit reported address {:#010x}/size {}, expected {address:#010x}/size {width}",
+            exit.address, exit.access_size,
+        ));
+    }
+    Ok(())
 }
 
 fn execute_slot(

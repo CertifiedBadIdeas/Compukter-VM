@@ -20,8 +20,42 @@
 use super::{Rv32ElfLoader, Rv32LoadedImage, Rv32PagePermissions};
 use crate::bus::MachineBus;
 use crate::memory::{AtomicWordAccess, MemoryBus, MemoryFault};
-use crate::rv32_jit::abi::JitRamView;
+use std::marker::PhantomData;
 use thiserror::Error;
+
+pub(super) struct Rv32DirectRamView<'memory> {
+    base: *mut u8,
+    len: usize,
+    page_permissions: *const u8,
+    page_count: usize,
+    _borrow: PhantomData<&'memory mut ()>,
+}
+
+impl Rv32DirectRamView<'_> {
+    pub(super) const fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    pub(super) const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) const fn page_permissions(&self) -> *const u8 {
+        self.page_permissions
+    }
+
+    pub(super) const fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    #[cfg(test)]
+    fn page_permission_bits(&self, page: usize) -> u8 {
+        if page >= self.page_count {
+            return 0;
+        }
+        unsafe { *self.page_permissions.add(page) }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum Rv32AddressSpaceError {
@@ -73,22 +107,19 @@ impl Rv32AddressSpace {
         &self.bus
     }
 
-    #[allow(
-        dead_code,
-        reason = "the RV32 JIT dispatcher consumes the direct RAM view in a later slice"
-    )]
-    pub(crate) fn jit_ram_view(&mut self) -> JitRamView<'_> {
+    pub(super) fn direct_ram_view(&mut self) -> Rv32DirectRamView<'_> {
         let (base, len) = {
             let memory = self.bus.memory_mut();
             let len = memory.len();
             (memory.as_mut_ptr(), len)
         };
-        JitRamView::new(
+        Rv32DirectRamView {
             base,
             len,
-            self.page_permissions.as_ptr().cast(),
-            self.page_permissions.len(),
-        )
+            page_permissions: self.page_permissions.as_ptr().cast(),
+            page_count: self.page_permissions.len(),
+            _borrow: PhantomData,
+        }
     }
 
     fn require(&self, address: u32, size: usize, access: Access) -> Result<bool, MemoryFault> {
@@ -328,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_ram_view_exposes_only_ram_and_its_page_permissions() {
+    fn direct_ram_view_exposes_only_ram_and_its_page_permissions() {
         let mut space = Rv32AddressSpace {
             bus: MachineBus::new(0x1000).unwrap(),
             page_permissions: vec![Rv32PagePermissions::READ_EXECUTE],
@@ -339,7 +370,7 @@ mod tests {
             .map_mmio(0x1000, Box::new(RegisterDevice(0)))
             .unwrap();
 
-        let view = space.jit_ram_view();
+        let view = space.direct_ram_view();
 
         assert_eq!(view.len(), 0x1000);
         assert_eq!(view.page_permission_bits(0), 0b101);

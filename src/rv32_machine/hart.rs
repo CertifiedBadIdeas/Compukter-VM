@@ -60,7 +60,6 @@ impl Rv32MachineHart {
         self.cpu.pc()
     }
 
-    #[cfg(test)]
     pub(super) fn register(&self, register: usize) -> u32 {
         self.cpu.register(register)
     }
@@ -79,6 +78,33 @@ impl Rv32MachineHart {
         };
         self.cpu.commit_instructions(executed);
         executed
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn dbt_state(&mut self) -> (*mut crate::rv32im::Rv32ArchitecturalState, u32, u32) {
+        let reservation = self.cpu.reservation_address();
+        (
+            self.cpu.architectural_state_mut(),
+            u32::from(reservation.is_some()),
+            reservation.unwrap_or(0),
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn commit_dbt_prefix(
+        &mut self,
+        retired: u32,
+        reservation_valid: u32,
+        reservation_address: u32,
+    ) -> Result<(), &'static str> {
+        match reservation_valid {
+            0 => self.cpu.clear_reservation(),
+            1 if self.cpu.reservation_address() == Some(reservation_address) => {}
+            1 => return Err("DBT returned a reservation not owned by the canonical hart"),
+            _ => return Err("DBT returned a non-boolean reservation-valid value"),
+        }
+        self.cpu.commit_instructions(retired);
+        Ok(())
     }
 
     #[allow(
