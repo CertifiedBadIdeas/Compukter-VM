@@ -98,12 +98,8 @@ impl ExecutableMapping {
             })?,
         };
         writable[offset..end].copy_from_slice(code);
-        writable.flush().map_err(|error| {
-            Self::fault(
-                DbtFaultKind::ExecutableMemory,
-                format!("failed to flush executable mapping code: {error}"),
-            )
-        })?;
+        // x86_64 has coherent instruction and data caches. A future backend for a host without
+        // that guarantee must perform explicit instruction-cache maintenance before make_exec.
         let executable = writable.make_exec().map_err(|error| {
             Self::fault(
                 DbtFaultKind::ExecutableMemory,
@@ -199,6 +195,8 @@ mod tests {
         let first_entry = scratch.entry_address().unwrap();
         assert_eq!(unsafe { execute(first_entry) }, 7);
 
+        // Republishing the same virtual address proves x86_64 instruction visibility without a
+        // file-durability flush; this is the contract future host backends must preserve.
         scratch.publish(&[0xb8, 9, 0, 0, 0, 0xc3]).unwrap();
 
         assert_eq!(scratch.reserved_bytes(), PAGE_BYTES);
