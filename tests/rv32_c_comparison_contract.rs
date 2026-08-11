@@ -57,8 +57,7 @@ fn portable_c_kernel_has_one_platform_neutral_entrypoint() {
 #[test]
 fn comparison_build_keeps_one_rv32_kernel_object_for_both_platforms() {
     let script = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts/compile-rv32-c-comparison.sh"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/compile-rv32-c-comparison.sh"),
     )
     .unwrap();
 
@@ -85,6 +84,15 @@ fn product_c_artifact_matches_the_fixed_native_and_qemu_oracle() {
         Rv32ExecutionBackendConfig::BlockCached {
             sets: 32,
             max_instructions: 8,
+        },
+        Rv32ExecutionBackendConfig::DirectDbt {
+            max_instructions: 8,
+            code_bytes: 64 * 1024,
+        },
+        Rv32ExecutionBackendConfig::CachedDbt {
+            sets: 32,
+            max_instructions: 8,
+            code_bytes: 64 * 1024,
         },
     ] {
         let mut machine = Rv32Machine::from_elf(
@@ -160,11 +168,19 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     }
     assert!(source.contains("candidate\\tmode\\titerations\\tseed\\tbatch\\tchecksum"));
     assert!(source.contains("rv32-block-cached"));
+    assert!(source.contains("rv32-direct-dbt"));
+    assert!(source.contains("rv32-cached-dbt"));
     assert!(source.contains("product-machine-block-cached"));
     assert!(source.contains("lookup_unit\\tcache_hits\\tcache_misses\\tcache_evictions"));
     assert!(source.contains("blocks_built\\tdecoded_slots_built\\ttranslation_bytes"));
+    assert!(source.contains("dbt_translations\\tdbt_publications\\tdbt_native_dispatches"));
+    assert!(
+        source.contains("dbt_typed_slow_exits\\tdbt_lowered_load_sites\\tdbt_lowered_store_sites")
+    );
     assert!(source.contains("steady_allocations\\tsteady_allocated_bytes"));
     assert!(source.contains("block-cached-calibrated-sha256"));
+    assert!(source.contains("direct-dbt-calibrated-sha256"));
+    assert!(source.contains("cached-dbt-calibrated-sha256"));
     assert!(!source.contains("Command::new(\"sh\")"));
     assert!(!source.contains("Command::new(\"bash\")"));
 }
@@ -172,8 +188,7 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
 #[test]
 fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     let source = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts/tests/rv32-c-qemu-comparison.sh"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/tests/rv32-c-qemu-comparison.sh"),
     )
     .unwrap();
 
@@ -182,8 +197,12 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("rv32_c_comparison"));
     assert!(source.contains("--ignored --exact"));
     assert!(source.contains("rv32-block-cached"));
-    assert!(source.contains("count == 5"));
+    assert!(source.contains("rv32-direct-dbt"));
+    assert!(source.contains("rv32-cached-dbt"));
+    assert!(source.contains("count == 7"));
     assert!(source.contains("product-block-cached-calibrated-disassembly.txt"));
+    assert!(source.contains("product-direct-dbt-calibrated-disassembly.txt"));
+    assert!(source.contains("product-cached-dbt-calibrated-disassembly.txt"));
     assert!(!source.contains("|| true"));
     assert!(!source.contains("qemu-riscv32"));
 }
