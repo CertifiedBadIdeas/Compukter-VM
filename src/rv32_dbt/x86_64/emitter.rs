@@ -208,6 +208,21 @@ impl X64Emitter {
         )
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bytes
+            .capacity()
+            .saturating_add(
+                self.labels
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<usize>>()),
+            )
+            .saturating_add(
+                self.fixups
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Fixup>()),
+            )
+    }
+
     pub(crate) fn new_label(&mut self) -> Result<Label, EmitError> {
         if self.labels.len() == self.control_capacity {
             return Err(EmitError::ControlCapacity {

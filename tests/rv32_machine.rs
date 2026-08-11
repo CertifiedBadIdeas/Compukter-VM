@@ -25,8 +25,8 @@ use compukter_vm::rv32_machine::{
     DEBUG_BASE, STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC,
 };
 use compukter_vm::rv32im::encoding::{
-    add, addi, amoswap_w, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, materialize, sb,
-    sc_w, sh, sw,
+    add, addi, amoswap_w, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, lw, materialize,
+    sb, sc_w, sh, sw,
 };
 use rv32_elf_support::{halting_machine_elf, machine_program_elf, Elf32Builder, LoadSegment};
 
@@ -35,13 +35,22 @@ const CSR_MEPC: u16 = 0x341;
 const CSR_MCAUSE: u16 = 0x342;
 const CSR_MTVAL: u16 = 0x343;
 
-fn configs() -> [Rv32ExecutionBackendConfig; 3] {
+fn configs() -> [Rv32ExecutionBackendConfig; 5] {
     [
         Rv32ExecutionBackendConfig::Cached { sets: 64 },
         Rv32ExecutionBackendConfig::Predecoded,
         Rv32ExecutionBackendConfig::BlockCached {
             sets: 32,
             max_instructions: 8,
+        },
+        Rv32ExecutionBackendConfig::DirectDbt {
+            max_instructions: 8,
+            code_bytes: 4096,
+        },
+        Rv32ExecutionBackendConfig::CachedDbt {
+            sets: 32,
+            max_instructions: 8,
+            code_bytes: 4096,
         },
     ]
 }
@@ -243,6 +252,89 @@ fn all_backends_execute_the_same_rv32a_reservation_and_amo_program() {
         );
         assert_eq!(machine.debug_bytes(), &[0, 41, 0, 42, 1]);
     }
+}
+
+#[test]
+fn all_backends_execute_aligned_ram_loads_and_stores_once() {
+    let [data_hi, data_lo] = materialize(1, 0x3000);
+    let [debug_hi, debug_lo] = materialize(10, DEBUG_BASE);
+    let elf = machine_program_elf(&[
+        data_hi,
+        data_lo,
+        addi(2, 0, 73),
+        sw(1, 2, 0),
+        lw(3, 1, 0),
+        debug_hi,
+        debug_lo,
+        sb(10, 3, 0),
+        addi(10, 10, -0x100),
+        sw(10, 0, 8),
+        addi(11, 0, STATUS_HALTED),
+        sw(10, 11, 0),
+    ]);
+
+    for execution in configs() {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 1)).unwrap();
+        assert!(matches!(
+            machine.run(32).unwrap(),
+            Rv32MachineOutcome::Halted { .. }
+        ));
+        assert_eq!(machine.debug_bytes(), b"I");
+        if matches!(
+            execution,
+            Rv32ExecutionBackendConfig::DirectDbt { .. }
+                | Rv32ExecutionBackendConfig::CachedDbt { .. }
+        ) {
+            let stats = machine.dbt_stats().unwrap();
+            assert!(stats.lowered_load_sites >= 1);
+            assert!(stats.lowered_store_sites >= 1);
+            assert!(stats.native_dispatches >= 1);
+            assert!(machine.translation_bytes() > 4096);
+        }
+    }
+}
+
+#[test]
+fn all_backends_trap_misaligned_ram_access_without_retiring_it() {
+    let [data_hi, data_lo] = materialize(1, 0x3001);
+    let elf = machine_program_elf(&[data_hi, data_lo, lw(2, 1, 0)]);
+
+    for execution in configs() {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 0)).unwrap();
+        assert_eq!(
+            machine.run(8).unwrap(),
+            Rv32MachineOutcome::BudgetExhausted {
+                retired_delta: 2,
+                retired_total: 2,
+            }
+        );
+        assert_eq!(machine.pc(), 0);
+    }
+}
+
+#[test]
+fn cached_dbt_fence_i_revokes_the_previous_generation() {
+    let elf = machine_program_elf(&[fence_i(), jal(0, -4)]);
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 4,
+                max_instructions: 8,
+                code_bytes: 4096,
+            },
+            0,
+        ),
+    )
+    .unwrap();
+
+    machine.run(2).unwrap();
+    assert_eq!(machine.dbt_stats().unwrap().translations, 2);
+    machine.run(1).unwrap();
+
+    let stats = machine.dbt_stats().unwrap();
+    assert_eq!(stats.translations, 3);
+    assert_eq!(stats.native_dispatches, 3);
 }
 
 #[test]
@@ -550,6 +642,29 @@ fn invalid_cache_and_ram_layouts_fail_before_machine_allocation() {
             Rv32ExecutionBackendConfig::BlockCached {
                 sets: 32,
                 max_instructions: 65,
+            },
+            8,
+        )
+    )
+    .is_err());
+    assert!(Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::DirectDbt {
+                max_instructions: 0,
+                code_bytes: 4096,
+            },
+            8,
+        )
+    )
+    .is_err());
+    assert!(Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 0,
+                max_instructions: 8,
+                code_bytes: 4096,
             },
             8,
         )

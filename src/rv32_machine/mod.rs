@@ -47,6 +47,7 @@ pub struct Rv32DbtStats {
     pub typed_slow_exits: u64,
     pub lowered_load_sites: u64,
     pub lowered_store_sites: u64,
+    pub decoded_slots_built: u64,
     pub emitted_bytes: u64,
     pub reserved_bytes: usize,
     pub metadata_bytes: usize,
