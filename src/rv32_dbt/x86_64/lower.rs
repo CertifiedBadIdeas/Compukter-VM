@@ -28,7 +28,8 @@ use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, TranslatedBlock};
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 use crate::rv32im::{
-    Branch, DecodedInstruction, ImmOp, Op, Rv32ArchitecturalState, Rv32ResolvedInstruction,
+    Branch, DecodedInstruction, ImmOp, Load, Op, Rv32ArchitecturalState, Rv32ResolvedInstruction,
+    Store,
 };
 
 pub(crate) struct DbtTranslationWorkspace {
@@ -40,7 +41,7 @@ impl DbtTranslationWorkspace {
         code_capacity: usize,
         max_block_instructions: usize,
     ) -> Result<Self, DbtFault> {
-        let control_capacity = max_block_instructions.checked_mul(8).ok_or_else(|| {
+        let control_capacity = max_block_instructions.checked_mul(16).ok_or_else(|| {
             fault(
                 DbtFaultKind::Capacity,
                 0,
@@ -63,6 +64,8 @@ impl DbtTranslationWorkspace {
         let mut cache = RegisterCache::new();
         let mut terminal = None;
         let mut emitted_terminal = false;
+        let mut lowered_load_sites = 0_u32;
+        let mut lowered_store_sites = 0_u32;
         let bounded_limit = match input.mode() {
             DbtBlockMode::Fast => None,
             DbtBlockMode::Bounded { max_attempts } => Some(max_attempts as usize),
@@ -133,6 +136,50 @@ impl DbtTranslationWorkspace {
                     emitted_terminal = true;
                     break;
                 }
+                DecodedInstruction::Load {
+                    kind,
+                    rd,
+                    rs1,
+                    immediate,
+                } => {
+                    lowered_load_sites += 1;
+                    lower_load(
+                        kind,
+                        rd,
+                        rs1,
+                        immediate,
+                        pc,
+                        word,
+                        attempted,
+                        &input.slots()[index + 1..],
+                        &mut cache,
+                        &mut out,
+                    )
+                    .map_err(|error| emit_fault(pc, Some(word), error))?;
+                    continue;
+                }
+                DecodedInstruction::Store {
+                    kind,
+                    rs1,
+                    rs2,
+                    immediate,
+                } => {
+                    lowered_store_sites += 1;
+                    lower_store(
+                        kind,
+                        rs1,
+                        rs2,
+                        immediate,
+                        pc,
+                        word,
+                        attempted,
+                        &input.slots()[index + 1..],
+                        &mut cache,
+                        &mut out,
+                    )
+                    .map_err(|error| emit_fault(pc, Some(word), error))?;
+                    continue;
+                }
                 _ => {}
             }
             if !lower_instruction(
@@ -179,7 +226,7 @@ impl DbtTranslationWorkspace {
         let code = out
             .finish()
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
-        TranslatedBlock::new(input, code)
+        TranslatedBlock::new(input, code, lowered_load_sites, lowered_store_sites)
             .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))
     }
 
@@ -384,6 +431,170 @@ fn lower_instruction(
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_load(
+    kind: Load,
+    rd: usize,
+    rs1: usize,
+    immediate: i32,
+    pc: u32,
+    word: u32,
+    attempted: u32,
+    remaining: &[Rv32ResolvedInstruction],
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let width = match kind {
+        Load::Byte | Load::ByteU => 1,
+        Load::Half | Load::HalfU => 2,
+        Load::Word => 4,
+    };
+    let base = cache.read(rs1, remaining, &[], out)?;
+    out.mov_r32_r32(Gpr::Rdx, base)?;
+    if immediate != 0 {
+        out.add_r32_imm32(Gpr::Rdx, immediate)?;
+    }
+    let mut slow_cache = cache.clone();
+    let slow = out.new_label()?;
+    let done = out.new_label()?;
+    emit_ram_checks(Gpr::Rdx, width, 0b001, slow, out)?;
+
+    let dst = cache.write(rd, remaining, &[], out)?.unwrap_or(Gpr::Rax);
+    let memory = Mem::base_index_disp(Gpr::R13, Gpr::Rdx, super::emitter::Scale::One, 0);
+    match kind {
+        Load::Byte => out.movsx_r32_m8(dst, memory)?,
+        Load::Half => out.movsx_r32_m16(dst, memory)?,
+        Load::Word => out.mov_r32_m32(dst, memory)?,
+        Load::ByteU => out.movzx_r32_m8(dst, memory)?,
+        Load::HalfU => out.movzx_r32_m16(dst, memory)?,
+    }
+    out.jmp(done)?;
+
+    out.bind(slow)?;
+    emit_memory_exit(&mut slow_cache, out, pc, word, attempted, Gpr::Rdx, width)?;
+    out.bind(done)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_store(
+    kind: Store,
+    rs1: usize,
+    rs2: usize,
+    immediate: i32,
+    pc: u32,
+    word: u32,
+    attempted: u32,
+    remaining: &[Rv32ResolvedInstruction],
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let width = match kind {
+        Store::Byte => 1,
+        Store::Half => 2,
+        Store::Word => 4,
+    };
+    let base = cache.read(rs1, remaining, &[], out)?;
+    out.mov_r32_r32(Gpr::Rdx, base)?;
+    if immediate != 0 {
+        out.add_r32_imm32(Gpr::Rdx, immediate)?;
+    }
+    let mut slow_cache = cache.clone();
+    let slow = out.new_label()?;
+    let done = out.new_label()?;
+    emit_ram_checks(Gpr::Rdx, width, 0b010, slow, out)?;
+
+    let value = cache.read(rs2, remaining, &[Gpr::Rdx], out)?;
+    let memory = Mem::base_index_disp(Gpr::R13, Gpr::Rdx, super::emitter::Scale::One, 0);
+    match kind {
+        Store::Byte => out.mov_m8_r8(memory, value)?,
+        Store::Half => out.mov_m16_r16(memory, value)?,
+        Store::Word => out.mov_m32_r32(memory, value)?,
+    }
+    emit_store_reservation_invalidation(Gpr::Rdx, width, out)?;
+    out.jmp(done)?;
+
+    out.bind(slow)?;
+    emit_memory_exit(&mut slow_cache, out, pc, word, attempted, Gpr::Rdx, width)?;
+    out.bind(done)
+}
+
+fn emit_store_reservation_invalidation(
+    address: Gpr,
+    width: u32,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let keep = out.new_label()?;
+    out.mov_r32_m32(
+        Gpr::Rcx,
+        Mem::base_disp(Gpr::R15, DbtContext::RESERVATION_VALID_OFFSET as i32),
+    )?;
+    out.test_r32_r32(Gpr::Rcx, Gpr::Rcx)?;
+    out.jcc(Condition::Equal, keep)?;
+    out.mov_r32_m32(
+        Gpr::Rax,
+        Mem::base_disp(Gpr::R15, DbtContext::RESERVATION_ADDRESS_OFFSET as i32),
+    )?;
+    out.mov_r32_r32(Gpr::Rcx, Gpr::Rax)?;
+    out.add_r32_imm32(Gpr::Rcx, 4)?;
+    out.cmp_r32_r32(address, Gpr::Rcx)?;
+    out.jcc(Condition::AboveEqual, keep)?;
+    out.mov_r32_r32(Gpr::Rcx, address)?;
+    out.add_r32_imm32(Gpr::Rcx, width as i32)?;
+    out.cmp_r32_r32(Gpr::Rax, Gpr::Rcx)?;
+    out.jcc(Condition::AboveEqual, keep)?;
+    out.mov_r32_imm32(Gpr::Rax, 0)?;
+    out.mov_m32_r32(
+        Mem::base_disp(Gpr::R15, DbtContext::RESERVATION_VALID_OFFSET as i32),
+        Gpr::Rax,
+    )?;
+    out.bind(keep)
+}
+
+fn emit_ram_checks(
+    address: Gpr,
+    width: u32,
+    permission: i32,
+    slow: super::emitter::Label,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    if width > 1 {
+        out.mov_r32_r32(Gpr::Rax, address)?;
+        out.and_r32_imm32(Gpr::Rax, width as i32 - 1)?;
+        out.jcc(Condition::NotEqual, slow)?;
+    }
+    out.mov_r32_m32(
+        Gpr::Rcx,
+        Mem::base_disp(Gpr::R15, DbtContext::RAM_LEN_OFFSET as i32),
+    )?;
+    out.cmp_r32_imm32(Gpr::Rcx, width as i32)?;
+    out.jcc(Condition::Below, slow)?;
+    out.add_r32_imm32(Gpr::Rcx, -(width as i32))?;
+    out.cmp_r32_r32(address, Gpr::Rcx)?;
+    out.jcc(Condition::Above, slow)?;
+
+    out.mov_r32_r32(Gpr::Rax, address)?;
+    out.shr_r32_imm8(Gpr::Rax, 12)?;
+    out.mov_r32_r32(Gpr::Rcx, address)?;
+    if width > 1 {
+        out.add_r32_imm32(Gpr::Rcx, width as i32 - 1)?;
+    }
+    out.shr_r32_imm8(Gpr::Rcx, 12)?;
+    out.cmp_r32_r32(Gpr::Rax, Gpr::Rcx)?;
+    out.jcc(Condition::NotEqual, slow)?;
+    out.mov_r32_m32(
+        Gpr::Rcx,
+        Mem::base_disp(Gpr::R15, DbtContext::PAGE_COUNT_OFFSET as i32),
+    )?;
+    out.cmp_r32_r32(Gpr::Rax, Gpr::Rcx)?;
+    out.jcc(Condition::AboveEqual, slow)?;
+    out.movzx_r32_m8(
+        Gpr::Rcx,
+        Mem::base_index_disp(Gpr::R12, Gpr::Rax, super::emitter::Scale::One, 0),
+    )?;
+    out.and_r32_imm32(Gpr::Rcx, permission)?;
+    out.jcc(Condition::Equal, slow)
 }
 
 fn lower_immediate(
@@ -645,6 +856,63 @@ fn emit_signed_division(op: Op, lhs: Gpr, rhs: Gpr, out: &mut X64Emitter) -> Res
     out.bind(done)
 }
 
+fn emit_memory_exit(
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+    instruction_pc: u32,
+    instruction_word: u32,
+    attempted: u32,
+    address: Gpr,
+    access_size: u32,
+) -> Result<(), EmitError> {
+    cache.flush(out)?;
+    write_u32(out, Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0)?;
+    write_u32(
+        out,
+        Gpr::R14,
+        Rv32ArchitecturalState::PC_OFFSET,
+        instruction_pc,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::NEXT_PC_OFFSET,
+        instruction_pc,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::ATTEMPTED_OFFSET,
+        attempted,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::INSTRUCTION_PC_OFFSET,
+        instruction_pc,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::INSTRUCTION_WORD_OFFSET,
+        instruction_word,
+    )?;
+    out.mov_m32_r32(
+        Mem::base_disp(
+            Gpr::R15,
+            (DbtContext::EXIT_OFFSET + DbtExitRecord::ADDRESS_OFFSET) as i32,
+        ),
+        address,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::ACCESS_SIZE_OFFSET,
+        access_size,
+    )?;
+    emit_epilogue(out, DbtExitTag::MemoryAccess)
+}
+
 fn emit_exit(
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
@@ -770,7 +1038,10 @@ fn write_u32(out: &mut X64Emitter, base: Gpr, offset: usize, value: u32) -> Resu
 }
 
 fn emit_fault(pc: u32, word: Option<u32>, error: EmitError) -> DbtFault {
-    let kind = if matches!(error, EmitError::Capacity { .. }) {
+    let kind = if matches!(
+        error,
+        EmitError::Capacity { .. } | EmitError::ControlCapacity { .. }
+    ) {
         DbtFaultKind::Capacity
     } else {
         DbtFaultKind::Translation
@@ -784,17 +1055,19 @@ fn fault(kind: DbtFaultKind, pc: u32, word: Option<u32>, message: impl Into<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::DbtTranslationWorkspace;
+    use super::{emit_fault, DbtTranslationWorkspace};
     use crate::memory::MachineMemory;
     use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
     use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
     use crate::rv32_dbt::executable::ExecutableScratch;
+    use crate::rv32_dbt::x86_64::emitter::EmitError;
+    use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{
         decode_product_word,
         encoding::{
             add, addi, and, andi, auipc, beq, bge, bgeu, blt, bltu, bne, div, divu, fence, fence_i,
-            jal, jalr, lui, mul, mulh, mulhsu, mulhu, or, ori, rem, remu, sll, slli, slt, slti,
-            sltiu, sltu, sra, srai, srl, srli, sub, xor, xori,
+            jal, jalr, lb, lbu, lh, lhu, lui, lw, mul, mulh, mulhsu, mulhu, or, ori, rem, remu, sb,
+            sh, sll, slli, slt, slti, sltiu, sltu, sra, srai, srl, srli, sub, sw, xor, xori,
         },
         Rv32ResolvedInstruction, Rv32imCpu,
     };
@@ -838,6 +1111,168 @@ mod tests {
         let tag = DbtExitTag::try_from(unsafe { entry(&mut context) }).unwrap();
         let exit = context.exit;
         (cpu, tag, exit, code)
+    }
+
+    fn execute_memory(
+        word: u32,
+        registers: &[(usize, u32)],
+        ram: &mut [u8],
+        permissions: &[u8],
+    ) -> (Rv32imCpu, DbtExitTag, DbtExitRecord) {
+        let (cpu, tag, exit, _) =
+            execute_memory_with_reservation(word, registers, ram, permissions, None);
+        (cpu, tag, exit)
+    }
+
+    fn execute_memory_with_reservation(
+        word: u32,
+        registers: &[(usize, u32)],
+        ram: &mut [u8],
+        permissions: &[u8],
+        reservation: Option<u32>,
+    ) -> (Rv32imCpu, DbtExitTag, DbtExitRecord, u32) {
+        let slots = slots(&[word]);
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Fast).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, 1).unwrap();
+        let block = workspace.lower(&input).unwrap();
+        let mut scratch = ExecutableScratch::new(4096).unwrap();
+        scratch.publish(block.code()).unwrap();
+        let mut cpu = Rv32imCpu::new(0x1000);
+        for &(register, value) in registers {
+            cpu.set_register(register, value).unwrap();
+        }
+        let mut context = DbtContext {
+            state: cpu.architectural_state_mut(),
+            ram_base: ram.as_mut_ptr(),
+            ram_len: ram.len() as u32,
+            page_permissions: permissions.as_ptr(),
+            page_count: permissions.len() as u32,
+            remaining_budget: 1,
+            reservation_valid: u32::from(reservation.is_some()),
+            reservation_address: reservation.unwrap_or(0),
+            exit: DbtExitRecord::default(),
+        };
+        let entry: DbtEntry = unsafe { std::mem::transmute(scratch.entry_address().unwrap()) };
+        let tag = DbtExitTag::try_from(unsafe { entry(&mut context) }).unwrap();
+        let exit = context.exit;
+        let reservation_valid = context.reservation_valid;
+        drop(context);
+        (cpu, tag, exit, reservation_valid)
+    }
+
+    #[test]
+    fn native_ram_loads_preserve_width_and_sign_extension() {
+        let cases = [
+            (lb(3, 1, 0), vec![0x80], 0xffff_ff80),
+            (lbu(3, 1, 0), vec![0x80], 0x80),
+            (lh(3, 1, 0), vec![0x00, 0x80], 0xffff_8000),
+            (lhu(3, 1, 0), vec![0x00, 0x80], 0x8000),
+            (lw(3, 1, 0), vec![0x21, 0x43, 0x65, 0x87], 0x8765_4321),
+        ];
+        for (word, bytes, expected) in cases {
+            let mut ram = vec![0; 4096];
+            ram[64..64 + bytes.len()].copy_from_slice(&bytes);
+
+            let (cpu, tag, exit) = execute_memory(word, &[(1, 64), (3, 7)], &mut ram, &[0b001]);
+
+            assert_eq!(tag, DbtExitTag::Completed, "word={word:#010x}");
+            assert_eq!(cpu.register(3), expected, "word={word:#010x}");
+            assert_eq!(cpu.pc(), 0x1004);
+            assert_eq!(exit.attempted, 1);
+        }
+    }
+
+    #[test]
+    fn native_ram_stores_preserve_width_and_neighbors() {
+        let cases = [
+            (sb(1, 2, 0), 1_usize),
+            (sh(1, 2, 0), 2_usize),
+            (sw(1, 2, 0), 4_usize),
+        ];
+        for (word, width) in cases {
+            let mut ram = vec![0xa5; 4096];
+
+            let (cpu, tag, exit) =
+                execute_memory(word, &[(1, 64), (2, 0x8765_4321)], &mut ram, &[0b011]);
+
+            assert_eq!(tag, DbtExitTag::Completed, "word={word:#010x}");
+            assert_eq!(
+                &ram[64..64 + width],
+                &0x8765_4321_u32.to_le_bytes()[..width]
+            );
+            assert_eq!(ram[63], 0xa5);
+            assert_eq!(ram[64 + width], 0xa5);
+            assert_eq!(cpu.pc(), 0x1004);
+            assert_eq!(exit.attempted, 1);
+        }
+    }
+
+    #[test]
+    fn native_ram_rejects_access_before_guest_visible_mutation() {
+        let cases = [
+            (lw(3, 1, 0), 65_u32, vec![0b001], 4_u32),
+            (lw(3, 1, 0), 4096_u32, vec![0b001], 4_u32),
+            (lw(3, 1, 0), 64_u32, vec![0b010], 4_u32),
+            (sw(1, 2, 0), 64_u32, vec![0b001], 4_u32),
+        ];
+        for (word, address, permissions, width) in cases {
+            let mut ram = vec![0xa5; 4096];
+            let before = ram.clone();
+
+            let (cpu, tag, exit) = execute_memory(
+                word,
+                &[(1, address), (2, 0x1122_3344), (3, 0xfeed_face)],
+                &mut ram,
+                &permissions,
+            );
+
+            assert_eq!(tag, DbtExitTag::MemoryAccess, "word={word:#010x}");
+            assert_eq!(cpu.register(3), 0xfeed_face);
+            assert_eq!(ram, before);
+            assert_eq!(cpu.pc(), 0x1000);
+            assert_eq!(exit.attempted, 1);
+            assert_eq!(exit.instruction_pc, 0x1000);
+            assert_eq!(exit.instruction_word, word);
+            assert_eq!(exit.address, address);
+            assert_eq!(exit.access_size, width);
+        }
+    }
+
+    #[test]
+    fn native_ram_store_invalidates_only_an_overlapping_reservation() {
+        for (reservation, expected_valid) in [(66, 0), (128, 1)] {
+            let mut ram = vec![0; 4096];
+
+            let (_, tag, _, reservation_valid) = execute_memory_with_reservation(
+                sw(1, 2, 0),
+                &[(1, 64), (2, 0x1122_3344)],
+                &mut ram,
+                &[0b011],
+                Some(reservation),
+            );
+
+            assert_eq!(tag, DbtExitTag::Completed);
+            assert_eq!(reservation_valid, expected_valid);
+        }
+    }
+
+    #[test]
+    fn translated_block_reports_static_native_ram_sites() {
+        let slots = slots(&[lw(3, 1, 0), sw(1, 2, 0), addi(4, 4, 1)]);
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Fast).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
+
+        let block = workspace.lower(&input).unwrap();
+
+        assert_eq!(block.lowered_load_sites(), 1);
+        assert_eq!(block.lowered_store_sites(), 1);
+    }
+
+    #[test]
+    fn control_workspace_exhaustion_is_a_capacity_fault() {
+        let fault = emit_fault(0x1000, None, EmitError::ControlCapacity { limit: 8 });
+
+        assert_eq!(fault.kind(), DbtFaultKind::Capacity);
     }
 
     #[test]
