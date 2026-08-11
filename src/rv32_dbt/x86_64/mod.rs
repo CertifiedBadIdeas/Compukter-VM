@@ -18,3 +18,5 @@
  */
 
 pub(crate) mod emitter;
+pub(crate) mod lower;
+pub(crate) mod register_cache;

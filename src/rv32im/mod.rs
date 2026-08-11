@@ -110,7 +110,7 @@ impl Rv32ArchitecturalState {
         dead_code,
         reason = "the first generated RV32 block consumes the state layout in a later slice"
     )]
-    pub(crate) const ABI_VERSION: u32 = crate::rv32_jit::abi::JIT_ABI_VERSION;
+    pub(crate) const ABI_VERSION: u32 = crate::rv32_dbt::abi::DBT_ABI_VERSION;
     #[allow(
         dead_code,
         reason = "the first generated RV32 block consumes the state layout in a later slice"

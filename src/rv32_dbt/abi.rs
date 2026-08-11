@@ -61,6 +61,15 @@ pub(crate) struct DbtExitRecord {
     pub(crate) access_size: u32,
 }
 
+impl DbtExitRecord {
+    pub(crate) const NEXT_PC_OFFSET: usize = std::mem::offset_of!(Self, next_pc);
+    pub(crate) const ATTEMPTED_OFFSET: usize = std::mem::offset_of!(Self, attempted);
+    pub(crate) const INSTRUCTION_PC_OFFSET: usize = std::mem::offset_of!(Self, instruction_pc);
+    pub(crate) const INSTRUCTION_WORD_OFFSET: usize = std::mem::offset_of!(Self, instruction_word);
+    pub(crate) const ADDRESS_OFFSET: usize = std::mem::offset_of!(Self, address);
+    pub(crate) const ACCESS_SIZE_OFFSET: usize = std::mem::offset_of!(Self, access_size);
+}
+
 #[repr(C)]
 pub(crate) struct DbtContext {
     pub(crate) state: *mut Rv32ArchitecturalState,
@@ -97,6 +106,10 @@ mod tests {
     fn context_offsets_match_repr_c_layout() {
         assert_eq!(DbtContext::ABI_VERSION, 1);
         assert_eq!(
+            crate::rv32im::Rv32ArchitecturalState::ABI_VERSION,
+            DbtContext::ABI_VERSION
+        );
+        assert_eq!(
             DbtContext::STATE_OFFSET,
             std::mem::offset_of!(DbtContext, state)
         );
@@ -109,6 +122,12 @@ mod tests {
             std::mem::offset_of!(DbtContext, exit)
         );
         assert_eq!(std::mem::size_of::<DbtExitRecord>() % 4, 0);
+        assert_eq!(DbtExitRecord::NEXT_PC_OFFSET, 0);
+        assert_eq!(DbtExitRecord::ATTEMPTED_OFFSET, 4);
+        assert_eq!(DbtExitRecord::INSTRUCTION_PC_OFFSET, 8);
+        assert_eq!(DbtExitRecord::INSTRUCTION_WORD_OFFSET, 12);
+        assert_eq!(DbtExitRecord::ADDRESS_OFFSET, 16);
+        assert_eq!(DbtExitRecord::ACCESS_SIZE_OFFSET, 20);
     }
 
     #[test]
