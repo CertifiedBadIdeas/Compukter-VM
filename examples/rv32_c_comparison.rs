@@ -152,7 +152,7 @@ fn run() -> Result<(), String> {
     }
 
     let source_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/benchmarks/rv32-c-comparison");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
     let native = build_dir.join("native-kernel");
     let manifest = read_manifest(&build_dir.join("manifest.tsv"))?;
     let qemu = env::var_os("RV32_C_QEMU").unwrap_or_else(|| "qemu-system-riscv32".into());

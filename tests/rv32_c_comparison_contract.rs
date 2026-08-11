@@ -21,7 +21,7 @@ use compukter_vm::rv32_machine::{
 };
 
 fn workload_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/benchmarks/rv32-c-comparison")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison")
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn portable_c_kernel_has_one_platform_neutral_entrypoint() {
 fn comparison_build_keeps_one_rv32_kernel_object_for_both_platforms() {
     let script = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/compile-rv32-c-comparison.sh"),
+            .join("scripts/compile-rv32-c-comparison.sh"),
     )
     .unwrap();
 
@@ -173,7 +173,7 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
 fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     let source = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/tests/rv32-c-qemu-comparison.sh"),
+            .join("scripts/tests/rv32-c-qemu-comparison.sh"),
     )
     .unwrap();
 
@@ -186,4 +186,19 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("product-block-cached-calibrated-disassembly.txt"));
     assert!(!source.contains("|| true"));
     assert!(!source.contains("qemu-riscv32"));
+}
+
+#[test]
+fn standalone_comparison_paths_do_not_reach_into_a_parent_repository() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let runner = fs::read_to_string(root.join("examples/rv32_c_comparison.rs")).unwrap();
+    let compiler = fs::read_to_string(root.join("scripts/compile-rv32-c-comparison.sh")).unwrap();
+    let gate = fs::read_to_string(root.join("scripts/tests/rv32-c-qemu-comparison.sh")).unwrap();
+
+    assert!(runner.contains("join(\"benchmarks/rv32-c-comparison\")"));
+    assert!(!runner.contains("../../tools"));
+    for source in [compiler, gate] {
+        assert!(!source.contains("host/compukter-vm"));
+        assert!(!source.contains("../"));
+    }
 }
