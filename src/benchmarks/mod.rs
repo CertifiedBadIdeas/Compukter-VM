@@ -18,6 +18,8 @@
  */
 
 mod c_comparison;
+#[cfg(target_arch = "x86_64")]
+mod dbt_compute;
 mod decoder;
 mod native;
 mod product_machine;
@@ -30,6 +32,8 @@ pub use c_comparison::{
     c_comparison_next_batch, c_comparison_qemu_target_nanos, c_comparison_timeout_nanos,
     parse_c_comparison_result,
 };
+#[cfg(target_arch = "x86_64")]
+pub use dbt_compute::{DirectDbtComputeObservation, PreparedDirectDbtCompute32};
 pub use decoder::{
     DecoderBenchmarkImplementation, DecoderBenchmarkObservation, DecoderBenchmarkScenario,
     PreparedDecoderBenchmark,
@@ -57,17 +61,31 @@ pub enum BenchmarkCandidate {
     Rv32Direct,
     Rv32Cached,
     Rv32Predecoded,
+    Rv32DirectDbt,
     NativeRust,
 }
 
 impl BenchmarkCandidate {
     pub const fn all() -> &'static [Self] {
-        &[
-            Self::Rv32Direct,
-            Self::Rv32Cached,
-            Self::Rv32Predecoded,
-            Self::NativeRust,
-        ]
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                Self::Rv32Direct,
+                Self::Rv32Cached,
+                Self::Rv32Predecoded,
+                Self::Rv32DirectDbt,
+                Self::NativeRust,
+            ]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[
+                Self::Rv32Direct,
+                Self::Rv32Cached,
+                Self::Rv32Predecoded,
+                Self::NativeRust,
+            ]
+        }
     }
 
     pub const fn name(self) -> &'static str {
@@ -76,12 +94,26 @@ impl BenchmarkCandidate {
             Self::Rv32Direct => "rv32-direct",
             Self::Rv32Cached => "rv32-cached",
             Self::Rv32Predecoded => "rv32-predecoded",
+            Self::Rv32DirectDbt => "rv32-dbt-direct",
             Self::NativeRust => "native-rust",
         }
     }
 
     pub const fn is_native(self) -> bool {
         matches!(self, Self::NativeRust)
+    }
+
+    pub const fn supports(self, workload: BenchmarkWorkload) -> bool {
+        match self {
+            Self::Rv32DirectDbt => {
+                cfg!(target_arch = "x86_64") && matches!(workload, BenchmarkWorkload::Compute32)
+            }
+            Self::RvsimRv32im
+            | Self::Rv32Direct
+            | Self::Rv32Cached
+            | Self::Rv32Predecoded
+            | Self::NativeRust => true,
+        }
     }
 }
 
@@ -147,6 +179,8 @@ pub struct PreparedBenchmark {
 enum PreparedCandidate {
     Native(native::Prepared),
     Rv32(rv32::Prepared),
+    #[cfg(target_arch = "x86_64")]
+    DirectDbtCompute(dbt_compute::PreparedDirectDbtCompute32),
 }
 
 impl PreparedBenchmark {
@@ -164,6 +198,25 @@ impl PreparedBenchmark {
             BenchmarkCandidate::NativeRust => {
                 PreparedCandidate::Native(native::Prepared::new(workload, iterations))
             }
+            BenchmarkCandidate::Rv32DirectDbt => {
+                if !candidate.supports(workload) {
+                    return Err(format!(
+                        "candidate {} does not support workload {}",
+                        candidate.name(),
+                        workload.name()
+                    ));
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    PreparedCandidate::DirectDbtCompute(
+                        dbt_compute::PreparedDirectDbtCompute32::new(iterations)?,
+                    )
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    return Err("rv32-dbt-direct requires x86_64".to_string());
+                }
+            }
             BenchmarkCandidate::RvsimRv32im => {
                 return Err("rvsim is a correctness reference, not a benchmark candidate".into())
             }
@@ -175,6 +228,23 @@ impl PreparedBenchmark {
         match &mut self.inner {
             PreparedCandidate::Native(prepared) => prepared.execute(),
             PreparedCandidate::Rv32(prepared) => prepared.execute(),
+            #[cfg(target_arch = "x86_64")]
+            PreparedCandidate::DirectDbtCompute(prepared) => {
+                let observation = prepared.execute()?;
+                Ok(BenchmarkObservation {
+                    candidate: BenchmarkCandidate::Rv32DirectDbt,
+                    workload: BenchmarkWorkload::Compute32,
+                    iterations: prepared.iterations(),
+                    checksum: observation.checksum,
+                    retired_instructions: observation.attempted_instructions.saturating_sub(1),
+                    yields: 0,
+                    instruction_fetch: BenchmarkTraffic::default(),
+                    data_ram: BenchmarkTraffic::default(),
+                    mmio: BenchmarkTraffic::default(),
+                    cpu_state_bytes: crate::rv32im::Rv32imCpu::cpu_state_bytes(),
+                    translation_bytes: observation.translated_bytes as usize,
+                })
+            }
         }
     }
 }
