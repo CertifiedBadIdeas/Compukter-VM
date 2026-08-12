@@ -40,6 +40,18 @@ rv32_flags=(
     -Wextra
     -Werror
 )
+wasm_flags=(
+    --target=wasm32-unknown-unknown
+    -O3
+    -flto
+    -msimd128
+    -ffreestanding
+    -fno-builtin
+    -fno-stack-protector
+    -Wall
+    -Wextra
+    -Werror
+)
 
 "$RV32_C_CLANG" "${native_flags[@]}" -Rpass=loop-vectorize -Rpass=slp-vectorize \
     -Rpass-missed=loop-vectorize "$SOURCE_ROOT/kernel.c" "$SOURCE_ROOT/native-wrapper.c" \
@@ -50,6 +62,8 @@ rv32_flags=(
 "$RV32_C_CLANG" "${rv32_flags[@]}" -c "$SOURCE_ROOT/product-wrapper.c" -o "$BUILD_DIR/product-wrapper.o"
 "$RV32_C_CLANG" "${rv32_flags[@]}" -c "$SOURCE_ROOT/qemu-start.S" -o "$BUILD_DIR/qemu-start.o"
 "$RV32_C_CLANG" "${rv32_flags[@]}" -c "$SOURCE_ROOT/qemu-wrapper.c" -o "$BUILD_DIR/qemu-wrapper.o"
+"$RV32_C_CLANG" "${wasm_flags[@]}" -c "$SOURCE_ROOT/kernel.c" -o "$BUILD_DIR/kernel-wasm.o"
+"$RV32_C_CLANG" "${wasm_flags[@]}" -c "$SOURCE_ROOT/wasm-wrapper.c" -o "$BUILD_DIR/wasm-wrapper.o"
 
 "$RV32_C_LLD" -m elf32lriscv --no-relax --fatal-warnings --defsym=__ck_batch=1 \
     -T "$SOURCE_ROOT/product.ld" "$BUILD_DIR/product-start.o" \
@@ -57,10 +71,20 @@ rv32_flags=(
 "$RV32_C_LLD" -m elf32lriscv --no-relax --fatal-warnings --defsym=__ck_batch=1 \
     -T "$SOURCE_ROOT/qemu.ld" "$BUILD_DIR/qemu-start.o" \
     "$BUILD_DIR/qemu-wrapper.o" "$BUILD_DIR/kernel-rv32.o" -o "$BUILD_DIR/qemu.elf"
+"$RV32_C_CLANG" "${wasm_flags[@]}" -nostdlib \
+    -Wl,--no-entry -Wl,--export=benchmark_batch -Wl,--export-memory \
+    -Wl,--initial-memory=131072 -Wl,--max-memory=131072 \
+    "$BUILD_DIR/kernel-wasm.o" "$BUILD_DIR/wasm-wrapper.o" -o "$BUILD_DIR/module.wasm"
 
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/native-kernel" >"$BUILD_DIR/native-disassembly.txt"
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/product.elf" >"$BUILD_DIR/product-disassembly.txt"
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/qemu.elf" >"$BUILD_DIR/qemu-disassembly.txt"
+"$RV32_C_OBJDUMP" -d "$BUILD_DIR/module.wasm" >"$BUILD_DIR/wasm-disassembly.txt"
+"$RV32_C_READOBJ" --sections "$BUILD_DIR/module.wasm" >"$BUILD_DIR/wasm-readobj.txt"
+if grep -Eq 'Type:[[:space:]]+IMPORT' "$BUILD_DIR/wasm-readobj.txt"; then
+    echo "Wasm module unexpectedly imports host functions" >&2
+    exit 1
+fi
 "$RV32_C_READOBJ" --file-headers --program-headers --arch-specific \
     "$BUILD_DIR/product.elf" >"$BUILD_DIR/product-readobj.txt"
 "$RV32_C_READOBJ" --file-headers --program-headers --arch-specific \
@@ -72,23 +96,29 @@ kernel_hash="$(sha256sum "$BUILD_DIR/kernel-rv32.o" | cut -d' ' -f1)"
 native_hash="$(sha256sum "$BUILD_DIR/native-kernel" | cut -d' ' -f1)"
 product_hash="$(sha256sum "$BUILD_DIR/product.elf" | cut -d' ' -f1)"
 qemu_hash="$(sha256sum "$BUILD_DIR/qemu.elf" | cut -d' ' -f1)"
+wasm_hash="$(sha256sum "$BUILD_DIR/module.wasm" | cut -d' ' -f1)"
 native_text_bytes="$("$RV32_C_SIZE" --format=berkeley "$BUILD_DIR/native-kernel" | tail -n 1 | awk '{print $1}')"
 product_text_bytes="$("$RV32_C_SIZE" --format=berkeley "$BUILD_DIR/product.elf" | tail -n 1 | awk '{print $1}')"
 qemu_text_bytes="$("$RV32_C_SIZE" --format=berkeley "$BUILD_DIR/qemu.elf" | tail -n 1 | awk '{print $1}')"
+wasm_bytes="$(wc -c <"$BUILD_DIR/module.wasm")"
 
 {
     echo -e "key\tvalue"
     echo -e "native-flags\t-O3 -march=native -flto"
     echo -e "rv32-flags\t-O3 -march=rv32im_zicsr -mabi=ilp32 -ffreestanding -fno-builtin"
+    echo -e "wasm-flags\t-O3 -flto -msimd128 -ffreestanding -fno-builtin"
     echo -e "kernel-object-sha256\t$kernel_hash"
     echo -e "native-sha256\t$native_hash"
     echo -e "product-sha256\t$product_hash"
     echo -e "qemu-sha256\t$qemu_hash"
+    echo -e "wasm-sha256\t$wasm_hash"
     echo -e "native-text-bytes\t$native_text_bytes"
     echo -e "product-text-bytes\t$product_text_bytes"
     echo -e "qemu-text-bytes\t$qemu_text_bytes"
+    echo -e "wasm-bytes\t$wasm_bytes"
     echo -e "product-elf\t$BUILD_DIR/product.elf"
     echo -e "qemu-elf\t$BUILD_DIR/qemu.elf"
+    echo -e "wasm-module\t$BUILD_DIR/module.wasm"
 } >"$BUILD_DIR/manifest.tsv"
 
 grep -Eq 'Class:[[:space:]]+32-bit' "$BUILD_DIR/product-readobj.txt"
