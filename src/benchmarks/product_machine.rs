@@ -22,7 +22,7 @@ use super::{native_checksum, BenchmarkWorkload, DATA_BASE};
 use crate::rv32_machine::{
     Rv32DbtStats, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
     Rv32TranslationStats, CONTROL_BASE, DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_BYTES,
-    DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_SCRATCH_BYTES, STATUS_HALTED,
+    DEFAULT_DBT_SCRATCH_BYTES, STATUS_HALTED,
 };
 use crate::rv32im::encoding::{addi, bne, csrrs, csrrw, ebreak, ecall, jal, materialize, mret, sw};
 use std::collections::HashMap;
@@ -40,7 +40,7 @@ pub const PRODUCT_CACHE_SETS: usize = 64;
 pub const PRODUCT_BLOCK_CACHE_SETS: usize = 32;
 pub const PRODUCT_BLOCK_MAX_INSTRUCTIONS: usize = 8;
 pub const PRODUCT_DBT_CACHE_SETS: usize = DEFAULT_DBT_CACHE_SETS;
-pub const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = DEFAULT_DBT_MAX_INSTRUCTIONS;
+pub const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = 16;
 pub const PRODUCT_DBT_CODE_BYTES: usize = DEFAULT_DBT_CODE_BYTES;
 pub const PRODUCT_DEBUG_LIMIT: usize = 0;
 pub const PRODUCT_MACHINE_TARGET_NANOS: u128 = 5_000_000;

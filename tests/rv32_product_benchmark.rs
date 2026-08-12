@@ -23,10 +23,16 @@ use compukter_vm::benchmarks::{
     populate_product_ratios, product_backend_order, product_machine_batch, product_percentile,
     PreparedProductMachine, PreparedProductNative, ProductActiveTiming, ProductExecutionCandidate,
     ProductMachineBackend, ProductMachineImage, ProductMachineWorkload,
-    PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_MACHINE_MAX_BATCH, PRODUCT_MACHINE_TARGET_NANOS,
-    PRODUCT_RESIDENT_REPORT_HEADER,
+    PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_MACHINE_MAX_BATCH,
+    PRODUCT_MACHINE_TARGET_NANOS, PRODUCT_RESIDENT_REPORT_HEADER,
 };
-use compukter_vm::rv32_machine::Rv32TranslationLookupUnit;
+use compukter_vm::rv32_machine::{Rv32TranslationLookupUnit, DEFAULT_DBT_MAX_INSTRUCTIONS};
+
+#[test]
+fn product_benchmark_tests_block_16_without_changing_the_vm_default() {
+    assert_eq!(PRODUCT_DBT_MAX_INSTRUCTIONS, 16);
+    assert_eq!(DEFAULT_DBT_MAX_INSTRUCTIONS, 8);
+}
 
 #[test]
 fn all_vm_backends_use_identical_strict_elf() {
