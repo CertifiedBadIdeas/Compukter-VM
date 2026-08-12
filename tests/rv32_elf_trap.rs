@@ -39,12 +39,13 @@ fn stock_toolchain_rv32_elf_handles_ecall_and_returns() {
         },
         Rv32ExecutionBackendConfig::DirectDbt {
             max_instructions: 8,
-            code_bytes: 64 * 1024,
+            scratch_bytes: 8 * 1024,
         },
         Rv32ExecutionBackendConfig::CachedDbt {
             sets: 32,
             max_instructions: 8,
-            code_bytes: 64 * 1024,
+            scratch_bytes: 8 * 1024,
+            cache_bytes: 64 * 1024,
         },
     ] {
         let config = Rv32MachineConfig {

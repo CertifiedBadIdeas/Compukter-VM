@@ -302,12 +302,13 @@ impl ProductMachineBackend {
             },
             Self::DirectDbt => Rv32ExecutionBackendConfig::DirectDbt {
                 max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
-                code_bytes: PRODUCT_DBT_CODE_BYTES,
+                scratch_bytes: 8 * 1024,
             },
             Self::CachedDbt => Rv32ExecutionBackendConfig::CachedDbt {
                 sets: PRODUCT_DBT_CACHE_SETS,
                 max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
-                code_bytes: PRODUCT_DBT_CODE_BYTES,
+                scratch_bytes: 8 * 1024,
+                cache_bytes: PRODUCT_DBT_CODE_BYTES,
             },
         }
     }

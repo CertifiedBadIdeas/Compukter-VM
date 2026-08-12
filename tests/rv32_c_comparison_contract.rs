@@ -87,12 +87,13 @@ fn product_c_artifact_matches_the_fixed_native_and_qemu_oracle() {
         },
         Rv32ExecutionBackendConfig::DirectDbt {
             max_instructions: 8,
-            code_bytes: 64 * 1024,
+            scratch_bytes: 8 * 1024,
         },
         Rv32ExecutionBackendConfig::CachedDbt {
             sets: 32,
             max_instructions: 8,
-            code_bytes: 64 * 1024,
+            scratch_bytes: 8 * 1024,
+            cache_bytes: 64 * 1024,
         },
     ] {
         let mut machine = Rv32Machine::from_elf(
@@ -170,17 +171,22 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     assert!(source.contains("rv32-block-cached"));
     assert!(source.contains("rv32-direct-dbt"));
     assert!(source.contains("rv32-cached-dbt"));
+    for cache_kib in [16, 32, 64, 128, 256, 512] {
+        assert!(source.contains(&format!("rv32-cached-dbt-{cache_kib}k")));
+    }
     assert!(source.contains("product-machine-block-cached"));
     assert!(source.contains("lookup_unit\\tcache_hits\\tcache_misses\\tcache_evictions"));
     assert!(source.contains("blocks_built\\tdecoded_slots_built\\ttranslation_bytes"));
     assert!(source.contains("dbt_translations\\tdbt_publications\\tdbt_native_dispatches"));
-    assert!(
-        source.contains("dbt_typed_slow_exits\\tdbt_lowered_load_sites\\tdbt_lowered_store_sites")
-    );
+    assert!(source.contains("dbt_metadata_evictions\\tdbt_overlap_invalidations"));
+    assert!(source.contains(
+        "dbt_typed_slow_exits\\tdbt_metadata_evictions\\tdbt_overlap_invalidations\\tdbt_lowered_load_sites\\tdbt_lowered_store_sites"
+    ));
     assert!(source.contains("steady_allocations\\tsteady_allocated_bytes"));
-    assert!(source.contains("block-cached-calibrated-sha256"));
-    assert!(source.contains("direct-dbt-calibrated-sha256"));
-    assert!(source.contains("cached-dbt-calibrated-sha256"));
+    assert!(source.contains("Self::BlockCached => Some(\"block-cached\")"));
+    assert!(source.contains("Self::DirectDbt => Some(\"direct-dbt\")"));
+    assert!(source.contains("cached-dbt-64k"));
+    assert!(source.contains("{stem}-calibrated-sha256"));
     assert!(!source.contains("Command::new(\"sh\")"));
     assert!(!source.contains("Command::new(\"bash\")"));
 }
@@ -199,10 +205,10 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("rv32-block-cached"));
     assert!(source.contains("rv32-direct-dbt"));
     assert!(source.contains("rv32-cached-dbt"));
-    assert!(source.contains("count == 7"));
+    assert!(source.contains("count == 12"));
     assert!(source.contains("product-block-cached-calibrated-disassembly.txt"));
     assert!(source.contains("product-direct-dbt-calibrated-disassembly.txt"));
-    assert!(source.contains("product-cached-dbt-calibrated-disassembly.txt"));
+    assert!(source.contains("product-cached-dbt-${cache_kib}k-calibrated-disassembly.txt"));
     assert!(!source.contains("|| true"));
     assert!(!source.contains("qemu-riscv32"));
 }
