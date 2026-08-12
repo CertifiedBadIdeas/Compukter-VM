@@ -77,6 +77,7 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 enum CandidateKind {
     Native,
     Qemu,
+    Wasmtime,
     Cached,
     Predecoded,
     BlockCached,
@@ -95,7 +96,7 @@ struct Candidate {
 impl Candidate {
     fn product_config(self) -> Option<Rv32ExecutionBackendConfig> {
         match self.kind {
-            CandidateKind::Native | CandidateKind::Qemu => None,
+            CandidateKind::Native | CandidateKind::Qemu | CandidateKind::Wasmtime => None,
             CandidateKind::Cached => Some(Rv32ExecutionBackendConfig::Cached {
                 sets: PRODUCT_CACHE_SETS,
             }),
@@ -134,7 +135,7 @@ const fn cached_dbt_candidate(
     }
 }
 
-const COMMON_CANDIDATES: [Candidate; 6] = [
+const COMMON_CANDIDATES: [Candidate; 7] = [
     Candidate {
         name: "native-clang",
         mode: "clang-O3-native-lto",
@@ -146,6 +147,12 @@ const COMMON_CANDIDATES: [Candidate; 6] = [
         mode: "virt-system-tcg",
         artifact_stem: Some("qemu"),
         kind: CandidateKind::Qemu,
+    },
+    Candidate {
+        name: "wasmtime-aot",
+        mode: "wasmtime compile -O opt-level=2",
+        artifact_stem: Some("wasmtime-aot"),
+        kind: CandidateKind::Wasmtime,
     },
     Candidate {
         name: "rv32-cached",
@@ -247,6 +254,12 @@ struct ProcessObservation {
     checksum: u32,
 }
 
+#[derive(Clone, Copy)]
+enum ProcessOutputFormat {
+    ChecksumRecord,
+    WasmtimeI32,
+}
+
 #[derive(Default, Clone, Copy)]
 struct ProductDetails {
     retired_instructions: u64,
@@ -318,8 +331,12 @@ fn run() -> Result<(), String> {
     let native = build_dir.join("native-kernel");
     let manifest = read_manifest(&build_dir.join("manifest.tsv"))?;
     let qemu = env::var_os("RV32_C_QEMU").unwrap_or_else(|| "qemu-system-riscv32".into());
+    let wasmtime = env::var_os("RV32_C_WASMTIME").unwrap_or_else(|| "wasmtime".into());
     let clang = env::var_os("RV32_C_CLANG").unwrap_or_else(|| "clang".into());
     let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
+    let wasm = build_dir.join("module.wasm");
+    let cwasm = build_dir.join("module.cwasm");
+    compile_wasmtime(&wasmtime, &wasm, &cwasm)?;
 
     let empty_qemu_elf = link_platform(&linker, &source_root, &build_dir, "qemu", 0)?;
     let mut startup_durations = Vec::with_capacity(STARTUP_SAMPLES);
@@ -338,10 +355,14 @@ fn run() -> Result<(), String> {
         let elf = link_platform(&linker, &source_root, &build_dir, "qemu", batch)?;
         run_qemu(&qemu, &elf, Duration::from_secs(60), EXPECTED_CHECKSUM)
     })?;
+    let wasmtime_batch = calibrate_process(SAMPLE_TARGET_NANOS, |batch| {
+        run_wasmtime(&wasmtime, &cwasm, batch, Duration::from_secs(30))
+    })?;
     let mut batches = vec![0_u64; candidates.len()];
     batches[0] = native_batch;
     batches[1] = qemu_batch;
-    for (index, candidate) in candidates.iter().copied().enumerate().skip(2) {
+    batches[2] = wasmtime_batch;
+    for (index, candidate) in candidates.iter().copied().enumerate().skip(3) {
         batches[index] = calibrate_product(
             &linker,
             &source_root,
@@ -358,6 +379,7 @@ fn run() -> Result<(), String> {
             CandidateKind::Qemu => {
                 link_platform(&linker, &source_root, &build_dir, "qemu", batch).map(Some)
             }
+            CandidateKind::Wasmtime => Ok(Some(cwasm.clone())),
             _ => link_platform(&linker, &source_root, &build_dir, "product", batch).map(Some),
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -393,6 +415,16 @@ fn run() -> Result<(), String> {
                     .elapsed_nanos,
                     ProductDetails::default(),
                 ),
+                CandidateKind::Wasmtime => (
+                    run_wasmtime(
+                        &wasmtime,
+                        candidate_elfs[candidate_index].as_ref().unwrap(),
+                        measurement.batch,
+                        Duration::from_secs(30),
+                    )?
+                    .elapsed_nanos,
+                    ProductDetails::default(),
+                ),
                 _ => run_product(
                     candidate_elfs[candidate_index].as_ref().unwrap(),
                     measurement.batch,
@@ -414,6 +446,7 @@ fn run() -> Result<(), String> {
     println!("qemu_target_ns\t{qemu_target}");
     println!("qemu_mode\t-M virt -bios none -accel tcg -nographic -monitor none");
     println!("qemu-version\t{}", version_line(&qemu)?);
+    println!("wasmtime-version\t{}", version_line(&wasmtime)?);
     println!("clang-version\t{}", version_line(&clang)?);
     println!("lld-version\t{}", version_line(&linker)?);
     for key in [
@@ -424,6 +457,9 @@ fn run() -> Result<(), String> {
         "native-text-bytes",
         "product-text-bytes",
         "qemu-text-bytes",
+        "wasm-flags",
+        "wasm-sha256",
+        "wasm-bytes",
     ] {
         println!("{key}\t{}", manifest_value(&manifest, key)?);
     }
@@ -436,7 +472,7 @@ fn run() -> Result<(), String> {
         }
     }
     println!(
-        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes\tdbt_budget_overshoot\tdbt_max_budget_overshoot"
+        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\tvs_wasmtime\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes\tdbt_budget_overshoot\tdbt_max_budget_overshoot"
     );
 
     let normalized = measurements
@@ -451,6 +487,7 @@ fn run() -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?;
     let native_nanos = normalized[0];
     let qemu_nanos = normalized[1];
+    let wasmtime_nanos = normalized[2];
 
     for (index, measurement) in measurements.iter().enumerate() {
         let median = product_percentile(&measurement.samples, 50);
@@ -459,12 +496,16 @@ fn run() -> Result<(), String> {
         let text_bytes = match measurement.candidate.kind {
             CandidateKind::Native => manifest_value(&manifest, "native-text-bytes")?.to_string(),
             CandidateKind::Qemu => manifest_value(&manifest, "qemu-text-bytes")?.to_string(),
+            CandidateKind::Wasmtime => fs::metadata(&cwasm)
+                .map_err(|error| format!("failed to inspect {}: {error}", cwasm.display()))?
+                .len()
+                .to_string(),
             _ => measurement.details.executable_bytes.to_string(),
         };
         let mode = measurement.candidate.mode;
         let product_candidate = measurement.candidate.product_config().is_some();
         println!(
-            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             measurement.candidate.name,
             mode,
             ITERATIONS,
@@ -477,6 +518,7 @@ fn run() -> Result<(), String> {
             1_000_000_000.0 / per_kernel,
             per_kernel / native_nanos,
             per_kernel / qemu_nanos,
+            per_kernel / wasmtime_nanos,
             text_bytes,
             if matches!(measurement.candidate.kind, CandidateKind::Qemu) {
                 startup_median.to_string()
@@ -567,6 +609,7 @@ fn run_native(
             batch.to_string().into(),
         ],
         timeout,
+        ProcessOutputFormat::ChecksumRecord,
     )
 }
 
@@ -592,6 +635,7 @@ fn run_qemu(
             elf.as_os_str().to_owned(),
         ],
         timeout,
+        ProcessOutputFormat::ChecksumRecord,
     )?;
     if observation.checksum != expected {
         return Err(format!(
@@ -602,10 +646,58 @@ fn run_qemu(
     Ok(observation)
 }
 
+fn compile_wasmtime(wasmtime: &OsStr, wasm: &Path, cwasm: &Path) -> Result<(), String> {
+    let output = Command::new(wasmtime)
+        .args(["compile", "-O", "opt-level=2", "-o"])
+        .arg(cwasm)
+        .arg(wasm)
+        .output()
+        .map_err(|error| format!("failed to precompile {}: {error}", wasm.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Wasmtime AOT compilation failed with {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    Ok(())
+}
+
+fn run_wasmtime(
+    wasmtime: &OsStr,
+    cwasm: &Path,
+    batch: u64,
+    timeout: Duration,
+) -> Result<ProcessObservation, String> {
+    let observation = run_process(
+        wasmtime,
+        &[
+            "run".into(),
+            "--allow-precompiled".into(),
+            "--invoke".into(),
+            "benchmark_batch".into(),
+            cwasm.as_os_str().to_owned(),
+            ITERATIONS.to_string().into(),
+            SEED.to_string().into(),
+            batch.to_string().into(),
+        ],
+        timeout,
+        ProcessOutputFormat::WasmtimeI32,
+    )?;
+    if observation.checksum != EXPECTED_CHECKSUM {
+        return Err(format!(
+            "Wasmtime checksum mismatch: expected {EXPECTED_CHECKSUM:08x}, actual {:08x}",
+            observation.checksum,
+        ));
+    }
+    Ok(observation)
+}
+
 fn run_process(
     program: &OsStr,
     arguments: &[OsString],
     timeout: Duration,
+    format: ProcessOutputFormat,
 ) -> Result<ProcessObservation, String> {
     let start = Instant::now();
     let mut child = Command::new(program)
@@ -633,7 +725,7 @@ fn run_process(
                     String::from_utf8_lossy(&output.stderr)
                 ));
             }
-            if !output.stderr.is_empty() {
+            if matches!(format, ProcessOutputFormat::ChecksumRecord) && !output.stderr.is_empty() {
                 return Err(format!(
                     "{:?} produced unexpected stderr: {}",
                     program,
@@ -642,7 +734,12 @@ fn run_process(
             }
             return Ok(ProcessObservation {
                 elapsed_nanos,
-                checksum: parse_c_comparison_result(&output.stdout)?,
+                checksum: match format {
+                    ProcessOutputFormat::ChecksumRecord => {
+                        parse_c_comparison_result(&output.stdout)?
+                    }
+                    ProcessOutputFormat::WasmtimeI32 => parse_wasmtime_i32(&output.stdout)?,
+                },
             });
         }
         if start.elapsed() >= timeout {
@@ -654,6 +751,16 @@ fn run_process(
         }
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+fn parse_wasmtime_i32(output: &[u8]) -> Result<u32, String> {
+    let text = std::str::from_utf8(output)
+        .map_err(|error| format!("Wasmtime result is not UTF-8: {error}"))?;
+    let value = text
+        .trim_end()
+        .parse::<i32>()
+        .map_err(|error| format!("Wasmtime result is not one i32: {error}"))?;
+    Ok(value as u32)
 }
 
 fn run_product(

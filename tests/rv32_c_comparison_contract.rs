@@ -55,13 +55,13 @@ fn portable_c_kernel_has_one_platform_neutral_entrypoint() {
 }
 
 #[test]
-fn comparison_build_keeps_one_rv32_kernel_object_for_both_platforms() {
+fn comparison_build_keeps_shared_rv32_and_wasm_kernel_sources() {
     let script = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/compile-rv32-c-comparison.sh"),
     )
     .unwrap();
 
-    assert_eq!(script.matches("-c \"$SOURCE_ROOT/kernel.c\"").count(), 1);
+    assert_eq!(script.matches("-c \"$SOURCE_ROOT/kernel.c\"").count(), 2);
     assert!(script.matches("\"$BUILD_DIR/kernel-rv32.o\"").count() >= 3);
     assert!(script.contains("-O3 -march=native -flto"));
     assert!(script.contains("-march=rv32im_zicsr"));
@@ -69,6 +69,20 @@ fn comparison_build_keeps_one_rv32_kernel_object_for_both_platforms() {
     assert!(script.contains("kernel-object-sha256"));
     assert!(script.contains("product.elf"));
     assert!(script.contains("qemu.elf"));
+    assert!(script.contains("--target=wasm32-unknown-unknown"));
+    assert!(script.contains("-msimd128"));
+    assert!(script.contains("--export=benchmark_batch"));
+    assert!(script.contains("kernel-wasm.o"));
+    assert!(script.contains("wasm-flags"));
+    assert!(script.contains("wasm-sha256"));
+    assert!(script.contains("wasm-readobj.txt"));
+    assert!(script.contains("Type:[[:space:]]+IMPORT"));
+    assert!(script.contains("Wasm module unexpectedly imports host functions"));
+
+    let wrapper = fs::read_to_string(workload_root().join("wasm-wrapper.c")).unwrap();
+    assert!(wrapper.contains("benchmark_batch"));
+    assert!(wrapper.contains("benchmark_kernel(runtime_iterations, runtime_seed)"));
+    assert!(!wrapper.contains("wasi"));
 }
 
 #[test]
@@ -169,6 +183,10 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     }
     assert!(source.contains("candidate\\tmode\\titerations\\tseed\\tbatch\\tchecksum"));
     assert!(source.contains("rv32-block-cached"));
+    assert!(source.contains("wasmtime-aot"));
+    assert!(source.contains("wasmtime compile"));
+    assert!(source.contains("benchmark_batch"));
+    assert!(source.contains("vs_wasmtime"));
     assert!(source.contains("rv32-direct-dbt"));
     assert!(source.contains("rv32-cached-dbt"));
     for cache_kib in [16, 32, 64, 128, 256, 512] {
@@ -211,6 +229,7 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     .unwrap();
 
     assert!(source.contains("qemu-system-riscv32"));
+    assert!(source.contains("wasmtime"));
     assert!(source.contains("compile-rv32-c-comparison.sh"));
     assert!(source.contains("rv32_c_comparison"));
     assert!(!source.contains("RV32_C_DBT_SWEEP"));
@@ -218,7 +237,9 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("rv32-block-cached"));
     assert!(source.contains("rv32-direct-dbt"));
     assert!(source.contains("rv32-cached-dbt"));
-    assert!(source.contains("count == 17"));
+    assert!(source.contains("count == 18"));
+    assert!(source.contains("wasmtime-aot"));
+    assert!(source.contains("module.cwasm"));
     assert!(source.contains("product-block-cached-calibrated-disassembly.txt"));
     assert!(source.contains("product-direct-dbt-calibrated-disassembly.txt"));
     assert!(source.contains("for cache_kib in 16 32 64 128 256 512"));

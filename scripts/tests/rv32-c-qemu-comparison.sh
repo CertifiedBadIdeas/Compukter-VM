@@ -4,9 +4,10 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 BUILD_DIR="${RV32_C_COMPARISON_BUILD_DIR:-$ROOT/target/rv32-c-comparison}"
 : "${RV32_C_QEMU:=qemu-system-riscv32}"
+: "${RV32_C_WASMTIME:=wasmtime}"
 : "${RV32_C_OBJDUMP:=llvm-objdump}"
 
-for tool in "$RV32_C_QEMU" "$RV32_C_OBJDUMP" cargo awk grep tee; do
+for tool in "$RV32_C_QEMU" "$RV32_C_WASMTIME" "$RV32_C_OBJDUMP" cargo awk grep tee; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "required focused C/QEMU comparison tool is unavailable: $tool" >&2
         exit 2
@@ -29,6 +30,15 @@ if [[ "$qemu_output" != $'CK_RESULT\tee053d58' ]]; then
     exit 1
 fi
 
+"$RV32_C_WASMTIME" compile -O opt-level=2 -o "$BUILD_DIR/module.cwasm" \
+    "$BUILD_DIR/module.wasm"
+wasmtime_output="$("$RV32_C_WASMTIME" run --allow-precompiled --invoke benchmark_batch \
+    "$BUILD_DIR/module.cwasm" 1000 305419896 1 2>"$BUILD_DIR/wasmtime-invoke-warnings.txt")"
+if [[ "$wasmtime_output" != "-301646504" ]]; then
+    echo "Wasmtime C oracle mismatch: $wasmtime_output" >&2
+    exit 1
+fi
+
 RV32_C_PRODUCT_ELF="$BUILD_DIR/product.elf" \
     cargo test --manifest-path "$ROOT/Cargo.toml" \
     --test rv32_c_comparison_contract \
@@ -40,8 +50,8 @@ cargo run --manifest-path "$ROOT/Cargo.toml" --release \
     | tee "$BUILD_DIR/report.tsv"
 
 awk -F '\t' '
-    $1 ~ /^(native-clang|qemu-rv32-tcg|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|rv32-cached-dbt-(16|32|64|128|256|512)k|rv32-cached-dbt-(16|64|128|256|512)-sets)$/ && $6 == "ee053d58" { count++ }
-    END { exit count == 17 ? 0 : 1 }
+    $1 ~ /^(native-clang|qemu-rv32-tcg|wasmtime-aot|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|rv32-cached-dbt-(16|32|64|128|256|512)k|rv32-cached-dbt-(16|64|128|256|512)-sets)$/ && $6 == "ee053d58" { count++ }
+    END { exit count == 18 ? 0 : 1 }
 ' "$BUILD_DIR/report.tsv"
 
 startup_ns="$(awk -F '\t' '$1 == "qemu_startup_median_ns" { print $2 }' "$BUILD_DIR/report.tsv")"
@@ -67,6 +77,8 @@ direct_dbt_batch="$(awk -F '\t' '$1 == "rv32-direct-dbt" { print $5 }' "$BUILD_D
     >"$BUILD_DIR/product-block-cached-calibrated-disassembly.txt"
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/product-batch-$direct_dbt_batch.elf" \
     >"$BUILD_DIR/product-direct-dbt-calibrated-disassembly.txt"
+"$RV32_C_WASMTIME" objdump "$BUILD_DIR/module.cwasm" \
+    >"$BUILD_DIR/wasmtime-aot-objdump.txt"
 write_dbt_disassembly() {
     candidate="$1"
     cached_dbt_batch="$(awk -F '\t' -v candidate="$candidate" '$1 == candidate { print $5 }' "$BUILD_DIR/report.tsv")"
