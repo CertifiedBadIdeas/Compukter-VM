@@ -23,20 +23,22 @@
 )]
 
 use super::{DbtFault, DbtFaultKind};
-use memmap2::{Mmap, MmapMut};
+#[cfg(not(target_os = "linux"))]
+compile_error!("the x86-64 DBT executable arena currently requires Linux memfd aliases");
+
+use memmap2::{Mmap, MmapMut, MmapOptions};
+use std::fs::File;
+use std::os::fd::FromRawFd;
+use std::sync::atomic::{compiler_fence, Ordering};
 
 const PAGE_BYTES: usize = 4096;
 
 #[derive(Debug)]
-enum MappingState {
-    Writable(MmapMut),
-    Executable(Mmap),
-}
-
-#[derive(Debug)]
 pub(super) struct ExecutableMapping {
     capacity: usize,
-    state: Option<MappingState>,
+    writable: MmapMut,
+    executable: Mmap,
+    published: bool,
 }
 
 impl ExecutableMapping {
@@ -47,15 +49,42 @@ impl ExecutableMapping {
                 "executable mapping capacity must be a positive multiple of 4096 bytes",
             ));
         }
-        let mapping = MmapMut::map_anon(capacity).map_err(|error| {
+        let descriptor =
+            unsafe { libc::memfd_create(c"compukter-dbt".as_ptr(), libc::MFD_CLOEXEC) };
+        if descriptor < 0 {
+            return Err(Self::fault(
+                DbtFaultKind::ExecutableMemory,
+                format!(
+                    "failed to create DBT memfd: {}",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        let backing = unsafe { File::from_raw_fd(descriptor) };
+        backing.set_len(capacity as u64).map_err(|error| {
             Self::fault(
                 DbtFaultKind::ExecutableMemory,
-                format!("failed to reserve executable mapping: {error}"),
+                format!("failed to size DBT memfd to {capacity} bytes: {error}"),
+            )
+        })?;
+        let mut options = MmapOptions::new();
+        let writable = unsafe { options.len(capacity).map_mut(&backing) }.map_err(|error| {
+            Self::fault(
+                DbtFaultKind::ExecutableMemory,
+                format!("failed to map DBT memfd as RW: {error}"),
+            )
+        })?;
+        let executable = unsafe { options.len(capacity).map_exec(&backing) }.map_err(|error| {
+            Self::fault(
+                DbtFaultKind::ExecutableMemory,
+                format!("failed to map DBT memfd as RX: {error}"),
             )
         })?;
         Ok(Self {
             capacity,
-            state: Some(MappingState::Writable(mapping)),
+            writable,
+            executable,
+            published: false,
         })
     }
 
@@ -82,31 +111,12 @@ impl ExecutableMapping {
             ));
         }
 
-        let state = self.state.take().ok_or_else(|| {
-            Self::fault(
-                DbtFaultKind::ExecutableMemory,
-                "executable mapping is unavailable after a failed permission transition",
-            )
-        })?;
-        let mut writable = match state {
-            MappingState::Writable(mapping) => mapping,
-            MappingState::Executable(mapping) => mapping.make_mut().map_err(|error| {
-                Self::fault(
-                    DbtFaultKind::ExecutableMemory,
-                    format!("failed to transition executable mapping from RX to RW: {error}"),
-                )
-            })?,
-        };
-        writable[offset..end].copy_from_slice(code);
-        // x86_64 has coherent instruction and data caches. A future backend for a host without
-        // that guarantee must perform explicit instruction-cache maintenance before make_exec.
-        let executable = writable.make_exec().map_err(|error| {
-            Self::fault(
-                DbtFaultKind::ExecutableMemory,
-                format!("failed to transition executable mapping from RW to RX: {error}"),
-            )
-        })?;
-        self.state = Some(MappingState::Executable(executable));
+        self.writable[offset..end].copy_from_slice(code);
+        // Linux MAP_SHARED aliases expose the same backing pages. x86-64 keeps instruction and
+        // data caches coherent; publication only needs to keep the completed copy ordered before
+        // the caller exposes the RX entry address.
+        compiler_fence(Ordering::Release);
+        self.published = true;
         Ok(())
     }
 
@@ -114,10 +124,8 @@ impl ExecutableMapping {
         if offset >= self.capacity {
             return None;
         }
-        match self.state.as_ref()? {
-            MappingState::Executable(mapping) => Some(unsafe { mapping.as_ptr().add(offset) }),
-            MappingState::Writable(_) => None,
-        }
+        self.published
+            .then(|| unsafe { self.executable.as_ptr().add(offset) })
     }
 
     pub(super) const fn capacity(&self) -> usize {
@@ -125,7 +133,12 @@ impl ExecutableMapping {
     }
 
     pub(super) const fn reserved_bytes(&self) -> usize {
-        self.capacity
+        self.capacity.saturating_mul(2)
+    }
+
+    #[cfg(test)]
+    fn writable_address(&self) -> *const u8 {
+        self.writable.as_ptr()
     }
 
     fn fault(kind: DbtFaultKind, message: impl Into<String>) -> DbtFault {
@@ -174,6 +187,8 @@ impl ExecutableScratch {
 mod tests {
     use super::{ExecutableMapping, ExecutableScratch};
     use crate::rv32_dbt::DbtFaultKind;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    use std::fs;
 
     const PAGE_BYTES: usize = 4096;
 
@@ -183,6 +198,38 @@ mod tests {
         unsafe { entry() }
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn mapping_permissions(address: *const u8) -> String {
+        let address = address as usize;
+        fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let range = fields.next()?;
+                let permissions = fields.next()?;
+                let (start, end) = range.split_once('-')?;
+                let start = usize::from_str_radix(start, 16).ok()?;
+                let end = usize::from_str_radix(end, 16).ok()?;
+                (start <= address && address < end).then(|| permissions.to_string())
+            })
+            .expect("alias address must appear in /proc/self/maps")
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn uses_distinct_non_rwx_aliases() {
+        let mut mapping = ExecutableMapping::new(PAGE_BYTES).unwrap();
+        mapping.publish_at(0, &[0xb8, 7, 0, 0, 0, 0xc3]).unwrap();
+
+        let writable = mapping.writable_address();
+        let executable = mapping.entry_address(0).unwrap();
+        assert_ne!(writable, executable);
+        assert_eq!(mapping_permissions(writable), "rw-s");
+        assert_eq!(mapping_permissions(executable), "r-xs");
+        assert_eq!(unsafe { execute(executable) }, 7);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn republishes_one_fixed_mapping_with_new_code() {
@@ -190,7 +237,7 @@ mod tests {
         scratch.publish(&[0xb8, 7, 0, 0, 0, 0xc3]).unwrap();
 
         assert_eq!(scratch.capacity(), PAGE_BYTES);
-        assert_eq!(scratch.reserved_bytes(), PAGE_BYTES);
+        assert_eq!(scratch.reserved_bytes(), PAGE_BYTES * 2);
         assert_eq!(scratch.emitted_bytes(), 6);
         let first_entry = scratch.entry_address().unwrap();
         assert_eq!(unsafe { execute(first_entry) }, 7);
@@ -199,7 +246,7 @@ mod tests {
         // file-durability flush; this is the contract future host backends must preserve.
         scratch.publish(&[0xb8, 9, 0, 0, 0, 0xc3]).unwrap();
 
-        assert_eq!(scratch.reserved_bytes(), PAGE_BYTES);
+        assert_eq!(scratch.reserved_bytes(), PAGE_BYTES * 2);
         assert_eq!(scratch.emitted_bytes(), 6);
         let second_entry = scratch.entry_address().unwrap();
         assert_eq!(second_entry, first_entry);
