@@ -50,6 +50,7 @@ dependencies = [
  "cranelift-control",
  "cranelift-frontend",
  "cranelift-native",
+ "libc",
  "memmap2",
  "rvsim",
  "thiserror",
