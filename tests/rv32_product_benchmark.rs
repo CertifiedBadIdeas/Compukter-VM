@@ -131,6 +131,31 @@ fn product_observation_reports_backend_owned_storage() {
 }
 
 #[test]
+fn product_observation_exposes_lazy_chain_counters() {
+    let mut direct = PreparedProductMachine::new(
+        ProductMachineBackend::DirectDbt,
+        ProductMachineWorkload::Compute32,
+        32,
+    )
+    .unwrap();
+    let direct = direct.execute().unwrap().dbt_stats.unwrap();
+    assert_eq!(direct.chain_transitions, 0);
+    assert_eq!(direct.links_established, 0);
+    assert_eq!(direct.links_reset, 0);
+
+    let mut cached = PreparedProductMachine::new(
+        ProductMachineBackend::CachedDbt,
+        ProductMachineWorkload::Compute32,
+        32,
+    )
+    .unwrap();
+    let cached = cached.execute().unwrap().dbt_stats.unwrap();
+    assert!(cached.links_established > 0);
+    assert!(cached.chain_transitions > 0);
+    assert!(cached.native_dispatches < cached.chain_transitions);
+}
+
+#[test]
 fn product_sampling_order_is_interleaved_and_percentiles_are_stable() {
     assert_eq!(
         product_backend_order(0, 0),
@@ -203,7 +228,7 @@ fn resident_report_header_remains_stable() {
     );
     assert_eq!(
         PRODUCT_ACTIVE_REPORT_HEADER,
-        "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native"
+        "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native"
     );
 }
 

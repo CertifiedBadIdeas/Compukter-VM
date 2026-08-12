@@ -20,7 +20,7 @@
 use super::rv32::{mmio_control_program, rv32_workload, ProgramImage};
 use super::{native_checksum, BenchmarkWorkload, DATA_BASE};
 use crate::rv32_machine::{
-    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
+    Rv32DbtStats, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
     Rv32TranslationStats, CONTROL_BASE, DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_BYTES,
     DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_SCRATCH_BYTES, STATUS_HALTED,
 };
@@ -44,7 +44,7 @@ pub const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = DEFAULT_DBT_MAX_INSTRUCTIONS;
 pub const PRODUCT_DBT_CODE_BYTES: usize = DEFAULT_DBT_CODE_BYTES;
 pub const PRODUCT_DEBUG_LIMIT: usize = 0;
 pub const PRODUCT_RESIDENT_REPORT_HEADER: &str = "backend\tpopulation\tconstruction_median_ns\tconstruction_p95_ns\tresident_live_bytes\tpeak_construction_bytes\tlive_bytes_per_machine\taggregate_ram_bytes\telf_bytes\texecutable_bytes\trw_initialized_bytes\tram_bytes\tdebug_limit\tcache_sets\tblock_cache_sets\tblock_max_instructions\tdbt_cache_sets\tdbt_max_instructions\tdbt_code_bytes";
-pub const PRODUCT_ACTIVE_REPORT_HEADER: &str = "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native";
+pub const PRODUCT_ACTIVE_REPORT_HEADER: &str = "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductExecutionCandidate {
@@ -173,12 +173,17 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
         cache_evictions,
         blocks_built,
         decoded_slots_built,
+        dbt_native_dispatches,
+        dbt_chain_transitions,
+        dbt_links_established,
+        dbt_links_reset,
         ram,
         executable,
         translation,
     ) = match row.machine.as_ref() {
         Some(machine) => {
             let stats = machine.translation_stats;
+            let dbt = machine.dbt_stats;
             (
                 machine.retired_instructions.to_string(),
                 stats.map_or_else(unavailable, |value| value.lookup_unit.name().to_string()),
@@ -187,6 +192,10 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
                 stats.map_or_else(unavailable, |value| value.evictions.to_string()),
                 stats.map_or_else(unavailable, |value| value.blocks_built.to_string()),
                 stats.map_or_else(unavailable, |value| value.decoded_slots_built.to_string()),
+                dbt.map_or_else(unavailable, |value| value.native_dispatches.to_string()),
+                dbt.map_or_else(unavailable, |value| value.chain_transitions.to_string()),
+                dbt.map_or_else(unavailable, |value| value.links_established.to_string()),
+                dbt.map_or_else(unavailable, |value| value.links_reset.to_string()),
                 machine.ram_bytes.to_string(),
                 machine.executable_bytes.to_string(),
                 machine.translation_bytes.to_string(),
@@ -203,10 +212,14 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
             unavailable(),
             unavailable(),
             unavailable(),
+            unavailable(),
+            unavailable(),
+            unavailable(),
+            unavailable(),
         ),
     };
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
+        "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
         row.workload.name(),
         row.candidate.name(),
         row.iterations,
@@ -223,6 +236,10 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
         cache_evictions,
         blocks_built,
         decoded_slots_built,
+        dbt_native_dispatches,
+        dbt_chain_transitions,
+        dbt_links_established,
+        dbt_links_reset,
         ram,
         executable,
         translation,
@@ -471,6 +488,7 @@ pub struct ProductMachineObservation {
     pub checksum: u32,
     pub retired_instructions: u64,
     pub translation_stats: Option<Rv32TranslationStats>,
+    pub dbt_stats: Option<Rv32DbtStats>,
     pub ram_bytes: usize,
     pub executable_bytes: usize,
     pub translation_bytes: usize,
@@ -579,6 +597,7 @@ impl PreparedProductMachine {
             checksum: exit_code,
             retired_instructions,
             translation_stats: self.machine.translation_stats(),
+            dbt_stats: self.machine.dbt_stats(),
             ram_bytes: PRODUCT_RAM_BYTES,
             executable_bytes,
             translation_bytes: self.machine.translation_bytes(),
