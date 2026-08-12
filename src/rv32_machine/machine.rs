@@ -553,7 +553,7 @@ impl Rv32Machine {
                     })?
                 };
                 if exit.attempted == 0
-                    || exit.attempted > prepared.instruction_count()
+                    || (!prepared.is_cached() && exit.attempted > prepared.instruction_count())
                     || u64::from(exit.attempted) > remaining
                     || exit.next_pc != self.hart.pc()
                 {
@@ -874,6 +874,8 @@ fn create_dbt_context(
         remaining_budget: 0,
         reservation_valid,
         reservation_address,
+        chain_attempted: 0,
+        chain_transitions: 0,
         exit: DbtExitRecord::default(),
     })
 }
@@ -889,6 +891,8 @@ fn refresh_dbt_context(
     context.remaining_budget = remaining_budget.min(u64::from(u32::MAX)) as u32;
     context.reservation_valid = reservation_valid;
     context.reservation_address = reservation_address;
+    context.chain_attempted = 0;
+    context.chain_transitions = 0;
     context.exit = DbtExitRecord::default();
 }
 

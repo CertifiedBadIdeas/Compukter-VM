@@ -141,6 +141,8 @@ impl PreparedDirectDbtCompute32 {
                 remaining_budget: u32::MAX,
                 reservation_valid: 0,
                 reservation_address: 0,
+                chain_attempted: 0,
+                chain_transitions: 0,
                 exit: DbtExitRecord::default(),
             };
             let entry: DbtEntry = unsafe {
@@ -341,7 +343,6 @@ impl PreparedCachedDbtCompute32 {
                 publications += 1;
                 hit
             };
-            let instruction_count = hit.instruction_count();
             let entry_address = hit.entry();
             let mut context = DbtContext {
                 state: cpu.architectural_state_mut(),
@@ -352,6 +353,8 @@ impl PreparedCachedDbtCompute32 {
                 remaining_budget: u32::MAX,
                 reservation_valid: 0,
                 reservation_address: 0,
+                chain_attempted: 0,
+                chain_transitions: 0,
                 exit: DbtExitRecord::default(),
             };
             let entry: DbtEntry = unsafe { std::mem::transmute(entry_address) };
@@ -365,11 +368,8 @@ impl PreparedCachedDbtCompute32 {
 
             match tag {
                 DbtExitTag::Completed => {
-                    if context.exit.attempted == 0 || context.exit.attempted > instruction_count {
-                        return Err(format!(
-                            "invalid completed cached DBT attempted count {} for {instruction_count} slots",
-                            context.exit.attempted
-                        ));
+                    if context.exit.attempted == 0 {
+                        return Err("completed cached DBT attempted no instructions".to_string());
                     }
                     cpu.commit_instructions(context.exit.attempted);
                 }
@@ -377,12 +377,6 @@ impl PreparedCachedDbtCompute32 {
                     let prefix = context.exit.attempted.checked_sub(1).ok_or_else(|| {
                         "slow cached DBT exit did not include its instruction attempt".to_string()
                     })?;
-                    if context.exit.attempted > instruction_count {
-                        return Err(format!(
-                            "slow cached DBT attempted count {} exceeds {instruction_count} slots",
-                            context.exit.attempted
-                        ));
-                    }
                     cpu.commit_instructions(prefix);
                     if context.exit.instruction_pc != cpu.pc() {
                         return Err(format!(

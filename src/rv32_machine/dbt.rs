@@ -53,6 +53,10 @@ impl PreparedDbtBlock {
     pub(crate) const fn instruction_count(self) -> u32 {
         self.instruction_count
     }
+
+    pub(crate) const fn is_cached(self) -> bool {
+        matches!(self.location, PreparedLocation::Cache(_))
+    }
 }
 
 enum Rv32DbtStorage {
@@ -77,6 +81,7 @@ pub(crate) struct Rv32DbtExecution {
     context_initializations: u64,
     native_dispatches: u64,
     typed_slow_exits: u64,
+    chain_transitions: u64,
     lowered_load_sites: u64,
     lowered_store_sites: u64,
     emitted_bytes: u64,
@@ -138,6 +143,7 @@ impl Rv32DbtExecution {
             context_initializations: 0,
             native_dispatches: 0,
             typed_slow_exits: 0,
+            chain_transitions: 0,
             lowered_load_sites: 0,
             lowered_store_sites: 0,
             emitted_bytes: 0,
@@ -272,6 +278,9 @@ impl Rv32DbtExecution {
         let tag = DbtExitTag::try_from(raw_tag)
             .map_err(|message| Self::fault(DbtFaultKind::InvalidExit, message))?;
         self.native_dispatches = self.native_dispatches.saturating_add(1);
+        self.chain_transitions = self
+            .chain_transitions
+            .saturating_add(u64::from(context.chain_transitions));
         if matches!(tag, DbtExitTag::SlowInstruction | DbtExitTag::MemoryAccess) {
             self.typed_slow_exits = self.typed_slow_exits.saturating_add(1);
         }
@@ -332,6 +341,9 @@ impl Rv32DbtExecution {
             context_initializations: self.context_initializations,
             native_dispatches: self.native_dispatches,
             typed_slow_exits: self.typed_slow_exits,
+            chain_transitions: self.chain_transitions,
+            links_established: cache_stats.links_established,
+            links_reset: cache_stats.links_reset,
             lowered_load_sites: self.lowered_load_sites,
             lowered_store_sites: self.lowered_store_sites,
             decoded_slots_built: self.decoded_slots_built,
@@ -360,6 +372,15 @@ mod tests {
 
     fn fill_one(execution: &mut Rv32DbtExecution) {
         let word = addi(1, 1, 1);
+        execution
+            .decoded_slots_mut()
+            .push(Rv32ResolvedInstruction::Valid {
+                word,
+                instruction: decode_product_word(word).unwrap(),
+            });
+    }
+
+    fn fill_word(execution: &mut Rv32DbtExecution, word: u32) {
         execution
             .decoded_slots_mut()
             .push(Rv32ResolvedInstruction::Valid {
@@ -489,6 +510,8 @@ mod tests {
             remaining_budget: 1,
             reservation_valid: 0,
             reservation_address: 0,
+            chain_attempted: 0,
+            chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
         let error = unsafe { direct.execute(stale, &mut context) }.unwrap_err();
@@ -514,6 +537,8 @@ mod tests {
             remaining_budget: 1,
             reservation_valid: 0,
             reservation_address: 0,
+            chain_attempted: 0,
+            chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
 
@@ -523,6 +548,148 @@ mod tests {
         assert_eq!(cpu.register(1), 1);
         assert_eq!(context.exit.attempted, 1);
         assert_eq!(direct.stats().native_dispatches, 1);
+    }
+
+    #[test]
+    fn lazy_chain_crosses_resident_blocks_without_exceeding_budget() {
+        let mut cached = Rv32DbtExecution::new(
+            Rv32DbtPolicy::Cached {
+                sets: 8,
+                cache_bytes: 4096,
+            },
+            8,
+            4096,
+        )
+        .unwrap();
+        fill_word(&mut cached, addi(1, 1, 1));
+        cached.translate(0x1000, DbtBlockMode::Fast).unwrap();
+        fill_word(&mut cached, addi(2, 2, 1));
+        cached.translate(0x1004, DbtBlockMode::Fast).unwrap();
+
+        for (budget, expected_pc, expected_x2) in [(1, 0x1004, 0), (2, 0x1008, 1)] {
+            let prepared = cached.lookup(0x1000, DbtBlockMode::Fast).unwrap();
+            let mut cpu = Rv32imCpu::new(0x1000);
+            let mut context = DbtContext {
+                state: cpu.architectural_state_mut(),
+                ram_base: std::ptr::null_mut(),
+                ram_len: 0,
+                page_permissions: std::ptr::null(),
+                page_count: 0,
+                remaining_budget: budget,
+                reservation_valid: 0,
+                reservation_address: 0,
+                chain_attempted: 0,
+                chain_transitions: 0,
+                exit: DbtExitRecord::default(),
+            };
+
+            let tag = unsafe { cached.execute(prepared, &mut context) }.unwrap();
+
+            assert_eq!(tag, DbtExitTag::Completed);
+            assert_eq!(context.exit.attempted, budget);
+            assert_eq!(context.chain_attempted, budget);
+            assert_eq!(context.chain_transitions, 1);
+            assert_eq!(cpu.pc(), expected_pc);
+            assert_eq!(cpu.register(1), 1);
+            assert_eq!(cpu.register(2), expected_x2);
+        }
+    }
+
+    #[test]
+    fn lazy_chain_reports_a_precise_slow_memory_exit() {
+        let mut cached = Rv32DbtExecution::new(
+            Rv32DbtPolicy::Cached {
+                sets: 8,
+                cache_bytes: 4096,
+            },
+            8,
+            4096,
+        )
+        .unwrap();
+        fill_word(&mut cached, addi(1, 1, 4));
+        cached.translate(0x2000, DbtBlockMode::Fast).unwrap();
+        fill_word(&mut cached, lw(2, 1, 0));
+        cached.translate(0x2004, DbtBlockMode::Fast).unwrap();
+        let prepared = cached.lookup(0x2000, DbtBlockMode::Fast).unwrap();
+        let mut cpu = Rv32imCpu::new(0x2000);
+        let mut context = DbtContext {
+            state: cpu.architectural_state_mut(),
+            ram_base: std::ptr::null_mut(),
+            ram_len: 0,
+            page_permissions: std::ptr::null(),
+            page_count: 0,
+            remaining_budget: 2,
+            reservation_valid: 1,
+            reservation_address: 0x80,
+            chain_attempted: 0,
+            chain_transitions: 0,
+            exit: DbtExitRecord::default(),
+        };
+
+        let tag = unsafe { cached.execute(prepared, &mut context) }.unwrap();
+
+        assert_eq!(tag, DbtExitTag::MemoryAccess);
+        assert_eq!(context.exit.attempted, 2);
+        assert_eq!(context.exit.instruction_pc, 0x2004);
+        assert_eq!(context.exit.address, 4);
+        assert_eq!(context.exit.access_size, 4);
+        assert_eq!(context.chain_attempted, 1);
+        assert_eq!(context.chain_transitions, 1);
+        assert_eq!(context.reservation_valid, 1);
+        assert_eq!(context.reservation_address, 0x80);
+        assert_eq!(cpu.pc(), 0x2004);
+        assert_eq!(cpu.register(1), 4);
+        assert_eq!(cpu.register(2), 0);
+    }
+
+    #[test]
+    fn lazy_chain_stops_before_a_partially_fitting_target_block() {
+        let mut cached = Rv32DbtExecution::new(
+            Rv32DbtPolicy::Cached {
+                sets: 8,
+                cache_bytes: 4096,
+            },
+            8,
+            4096,
+        )
+        .unwrap();
+        fill_word(&mut cached, addi(1, 1, 1));
+        cached.translate(0x3000, DbtBlockMode::Fast).unwrap();
+        let slots = cached.decoded_slots_mut();
+        for word in [addi(2, 2, 1), addi(3, 3, 1)] {
+            slots.push(Rv32ResolvedInstruction::Valid {
+                word,
+                instruction: decode_product_word(word).unwrap(),
+            });
+        }
+        cached.translate(0x3004, DbtBlockMode::Fast).unwrap();
+        let prepared = cached.lookup(0x3000, DbtBlockMode::Fast).unwrap();
+        let mut cpu = Rv32imCpu::new(0x3000);
+        let mut context = DbtContext {
+            state: cpu.architectural_state_mut(),
+            ram_base: std::ptr::null_mut(),
+            ram_len: 0,
+            page_permissions: std::ptr::null(),
+            page_count: 0,
+            remaining_budget: 2,
+            reservation_valid: 0,
+            reservation_address: 0,
+            chain_attempted: 0,
+            chain_transitions: 0,
+            exit: DbtExitRecord::default(),
+        };
+
+        let tag = unsafe { cached.execute(prepared, &mut context) }.unwrap();
+
+        assert_eq!(tag, DbtExitTag::Completed);
+        assert_eq!(context.exit.attempted, 1);
+        assert_eq!(context.chain_attempted, 1);
+        assert_eq!(context.remaining_budget, 1);
+        assert_eq!(context.chain_transitions, 1);
+        assert_eq!(cpu.pc(), 0x3004);
+        assert_eq!(cpu.register(1), 1);
+        assert_eq!(cpu.register(2), 0);
+        assert_eq!(cpu.register(3), 0);
     }
 
     #[test]

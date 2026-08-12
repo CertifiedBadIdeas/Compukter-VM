@@ -94,7 +94,8 @@ fn cached_dbt_initializes_one_context_per_run_call() {
         }
     ));
     let first = machine.dbt_stats().unwrap();
-    assert!(first.native_dispatches > 1);
+    assert_eq!(first.native_dispatches, 1);
+    assert!(first.chain_transitions > 0);
     assert_eq!(first.context_initializations, 1);
 
     machine.run(16).unwrap();
