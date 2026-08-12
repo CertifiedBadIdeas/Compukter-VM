@@ -181,7 +181,7 @@ fn measure_active(iterations: u32, warm_samples: usize) -> Result<Vec<ActiveMeas
 
         let native = active_for_candidate(&mut measurements, ProductExecutionCandidate::NativeHost);
         native.batch = calibrate_native(native)?;
-        for candidate_index in benchmark_rotating_order::<6>(workload_index, 0) {
+        for candidate_index in benchmark_rotating_order::<3>(workload_index, 0) {
             let candidate = ProductExecutionCandidate::all()[candidate_index];
             let measurement = active_for_candidate(&mut measurements, candidate);
             let (checksum, observation, nanos, allocations, allocated_bytes) =
@@ -193,7 +193,7 @@ fn measure_active(iterations: u32, warm_samples: usize) -> Result<Vec<ActiveMeas
             measurement.steady_allocated_bytes = allocated_bytes;
         }
         for sample_index in 0..warm_samples {
-            for candidate_index in benchmark_rotating_order::<6>(workload_index, sample_index + 1) {
+            for candidate_index in benchmark_rotating_order::<3>(workload_index, sample_index + 1) {
                 let candidate = ProductExecutionCandidate::all()[candidate_index];
                 let measurement = active_for_candidate(&mut measurements, candidate);
                 let (checksum, observation, nanos, allocations, allocated_bytes) =

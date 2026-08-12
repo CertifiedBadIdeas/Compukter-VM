@@ -135,9 +135,6 @@ fn product_sampling_order_is_interleaved_and_percentiles_are_stable() {
     assert_eq!(
         product_backend_order(0, 0),
         [
-            ProductMachineBackend::Cached,
-            ProductMachineBackend::Predecoded,
-            ProductMachineBackend::BlockCached,
             ProductMachineBackend::DirectDbt,
             ProductMachineBackend::CachedDbt,
         ]
@@ -145,11 +142,16 @@ fn product_sampling_order_is_interleaved_and_percentiles_are_stable() {
     assert_eq!(
         product_backend_order(0, 1),
         [
-            ProductMachineBackend::Predecoded,
-            ProductMachineBackend::BlockCached,
-            ProductMachineBackend::DirectDbt,
             ProductMachineBackend::CachedDbt,
-            ProductMachineBackend::Cached,
+            ProductMachineBackend::DirectDbt,
+        ]
+    );
+    assert_eq!(
+        ProductExecutionCandidate::all(),
+        [
+            ProductExecutionCandidate::NativeHost,
+            ProductExecutionCandidate::DirectDbt,
+            ProductExecutionCandidate::CachedDbt,
         ]
     );
     assert_eq!(product_percentile(&[10, 20, 30, 40, 50], 50), 30);
