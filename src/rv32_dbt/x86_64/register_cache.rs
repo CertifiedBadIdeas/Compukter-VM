@@ -19,7 +19,7 @@
 
 #![allow(
     dead_code,
-    reason = "the RV32 arithmetic lowerer consumes the register cache in the same issue #498 slice"
+    reason = "the RV32 arithmetic lowerer consumes the register cache in the same issue #17 slice"
 )]
 
 use super::emitter::{EmitError, Gpr, Mem, X64Emitter};
