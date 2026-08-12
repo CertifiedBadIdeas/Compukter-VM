@@ -174,6 +174,10 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     for cache_kib in [16, 32, 64, 128, 256, 512] {
         assert!(source.contains(&format!("rv32-cached-dbt-{cache_kib}k")));
     }
+    for sets in [16, 32, 64, 128, 256, 512] {
+        assert!(source.contains(&format!("rv32-cached-dbt-{sets}-sets")));
+    }
+    assert!(source.contains("cache|sets"));
     assert!(source.contains("product-machine-block-cached"));
     assert!(source.contains("lookup_unit\\tcache_hits\\tcache_misses\\tcache_evictions"));
     assert!(source.contains("blocks_built\\tdecoded_slots_built\\ttranslation_bytes"));
@@ -183,8 +187,8 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
         "dbt_typed_slow_exits\\tdbt_metadata_evictions\\tdbt_overlap_invalidations\\tdbt_lowered_load_sites\\tdbt_lowered_store_sites"
     ));
     assert!(source.contains("steady_allocations\\tsteady_allocated_bytes"));
-    assert!(source.contains("Self::BlockCached => Some(\"block-cached\")"));
-    assert!(source.contains("Self::DirectDbt => Some(\"direct-dbt\")"));
+    assert!(source.contains("artifact_stem: Some(\"block-cached\")"));
+    assert!(source.contains("artifact_stem: Some(\"direct-dbt\")"));
     assert!(source.contains("cached-dbt-64k"));
     assert!(source.contains("{stem}-calibrated-sha256"));
     assert!(!source.contains("Command::new(\"sh\")"));
@@ -201,6 +205,7 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("qemu-system-riscv32"));
     assert!(source.contains("compile-rv32-c-comparison.sh"));
     assert!(source.contains("rv32_c_comparison"));
+    assert!(source.contains("RV32_C_DBT_SWEEP"));
     assert!(source.contains("--ignored --exact"));
     assert!(source.contains("rv32-block-cached"));
     assert!(source.contains("rv32-direct-dbt"));
@@ -208,7 +213,7 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("count == 12"));
     assert!(source.contains("product-block-cached-calibrated-disassembly.txt"));
     assert!(source.contains("product-direct-dbt-calibrated-disassembly.txt"));
-    assert!(source.contains("product-cached-dbt-${cache_kib}k-calibrated-disassembly.txt"));
+    assert!(source.contains("product-${candidate}-calibrated-disassembly.txt"));
     assert!(!source.contains("|| true"));
     assert!(!source.contains("qemu-riscv32"));
 }

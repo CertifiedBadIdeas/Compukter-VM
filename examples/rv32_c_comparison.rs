@@ -10,9 +10,8 @@
  */
 
 use compukter_vm::benchmarks::{
-    benchmark_normalize_nanos, benchmark_rotating_order, c_comparison_next_batch,
-    c_comparison_qemu_target_nanos, c_comparison_timeout_nanos, parse_c_comparison_result,
-    product_percentile,
+    benchmark_normalize_nanos, c_comparison_next_batch, c_comparison_qemu_target_nanos,
+    c_comparison_timeout_nanos, parse_c_comparison_result, product_percentile,
 };
 use compukter_vm::rv32_machine::{
     Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
@@ -75,121 +74,182 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 #[derive(Clone, Copy)]
-enum Candidate {
+enum CandidateKind {
     Native,
     Qemu,
     Cached,
     Predecoded,
     BlockCached,
     DirectDbt,
-    CachedDbt16K,
-    CachedDbt32K,
-    CachedDbt64K,
-    CachedDbt128K,
-    CachedDbt256K,
-    CachedDbt512K,
+    CachedDbt { sets: usize, cache_bytes: usize },
+}
+
+#[derive(Clone, Copy)]
+struct Candidate {
+    name: &'static str,
+    mode: &'static str,
+    artifact_stem: Option<&'static str>,
+    kind: CandidateKind,
 }
 
 impl Candidate {
-    const ALL: [Self; 12] = [
-        Self::Native,
-        Self::Qemu,
-        Self::Cached,
-        Self::Predecoded,
-        Self::BlockCached,
-        Self::DirectDbt,
-        Self::CachedDbt16K,
-        Self::CachedDbt32K,
-        Self::CachedDbt64K,
-        Self::CachedDbt128K,
-        Self::CachedDbt256K,
-        Self::CachedDbt512K,
-    ];
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Native => "native-clang",
-            Self::Qemu => "qemu-rv32-tcg",
-            Self::Cached => "rv32-cached",
-            Self::Predecoded => "rv32-predecoded",
-            Self::BlockCached => "rv32-block-cached",
-            Self::DirectDbt => "rv32-direct-dbt",
-            Self::CachedDbt16K => "rv32-cached-dbt-16k",
-            Self::CachedDbt32K => "rv32-cached-dbt-32k",
-            Self::CachedDbt64K => "rv32-cached-dbt-64k",
-            Self::CachedDbt128K => "rv32-cached-dbt-128k",
-            Self::CachedDbt256K => "rv32-cached-dbt-256k",
-            Self::CachedDbt512K => "rv32-cached-dbt-512k",
-        }
-    }
-
     fn product_config(self) -> Option<Rv32ExecutionBackendConfig> {
-        match self {
-            Self::Native | Self::Qemu => None,
-            Self::Cached => Some(Rv32ExecutionBackendConfig::Cached {
+        match self.kind {
+            CandidateKind::Native | CandidateKind::Qemu => None,
+            CandidateKind::Cached => Some(Rv32ExecutionBackendConfig::Cached {
                 sets: PRODUCT_CACHE_SETS,
             }),
-            Self::Predecoded => Some(Rv32ExecutionBackendConfig::Predecoded),
-            Self::BlockCached => Some(Rv32ExecutionBackendConfig::BlockCached {
+            CandidateKind::Predecoded => Some(Rv32ExecutionBackendConfig::Predecoded),
+            CandidateKind::BlockCached => Some(Rv32ExecutionBackendConfig::BlockCached {
                 sets: PRODUCT_BLOCK_CACHE_SETS,
                 max_instructions: PRODUCT_BLOCK_MAX_INSTRUCTIONS,
             }),
-            Self::DirectDbt => Some(Rv32ExecutionBackendConfig::DirectDbt {
+            CandidateKind::DirectDbt => Some(Rv32ExecutionBackendConfig::DirectDbt {
                 max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
                 scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
             }),
-            Self::CachedDbt16K => Some(cached_dbt_config(16 * 1024)),
-            Self::CachedDbt32K => Some(cached_dbt_config(32 * 1024)),
-            Self::CachedDbt64K => Some(cached_dbt_config(64 * 1024)),
-            Self::CachedDbt128K => Some(cached_dbt_config(128 * 1024)),
-            Self::CachedDbt256K => Some(cached_dbt_config(256 * 1024)),
-            Self::CachedDbt512K => Some(cached_dbt_config(512 * 1024)),
-        }
-    }
-
-    fn mode(self) -> &'static str {
-        match self {
-            Self::Native => "clang-O3-native-lto",
-            Self::Qemu => "virt-system-tcg",
-            Self::Cached => "product-machine-cached",
-            Self::Predecoded => "product-machine-predecoded",
-            Self::BlockCached => "product-machine-block-cached",
-            Self::DirectDbt => "product-machine-direct-dbt",
-            Self::CachedDbt16K
-            | Self::CachedDbt32K
-            | Self::CachedDbt64K
-            | Self::CachedDbt128K
-            | Self::CachedDbt256K
-            | Self::CachedDbt512K => "product-machine-cached-dbt",
-        }
-    }
-
-    fn artifact_stem(self) -> Option<&'static str> {
-        match self {
-            Self::Native => None,
-            Self::Qemu => Some("qemu"),
-            Self::Cached => Some("cached"),
-            Self::Predecoded => Some("predecoded"),
-            Self::BlockCached => Some("block-cached"),
-            Self::DirectDbt => Some("direct-dbt"),
-            Self::CachedDbt16K => Some("cached-dbt-16k"),
-            Self::CachedDbt32K => Some("cached-dbt-32k"),
-            Self::CachedDbt64K => Some("cached-dbt-64k"),
-            Self::CachedDbt128K => Some("cached-dbt-128k"),
-            Self::CachedDbt256K => Some("cached-dbt-256k"),
-            Self::CachedDbt512K => Some("cached-dbt-512k"),
+            CandidateKind::CachedDbt { sets, cache_bytes } => {
+                Some(Rv32ExecutionBackendConfig::CachedDbt {
+                    sets,
+                    max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+                    scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
+                    cache_bytes,
+                })
+            }
         }
     }
 }
 
-const fn cached_dbt_config(cache_bytes: usize) -> Rv32ExecutionBackendConfig {
-    Rv32ExecutionBackendConfig::CachedDbt {
-        sets: PRODUCT_DBT_CACHE_SETS,
-        max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
-        scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
-        cache_bytes,
+const fn cached_dbt_candidate(
+    name: &'static str,
+    artifact_stem: &'static str,
+    sets: usize,
+    cache_bytes: usize,
+) -> Candidate {
+    Candidate {
+        name,
+        mode: "product-machine-cached-dbt",
+        artifact_stem: Some(artifact_stem),
+        kind: CandidateKind::CachedDbt { sets, cache_bytes },
     }
 }
+
+const COMMON_CANDIDATES: [Candidate; 6] = [
+    Candidate {
+        name: "native-clang",
+        mode: "clang-O3-native-lto",
+        artifact_stem: None,
+        kind: CandidateKind::Native,
+    },
+    Candidate {
+        name: "qemu-rv32-tcg",
+        mode: "virt-system-tcg",
+        artifact_stem: Some("qemu"),
+        kind: CandidateKind::Qemu,
+    },
+    Candidate {
+        name: "rv32-cached",
+        mode: "product-machine-cached",
+        artifact_stem: Some("cached"),
+        kind: CandidateKind::Cached,
+    },
+    Candidate {
+        name: "rv32-predecoded",
+        mode: "product-machine-predecoded",
+        artifact_stem: Some("predecoded"),
+        kind: CandidateKind::Predecoded,
+    },
+    Candidate {
+        name: "rv32-block-cached",
+        mode: "product-machine-block-cached",
+        artifact_stem: Some("block-cached"),
+        kind: CandidateKind::BlockCached,
+    },
+    Candidate {
+        name: "rv32-direct-dbt",
+        mode: "product-machine-direct-dbt",
+        artifact_stem: Some("direct-dbt"),
+        kind: CandidateKind::DirectDbt,
+    },
+];
+
+const CACHE_SWEEP: [Candidate; 6] = [
+    cached_dbt_candidate(
+        "rv32-cached-dbt-16k",
+        "cached-dbt-16k",
+        PRODUCT_DBT_CACHE_SETS,
+        16 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-32k",
+        "cached-dbt-32k",
+        PRODUCT_DBT_CACHE_SETS,
+        32 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-64k",
+        "cached-dbt-64k",
+        PRODUCT_DBT_CACHE_SETS,
+        64 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-128k",
+        "cached-dbt-128k",
+        PRODUCT_DBT_CACHE_SETS,
+        128 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-256k",
+        "cached-dbt-256k",
+        PRODUCT_DBT_CACHE_SETS,
+        256 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-512k",
+        "cached-dbt-512k",
+        PRODUCT_DBT_CACHE_SETS,
+        512 * 1024,
+    ),
+];
+
+const SETS_SWEEP: [Candidate; 6] = [
+    cached_dbt_candidate(
+        "rv32-cached-dbt-16-sets",
+        "cached-dbt-16-sets",
+        16,
+        128 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-32-sets",
+        "cached-dbt-32-sets",
+        32,
+        128 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-64-sets",
+        "cached-dbt-64-sets",
+        64,
+        128 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-128-sets",
+        "cached-dbt-128-sets",
+        128,
+        128 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-256-sets",
+        "cached-dbt-256-sets",
+        256,
+        128 * 1024,
+    ),
+    cached_dbt_candidate(
+        "rv32-cached-dbt-512-sets",
+        "cached-dbt-512-sets",
+        512,
+        128 * 1024,
+    ),
+];
 
 struct ProcessObservation {
     elapsed_nanos: u128,
@@ -237,8 +297,8 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.len() != 2 {
-        return Err("usage: rv32_c_comparison BUILD_DIR WARM_SAMPLES".to_string());
+    if arguments.len() != 3 {
+        return Err("usage: rv32_c_comparison BUILD_DIR WARM_SAMPLES cache|sets".to_string());
     }
     let build_dir = PathBuf::from(&arguments[0]);
     let samples = arguments[1]
@@ -251,6 +311,16 @@ fn run() -> Result<(), String> {
             "warm sample count must be at least {MINIMUM_SAMPLES}"
         ));
     }
+    let (sweep_name, sweep) = match arguments[2].to_str() {
+        Some("cache") => ("cache", &CACHE_SWEEP[..]),
+        Some("sets") => ("sets", &SETS_SWEEP[..]),
+        _ => return Err("DBT sweep must be cache or sets".to_string()),
+    };
+    let candidates = COMMON_CANDIDATES
+        .iter()
+        .chain(sweep)
+        .copied()
+        .collect::<Vec<_>>();
 
     let source_root =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
@@ -277,10 +347,10 @@ fn run() -> Result<(), String> {
         let elf = link_platform(&linker, &source_root, &build_dir, "qemu", batch)?;
         run_qemu(&qemu, &elf, Duration::from_secs(60), EXPECTED_CHECKSUM)
     })?;
-    let mut batches = [0_u64; Candidate::ALL.len()];
+    let mut batches = vec![0_u64; candidates.len()];
     batches[0] = native_batch;
     batches[1] = qemu_batch;
-    for (index, candidate) in Candidate::ALL.iter().copied().enumerate().skip(2) {
+    for (index, candidate) in candidates.iter().copied().enumerate().skip(2) {
         batches[index] = calibrate_product(
             &linker,
             &source_root,
@@ -288,21 +358,22 @@ fn run() -> Result<(), String> {
             candidate.product_config().unwrap(),
         )?;
     }
-    let candidate_elfs = Candidate::ALL
+    let candidate_elfs = candidates
         .iter()
         .copied()
-        .zip(batches)
-        .map(|(candidate, batch)| match candidate {
-            Candidate::Native => Ok(None),
-            Candidate::Qemu => {
+        .zip(batches.iter().copied())
+        .map(|(candidate, batch)| match candidate.kind {
+            CandidateKind::Native => Ok(None),
+            CandidateKind::Qemu => {
                 link_platform(&linker, &source_root, &build_dir, "qemu", batch).map(Some)
             }
             _ => link_platform(&linker, &source_root, &build_dir, "product", batch).map(Some),
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let mut measurements = Candidate::ALL
-        .into_iter()
-        .zip(batches)
+    let mut measurements = candidates
+        .iter()
+        .copied()
+        .zip(batches.iter().copied())
         .map(|(candidate, batch)| CandidateMeasurements {
             candidate,
             batch,
@@ -313,14 +384,15 @@ fn run() -> Result<(), String> {
 
     let qemu_timeout = duration_from_nanos(c_comparison_timeout_nanos(qemu_target))?;
     for sample in 0..samples {
-        for candidate_index in benchmark_rotating_order::<12>(0, sample) {
+        for offset in 0..candidates.len() {
+            let candidate_index = (sample + offset) % candidates.len();
             let measurement = &mut measurements[candidate_index];
-            let (elapsed, details) = match measurement.candidate {
-                Candidate::Native => (
+            let (elapsed, details) = match measurement.candidate.kind {
+                CandidateKind::Native => (
                     run_native(&native, measurement.batch, Duration::from_secs(30))?.elapsed_nanos,
                     ProductDetails::default(),
                 ),
-                Candidate::Qemu => (
+                CandidateKind::Qemu => (
                     run_qemu(
                         &qemu,
                         candidate_elfs[candidate_index].as_ref().unwrap(),
@@ -330,10 +402,10 @@ fn run() -> Result<(), String> {
                     .elapsed_nanos,
                     ProductDetails::default(),
                 ),
-                candidate => run_product(
+                _ => run_product(
                     candidate_elfs[candidate_index].as_ref().unwrap(),
                     measurement.batch,
-                    candidate.product_config().unwrap(),
+                    measurement.candidate.product_config().unwrap(),
                 )?,
             };
             measurement.samples.push(elapsed);
@@ -345,6 +417,7 @@ fn run() -> Result<(), String> {
     println!("iterations\t{ITERATIONS}");
     println!("seed\t0x{SEED:08x}");
     println!("warm_samples\t{samples}");
+    println!("dbt_sweep\t{sweep_name}");
     println!("qemu_startup_samples\t{STARTUP_SAMPLES}");
     println!("qemu_startup_median_ns\t{startup_median}");
     println!("qemu_target_ns\t{qemu_target}");
@@ -363,8 +436,8 @@ fn run() -> Result<(), String> {
     ] {
         println!("{key}\t{}", manifest_value(&manifest, key)?);
     }
-    for (candidate, elf) in Candidate::ALL.iter().copied().zip(&candidate_elfs) {
-        if let Some(stem) = candidate.artifact_stem() {
+    for (candidate, elf) in candidates.iter().copied().zip(&candidate_elfs) {
+        if let Some(stem) = candidate.artifact_stem {
             println!(
                 "{stem}-calibrated-sha256\t{}",
                 sha256_file(elf.as_ref().unwrap())?
@@ -392,16 +465,16 @@ fn run() -> Result<(), String> {
         let median = product_percentile(&measurement.samples, 50);
         let p95 = product_percentile(&measurement.samples, 95);
         let per_kernel = normalized[index];
-        let text_bytes = match measurement.candidate {
-            Candidate::Native => manifest_value(&manifest, "native-text-bytes")?.to_string(),
-            Candidate::Qemu => manifest_value(&manifest, "qemu-text-bytes")?.to_string(),
+        let text_bytes = match measurement.candidate.kind {
+            CandidateKind::Native => manifest_value(&manifest, "native-text-bytes")?.to_string(),
+            CandidateKind::Qemu => manifest_value(&manifest, "qemu-text-bytes")?.to_string(),
             _ => measurement.details.executable_bytes.to_string(),
         };
-        let mode = measurement.candidate.mode();
+        let mode = measurement.candidate.mode;
         let product_candidate = measurement.candidate.product_config().is_some();
         println!(
             "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            measurement.candidate.name(),
+            measurement.candidate.name,
             mode,
             ITERATIONS,
             SEED,
@@ -414,7 +487,7 @@ fn run() -> Result<(), String> {
             per_kernel / native_nanos,
             per_kernel / qemu_nanos,
             text_bytes,
-            if matches!(measurement.candidate, Candidate::Qemu) {
+            if matches!(measurement.candidate.kind, CandidateKind::Qemu) {
                 startup_median.to_string()
             } else {
                 "-".to_string()
