@@ -182,6 +182,9 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     assert!(source.contains("lookup_unit\\tcache_hits\\tcache_misses\\tcache_evictions"));
     assert!(source.contains("blocks_built\\tdecoded_slots_built\\ttranslation_bytes"));
     assert!(source.contains("dbt_translations\\tdbt_publications\\tdbt_native_dispatches"));
+    assert!(source.contains(
+        "dbt_native_dispatches\\tdbt_chain_transitions\\tdbt_links_established\\tdbt_links_reset"
+    ));
     assert!(source.contains("dbt_metadata_evictions\\tdbt_overlap_invalidations"));
     assert!(source.contains(
         "dbt_typed_slow_exits\\tdbt_metadata_evictions\\tdbt_overlap_invalidations\\tdbt_lowered_load_sites\\tdbt_lowered_store_sites"
