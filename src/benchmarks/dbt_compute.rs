@@ -121,7 +121,7 @@ impl PreparedDirectDbtCompute32 {
             let input = DbtBlockInput::new(cpu.pc(), &self.decoded, DbtBlockMode::DirectFast)?;
             let compiled = self
                 .workspace
-                .lower(&input)
+                .lower(&input, self.memory.len() as u32)
                 .map_err(|error| error.to_string())?;
             translation_nanos += translation_started.elapsed().as_nanos();
             translated_bytes = translated_bytes.saturating_add(compiled.code().len() as u64);
@@ -328,7 +328,7 @@ impl PreparedCachedDbtCompute32 {
                     DbtBlockInput::new(cpu.pc(), &self.decoded, DbtBlockMode::ChainableThroughput)?;
                 let compiled = self
                     .workspace
-                    .lower(&input)
+                    .lower(&input, self.memory.len() as u32)
                     .map_err(|error| error.to_string())?;
                 translation_nanos += translation_started.elapsed().as_nanos();
                 translations += 1;

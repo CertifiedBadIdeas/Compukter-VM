@@ -399,6 +399,19 @@ impl X64Emitter {
         self.reg_reg(&[0x85], true, rhs, lhs, false)
     }
 
+    pub(crate) fn test_m8_imm8(&mut self, memory: Mem, value: u8) -> Result<(), EmitError> {
+        self.with_rollback(|out| {
+            if memory.index.is_some_and(|(index, _)| index == Gpr::Rsp) {
+                return Err(EmitError::InvalidOperand("RSP cannot be a SIB index"));
+            }
+            let index_high = memory.index.is_some_and(|(index, _)| index.high());
+            out.emit_rex(false, false, index_high, memory.base.high(), false)?;
+            out.emit_u8(0xf6)?;
+            out.emit_memory_operand(0, memory)?;
+            out.emit_u8(value)
+        })
+    }
+
     pub(crate) fn add_r32_imm32(&mut self, dst: Gpr, value: i32) -> Result<(), EmitError> {
         self.group_imm32(dst, 0, value)
     }
@@ -822,6 +835,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(out.finish().unwrap(), [0x40, 0x88, 0x30]);
+    }
+
+    #[test]
+    fn encodes_direct_byte_permission_test() {
+        let mut out = X64Emitter::new(16, 1).unwrap();
+        out.test_m8_imm8(
+            Mem::base_index_disp(Gpr::R12, Gpr::Rax, Scale::One, 0),
+            0b010,
+        )
+        .unwrap();
+
+        assert_eq!(out.finish().unwrap(), [0x41, 0xf6, 0x04, 0x04, 0x02]);
     }
 
     #[test]
