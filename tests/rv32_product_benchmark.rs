@@ -19,10 +19,12 @@
 
 use compukter_vm::benchmarks::{
     benchmark_geomean, benchmark_normalize_nanos, benchmark_rotating_order,
-    format_product_active_row, native_checksum, populate_product_ratios, product_backend_order,
-    product_percentile, PreparedProductMachine, PreparedProductNative, ProductActiveTiming,
-    ProductExecutionCandidate, ProductMachineBackend, ProductMachineImage, ProductMachineWorkload,
-    PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_RESIDENT_REPORT_HEADER,
+    execute_product_machine_batch, format_product_active_row, native_checksum,
+    populate_product_ratios, product_backend_order, product_machine_batch, product_percentile,
+    PreparedProductMachine, PreparedProductNative, ProductActiveTiming, ProductExecutionCandidate,
+    ProductMachineBackend, ProductMachineImage, ProductMachineWorkload,
+    PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_MACHINE_MAX_BATCH, PRODUCT_MACHINE_TARGET_NANOS,
+    PRODUCT_RESIDENT_REPORT_HEADER,
 };
 use compukter_vm::rv32_machine::Rv32TranslationLookupUnit;
 
@@ -262,6 +264,38 @@ fn product_timing_math_is_normalized_and_rotated() {
         ProductExecutionCandidate::CachedDbt.name(),
         "rv32-cached-dbt"
     );
+}
+
+#[test]
+fn short_product_machine_samples_use_bounded_power_of_two_batches() {
+    assert_eq!(PRODUCT_MACHINE_TARGET_NANOS, 5_000_000);
+    assert_eq!(PRODUCT_MACHINE_MAX_BATCH, 1024);
+    assert_eq!(product_machine_batch(10_000_000), 1);
+    assert_eq!(product_machine_batch(5_000_000), 1);
+    assert_eq!(product_machine_batch(2_500_000), 2);
+    assert_eq!(product_machine_batch(1_250_000), 4);
+    assert_eq!(product_machine_batch(10_000), 512);
+    assert_eq!(product_machine_batch(1), PRODUCT_MACHINE_MAX_BATCH);
+    assert_eq!(product_machine_batch(0), PRODUCT_MACHINE_MAX_BATCH);
+}
+
+#[test]
+fn product_machine_batch_executes_independent_prepared_machines() {
+    let image = ProductMachineImage::new(ProductMachineWorkload::Compute32, 32).unwrap();
+    assert!(image
+        .prepare_batch(ProductMachineBackend::CachedDbt, 0)
+        .is_err());
+    let mut machines = image
+        .prepare_batch(ProductMachineBackend::CachedDbt, 3)
+        .unwrap();
+
+    let observation = execute_product_machine_batch(&mut machines).unwrap();
+
+    assert_eq!(machines.len(), 3);
+    assert_eq!(observation.backend, ProductMachineBackend::CachedDbt);
+    assert_eq!(observation.workload, ProductMachineWorkload::Compute32);
+    assert!(observation.complete_machine);
+    assert!(observation.retired_instructions > 0);
 }
 
 #[test]
