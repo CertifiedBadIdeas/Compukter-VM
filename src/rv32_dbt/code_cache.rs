@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(cache.stats().hits, 1);
         assert_eq!(cache.stats().misses, 2);
         assert_eq!(cache.stats().publications, 1);
-        assert_eq!(cache.reserved_bytes(), PAGE_BYTES);
+        assert_eq!(cache.reserved_bytes(), PAGE_BYTES * 2);
     }
 
     #[test]
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(cache.instruction_count(handle), None);
         assert_eq!(cache.live_entry_bytes(), 0);
         assert_eq!(cache.metadata_bytes(), metadata_bytes);
-        assert_eq!(cache.reserved_bytes(), PAGE_BYTES);
+        assert_eq!(cache.reserved_bytes(), PAGE_BYTES * 2);
     }
 
     #[test]

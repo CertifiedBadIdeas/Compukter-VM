@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 rvsim = { version = "=0.2.2", default-features = false }
 thiserror = "1.0"
 memmap2 = "=0.9.9"
+libc = "=0.2.189"
 cranelift-codegen = "=0.134.2"
 cranelift-control = "=0.134.3"
 cranelift-frontend = "=0.134.2"
