@@ -64,7 +64,7 @@ fn cached_dbt_uses_the_common_compute32_contract() {
     assert_eq!(warm.cache_misses, 0);
     assert_eq!(warm.translations, 0);
     assert_eq!(warm.publications, 0);
-    assert_eq!(warm.executable_reserved_bytes, 64 * 1024);
+    assert_eq!(warm.executable_reserved_bytes, 128 * 1024);
     assert!(warm.metadata_bytes > 0);
 }
 

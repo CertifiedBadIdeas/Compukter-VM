@@ -454,7 +454,7 @@ mod tests {
             assert!(observation.dispatches >= 3);
             assert!(observation.attempted_instructions > u64::from(iterations));
             assert!(observation.translated_bytes > 0);
-            assert_eq!(observation.reserved_bytes, 64 * 1024);
+            assert_eq!(observation.reserved_bytes, 128 * 1024);
         }
     }
 
