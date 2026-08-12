@@ -118,7 +118,6 @@ pub(crate) struct DirectDbtCodeCache {
     set_mask: usize,
     write_cursor: usize,
     stats: DbtCodeCacheStats,
-    chaining_enabled: bool,
 }
 
 impl DirectDbtCodeCache {
@@ -135,15 +134,7 @@ impl DirectDbtCodeCache {
             set_mask: sets - 1,
             write_cursor: 0,
             stats: DbtCodeCacheStats::default(),
-            chaining_enabled: false,
         })
-    }
-
-    #[cfg(test)]
-    fn new_with_chaining(sets: usize, executable_bytes: usize) -> Result<Self, DbtFault> {
-        let mut cache = Self::new(sets, executable_bytes)?;
-        cache.chaining_enabled = true;
-        Ok(cache)
     }
 
     pub(crate) fn lookup(&mut self, key: DbtCacheKey) -> Option<DbtCacheHit> {
@@ -232,10 +223,8 @@ impl DirectDbtCodeCache {
         self.sets[set].mru_way = way as u8;
         self.write_cursor = end;
         self.stats.publications = self.stats.publications.saturating_add(1);
-        if self.chaining_enabled {
-            self.link_outgoing(set, way)?;
-            self.link_incoming(set, way)?;
-        }
+        self.link_outgoing(set, way)?;
+        self.link_incoming(set, way)?;
         let entry = self.mapping.entry_address(offset).ok_or_else(|| {
             Self::fault(
                 DbtFaultKind::AbiInvariant,
@@ -655,7 +644,7 @@ mod tests {
     #[test]
     fn lazy_links_work_for_either_publication_order() {
         for target_first in [false, true] {
-            let mut cache = DirectDbtCodeCache::new_with_chaining(8, PAGE_BYTES).unwrap();
+            let mut cache = DirectDbtCodeCache::new(8, PAGE_BYTES).unwrap();
             let source_key = DbtCacheKey::new(0x1000, 3);
             let target_key = DbtCacheKey::new(0x1004, 3);
             let (source_code, link) = source_link(0x1004);
@@ -687,7 +676,7 @@ mod tests {
 
     #[test]
     fn conditional_slots_link_independently() {
-        let mut cache = DirectDbtCodeCache::new_with_chaining(8, PAGE_BYTES).unwrap();
+        let mut cache = DirectDbtCodeCache::new(8, PAGE_BYTES).unwrap();
         let mut source_code = [0_u8; 22];
         let (first, _) = source_link(0x2004);
         let (second, _) = source_link(0x2008);
@@ -729,7 +718,7 @@ mod tests {
 
     #[test]
     fn destination_eviction_and_full_invalidation_reset_incoming_links() {
-        let mut cache = DirectDbtCodeCache::new_with_chaining(2, PAGE_BYTES).unwrap();
+        let mut cache = DirectDbtCodeCache::new(2, PAGE_BYTES).unwrap();
         let (source_code, link) = source_link(0x3004);
         let source = cache
             .publish(
@@ -762,7 +751,7 @@ mod tests {
 
     #[test]
     fn circular_overwrite_unlinks_a_destination_before_replacing_its_bytes() {
-        let mut cache = DirectDbtCodeCache::new_with_chaining(16, PAGE_BYTES).unwrap();
+        let mut cache = DirectDbtCodeCache::new(16, PAGE_BYTES).unwrap();
         cache
             .publish(DbtCacheKey::new(0x4004, 0), &block(0x4004, &returning(9)))
             .unwrap();
@@ -791,7 +780,7 @@ mod tests {
 
     #[test]
     fn cross_page_static_edge_never_links() {
-        let mut cache = DirectDbtCodeCache::new_with_chaining(4, PAGE_BYTES).unwrap();
+        let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
         let (source_code, link) = source_link(0x5000);
         let source = cache
             .publish(
