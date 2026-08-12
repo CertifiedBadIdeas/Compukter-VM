@@ -19,7 +19,7 @@
 
 #![allow(
     dead_code,
-    reason = "the direct DBT machine dispatcher consumes lowering in a later issue #498 task"
+    reason = "the direct DBT machine dispatcher consumes lowering in a later issue #17 task"
 )]
 
 use super::emitter::{Condition, EmitError, Gpr, Mem, X64Emitter};

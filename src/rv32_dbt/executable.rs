@@ -19,7 +19,7 @@
 
 #![allow(
     dead_code,
-    reason = "the direct DBT dispatcher consumes executable scratch memory in a later issue #498 task"
+    reason = "the direct DBT dispatcher consumes executable scratch memory in a later issue #17 task"
 )]
 
 use super::{DbtFault, DbtFaultKind};

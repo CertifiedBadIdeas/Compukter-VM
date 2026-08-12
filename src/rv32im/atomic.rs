@@ -48,7 +48,7 @@ impl Rv32Reservation {
 
     #[allow(
         dead_code,
-        reason = "the direct DBT context consumes normalized reservation state in a later issue #498 task"
+        reason = "the direct DBT context consumes normalized reservation state in a later issue #17 task"
     )]
     pub(crate) fn address(self) -> u32 {
         self.address

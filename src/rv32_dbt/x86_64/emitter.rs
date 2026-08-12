@@ -19,7 +19,7 @@
 
 #![allow(
     dead_code,
-    reason = "RV32 lowering consumes the complete typed emitter in subsequent issue #498 tasks"
+    reason = "RV32 lowering consumes the complete typed emitter in subsequent issue #17 tasks"
 )]
 
 use thiserror::Error;

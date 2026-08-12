@@ -19,7 +19,7 @@
 
 #![allow(
     dead_code,
-    reason = "the machine dispatcher consumes the per-VM DBT owner in the next issue #498 task"
+    reason = "the machine dispatcher consumes the per-VM DBT owner in the next issue #17 task"
 )]
 
 use super::Rv32DbtStats;

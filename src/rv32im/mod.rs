@@ -187,7 +187,7 @@ impl Rv32imCpu {
 
     #[allow(
         dead_code,
-        reason = "the direct DBT context consumes normalized reservation state in a later issue #498 task"
+        reason = "the direct DBT context consumes normalized reservation state in a later issue #17 task"
     )]
     pub(crate) fn reservation_address(&self) -> Option<u32> {
         self.state.reservation.map(Rv32Reservation::address)

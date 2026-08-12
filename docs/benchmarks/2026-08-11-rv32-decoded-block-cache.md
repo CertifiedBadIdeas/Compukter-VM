@@ -2,7 +2,7 @@
 
 ## Scope and revision
 
-This is Slice 1 of [#498](https://github.com/CertifiedBadIdeas/Compukter-Kraft/issues/498).
+This is Slice 1 of [#17](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/17).
 It adds the bounded two-way BlockCached backend without direct chaining,
 register caching, superinstructions, RAM fast paths, host code generation, or
 an ABI change. Cached and Predecoded remain available, and the product default
@@ -195,7 +195,7 @@ execution experiment. Reject this unchained, unfused implementation as the
 default or as a performance optimization by itself: it is slower than both
 existing product backends and materially heavier than Cached.
 
-The next #498 slice should reuse the decoded-block representation but measure a
+The next #17 slice should reuse the decoded-block representation but measure a
 fused block executor that keeps frequently used hart state in host locals and
 reduces per-slot dispatch/check overhead. Direct chaining, superinstructions,
 and a JIT remain later decisions. The fixed 32-set/eight-slot negative result is

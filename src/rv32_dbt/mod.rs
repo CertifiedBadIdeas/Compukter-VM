@@ -19,7 +19,7 @@
 
 #![allow(
     dead_code,
-    reason = "the direct DBT contracts are connected to the machine in subsequent issue #498 tasks"
+    reason = "the direct DBT contracts are connected to the machine in subsequent issue #17 tasks"
 )]
 
 pub(crate) mod abi;
