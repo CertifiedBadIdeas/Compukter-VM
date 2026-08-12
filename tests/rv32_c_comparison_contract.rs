@@ -195,8 +195,12 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     for sets in [16, 64, 128, 256, 512] {
         assert!(source.contains(&format!("rv32-cached-dbt-{sets}-sets")));
     }
+    for max_instructions in [16, 32, 64] {
+        assert!(source.contains(&format!("rv32-cached-dbt-block-{max_instructions}")));
+    }
     assert!(!source.contains("rv32-cached-dbt-32-sets"));
-    assert!(source.contains("const DBT_MATRIX: [Candidate; 11]"));
+    assert!(!source.contains("rv32-cached-dbt-block-4"));
+    assert!(source.contains("const DBT_MATRIX: [Candidate; 14]"));
     assert!(source.contains("usage: rv32_c_comparison BUILD_DIR WARM_SAMPLES"));
     assert!(source.contains("dbt_matrix\\tcache+sets"));
     assert!(!source.contains("cache|sets"));
@@ -237,13 +241,15 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("rv32-block-cached"));
     assert!(source.contains("rv32-direct-dbt"));
     assert!(source.contains("rv32-cached-dbt"));
-    assert!(source.contains("count == 18"));
+    assert!(source.contains("count == 21"));
     assert!(source.contains("wasmtime-aot"));
     assert!(source.contains("module.cwasm"));
     assert!(source.contains("product-block-cached-calibrated-disassembly.txt"));
     assert!(source.contains("product-direct-dbt-calibrated-disassembly.txt"));
     assert!(source.contains("for cache_kib in 16 32 64 128 256 512"));
     assert!(source.contains("for sets in 16 64 128 256 512"));
+    assert!(source.contains("for max_instructions in 16 32 64"));
+    assert!(source.contains("rv32-cached-dbt-block-${max_instructions}"));
     assert!(source.contains("product-${candidate}-calibrated-disassembly.txt"));
     assert!(!source.contains("|| true"));
     assert!(!source.contains("qemu-riscv32"));
