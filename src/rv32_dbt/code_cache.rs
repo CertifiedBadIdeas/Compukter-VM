@@ -17,12 +17,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use super::block::{DbtBlockMode, TranslatedBlock};
+use super::block::{DbtBlockMode, DbtStaticLink, TranslatedBlock, MAX_STATIC_LINKS};
 use super::executable::ExecutableMapping;
 use super::{DbtFault, DbtFaultKind};
 
 const WAYS: usize = 2;
 const CODE_ALIGNMENT: usize = 16;
+const GUEST_PAGE_BYTES: u32 = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DbtCacheKey {
@@ -59,15 +60,50 @@ pub(crate) struct DbtCodeCacheStats {
     pub(crate) publications: u64,
     pub(crate) metadata_evictions: u64,
     pub(crate) overlap_invalidations: u64,
+    pub(crate) links_established: u64,
+    pub(crate) links_reset: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
+struct CacheLink {
+    descriptor: DbtStaticLink,
+    destination: Option<DbtCacheKey>,
+}
+
+impl Default for CacheLink {
+    fn default() -> Self {
+        Self {
+            descriptor: DbtStaticLink::EMPTY,
+            destination: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct CacheEntry {
     valid: bool,
     key: Option<DbtCacheKey>,
     offset: usize,
     length: usize,
     instruction_count: u32,
+    chain_entry_offset: u32,
+    links: [CacheLink; MAX_STATIC_LINKS],
+    link_count: u8,
+}
+
+impl Default for CacheEntry {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            key: None,
+            offset: 0,
+            length: 0,
+            instruction_count: 0,
+            chain_entry_offset: 0,
+            links: [CacheLink::default(); MAX_STATIC_LINKS],
+            link_count: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,6 +118,7 @@ pub(crate) struct DirectDbtCodeCache {
     set_mask: usize,
     write_cursor: usize,
     stats: DbtCodeCacheStats,
+    chaining_enabled: bool,
 }
 
 impl DirectDbtCodeCache {
@@ -98,7 +135,15 @@ impl DirectDbtCodeCache {
             set_mask: sets - 1,
             write_cursor: 0,
             stats: DbtCodeCacheStats::default(),
+            chaining_enabled: false,
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_chaining(sets: usize, executable_bytes: usize) -> Result<Self, DbtFault> {
+        let mut cache = Self::new(sets, executable_bytes)?;
+        cache.chaining_enabled = true;
+        Ok(cache)
     }
 
     pub(crate) fn lookup(&mut self, key: DbtCacheKey) -> Option<DbtCacheHit> {
@@ -161,13 +206,18 @@ impl DirectDbtCodeCache {
             0
         };
         let end = offset + block.code().len();
-        self.invalidate_overlapping(offset, end);
-        self.mapping.publish_at(offset, block.code())?;
+        self.invalidate_overlapping(offset, end)?;
 
         let set = self.set_index(key);
         let way = self.select_way(set);
         if self.sets[set].ways[way].valid {
+            self.invalidate_entry(set, way)?;
             self.stats.metadata_evictions = self.stats.metadata_evictions.saturating_add(1);
+        }
+        self.mapping.publish_at(offset, block.code())?;
+        let mut links = [CacheLink::default(); MAX_STATIC_LINKS];
+        for (stored, descriptor) in links.iter_mut().zip(block.static_links()) {
+            stored.descriptor = *descriptor;
         }
         self.sets[set].ways[way] = CacheEntry {
             valid: true,
@@ -175,10 +225,17 @@ impl DirectDbtCodeCache {
             offset,
             length: block.code().len(),
             instruction_count: block.instruction_count(),
+            chain_entry_offset: block.chain_entry_offset(),
+            links,
+            link_count: block.static_links().len() as u8,
         };
         self.sets[set].mru_way = way as u8;
         self.write_cursor = end;
         self.stats.publications = self.stats.publications.saturating_add(1);
+        if self.chaining_enabled {
+            self.link_outgoing(set, way)?;
+            self.link_incoming(set, way)?;
+        }
         let entry = self.mapping.entry_address(offset).ok_or_else(|| {
             Self::fault(
                 DbtFaultKind::AbiInvariant,
@@ -192,9 +249,20 @@ impl DirectDbtCodeCache {
     }
 
     pub(crate) fn invalidate_all(&mut self) {
+        for set in 0..self.sets.len() {
+            for way in 0..WAYS {
+                let link_count = self.sets[set].ways[way].link_count as usize;
+                for link in 0..link_count {
+                    if self.sets[set].ways[way].links[link].destination.is_some() {
+                        self.reset_link(set, way, link)
+                            .expect("validated DBT link metadata must remain patchable");
+                    }
+                }
+            }
+        }
         for set in &mut self.sets {
             for entry in &mut set.ways {
-                entry.valid = false;
+                *entry = CacheEntry::default();
             }
         }
     }
@@ -234,15 +302,139 @@ impl DirectDbtCodeCache {
             .unwrap_or_else(|| usize::from(self.sets[set].mru_way ^ 1))
     }
 
-    fn invalidate_overlapping(&mut self, start: usize, end: usize) {
-        for entry in self.sets.iter_mut().flat_map(|set| set.ways.iter_mut()) {
-            if entry.valid && ranges_overlap(start, end, entry.offset, entry.offset + entry.length)
-            {
-                entry.valid = false;
-                self.stats.overlap_invalidations =
-                    self.stats.overlap_invalidations.saturating_add(1);
+    fn invalidate_overlapping(&mut self, start: usize, end: usize) -> Result<(), DbtFault> {
+        loop {
+            let victim = (0..self.sets.len()).find_map(|set| {
+                (0..WAYS).find_map(|way| {
+                    let entry = self.sets[set].ways[way];
+                    (entry.valid
+                        && ranges_overlap(start, end, entry.offset, entry.offset + entry.length))
+                    .then_some((set, way))
+                })
+            });
+            let Some((set, way)) = victim else {
+                return Ok(());
+            };
+            self.invalidate_entry(set, way)?;
+            self.stats.overlap_invalidations = self.stats.overlap_invalidations.saturating_add(1);
+        }
+    }
+
+    fn invalidate_entry(&mut self, target_set: usize, target_way: usize) -> Result<(), DbtFault> {
+        let target = self.sets[target_set].ways[target_way];
+        let Some(target_key) = target.valid.then_some(target.key).flatten() else {
+            return Ok(());
+        };
+        for set in 0..self.sets.len() {
+            for way in 0..WAYS {
+                let link_count = self.sets[set].ways[way].link_count as usize;
+                for link in 0..link_count {
+                    if self.sets[set].ways[way].links[link].destination == Some(target_key) {
+                        self.reset_link(set, way, link)?;
+                    }
+                }
             }
         }
+        self.sets[target_set].ways[target_way] = CacheEntry::default();
+        Ok(())
+    }
+
+    fn link_outgoing(&mut self, source_set: usize, source_way: usize) -> Result<(), DbtFault> {
+        let source = self.sets[source_set].ways[source_way];
+        let source_key = source.key.expect("valid cache entry must have a key");
+        for link in 0..source.link_count as usize {
+            let descriptor = source.links[link].descriptor;
+            if !same_guest_page(source_key.pc, descriptor.target_pc) {
+                continue;
+            }
+            let target_key = DbtCacheKey::new(descriptor.target_pc, source_key.generation);
+            if let Some((target_set, target_way)) = self.find_entry(target_key) {
+                self.establish_link(source_set, source_way, link, target_set, target_way)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn link_incoming(&mut self, target_set: usize, target_way: usize) -> Result<(), DbtFault> {
+        let target_key = self.sets[target_set].ways[target_way]
+            .key
+            .expect("valid cache entry must have a key");
+        for source_set in 0..self.sets.len() {
+            for source_way in 0..WAYS {
+                let source = self.sets[source_set].ways[source_way];
+                let Some(source_key) = source.valid.then_some(source.key).flatten() else {
+                    continue;
+                };
+                for link in 0..source.link_count as usize {
+                    let record = source.links[link];
+                    if record.destination.is_none()
+                        && record.descriptor.target_pc == target_key.pc
+                        && source_key.generation == target_key.generation
+                        && same_guest_page(source_key.pc, target_key.pc)
+                    {
+                        self.establish_link(source_set, source_way, link, target_set, target_way)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn establish_link(
+        &mut self,
+        source_set: usize,
+        source_way: usize,
+        link: usize,
+        target_set: usize,
+        target_way: usize,
+    ) -> Result<(), DbtFault> {
+        let source = self.sets[source_set].ways[source_way];
+        if source.links[link].destination.is_some() {
+            return Ok(());
+        }
+        let target = self.sets[target_set].ways[target_way];
+        let target_key = target.key.expect("valid cache entry must have a key");
+        let descriptor = source.links[link].descriptor;
+        self.mapping.patch_rel32(
+            source.offset,
+            source.length,
+            source.offset + descriptor.displacement_offset as usize,
+            target.offset + target.chain_entry_offset as usize,
+        )?;
+        self.sets[source_set].ways[source_way].links[link].destination = Some(target_key);
+        self.stats.links_established = self.stats.links_established.saturating_add(1);
+        Ok(())
+    }
+
+    fn reset_link(
+        &mut self,
+        source_set: usize,
+        source_way: usize,
+        link: usize,
+    ) -> Result<(), DbtFault> {
+        let source = self.sets[source_set].ways[source_way];
+        if source.links[link].destination.is_none() {
+            return Ok(());
+        }
+        let descriptor = source.links[link].descriptor;
+        self.mapping.patch_rel32(
+            source.offset,
+            source.length,
+            source.offset + descriptor.displacement_offset as usize,
+            source.offset + descriptor.reset_target_offset as usize,
+        )?;
+        self.sets[source_set].ways[source_way].links[link].destination = None;
+        self.stats.links_reset = self.stats.links_reset.saturating_add(1);
+        Ok(())
+    }
+
+    fn find_entry(&self, key: DbtCacheKey) -> Option<(usize, usize)> {
+        let set = self.set_index(key);
+        self.sets[set]
+            .ways
+            .iter()
+            .position(|entry| entry.valid && entry.key == Some(key))
+            .map(|way| (set, way))
     }
 
     fn fault(kind: DbtFaultKind, message: impl Into<String>) -> DbtFault {
@@ -260,23 +452,61 @@ fn ranges_overlap(lhs_start: usize, lhs_end: usize, rhs_start: usize, rhs_end: u
     lhs_start < rhs_end && rhs_start < lhs_end
 }
 
+fn same_guest_page(lhs: u32, rhs: u32) -> bool {
+    lhs / GUEST_PAGE_BYTES == rhs / GUEST_PAGE_BYTES
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DbtCacheKey, DirectDbtCodeCache};
-    use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, TranslatedBlock};
+    use crate::rv32_dbt::block::{
+        DbtBlockInput, DbtBlockMode, DbtLinkKind, DbtStaticLink, TranslatedBlock,
+    };
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
 
     const PAGE_BYTES: usize = 4096;
 
     fn block(pc: u32, code: &[u8]) -> TranslatedBlock<'_> {
+        block_with_links(pc, code, 0, &[])
+    }
+
+    fn block_with_links<'a>(
+        pc: u32,
+        code: &'a [u8],
+        chain_entry_offset: u32,
+        links: &[DbtStaticLink],
+    ) -> TranslatedBlock<'a> {
         let word = addi(1, 1, 1);
         let slots = [Rv32ResolvedInstruction::Valid {
             word,
             instruction: decode_product_word(word).unwrap(),
         }];
         let input = DbtBlockInput::new(pc, &slots, DbtBlockMode::Fast).unwrap();
-        TranslatedBlock::new(&input, code, 0, 0, 0, &[]).unwrap()
+        TranslatedBlock::new(&input, code, 0, 0, chain_entry_offset, links).unwrap()
+    }
+
+    fn returning(value: u32) -> [u8; 6] {
+        let mut code = [0xb8, 0, 0, 0, 0, 0xc3];
+        code[1..5].copy_from_slice(&value.to_le_bytes());
+        code
+    }
+
+    fn source_link(target_pc: u32) -> ([u8; 11], DbtStaticLink) {
+        let mut code = [0xe9, 0, 0, 0, 0, 0xb8, 0, 0, 0, 0, 0xc3];
+        code[6..10].copy_from_slice(&7_u32.to_le_bytes());
+        let link = DbtStaticLink {
+            target_pc,
+            displacement_offset: 1,
+            reset_target_offset: 5,
+            kind: DbtLinkKind::Fallthrough,
+        };
+        (code, link)
+    }
+
+    unsafe fn execute(entry: *const u8) -> u32 {
+        let entry: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(entry) };
+        unsafe { entry() }
     }
 
     fn bounded_block(pc: u32) -> TranslatedBlock<'static> {
@@ -420,5 +650,160 @@ mod tests {
 
         assert!(first.lookup(key).is_some());
         assert!(second.lookup(key).is_none());
+    }
+
+    #[test]
+    fn lazy_links_work_for_either_publication_order() {
+        for target_first in [false, true] {
+            let mut cache = DirectDbtCodeCache::new_with_chaining(8, PAGE_BYTES).unwrap();
+            let source_key = DbtCacheKey::new(0x1000, 3);
+            let target_key = DbtCacheKey::new(0x1004, 3);
+            let (source_code, link) = source_link(0x1004);
+            let target_code = returning(9);
+
+            if target_first {
+                cache
+                    .publish(target_key, &block(0x1004, &target_code))
+                    .unwrap();
+            }
+            let source = cache
+                .publish(
+                    source_key,
+                    &block_with_links(0x1000, &source_code, 0, &[link]),
+                )
+                .unwrap();
+            if target_first {
+                assert_eq!(unsafe { execute(source.entry()) }, 9);
+            } else {
+                assert_eq!(unsafe { execute(source.entry()) }, 7);
+                cache
+                    .publish(target_key, &block(0x1004, &target_code))
+                    .unwrap();
+                assert_eq!(unsafe { execute(source.entry()) }, 9);
+            }
+            assert_eq!(cache.stats().links_established, 1);
+        }
+    }
+
+    #[test]
+    fn conditional_slots_link_independently() {
+        let mut cache = DirectDbtCodeCache::new_with_chaining(8, PAGE_BYTES).unwrap();
+        let mut source_code = [0_u8; 22];
+        let (first, _) = source_link(0x2004);
+        let (second, _) = source_link(0x2008);
+        source_code[..11].copy_from_slice(&first);
+        source_code[11..].copy_from_slice(&second);
+        let links = [
+            DbtStaticLink {
+                target_pc: 0x2004,
+                displacement_offset: 1,
+                reset_target_offset: 5,
+                kind: DbtLinkKind::BranchNotTaken,
+            },
+            DbtStaticLink {
+                target_pc: 0x2008,
+                displacement_offset: 12,
+                reset_target_offset: 16,
+                kind: DbtLinkKind::BranchTaken,
+            },
+        ];
+        let source = cache
+            .publish(
+                DbtCacheKey::new(0x2000, 0),
+                &block_with_links(0x2000, &source_code, 0, &links),
+            )
+            .unwrap();
+
+        cache
+            .publish(DbtCacheKey::new(0x2004, 0), &block(0x2004, &returning(9)))
+            .unwrap();
+        assert_eq!(unsafe { execute(source.entry()) }, 9);
+        assert_eq!(unsafe { execute(source.entry().add(11)) }, 7);
+
+        cache
+            .publish(DbtCacheKey::new(0x2008, 0), &block(0x2008, &returning(11)))
+            .unwrap();
+        assert_eq!(unsafe { execute(source.entry().add(11)) }, 11);
+        assert_eq!(cache.stats().links_established, 2);
+    }
+
+    #[test]
+    fn destination_eviction_and_full_invalidation_reset_incoming_links() {
+        let mut cache = DirectDbtCodeCache::new_with_chaining(2, PAGE_BYTES).unwrap();
+        let (source_code, link) = source_link(0x3004);
+        let source = cache
+            .publish(
+                DbtCacheKey::new(0x3000, 0),
+                &block_with_links(0x3000, &source_code, 0, &[link]),
+            )
+            .unwrap();
+        cache
+            .publish(DbtCacheKey::new(0x3004, 0), &block(0x3004, &returning(9)))
+            .unwrap();
+        assert_eq!(unsafe { execute(source.entry()) }, 9);
+
+        cache
+            .publish(DbtCacheKey::new(0x300c, 0), &block(0x300c, &returning(10)))
+            .unwrap();
+        cache
+            .publish(DbtCacheKey::new(0x3014, 0), &block(0x3014, &returning(11)))
+            .unwrap();
+        assert_eq!(unsafe { execute(source.entry()) }, 7);
+        assert_eq!(cache.stats().links_reset, 1);
+
+        cache
+            .publish(DbtCacheKey::new(0x3004, 0), &block(0x3004, &returning(12)))
+            .unwrap();
+        assert_eq!(unsafe { execute(source.entry()) }, 12);
+        cache.invalidate_all();
+        assert_eq!(unsafe { execute(source.entry()) }, 7);
+        assert_eq!(cache.stats().links_reset, 2);
+    }
+
+    #[test]
+    fn circular_overwrite_unlinks_a_destination_before_replacing_its_bytes() {
+        let mut cache = DirectDbtCodeCache::new_with_chaining(16, PAGE_BYTES).unwrap();
+        cache
+            .publish(DbtCacheKey::new(0x4004, 0), &block(0x4004, &returning(9)))
+            .unwrap();
+        let (source_code, link) = source_link(0x4004);
+        let source = cache
+            .publish(
+                DbtCacheKey::new(0x4000, 0),
+                &block_with_links(0x4000, &source_code, 0, &[link]),
+            )
+            .unwrap();
+        assert_eq!(unsafe { execute(source.entry()) }, 9);
+
+        cache
+            .publish(
+                DbtCacheKey::new(0x4048, 0),
+                &block(0x4048, &vec![0x90; PAGE_BYTES - 32]),
+            )
+            .unwrap();
+        cache
+            .publish(DbtCacheKey::new(0x408c, 0), &block(0x408c, &returning(13)))
+            .unwrap();
+
+        assert_eq!(unsafe { execute(source.entry()) }, 7);
+        assert_eq!(cache.stats().links_reset, 1);
+    }
+
+    #[test]
+    fn cross_page_static_edge_never_links() {
+        let mut cache = DirectDbtCodeCache::new_with_chaining(4, PAGE_BYTES).unwrap();
+        let (source_code, link) = source_link(0x5000);
+        let source = cache
+            .publish(
+                DbtCacheKey::new(0x4ffc, 0),
+                &block_with_links(0x4ffc, &source_code, 0, &[link]),
+            )
+            .unwrap();
+        cache
+            .publish(DbtCacheKey::new(0x5000, 0), &block(0x5000, &returning(9)))
+            .unwrap();
+
+        assert_eq!(unsafe { execute(source.entry()) }, 7);
+        assert_eq!(cache.stats().links_established, 0);
     }
 }
