@@ -91,7 +91,16 @@ impl DbtTranslationWorkspace {
     pub(crate) fn lower<'a>(
         &'a mut self,
         input: &DbtBlockInput<'_>,
+        ram_len: u32,
     ) -> Result<TranslatedBlock<'a>, DbtFault> {
+        if ram_len == 0 {
+            return Err(fault(
+                DbtFaultKind::Capacity,
+                input.start_pc(),
+                None,
+                "RV32 DBT RAM length must be positive",
+            ));
+        }
         self.emitter.reset();
         let mut out = &mut self.emitter;
         let chainable = matches!(input.mode(), DbtBlockMode::ChainableThroughput);
@@ -225,6 +234,7 @@ impl DbtTranslationWorkspace {
                         pc,
                         word,
                         attempted,
+                        ram_len,
                         &input.slots()[index + 1..],
                         &mut cache,
                         &mut out,
@@ -247,6 +257,7 @@ impl DbtTranslationWorkspace {
                         pc,
                         word,
                         attempted,
+                        ram_len,
                         &input.slots()[index + 1..],
                         &mut cache,
                         &mut out,
@@ -568,6 +579,7 @@ fn lower_load(
     pc: u32,
     word: u32,
     attempted: u32,
+    ram_len: u32,
     remaining: &[Rv32ResolvedInstruction],
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
@@ -585,7 +597,7 @@ fn lower_load(
     let mut slow_cache = cache.clone();
     let slow = out.new_label()?;
     let done = out.new_label()?;
-    emit_ram_checks(Gpr::Rdx, width, 0b001, slow, out)?;
+    emit_ram_checks(Gpr::Rdx, width, 0b001, ram_len, slow, out)?;
 
     let dst = cache.write(rd, remaining, &[], out)?.unwrap_or(Gpr::Rax);
     let memory = Mem::base_index_disp(Gpr::R13, Gpr::Rdx, super::emitter::Scale::One, 0);
@@ -612,6 +624,7 @@ fn lower_store(
     pc: u32,
     word: u32,
     attempted: u32,
+    ram_len: u32,
     remaining: &[Rv32ResolvedInstruction],
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
@@ -629,7 +642,7 @@ fn lower_store(
     let mut slow_cache = cache.clone();
     let slow = out.new_label()?;
     let done = out.new_label()?;
-    emit_ram_checks(Gpr::Rdx, width, 0b010, slow, out)?;
+    emit_ram_checks(Gpr::Rdx, width, 0b010, ram_len, slow, out)?;
 
     let value = cache.read(rs2, remaining, &[Gpr::Rdx], out)?;
     let memory = Mem::base_index_disp(Gpr::R13, Gpr::Rdx, super::emitter::Scale::One, 0);
@@ -681,7 +694,8 @@ fn emit_store_reservation_invalidation(
 fn emit_ram_checks(
     address: Gpr,
     width: u32,
-    permission: i32,
+    permission: u8,
+    ram_len: u32,
     slow: super::emitter::Label,
     out: &mut X64Emitter,
 ) -> Result<(), EmitError> {
@@ -690,36 +704,18 @@ fn emit_ram_checks(
         out.and_r32_imm32(Gpr::Rax, width as i32 - 1)?;
         out.jcc(Condition::NotEqual, slow)?;
     }
-    out.mov_r32_m32(
-        Gpr::Rcx,
-        Mem::base_disp(Gpr::R15, DbtContext::RAM_LEN_OFFSET as i32),
-    )?;
-    out.cmp_r32_imm32(Gpr::Rcx, width as i32)?;
-    out.jcc(Condition::Below, slow)?;
-    out.add_r32_imm32(Gpr::Rcx, -(width as i32))?;
-    out.cmp_r32_r32(address, Gpr::Rcx)?;
+    let Some(inclusive_limit) = ram_len.checked_sub(width) else {
+        return out.jmp(slow);
+    };
+    out.cmp_r32_imm32(address, inclusive_limit as i32)?;
     out.jcc(Condition::Above, slow)?;
 
     out.mov_r32_r32(Gpr::Rax, address)?;
     out.shr_r32_imm8(Gpr::Rax, 12)?;
-    out.mov_r32_r32(Gpr::Rcx, address)?;
-    if width > 1 {
-        out.add_r32_imm32(Gpr::Rcx, width as i32 - 1)?;
-    }
-    out.shr_r32_imm8(Gpr::Rcx, 12)?;
-    out.cmp_r32_r32(Gpr::Rax, Gpr::Rcx)?;
-    out.jcc(Condition::NotEqual, slow)?;
-    out.mov_r32_m32(
-        Gpr::Rcx,
-        Mem::base_disp(Gpr::R15, DbtContext::PAGE_COUNT_OFFSET as i32),
-    )?;
-    out.cmp_r32_r32(Gpr::Rax, Gpr::Rcx)?;
-    out.jcc(Condition::AboveEqual, slow)?;
-    out.movzx_r32_m8(
-        Gpr::Rcx,
+    out.test_m8_imm8(
         Mem::base_index_disp(Gpr::R12, Gpr::Rax, super::emitter::Scale::One, 0),
+        permission,
     )?;
-    out.and_r32_imm32(Gpr::Rcx, permission)?;
     out.jcc(Condition::Equal, slow)
 }
 
@@ -1235,7 +1231,7 @@ mod tests {
     use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
     use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, DbtLinkKind};
     use crate::rv32_dbt::executable::ExecutableScratch;
-    use crate::rv32_dbt::x86_64::emitter::{EmitError, Gpr, X64Emitter};
+    use crate::rv32_dbt::x86_64::emitter::{EmitError, Gpr, Mem, X64Emitter};
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{
         decode_product_word,
@@ -1247,6 +1243,19 @@ mod tests {
         Rv32ArchitecturalState, Rv32ResolvedInstruction, Rv32imCpu,
     };
 
+    #[test]
+    fn translation_workspace_rejects_an_empty_specialized_ram_extent() {
+        let slots = slots(&[lw(1, 2, 0)]);
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, 1).unwrap();
+        let result = workspace.lower(&input, 0);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == DbtFaultKind::Capacity
+        ));
+    }
+
     fn write_u32_pattern(base: Gpr, offset: usize, value: u32) -> Vec<u8> {
         let mut emitter = X64Emitter::new(32, 1).unwrap();
         write_u32(&mut emitter, base, offset, value).unwrap();
@@ -1257,6 +1266,14 @@ mod tests {
         code.windows(pattern.len())
             .filter(|window| *window == pattern)
             .count()
+    }
+
+    fn context_u32_load_pattern(dst: Gpr, offset: usize) -> Vec<u8> {
+        let mut emitter = X64Emitter::new(16, 1).unwrap();
+        emitter
+            .mov_r32_m32(dst, Mem::base_disp(Gpr::R15, offset as i32))
+            .unwrap();
+        emitter.finish().unwrap().to_vec()
     }
 
     fn slots(words: &[u32]) -> Vec<Rv32ResolvedInstruction> {
@@ -1275,7 +1292,7 @@ mod tests {
         registers: &[(usize, u32)],
     ) -> (Rv32imCpu, DbtExitTag, DbtExitRecord, Vec<u8>) {
         let mut workspace = DbtTranslationWorkspace::new(64 * 1024, input.slots().len()).unwrap();
-        let compiled = workspace.lower(input).unwrap();
+        let compiled = workspace.lower(input, 4096).unwrap();
         let code = compiled.code().to_vec();
         let mut scratch = ExecutableScratch::new(64 * 1024).unwrap();
         scratch.publish(&code).unwrap();
@@ -1322,7 +1339,7 @@ mod tests {
         let slots = slots(&[word]);
         let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
         let mut workspace = DbtTranslationWorkspace::new(4096, 1).unwrap();
-        let block = workspace.lower(&input).unwrap();
+        let block = workspace.lower(&input, ram.len() as u32).unwrap();
         let mut scratch = ExecutableScratch::new(4096).unwrap();
         scratch.publish(block.code()).unwrap();
         let mut cpu = Rv32imCpu::new(0x1000);
@@ -1428,6 +1445,71 @@ mod tests {
     }
 
     #[test]
+    fn native_ram_accepts_aligned_accesses_ending_at_the_ram_boundary() {
+        let load_cases = [
+            (lbu(3, 1, 0), 4095_u32, 0xa5_u32),
+            (lhu(3, 1, 0), 4094_u32, 0xa5a5_u32),
+            (lw(3, 1, 0), 4092_u32, 0xa5a5_a5a5_u32),
+        ];
+        for (word, address, expected) in load_cases {
+            let mut ram = vec![0xa5; 4096];
+            let (cpu, tag, _) = execute_memory(word, &[(1, address)], &mut ram, &[0b001]);
+
+            assert_eq!(tag, DbtExitTag::Completed, "word={word:#010x}");
+            assert_eq!(cpu.register(3), expected, "word={word:#010x}");
+        }
+
+        for (word, address, width) in [
+            (sb(1, 2, 0), 4095_u32, 1_usize),
+            (sh(1, 2, 0), 4094_u32, 2_usize),
+            (sw(1, 2, 0), 4092_u32, 4_usize),
+        ] {
+            let mut ram = vec![0xa5; 4096];
+            let (_, tag, _) =
+                execute_memory(word, &[(1, address), (2, 0x8765_4321)], &mut ram, &[0b011]);
+
+            assert_eq!(tag, DbtExitTag::Completed, "word={word:#010x}");
+            assert_eq!(
+                &ram[address as usize..],
+                &0x8765_4321_u32.to_le_bytes()[..width],
+                "word={word:#010x}",
+            );
+        }
+    }
+
+    #[test]
+    fn native_ram_honors_the_byte_bound_on_a_partial_final_page() {
+        let mut ram = vec![0xa5; 4097];
+        ram[4096] = 0x7e;
+        let permissions = [0b011, 0b011];
+
+        let (cpu, tag, _) = execute_memory(lbu(3, 1, 0), &[(1, 4096)], &mut ram, &permissions);
+        assert_eq!(tag, DbtExitTag::Completed);
+        assert_eq!(cpu.register(3), 0x7e);
+
+        for (word, width) in [
+            (lhu(3, 1, 0), 2_u32),
+            (lw(3, 1, 0), 4_u32),
+            (sh(1, 2, 0), 2_u32),
+            (sw(1, 2, 0), 4_u32),
+        ] {
+            let before = ram.clone();
+            let (cpu, tag, exit) = execute_memory(
+                word,
+                &[(1, 4096), (2, 0x1122_3344), (3, 0xfeed_face)],
+                &mut ram,
+                &permissions,
+            );
+
+            assert_eq!(tag, DbtExitTag::MemoryAccess, "word={word:#010x}");
+            assert_eq!(cpu.register(3), 0xfeed_face, "word={word:#010x}");
+            assert_eq!(ram, before, "word={word:#010x}");
+            assert_eq!(exit.address, 4096, "word={word:#010x}");
+            assert_eq!(exit.access_size, width, "word={word:#010x}");
+        }
+    }
+
+    #[test]
     fn native_ram_store_invalidates_only_an_overlapping_reservation() {
         for (reservation, expected_valid) in [(66, 0), (128, 1)] {
             let mut ram = vec![0; 4096];
@@ -1451,10 +1533,29 @@ mod tests {
         let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
         let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
 
-        let block = workspace.lower(&input).unwrap();
+        let block = workspace.lower(&input, 4096).unwrap();
 
         assert_eq!(block.lowered_load_sites(), 1);
         assert_eq!(block.lowered_store_sites(), 1);
+    }
+
+    #[test]
+    fn native_ram_checks_specialize_the_vm_extent() {
+        fn translate(ram_len: u32) -> Vec<u8> {
+            let slots = slots(&[lw(3, 1, 0), sw(1, 2, 0)]);
+            let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
+            let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
+            workspace.lower(&input, ram_len).unwrap().code().to_vec()
+        }
+
+        let short = translate(4096);
+        let long = translate(8192);
+        let ram_len_load = context_u32_load_pattern(Gpr::Rcx, DbtContext::RAM_LEN_OFFSET);
+        let page_count_load = context_u32_load_pattern(Gpr::Rcx, DbtContext::PAGE_COUNT_OFFSET);
+
+        assert_eq!(pattern_count(&short, &ram_len_load), 0);
+        assert_eq!(pattern_count(&short, &page_count_load), 0);
+        assert_ne!(short, long);
     }
 
     #[test]
@@ -1485,7 +1586,7 @@ mod tests {
         for (start_pc, slots, expected) in cases {
             let input =
                 DbtBlockInput::new(start_pc, &slots, DbtBlockMode::ChainableThroughput).unwrap();
-            let block = workspace.lower(&input).unwrap();
+            let block = workspace.lower(&input, 4096).unwrap();
 
             assert!(block.chain_entry_offset() > 0);
             assert!((block.chain_entry_offset() as usize) < block.code().len());
@@ -1506,7 +1607,7 @@ mod tests {
         let slots = slots(&[addi(1, 1, 1), addi(2, 2, 1)]);
         let input =
             DbtBlockInput::new(0x5000, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
-        let block = workspace.lower(&input).unwrap();
+        let block = workspace.lower(&input, 4096).unwrap();
         assert!(block.static_links().is_empty());
     }
 
@@ -1518,7 +1619,7 @@ mod tests {
             DbtBlockInput::new(start_pc, &words, DbtBlockMode::ChainableThroughput).unwrap();
         let mut workspace = DbtTranslationWorkspace::new(4096, words.len()).unwrap();
 
-        let block = workspace.lower(&input).unwrap();
+        let block = workspace.lower(&input, 4096).unwrap();
         let x0_write = write_u32_pattern(Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0);
         let pc_write = write_u32_pattern(Gpr::R14, Rv32ArchitecturalState::PC_OFFSET, start_pc + 4);
 
@@ -1601,7 +1702,7 @@ mod tests {
         }
 
         let mut workspace = DbtTranslationWorkspace::new(64 * 1024, slots.len()).unwrap();
-        let compiled = workspace.lower(&input).unwrap();
+        let compiled = workspace.lower(&input, 4096).unwrap();
         let mut scratch = ExecutableScratch::new(64 * 1024).unwrap();
         scratch.publish(compiled.code()).unwrap();
         let mut context = DbtContext {
@@ -1640,7 +1741,7 @@ mod tests {
             .collect::<Vec<_>>();
         let input = DbtBlockInput::new(start_pc, &slots, DbtBlockMode::DirectFast).unwrap();
         let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
-        let compiled = workspace.lower(&input).unwrap();
+        let compiled = workspace.lower(&input, 4096).unwrap();
         let mut scratch = ExecutableScratch::new(4096).unwrap();
         scratch.publish(compiled.code()).unwrap();
         let mut cpu = Rv32imCpu::new(start_pc);
@@ -1886,13 +1987,13 @@ mod tests {
         let mut scratch = ExecutableScratch::new(4096).unwrap();
         let capacities = workspace.buffer_capacities();
 
-        let add_block = workspace.lower(&add_input).unwrap();
+        let add_block = workspace.lower(&add_input, 4096).unwrap();
         scratch.publish(add_block.code()).unwrap();
         let (add_cpu, add_tag, _, _) = execute_published(&scratch, 0x1000, &[(1, 5)], 1);
         assert_eq!(add_tag, DbtExitTag::Completed);
         assert_eq!(add_cpu.register(3), 12);
 
-        let mul_block = workspace.lower(&mul_input).unwrap();
+        let mul_block = workspace.lower(&mul_input, 4096).unwrap();
         scratch.publish(mul_block.code()).unwrap();
         let (mul_cpu, mul_tag, _, _) = execute_published(&scratch, 0x2000, &[(1, 6), (2, 7)], 1);
         assert_eq!(mul_tag, DbtExitTag::Completed);

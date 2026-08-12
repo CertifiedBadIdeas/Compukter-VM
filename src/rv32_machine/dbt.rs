@@ -85,6 +85,7 @@ pub(crate) struct Rv32DbtExecution {
     chain_transitions: u64,
     budget_overshoot: u64,
     max_budget_overshoot: u32,
+    ram_len: u32,
     lowered_load_sites: u64,
     lowered_store_sites: u64,
     emitted_bytes: u64,
@@ -97,7 +98,14 @@ impl Rv32DbtExecution {
         policy: Rv32DbtPolicy,
         max_instructions: usize,
         scratch_bytes: usize,
+        ram_len: u32,
     ) -> Result<Self, DbtFault> {
+        if ram_len == 0 {
+            return Err(Self::fault(
+                DbtFaultKind::Capacity,
+                "DBT RAM length must be positive",
+            ));
+        }
         if max_instructions == 0 || max_instructions > u32::MAX as usize {
             return Err(Self::fault(
                 DbtFaultKind::Capacity,
@@ -150,6 +158,7 @@ impl Rv32DbtExecution {
             chain_transitions: 0,
             budget_overshoot: 0,
             max_budget_overshoot: 0,
+            ram_len,
             lowered_load_sites: 0,
             lowered_store_sites: 0,
             emitted_bytes: 0,
@@ -215,7 +224,7 @@ impl Rv32DbtExecution {
         }
         let input = DbtBlockInput::new(pc, &self.decoded, mode)
             .map_err(|message| Self::fault(DbtFaultKind::Translation, message))?;
-        let block = self.workspace.lower(&input)?;
+        let block = self.workspace.lower(&input, self.ram_len)?;
         let instruction_count = block.instruction_count();
         let lowered_load_sites = block.lowered_load_sites();
         let lowered_store_sites = block.lowered_store_sites();
@@ -301,6 +310,15 @@ impl Rv32DbtExecution {
                 "prepared DBT block was invalidated before execution",
             )
         })?;
+        if context.ram_len != self.ram_len {
+            return Err(Self::fault(
+                DbtFaultKind::AbiInvariant,
+                format!(
+                    "DBT context RAM length {} differs from specialized length {}",
+                    context.ram_len, self.ram_len,
+                ),
+            ));
+        }
         let entry: DbtEntry = unsafe { std::mem::transmute(address) };
         let raw_tag = unsafe { entry(context) };
         let tag = DbtExitTag::try_from(raw_tag)
@@ -411,6 +429,16 @@ mod tests {
         Rv32ResolvedInstruction, Rv32imCpu,
     };
 
+    #[test]
+    fn execution_rejects_an_empty_specialized_ram_extent() {
+        let result = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 1, 4096, 0);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == DbtFaultKind::Capacity
+        ));
+    }
+
     fn fill_one(execution: &mut Rv32DbtExecution) {
         let word = addi(1, 1, 1);
         execution
@@ -442,7 +470,7 @@ mod tests {
 
     #[test]
     fn direct_and_cached_policies_share_one_lowerer() {
-        let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096).unwrap();
+        let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096, 4096).unwrap();
         fill_one(&mut direct);
         let first = direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
         fill_one(&mut direct);
@@ -457,6 +485,7 @@ mod tests {
                 cache_bytes: 4096,
             },
             8,
+            4096,
             4096,
         )
         .unwrap();
@@ -479,7 +508,7 @@ mod tests {
 
     #[test]
     fn transient_scratch_and_persistent_cache_have_independent_capacities() {
-        let direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 8 * 1024).unwrap();
+        let direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 8 * 1024, 4096).unwrap();
         assert_eq!(direct.stats().reserved_bytes, 16 * 1024);
 
         let cached = Rv32DbtExecution::new(
@@ -489,6 +518,7 @@ mod tests {
             },
             8,
             8 * 1024,
+            4096,
         )
         .unwrap();
         assert_eq!(cached.stats().reserved_bytes, 48 * 1024);
@@ -502,6 +532,7 @@ mod tests {
                 cache_bytes: 4096,
             },
             8,
+            4096,
             4096,
         )
         .unwrap();
@@ -529,6 +560,7 @@ mod tests {
             },
             8,
             4096,
+            4096,
         )
         .unwrap();
         fill_memory_pair(&mut cached);
@@ -548,7 +580,7 @@ mod tests {
 
     #[test]
     fn republishing_direct_scratch_revokes_the_previous_handle() {
-        let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096).unwrap();
+        let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096, 4096).unwrap();
         fill_one(&mut direct);
         let stale = direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
         fill_one(&mut direct);
@@ -575,7 +607,7 @@ mod tests {
 
     #[test]
     fn owner_executes_a_live_handle_without_exposing_its_entry_pointer() {
-        let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096).unwrap();
+        let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096, 4096).unwrap();
         fill_one(&mut direct);
         let prepared = direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
         let mut cpu = Rv32imCpu::new(0x1000);
@@ -603,6 +635,31 @@ mod tests {
     }
 
     #[test]
+    fn owner_rejects_a_context_with_a_different_ram_extent() {
+        let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096, 4096).unwrap();
+        fill_one(&mut direct);
+        let prepared = direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
+        let mut cpu = Rv32imCpu::new(0x1000);
+        let mut context = DbtContext {
+            state: cpu.architectural_state_mut(),
+            ram_base: std::ptr::null_mut(),
+            ram_len: 8192,
+            page_permissions: std::ptr::null(),
+            page_count: 0,
+            remaining_budget: 1,
+            reservation_valid: 0,
+            reservation_address: 0,
+            chain_transitions: 0,
+            exit: DbtExitRecord::default(),
+        };
+
+        let error = unsafe { direct.execute(prepared, &mut context) }.unwrap_err();
+
+        assert_eq!(error.kind(), DbtFaultKind::AbiInvariant);
+        assert_eq!(direct.stats().native_dispatches, 0);
+    }
+
+    #[test]
     fn lazy_chain_crosses_resident_blocks_without_exceeding_budget() {
         let mut cached = Rv32DbtExecution::new(
             Rv32DbtPolicy::Cached {
@@ -610,6 +667,7 @@ mod tests {
                 cache_bytes: 4096,
             },
             8,
+            4096,
             4096,
         )
         .unwrap();
@@ -630,7 +688,7 @@ mod tests {
             let mut context = DbtContext {
                 state: cpu.architectural_state_mut(),
                 ram_base: std::ptr::null_mut(),
-                ram_len: 0,
+                ram_len: 4096,
                 page_permissions: std::ptr::null(),
                 page_count: 0,
                 remaining_budget: budget,
@@ -663,6 +721,7 @@ mod tests {
             },
             8,
             4096,
+            4096,
         )
         .unwrap();
         fill_word(&mut cached, addi(1, 1, 4));
@@ -677,12 +736,14 @@ mod tests {
             .lookup(0x2000, DbtBlockMode::ChainableThroughput)
             .unwrap();
         let mut cpu = Rv32imCpu::new(0x2000);
+        let mut ram = [0_u8; 4096];
+        let permissions = [0_u8];
         let mut context = DbtContext {
             state: cpu.architectural_state_mut(),
-            ram_base: std::ptr::null_mut(),
-            ram_len: 0,
-            page_permissions: std::ptr::null(),
-            page_count: 0,
+            ram_base: ram.as_mut_ptr(),
+            ram_len: ram.len() as u32,
+            page_permissions: permissions.as_ptr(),
+            page_count: permissions.len() as u32,
             remaining_budget: 2,
             reservation_valid: 1,
             reservation_address: 0x80,
@@ -717,6 +778,7 @@ mod tests {
             },
             8,
             4096,
+            4096,
         )
         .unwrap();
         fill_word(&mut cached, addi(1, 1, 1));
@@ -740,7 +802,7 @@ mod tests {
         let mut context = DbtContext {
             state: cpu.architectural_state_mut(),
             ram_base: std::ptr::null_mut(),
-            ram_len: 0,
+            ram_len: 4096,
             page_permissions: std::ptr::null(),
             page_count: 0,
             remaining_budget: 2,
@@ -774,6 +836,7 @@ mod tests {
             },
             16,
             4096,
+            4096,
         )
         .unwrap();
         let slots = cached.decoded_slots_mut();
@@ -798,7 +861,7 @@ mod tests {
         let mut context = DbtContext {
             state: cpu.architectural_state_mut(),
             ram_base: std::ptr::null_mut(),
-            ram_len: 0,
+            ram_len: 4096,
             page_permissions: std::ptr::null(),
             page_count: 0,
             remaining_budget: 5,
@@ -820,14 +883,15 @@ mod tests {
     #[test]
     fn invalid_geometry_is_rejected_before_owner_construction() {
         for result in [
-            Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 0, 4096),
-            Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 1),
+            Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 0, 4096, 4096),
+            Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 1, 4096),
             Rv32DbtExecution::new(
                 Rv32DbtPolicy::Cached {
                     sets: 0,
                     cache_bytes: 4096,
                 },
                 8,
+                4096,
                 4096,
             ),
             Rv32DbtExecution::new(
@@ -836,6 +900,7 @@ mod tests {
                     cache_bytes: 4096,
                 },
                 8,
+                4096,
                 4096,
             ),
         ] {

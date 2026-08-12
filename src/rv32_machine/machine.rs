@@ -179,6 +179,7 @@ fn build_dbt_backend(
     build: Rv32DbtBackendBuild,
     max_instructions: usize,
     scratch_bytes: usize,
+    ram_len: u32,
 ) -> Result<Rv32ExecutionBackend, Rv32MachineBuildError> {
     let policy = match build {
         Rv32DbtBackendBuild::Direct => Rv32DbtPolicy::Direct,
@@ -186,7 +187,7 @@ fn build_dbt_backend(
             Rv32DbtPolicy::Cached { sets, cache_bytes }
         }
     };
-    Rv32DbtExecution::new(policy, max_instructions, scratch_bytes)
+    Rv32DbtExecution::new(policy, max_instructions, scratch_bytes, ram_len)
         .map(Rv32ExecutionBackend::Dbt)
         .map_err(|error| Rv32MachineBuildError::Backend(error.to_string()))
 }
@@ -196,6 +197,7 @@ fn build_dbt_backend(
     _build: Rv32DbtBackendBuild,
     _max_instructions: usize,
     _scratch_bytes: usize,
+    _ram_len: u32,
 ) -> Result<Rv32ExecutionBackend, Rv32MachineBuildError> {
     Err(Rv32MachineBuildError::Backend(
         "RV32 direct DBT is unavailable on non-x86_64 hosts".to_string(),
@@ -215,6 +217,9 @@ impl Rv32Machine {
     pub fn from_elf(elf: &[u8], config: Rv32MachineConfig) -> Result<Self, Rv32MachineBuildError> {
         validate_config(config)?;
         let image = Rv32ElfLoader::load(elf, config.ram_size)?;
+        let ram_len = u32::try_from(config.ram_size).map_err(|_| {
+            Rv32MachineBuildError::Config("RAM size exceeds the RV32 address space".to_string())
+        })?;
         let execution = match config.execution {
             Rv32ExecutionBackendConfig::Cached { sets } => Rv32ExecutionBackend::Cached(
                 BoundedCachedRv32imProgram::new(sets).map_err(Rv32MachineBuildError::Backend)?,
@@ -233,7 +238,12 @@ impl Rv32Machine {
             Rv32ExecutionBackendConfig::DirectDbt {
                 max_instructions,
                 scratch_bytes,
-            } => build_dbt_backend(Rv32DbtBackendBuild::Direct, max_instructions, scratch_bytes)?,
+            } => build_dbt_backend(
+                Rv32DbtBackendBuild::Direct,
+                max_instructions,
+                scratch_bytes,
+                ram_len,
+            )?,
             Rv32ExecutionBackendConfig::CachedDbt {
                 sets,
                 max_instructions,
@@ -243,6 +253,7 @@ impl Rv32Machine {
                 Rv32DbtBackendBuild::Cached { sets, cache_bytes },
                 max_instructions,
                 scratch_bytes,
+                ram_len,
             )?,
         };
         let (entry_point, ram, page_permissions, executable_ranges) = image.into_parts();
