@@ -177,7 +177,7 @@ impl DbtTranslationWorkspace {
                         pc,
                         word,
                         attempted,
-                        &input.slots()[index + 1..],
+                        &input.slots()[index..],
                         &mut cache,
                         &mut out,
                         chainable,
@@ -211,7 +211,7 @@ impl DbtTranslationWorkspace {
                         pc,
                         word,
                         attempted,
-                        &input.slots()[index + 1..],
+                        &input.slots()[index..],
                         &mut cache,
                         &mut out,
                     )
@@ -235,7 +235,7 @@ impl DbtTranslationWorkspace {
                         word,
                         attempted,
                         ram_len,
-                        &input.slots()[index + 1..],
+                        &input.slots()[index..],
                         &mut cache,
                         &mut out,
                     )
@@ -258,7 +258,7 @@ impl DbtTranslationWorkspace {
                         word,
                         attempted,
                         ram_len,
-                        &input.slots()[index + 1..],
+                        &input.slots()[index..],
                         &mut cache,
                         &mut out,
                     )
@@ -270,7 +270,7 @@ impl DbtTranslationWorkspace {
             if !lower_instruction(
                 instruction,
                 pc,
-                &input.slots()[index + 1..],
+                &input.slots()[index..],
                 &mut cache,
                 &mut out,
             )

@@ -28,6 +28,30 @@ use crate::rv32im::{
 };
 use std::cmp::Reverse;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FutureValue {
+    Read(usize),
+    Dead(usize),
+    Unused,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RegisterAccess {
+    reads: u32,
+    writes: u32,
+    may_exit_before_write: bool,
+}
+
+impl RegisterAccess {
+    fn reads(self, guest: usize) -> bool {
+        guest != 0 && self.reads & (1_u32 << guest) != 0
+    }
+
+    fn writes(self, guest: usize) -> bool {
+        guest != 0 && self.writes & (1_u32 << guest) != 0
+    }
+}
+
 const DIRECT_HOST_POOL: [Gpr; 8] = [
     Gpr::Rbx,
     Gpr::Rbp,
@@ -174,19 +198,29 @@ impl RegisterCache {
             .enumerate()
             .filter_map(|(index, resident)| {
                 let resident = resident.unwrap();
+                let future = future_value(remaining, resident.guest);
                 (!pinned.contains(&resident.host)).then_some((
                     index,
-                    next_use(remaining, resident.guest).unwrap_or(usize::MAX),
+                    matches!(future, FutureValue::Dead(_)),
+                    match future {
+                        FutureValue::Read(distance) | FutureValue::Dead(distance) => distance,
+                        FutureValue::Unused => usize::MAX,
+                    },
+                    !resident.dirty,
                     Reverse(resident.guest),
                 ))
             })
-            .max_by_key(|(_, next, guest)| (*next, *guest))
-            .map(|(index, _, _)| index)
+            .max_by_key(|(_, dead, distance, clean, guest)| (*dead, *distance, *clean, *guest))
+            .map(|(index, _, _, _, _)| index)
             .ok_or(EmitError::InvalidOperand(
                 "all RV32 register-cache hosts are pinned",
             ))?;
         if let Some(resident) = self.entries[index] {
-            if resident.dirty {
+            let dead = matches!(
+                future_value(remaining, resident.guest),
+                FutureValue::Dead(_)
+            );
+            if resident.dirty && !dead {
                 out.mov_m32_r32(
                     Mem::base_disp(
                         Gpr::R14,
@@ -232,47 +266,100 @@ impl RegisterCache {
     }
 }
 
-fn next_use(slots: &[Rv32ResolvedInstruction], guest: usize) -> Option<usize> {
-    slots
-        .iter()
-        .position(|slot| instruction_mentions(*slot, guest))
+fn future_value(slots: &[Rv32ResolvedInstruction], guest: usize) -> FutureValue {
+    let mut crossed_exit = false;
+    for (distance, slot) in slots.iter().copied().enumerate() {
+        let access = instruction_access(slot);
+        if access.reads(guest) {
+            return FutureValue::Read(distance);
+        }
+        crossed_exit |= access.may_exit_before_write;
+        if access.writes(guest) {
+            return if crossed_exit {
+                FutureValue::Read(distance)
+            } else {
+                FutureValue::Dead(distance)
+            };
+        }
+    }
+    FutureValue::Unused
 }
 
-fn instruction_mentions(slot: Rv32ResolvedInstruction, guest: usize) -> bool {
+fn instruction_access(slot: Rv32ResolvedInstruction) -> RegisterAccess {
     let Rv32ResolvedInstruction::Valid { instruction, .. } = slot else {
-        return false;
+        return RegisterAccess {
+            may_exit_before_write: true,
+            ..RegisterAccess::default()
+        };
     };
+    let mut access = RegisterAccess::default();
+    let mut read = |guest: usize| access.reads |= 1_u32 << guest;
+    let mut write = |guest: usize| access.writes |= 1_u32 << guest;
     match instruction {
         DecodedInstruction::Lui { rd, .. }
         | DecodedInstruction::Auipc { rd, .. }
-        | DecodedInstruction::Jal { rd, .. } => rd == guest,
+        | DecodedInstruction::Jal { rd, .. } => write(rd),
         DecodedInstruction::Jalr { rd, rs1, .. }
         | DecodedInstruction::Load { rd, rs1, .. }
-        | DecodedInstruction::LoadReserved { rd, rs1, .. } => rd == guest || rs1 == guest,
+        | DecodedInstruction::LoadReserved { rd, rs1, .. } => {
+            read(rs1);
+            write(rd);
+        }
         DecodedInstruction::Branch { rs1, rs2, .. }
-        | DecodedInstruction::Store { rs1, rs2, .. } => rs1 == guest || rs2 == guest,
-        DecodedInstruction::Immediate { rd, rs1, .. } => rd == guest || rs1 == guest,
+        | DecodedInstruction::Store { rs1, rs2, .. } => {
+            read(rs1);
+            read(rs2);
+        }
+        DecodedInstruction::Immediate { rd, rs1, .. } => {
+            read(rs1);
+            write(rd);
+        }
         DecodedInstruction::Register { rd, rs1, rs2, .. }
         | DecodedInstruction::StoreConditional { rd, rs1, rs2, .. }
         | DecodedInstruction::Atomic { rd, rs1, rs2, .. } => {
-            rd == guest || rs1 == guest || rs2 == guest
+            read(rs1);
+            read(rs2);
+            write(rd);
         }
         DecodedInstruction::Csr { rd, source, .. } => {
-            rd == guest || matches!(source, CsrSource::Register(rs) if rs == guest)
+            if let CsrSource::Register(rs) = source {
+                read(rs);
+            }
+            write(rd);
         }
         DecodedInstruction::Fence
         | DecodedInstruction::FenceI
         | DecodedInstruction::Ecall
         | DecodedInstruction::Ebreak
-        | DecodedInstruction::Mret => false,
+        | DecodedInstruction::Mret => {}
     }
+    access.may_exit_before_write = matches!(
+        instruction,
+        DecodedInstruction::Jal { .. }
+            | DecodedInstruction::Jalr { .. }
+            | DecodedInstruction::Load { .. }
+            | DecodedInstruction::Store { .. }
+            | DecodedInstruction::LoadReserved { .. }
+            | DecodedInstruction::StoreConditional { .. }
+            | DecodedInstruction::Atomic { .. }
+            | DecodedInstruction::Csr { .. }
+            | DecodedInstruction::FenceI
+            | DecodedInstruction::Ecall
+            | DecodedInstruction::Ebreak
+            | DecodedInstruction::Mret
+    );
+    access
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RegisterCache;
+    use super::{future_value, FutureValue, RegisterCache};
     use crate::rv32_dbt::x86_64::emitter::{Gpr, X64Emitter};
-    use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
+    use crate::rv32im::{
+        decode_product_word,
+        encoding::{addi, ecall, jal, jalr, lw},
+        Rv32ResolvedInstruction,
+    };
 
     fn slot(word: u32) -> Rv32ResolvedInstruction {
         Rv32ResolvedInstruction::Valid {
@@ -367,7 +454,25 @@ mod tests {
             slot(addi(6, 6, 1)),
             slot(addi(7, 7, 1)),
         ];
-        assert_eq!(cache.read(9, &future, &[], &mut out).unwrap(), Gpr::R11);
+        assert_eq!(
+            cache
+                .read(
+                    9,
+                    &future,
+                    &[
+                        Gpr::Rbx,
+                        Gpr::Rbp,
+                        Gpr::Rsi,
+                        Gpr::Rdi,
+                        Gpr::R8,
+                        Gpr::R9,
+                        Gpr::R10,
+                    ],
+                    &mut out,
+                )
+                .unwrap(),
+            Gpr::R11
+        );
         assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 9]);
 
         let future = [
@@ -397,10 +502,118 @@ mod tests {
             .map(|guest| slot(addi(guest, guest, 1)))
             .collect::<Vec<_>>();
 
-        assert_eq!(cache.read(9, &future, &[], &mut out).unwrap(), Gpr::R11);
+        assert_eq!(
+            cache
+                .read(
+                    9,
+                    &future,
+                    &[
+                        Gpr::Rbx,
+                        Gpr::Rbp,
+                        Gpr::Rsi,
+                        Gpr::Rdi,
+                        Gpr::R8,
+                        Gpr::R9,
+                        Gpr::R10,
+                    ],
+                    &mut out,
+                )
+                .unwrap(),
+            Gpr::R11
+        );
         assert_eq!(
             &out.bytes()[before..],
             [0x45, 0x89, 0x5e, 0x24, 0x45, 0x8b, 0x5e, 0x28]
         );
+    }
+
+    #[test]
+    fn farthest_read_beats_cleanliness_for_a_live_victim() {
+        let mut cache = RegisterCache::new();
+        let mut out = X64Emitter::new(512, 16).unwrap();
+        for guest in 1..=8 {
+            cache.read(guest, &[], &[], &mut out).unwrap();
+        }
+        cache.write(8, &[], &[], &mut out).unwrap();
+        let future = (1..=8)
+            .map(|guest| slot(addi(guest, guest, 1)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(cache.read(9, &future, &[], &mut out).unwrap(), Gpr::R11);
+    }
+
+    #[test]
+    fn future_value_distinguishes_reads_from_killing_writes() {
+        assert_eq!(
+            future_value(&[slot(addi(3, 0, 1))], 3),
+            FutureValue::Dead(0)
+        );
+        assert_eq!(
+            future_value(&[slot(addi(3, 3, 1))], 3),
+            FutureValue::Read(0)
+        );
+        assert_eq!(
+            future_value(&[slot(addi(4, 3, 1))], 3),
+            FutureValue::Read(0)
+        );
+        assert_eq!(future_value(&[slot(addi(4, 0, 1))], 3), FutureValue::Unused);
+    }
+
+    #[test]
+    fn future_value_does_not_drop_state_across_a_possible_exit() {
+        assert_eq!(future_value(&[slot(lw(4, 5, 0))], 4), FutureValue::Read(0));
+        assert_eq!(future_value(&[slot(lw(4, 5, 0))], 5), FutureValue::Read(0));
+        assert_eq!(
+            future_value(&[slot(ecall()), slot(addi(3, 0, 1))], 3),
+            FutureValue::Read(1)
+        );
+        assert_eq!(future_value(&[slot(jal(3, 2))], 3), FutureValue::Read(0));
+        assert_eq!(
+            future_value(&[slot(jalr(3, 4, 2))], 3),
+            FutureValue::Read(0)
+        );
+    }
+
+    #[test]
+    fn proven_dead_dirty_guest_is_evicted_without_a_store() {
+        let mut cache = RegisterCache::new();
+        let mut out = X64Emitter::new(512, 16).unwrap();
+        for guest in 1..=8 {
+            cache.read(guest, &[], &[], &mut out).unwrap();
+        }
+        cache.write(8, &[], &[], &mut out).unwrap();
+        let before = out.bytes().len();
+        let future = [
+            slot(addi(8, 0, 1)),
+            slot(addi(1, 1, 1)),
+            slot(addi(2, 2, 1)),
+            slot(addi(3, 3, 1)),
+            slot(addi(4, 4, 1)),
+            slot(addi(5, 5, 1)),
+            slot(addi(6, 6, 1)),
+            slot(addi(7, 7, 1)),
+        ];
+
+        assert_eq!(cache.read(9, &future, &[], &mut out).unwrap(), Gpr::R11);
+        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 9]);
+        assert_eq!(&out.bytes()[before..], [0x45, 0x8b, 0x5e, 0x28]);
+    }
+
+    #[test]
+    fn current_instruction_protects_a_not_yet_materialized_source() {
+        let mut cache = RegisterCache::new();
+        let mut out = X64Emitter::new(512, 16).unwrap();
+        for guest in 1..=8 {
+            cache.read(guest, &[], &[], &mut out).unwrap();
+        }
+        cache.write(8, &[], &[], &mut out).unwrap();
+        let current_and_future = [
+            slot(crate::rv32im::encoding::sub(9, 10, 8)),
+            slot(addi(8, 0, 1)),
+        ];
+
+        cache.read(10, &current_and_future, &[], &mut out).unwrap();
+
+        assert!(cache.resident_guests().contains(&8));
     }
 }
