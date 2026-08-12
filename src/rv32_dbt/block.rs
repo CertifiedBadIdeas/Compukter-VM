@@ -24,6 +24,33 @@
 
 use crate::rv32im::Rv32ResolvedInstruction;
 
+pub(crate) const MAX_STATIC_LINKS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbtLinkKind {
+    Fallthrough,
+    BranchTaken,
+    BranchNotTaken,
+    Jal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DbtStaticLink {
+    pub(crate) target_pc: u32,
+    pub(crate) displacement_offset: u32,
+    pub(crate) reset_target_offset: u32,
+    pub(crate) kind: DbtLinkKind,
+}
+
+impl DbtStaticLink {
+    pub(crate) const EMPTY: Self = Self {
+        target_pc: 0,
+        displacement_offset: 0,
+        reset_target_offset: 0,
+        kind: DbtLinkKind::Fallthrough,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbtBlockMode {
     Fast,
@@ -81,6 +108,9 @@ pub(crate) struct TranslatedBlock<'a> {
     mode: DbtBlockMode,
     lowered_load_sites: u32,
     lowered_store_sites: u32,
+    chain_entry_offset: u32,
+    static_links: [DbtStaticLink; MAX_STATIC_LINKS],
+    static_link_count: u8,
     code: &'a [u8],
 }
 
@@ -90,16 +120,46 @@ impl<'a> TranslatedBlock<'a> {
         code: &'a [u8],
         lowered_load_sites: u32,
         lowered_store_sites: u32,
+        chain_entry_offset: u32,
+        static_links: &[DbtStaticLink],
     ) -> Result<Self, String> {
         if code.is_empty() {
             return Err("RV32 DBT compiled block cannot be empty".to_string());
         }
+        if chain_entry_offset as usize >= code.len() {
+            return Err(format!(
+                "RV32 DBT chain entry offset {chain_entry_offset} is outside {} emitted bytes",
+                code.len()
+            ));
+        }
+        if static_links.len() > MAX_STATIC_LINKS {
+            return Err(format!(
+                "RV32 DBT block has {} static links but supports at most {MAX_STATIC_LINKS}",
+                static_links.len()
+            ));
+        }
+        if matches!(input.mode(), DbtBlockMode::Bounded { .. }) && !static_links.is_empty() {
+            return Err("RV32 DBT bounded blocks cannot expose static links".to_string());
+        }
+        for link in static_links {
+            let displacement_end = (link.displacement_offset as usize)
+                .checked_add(4)
+                .ok_or_else(|| "RV32 DBT link displacement range overflowed".to_string())?;
+            if displacement_end > code.len() || link.reset_target_offset as usize >= code.len() {
+                return Err("RV32 DBT static link lies outside emitted code".to_string());
+            }
+        }
+        let mut stored_links = [DbtStaticLink::EMPTY; MAX_STATIC_LINKS];
+        stored_links[..static_links.len()].copy_from_slice(static_links);
         Ok(Self {
             start_pc: input.start_pc(),
             instruction_count: input.slots().len() as u32,
             mode: input.mode(),
             lowered_load_sites,
             lowered_store_sites,
+            chain_entry_offset,
+            static_links: stored_links,
+            static_link_count: static_links.len() as u8,
             code,
         })
     }
@@ -124,6 +184,14 @@ impl<'a> TranslatedBlock<'a> {
         self.lowered_store_sites
     }
 
+    pub(crate) fn chain_entry_offset(&self) -> u32 {
+        self.chain_entry_offset
+    }
+
+    pub(crate) fn static_links(&self) -> &[DbtStaticLink] {
+        &self.static_links[..self.static_link_count as usize]
+    }
+
     pub(crate) fn code(&self) -> &[u8] {
         self.code
     }
@@ -131,7 +199,7 @@ impl<'a> TranslatedBlock<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DbtBlockInput, DbtBlockMode, TranslatedBlock};
+    use super::{DbtBlockInput, DbtBlockMode, DbtLinkKind, DbtStaticLink, TranslatedBlock};
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
 
     fn slot() -> Rv32ResolvedInstruction {
@@ -170,7 +238,7 @@ mod tests {
         let input =
             DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
         let code = [0xc3];
-        let block = TranslatedBlock::new(&input, &code, 3, 2).unwrap();
+        let block = TranslatedBlock::new(&input, &code, 3, 2, 0, &[]).unwrap();
 
         assert_eq!(block.start_pc(), 0x1000);
         assert_eq!(block.instruction_count(), 2);
@@ -178,5 +246,23 @@ mod tests {
         assert_eq!(block.lowered_load_sites(), 3);
         assert_eq!(block.lowered_store_sites(), 2);
         assert_eq!(block.code(), &[0xc3]);
+        assert_eq!(block.chain_entry_offset(), 0);
+        assert!(block.static_links().is_empty());
+    }
+
+    #[test]
+    fn translated_block_rejects_invalid_chain_metadata() {
+        let slots = [slot(), slot()];
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Fast).unwrap();
+        let code = [0xe9, 0, 0, 0, 0, 0xc3];
+        let invalid = DbtStaticLink {
+            target_pc: 0x1008,
+            displacement_offset: 3,
+            reset_target_offset: 6,
+            kind: DbtLinkKind::Fallthrough,
+        };
+
+        assert!(TranslatedBlock::new(&input, &code, 0, 0, 6, &[]).is_err());
+        assert!(TranslatedBlock::new(&input, &code, 0, 0, 0, &[invalid]).is_err());
     }
 }
