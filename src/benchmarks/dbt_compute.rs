@@ -30,7 +30,8 @@ use crate::rv32im::{
 };
 use std::time::Instant;
 
-const EXECUTABLE_BYTES: usize = 64 * 1024;
+const DIRECT_EXECUTABLE_BYTES: usize = 8 * 1024;
+const CACHED_EXECUTABLE_BYTES: usize = 64 * 1024;
 const CACHE_SETS: usize = 64;
 const MAX_BLOCK_INSTRUCTIONS: usize = 64;
 
@@ -74,9 +75,13 @@ impl PreparedDirectDbtCompute32 {
             words: image.words,
             result_register: image.result_register,
             memory,
-            scratch: ExecutableScratch::new(EXECUTABLE_BYTES).map_err(|error| error.to_string())?,
-            workspace: DbtTranslationWorkspace::new(EXECUTABLE_BYTES, MAX_BLOCK_INSTRUCTIONS)
+            scratch: ExecutableScratch::new(DIRECT_EXECUTABLE_BYTES)
                 .map_err(|error| error.to_string())?,
+            workspace: DbtTranslationWorkspace::new(
+                DIRECT_EXECUTABLE_BYTES,
+                MAX_BLOCK_INSTRUCTIONS,
+            )
+            .map_err(|error| error.to_string())?,
             decoded: Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS),
         })
     }
@@ -268,10 +273,13 @@ impl PreparedCachedDbtCompute32 {
             words: image.words,
             result_register: image.result_register,
             memory,
-            cache: DirectDbtCodeCache::new(CACHE_SETS, EXECUTABLE_BYTES)
+            cache: DirectDbtCodeCache::new(CACHE_SETS, CACHED_EXECUTABLE_BYTES)
                 .map_err(|error| error.to_string())?,
-            workspace: DbtTranslationWorkspace::new(EXECUTABLE_BYTES, MAX_BLOCK_INSTRUCTIONS)
-                .map_err(|error| error.to_string())?,
+            workspace: DbtTranslationWorkspace::new(
+                CACHED_EXECUTABLE_BYTES,
+                MAX_BLOCK_INSTRUCTIONS,
+            )
+            .map_err(|error| error.to_string())?,
             decoded: Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS),
         })
     }
@@ -454,7 +462,7 @@ mod tests {
             assert!(observation.dispatches >= 3);
             assert!(observation.attempted_instructions > u64::from(iterations));
             assert!(observation.translated_bytes > 0);
-            assert_eq!(observation.reserved_bytes, 128 * 1024);
+            assert_eq!(observation.reserved_bytes, 16 * 1024);
         }
     }
 
