@@ -173,7 +173,7 @@ const COMMON_CANDIDATES: [Candidate; 6] = [
     },
 ];
 
-const CACHE_SWEEP: [Candidate; 6] = [
+const DBT_MATRIX: [Candidate; 11] = [
     cached_dbt_candidate(
         "rv32-cached-dbt-16k",
         "cached-dbt-16k",
@@ -210,19 +210,10 @@ const CACHE_SWEEP: [Candidate; 6] = [
         PRODUCT_DBT_CACHE_SETS,
         512 * 1024,
     ),
-];
-
-const SETS_SWEEP: [Candidate; 6] = [
     cached_dbt_candidate(
         "rv32-cached-dbt-16-sets",
         "cached-dbt-16-sets",
         16,
-        128 * 1024,
-    ),
-    cached_dbt_candidate(
-        "rv32-cached-dbt-32-sets",
-        "cached-dbt-32-sets",
-        32,
         128 * 1024,
     ),
     cached_dbt_candidate(
@@ -302,8 +293,8 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.len() != 3 {
-        return Err("usage: rv32_c_comparison BUILD_DIR WARM_SAMPLES cache|sets".to_string());
+    if arguments.len() != 2 {
+        return Err("usage: rv32_c_comparison BUILD_DIR WARM_SAMPLES".to_string());
     }
     let build_dir = PathBuf::from(&arguments[0]);
     let samples = arguments[1]
@@ -316,14 +307,9 @@ fn run() -> Result<(), String> {
             "warm sample count must be at least {MINIMUM_SAMPLES}"
         ));
     }
-    let (sweep_name, sweep) = match arguments[2].to_str() {
-        Some("cache") => ("cache", &CACHE_SWEEP[..]),
-        Some("sets") => ("sets", &SETS_SWEEP[..]),
-        _ => return Err("DBT sweep must be cache or sets".to_string()),
-    };
     let candidates = COMMON_CANDIDATES
         .iter()
-        .chain(sweep)
+        .chain(&DBT_MATRIX)
         .copied()
         .collect::<Vec<_>>();
 
@@ -422,7 +408,7 @@ fn run() -> Result<(), String> {
     println!("iterations\t{ITERATIONS}");
     println!("seed\t0x{SEED:08x}");
     println!("warm_samples\t{samples}");
-    println!("dbt_sweep\t{sweep_name}");
+    println!("dbt_matrix\tcache+sets");
     println!("qemu_startup_samples\t{STARTUP_SAMPLES}");
     println!("qemu_startup_median_ns\t{startup_median}");
     println!("qemu_target_ns\t{qemu_target}");
