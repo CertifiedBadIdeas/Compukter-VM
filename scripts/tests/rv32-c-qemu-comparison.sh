@@ -5,20 +5,6 @@ ROOT="$(git rev-parse --show-toplevel)"
 BUILD_DIR="${RV32_C_COMPARISON_BUILD_DIR:-$ROOT/target/rv32-c-comparison}"
 : "${RV32_C_QEMU:=qemu-system-riscv32}"
 : "${RV32_C_OBJDUMP:=llvm-objdump}"
-: "${RV32_C_DBT_SWEEP:=cache}"
-
-case "$RV32_C_DBT_SWEEP" in
-    cache)
-        dbt_candidate_pattern='rv32-cached-dbt-(16|32|64|128|256|512)k'
-        ;;
-    sets)
-        dbt_candidate_pattern='rv32-cached-dbt-(16|32|64|128|256|512)-sets'
-        ;;
-    *)
-        echo "RV32_C_DBT_SWEEP must be cache or sets" >&2
-        exit 2
-        ;;
-esac
 
 for tool in "$RV32_C_QEMU" "$RV32_C_OBJDUMP" cargo awk grep tee; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -50,12 +36,12 @@ RV32_C_PRODUCT_ELF="$BUILD_DIR/product.elf" \
     --locked --offline -- --ignored --exact
 
 cargo run --manifest-path "$ROOT/Cargo.toml" --release \
-    --example rv32_c_comparison --locked --offline -- "$BUILD_DIR" 21 "$RV32_C_DBT_SWEEP" \
+    --example rv32_c_comparison --locked --offline -- "$BUILD_DIR" 21 \
     | tee "$BUILD_DIR/report.tsv"
 
-awk -F '\t' -v dbt_pattern="$dbt_candidate_pattern" '
-    $1 ~ "^(native-clang|qemu-rv32-tcg|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|" dbt_pattern ")$" && $6 == "ee053d58" { count++ }
-    END { exit count == 12 ? 0 : 1 }
+awk -F '\t' '
+    $1 ~ /^(native-clang|qemu-rv32-tcg|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|rv32-cached-dbt-(16|32|64|128|256|512)k|rv32-cached-dbt-(16|64|128|256|512)-sets)$/ && $6 == "ee053d58" { count++ }
+    END { exit count == 17 ? 0 : 1 }
 ' "$BUILD_DIR/report.tsv"
 
 startup_ns="$(awk -F '\t' '$1 == "qemu_startup_median_ns" { print $2 }' "$BUILD_DIR/report.tsv")"
@@ -81,15 +67,20 @@ direct_dbt_batch="$(awk -F '\t' '$1 == "rv32-direct-dbt" { print $5 }' "$BUILD_D
     >"$BUILD_DIR/product-block-cached-calibrated-disassembly.txt"
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/product-batch-$direct_dbt_batch.elf" \
     >"$BUILD_DIR/product-direct-dbt-calibrated-disassembly.txt"
-for value in 16 32 64 128 256 512; do
-    if [[ "$RV32_C_DBT_SWEEP" == cache ]]; then
-        candidate="rv32-cached-dbt-${value}k"
-    else
-        candidate="rv32-cached-dbt-${value}-sets"
-    fi
+write_dbt_disassembly() {
+    candidate="$1"
     cached_dbt_batch="$(awk -F '\t' -v candidate="$candidate" '$1 == candidate { print $5 }' "$BUILD_DIR/report.tsv")"
     "$RV32_C_OBJDUMP" -d "$BUILD_DIR/product-batch-$cached_dbt_batch.elf" \
         >"$BUILD_DIR/product-${candidate}-calibrated-disassembly.txt"
+}
+
+for cache_kib in 16 32 64 128 256 512; do
+    candidate="rv32-cached-dbt-${cache_kib}k"
+    write_dbt_disassembly "$candidate"
+done
+for sets in 16 64 128 256 512; do
+    candidate="rv32-cached-dbt-${sets}-sets"
+    write_dbt_disassembly "$candidate"
 done
 
 echo "Focused RV32 C/QEMU comparison passed; artifacts: $BUILD_DIR"
