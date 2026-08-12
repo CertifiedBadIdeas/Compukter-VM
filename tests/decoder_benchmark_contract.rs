@@ -82,6 +82,7 @@ fn direct_dbt_uses_the_common_compute32_contract() {
     observation.validate_checksum().unwrap();
     assert_eq!(observation.candidate, BenchmarkCandidate::Rv32DirectDbt);
     assert_eq!(observation.workload, BenchmarkWorkload::Compute32);
+    assert_eq!(observation.executable_reserved_bytes, 16 * 1024);
 
     assert!(PreparedBenchmark::new(
         BenchmarkCandidate::Rv32DirectDbt,
