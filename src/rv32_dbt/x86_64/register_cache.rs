@@ -81,6 +81,10 @@ impl RegisterCache {
         }
     }
 
+    pub(crate) const fn is_chainable(&self) -> bool {
+        self.host_pool.len() == CHAINABLE_HOST_POOL.len()
+    }
+
     pub(crate) fn read(
         &mut self,
         guest: usize,
@@ -165,8 +169,7 @@ impl RegisterCache {
         {
             return Ok(index);
         }
-        let index = self
-            .entries[..self.host_pool.len()]
+        let index = self.entries[..self.host_pool.len()]
             .iter()
             .enumerate()
             .filter_map(|(index, resident)| {

@@ -190,6 +190,7 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
         "dbt_typed_slow_exits\\tdbt_metadata_evictions\\tdbt_overlap_invalidations\\tdbt_lowered_load_sites\\tdbt_lowered_store_sites"
     ));
     assert!(source.contains("steady_allocations\\tsteady_allocated_bytes"));
+    assert!(source.contains("dbt_budget_overshoot\\tdbt_max_budget_overshoot"));
     assert!(source.contains("artifact_stem: Some(\"block-cached\")"));
     assert!(source.contains("artifact_stem: Some(\"direct-dbt\")"));
     assert!(source.contains("cached-dbt-64k"));

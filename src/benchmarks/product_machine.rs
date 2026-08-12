@@ -44,7 +44,7 @@ pub const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = DEFAULT_DBT_MAX_INSTRUCTIONS;
 pub const PRODUCT_DBT_CODE_BYTES: usize = DEFAULT_DBT_CODE_BYTES;
 pub const PRODUCT_DEBUG_LIMIT: usize = 0;
 pub const PRODUCT_RESIDENT_REPORT_HEADER: &str = "backend\tpopulation\tconstruction_median_ns\tconstruction_p95_ns\tresident_live_bytes\tpeak_construction_bytes\tlive_bytes_per_machine\taggregate_ram_bytes\telf_bytes\texecutable_bytes\trw_initialized_bytes\tram_bytes\tdebug_limit\tcache_sets\tblock_cache_sets\tblock_max_instructions\tdbt_cache_sets\tdbt_max_instructions\tdbt_code_bytes";
-pub const PRODUCT_ACTIVE_REPORT_HEADER: &str = "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native";
+pub const PRODUCT_ACTIVE_REPORT_HEADER: &str = "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native\tdbt_budget_overshoot\tdbt_max_budget_overshoot";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductExecutionCandidate {
@@ -180,6 +180,8 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
         ram,
         executable,
         translation,
+        dbt_budget_overshoot,
+        dbt_max_budget_overshoot,
     ) = match row.machine.as_ref() {
         Some(machine) => {
             let stats = machine.translation_stats;
@@ -199,6 +201,8 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
                 machine.ram_bytes.to_string(),
                 machine.executable_bytes.to_string(),
                 machine.translation_bytes.to_string(),
+                dbt.map_or_else(unavailable, |value| value.budget_overshoot.to_string()),
+                dbt.map_or_else(unavailable, |value| value.max_budget_overshoot.to_string()),
             )
         }
         None => (
@@ -216,10 +220,12 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
             unavailable(),
             unavailable(),
             unavailable(),
+            unavailable(),
+            unavailable(),
         ),
     };
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
+        "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}",
         row.workload.name(),
         row.candidate.name(),
         row.iterations,
@@ -246,6 +252,8 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
         row.steady_allocations,
         row.steady_allocated_bytes,
         row.vs_native,
+        dbt_budget_overshoot,
+        dbt_max_budget_overshoot,
     )
 }
 

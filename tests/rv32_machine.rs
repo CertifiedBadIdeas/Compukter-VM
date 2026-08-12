@@ -103,6 +103,44 @@ fn cached_dbt_initializes_one_context_per_run_call() {
 }
 
 #[test]
+fn cached_dbt_finishes_one_block_past_budget_without_debt() {
+    let mut words = vec![addi(1, 1, 1); 11];
+    words.push(jal(0, -(11 * 4)));
+    let elf = machine_program_elf(&words);
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 32,
+                max_instructions: 16,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+            },
+            0,
+        ),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        machine.run(5).unwrap(),
+        Rv32MachineOutcome::BudgetExhausted {
+            retired_delta: 12,
+            retired_total: 12,
+        }
+    ));
+    assert!(matches!(
+        machine.run(5).unwrap(),
+        Rv32MachineOutcome::BudgetExhausted {
+            retired_delta: 12,
+            retired_total: 24,
+        }
+    ));
+    let stats = machine.dbt_stats().unwrap();
+    assert_eq!(stats.budget_overshoot, 14);
+    assert_eq!(stats.max_budget_overshoot, 7);
+}
+
+#[test]
 fn all_backends_run_from_elf_entry_under_budget_and_halt_through_mmio() {
     let elf = halting_machine_elf(b'R');
 
@@ -122,18 +160,23 @@ fn all_backends_run_from_elf_entry_under_budget_and_halt_through_mmio() {
                 retired_total: 0,
             }
         );
+        let first_retired = if matches!(execution, Rv32ExecutionBackendConfig::CachedDbt { .. }) {
+            4
+        } else {
+            3
+        };
         assert_eq!(
             machine.run(3).unwrap(),
             Rv32MachineOutcome::BudgetExhausted {
-                retired_delta: 3,
-                retired_total: 3,
+                retired_delta: first_retired,
+                retired_total: first_retired,
             }
         );
         assert_eq!(
             machine.run(64).unwrap(),
             Rv32MachineOutcome::Halted {
                 exit_code: 0,
-                retired_delta: 4,
+                retired_delta: 7 - first_retired,
                 retired_total: 7,
             }
         );
@@ -144,7 +187,7 @@ fn all_backends_run_from_elf_entry_under_budget_and_halt_through_mmio() {
 }
 
 #[test]
-fn all_backends_match_cached_for_every_partial_budget_prefix() {
+fn precise_backends_match_cached_for_every_partial_budget_prefix() {
     let elf = halting_machine_elf(b'P');
     for budget in 0..=8 {
         let mut reference = Rv32Machine::from_elf(
@@ -159,6 +202,9 @@ fn all_backends_match_cached_for_every_partial_budget_prefix() {
         let expected_status = reference.control_status();
 
         for execution in configs() {
+            if matches!(execution, Rv32ExecutionBackendConfig::CachedDbt { .. }) {
+                continue;
+            }
             let mut machine = Rv32Machine::from_elf(&elf, config(execution, 16)).unwrap();
             assert_eq!(
                 machine.run(budget).unwrap(),

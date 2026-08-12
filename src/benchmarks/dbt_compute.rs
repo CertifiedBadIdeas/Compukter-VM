@@ -141,7 +141,6 @@ impl PreparedDirectDbtCompute32 {
                 remaining_budget: u32::MAX,
                 reservation_valid: 0,
                 reservation_address: 0,
-                chain_attempted: 0,
                 chain_transitions: 0,
                 exit: DbtExitRecord::default(),
             };
@@ -325,11 +324,8 @@ impl PreparedCachedDbtCompute32 {
                 .map_err(|error| error.to_string())?;
 
                 let translation_started = Instant::now();
-                let input = DbtBlockInput::new(
-                    cpu.pc(),
-                    &self.decoded,
-                    DbtBlockMode::ChainableThroughput,
-                )?;
+                let input =
+                    DbtBlockInput::new(cpu.pc(), &self.decoded, DbtBlockMode::ChainableThroughput)?;
                 let compiled = self
                     .workspace
                     .lower(&input)
@@ -357,7 +353,6 @@ impl PreparedCachedDbtCompute32 {
                 remaining_budget: u32::MAX,
                 reservation_valid: 0,
                 reservation_address: 0,
-                chain_attempted: 0,
                 chain_transitions: 0,
                 exit: DbtExitRecord::default(),
             };

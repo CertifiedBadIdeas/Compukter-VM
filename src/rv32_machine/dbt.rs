@@ -82,6 +82,8 @@ pub(crate) struct Rv32DbtExecution {
     native_dispatches: u64,
     typed_slow_exits: u64,
     chain_transitions: u64,
+    budget_overshoot: u64,
+    max_budget_overshoot: u32,
     lowered_load_sites: u64,
     lowered_store_sites: u64,
     emitted_bytes: u64,
@@ -144,6 +146,8 @@ impl Rv32DbtExecution {
             native_dispatches: 0,
             typed_slow_exits: 0,
             chain_transitions: 0,
+            budget_overshoot: 0,
+            max_budget_overshoot: 0,
             lowered_load_sites: 0,
             lowered_store_sites: 0,
             emitted_bytes: 0,
@@ -191,8 +195,10 @@ impl Rv32DbtExecution {
         pc: u32,
         mode: DbtBlockMode,
     ) -> Result<PreparedDbtBlock, DbtFault> {
-        if matches!(mode, DbtBlockMode::DirectFast | DbtBlockMode::ChainableThroughput)
-            && mode != self.fast_mode()
+        if matches!(
+            mode,
+            DbtBlockMode::DirectFast | DbtBlockMode::ChainableThroughput
+        ) && mode != self.fast_mode()
         {
             return Err(Self::fault(
                 DbtFaultKind::Translation,
@@ -233,12 +239,14 @@ impl Rv32DbtExecution {
                     serial: *scratch_serial,
                 }
             }
-            (Rv32DbtStorage::Cached { cache, .. }, DbtBlockMode::ChainableThroughput) => PreparedLocation::Cache(
-                cache.publish(DbtCacheKey::new(pc, self.generation), &block)?,
-            ),
-            (Rv32DbtStorage::Cached { .. }, DbtBlockMode::DirectFast) => unreachable!(
-                "DBT fast mode was validated before lowering"
-            ),
+            (Rv32DbtStorage::Cached { cache, .. }, DbtBlockMode::ChainableThroughput) => {
+                PreparedLocation::Cache(
+                    cache.publish(DbtCacheKey::new(pc, self.generation), &block)?,
+                )
+            }
+            (Rv32DbtStorage::Cached { .. }, DbtBlockMode::DirectFast) => {
+                unreachable!("DBT fast mode was validated before lowering")
+            }
         };
 
         self.translations = self.translations.saturating_add(1);
@@ -309,6 +317,11 @@ impl Rv32DbtExecution {
         self.context_initializations = self.context_initializations.saturating_add(1);
     }
 
+    pub(crate) fn record_budget_overshoot(&mut self, overshoot: u32) {
+        self.budget_overshoot = self.budget_overshoot.saturating_add(u64::from(overshoot));
+        self.max_budget_overshoot = self.max_budget_overshoot.max(overshoot);
+    }
+
     pub(crate) fn invalidate_all(&mut self) {
         self.generation = self.generation.saturating_add(1);
         if let Rv32DbtStorage::Cached { cache, .. } = &mut self.storage {
@@ -360,6 +373,8 @@ impl Rv32DbtExecution {
             native_dispatches: self.native_dispatches,
             typed_slow_exits: self.typed_slow_exits,
             chain_transitions: self.chain_transitions,
+            budget_overshoot: self.budget_overshoot,
+            max_budget_overshoot: self.max_budget_overshoot,
             links_established: cache_stats.links_established,
             links_reset: cache_stats.links_reset,
             lowered_load_sites: self.lowered_load_sites,
@@ -437,10 +452,17 @@ mod tests {
             4096,
         )
         .unwrap();
-        assert!(cached.lookup(0x1000, DbtBlockMode::ChainableThroughput).is_none());
+        assert!(cached
+            .lookup(0x1000, DbtBlockMode::ChainableThroughput)
+            .is_none());
         fill_one(&mut cached);
-        let published = cached.translate(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
-        assert_eq!(cached.lookup(0x1000, DbtBlockMode::ChainableThroughput), Some(published));
+        let published = cached
+            .translate(0x1000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+        assert_eq!(
+            cached.lookup(0x1000, DbtBlockMode::ChainableThroughput),
+            Some(published)
+        );
         assert_eq!(cached.stats().translations, 1);
         assert_eq!(cached.stats().publications, 1);
         assert_eq!(cached.stats().hits, 1);
@@ -482,7 +504,9 @@ mod tests {
             .translate(0x1000, DbtBlockMode::Bounded { max_attempts: 1 })
             .unwrap();
 
-        assert!(cached.lookup(0x1000, DbtBlockMode::ChainableThroughput).is_none());
+        assert!(cached
+            .lookup(0x1000, DbtBlockMode::ChainableThroughput)
+            .is_none());
         assert_eq!(cached.stats().translations, 1);
         assert_eq!(cached.stats().publications, 1);
         assert_eq!(cached.stats().misses, 1);
@@ -500,8 +524,12 @@ mod tests {
         )
         .unwrap();
         fill_memory_pair(&mut cached);
-        let published = cached.translate(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
-        let hit = cached.lookup(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
+        let published = cached
+            .translate(0x1000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+        let hit = cached
+            .lookup(0x1000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
 
         assert_eq!(published.instruction_count(), 2);
         assert_eq!(hit.instruction_count(), 2);
@@ -528,7 +556,6 @@ mod tests {
             remaining_budget: 1,
             reservation_valid: 0,
             reservation_address: 0,
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
@@ -555,7 +582,6 @@ mod tests {
             remaining_budget: 1,
             reservation_valid: 0,
             reservation_address: 0,
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
@@ -580,12 +606,18 @@ mod tests {
         )
         .unwrap();
         fill_word(&mut cached, addi(1, 1, 1));
-        cached.translate(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
+        cached
+            .translate(0x1000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
         fill_word(&mut cached, addi(2, 2, 1));
-        cached.translate(0x1004, DbtBlockMode::ChainableThroughput).unwrap();
+        cached
+            .translate(0x1004, DbtBlockMode::ChainableThroughput)
+            .unwrap();
 
         for (budget, expected_pc, expected_x2) in [(1, 0x1004, 0), (2, 0x1008, 1)] {
-            let prepared = cached.lookup(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
+            let prepared = cached
+                .lookup(0x1000, DbtBlockMode::ChainableThroughput)
+                .unwrap();
             let mut cpu = Rv32imCpu::new(0x1000);
             let mut context = DbtContext {
                 state: cpu.architectural_state_mut(),
@@ -596,7 +628,6 @@ mod tests {
                 remaining_budget: budget,
                 reservation_valid: 0,
                 reservation_address: 0,
-                chain_attempted: 0,
                 chain_transitions: 0,
                 exit: DbtExitRecord::default(),
             };
@@ -605,7 +636,6 @@ mod tests {
 
             assert_eq!(tag, DbtExitTag::Completed);
             assert_eq!(context.exit.attempted, budget);
-            assert_eq!(context.chain_attempted, budget);
             assert_eq!(context.chain_transitions, 1);
             assert_eq!(cpu.pc(), expected_pc);
             assert_eq!(cpu.register(1), 1);
@@ -625,10 +655,16 @@ mod tests {
         )
         .unwrap();
         fill_word(&mut cached, addi(1, 1, 4));
-        cached.translate(0x2000, DbtBlockMode::ChainableThroughput).unwrap();
+        cached
+            .translate(0x2000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
         fill_word(&mut cached, lw(2, 1, 0));
-        cached.translate(0x2004, DbtBlockMode::ChainableThroughput).unwrap();
-        let prepared = cached.lookup(0x2000, DbtBlockMode::ChainableThroughput).unwrap();
+        cached
+            .translate(0x2004, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+        let prepared = cached
+            .lookup(0x2000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
         let mut cpu = Rv32imCpu::new(0x2000);
         let mut context = DbtContext {
             state: cpu.architectural_state_mut(),
@@ -639,7 +675,6 @@ mod tests {
             remaining_budget: 2,
             reservation_valid: 1,
             reservation_address: 0x80,
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
@@ -651,7 +686,6 @@ mod tests {
         assert_eq!(context.exit.instruction_pc, 0x2004);
         assert_eq!(context.exit.address, 4);
         assert_eq!(context.exit.access_size, 4);
-        assert_eq!(context.chain_attempted, 1);
         assert_eq!(context.chain_transitions, 1);
         assert_eq!(context.reservation_valid, 1);
         assert_eq!(context.reservation_address, 0x80);
@@ -661,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_chain_stops_before_a_partially_fitting_target_block() {
+    fn lazy_chain_finishes_one_partially_fitting_target_block() {
         let mut cached = Rv32DbtExecution::new(
             Rv32DbtPolicy::Cached {
                 sets: 8,
@@ -672,7 +706,9 @@ mod tests {
         )
         .unwrap();
         fill_word(&mut cached, addi(1, 1, 1));
-        cached.translate(0x3000, DbtBlockMode::ChainableThroughput).unwrap();
+        cached
+            .translate(0x3000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
         let slots = cached.decoded_slots_mut();
         for word in [addi(2, 2, 1), addi(3, 3, 1)] {
             slots.push(Rv32ResolvedInstruction::Valid {
@@ -680,8 +716,12 @@ mod tests {
                 instruction: decode_product_word(word).unwrap(),
             });
         }
-        cached.translate(0x3004, DbtBlockMode::ChainableThroughput).unwrap();
-        let prepared = cached.lookup(0x3000, DbtBlockMode::ChainableThroughput).unwrap();
+        cached
+            .translate(0x3004, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+        let prepared = cached
+            .lookup(0x3000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
         let mut cpu = Rv32imCpu::new(0x3000);
         let mut context = DbtContext {
             state: cpu.architectural_state_mut(),
@@ -692,7 +732,6 @@ mod tests {
             remaining_budget: 2,
             reservation_valid: 0,
             reservation_address: 0,
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
@@ -700,14 +739,65 @@ mod tests {
         let tag = unsafe { cached.execute(prepared, &mut context) }.unwrap();
 
         assert_eq!(tag, DbtExitTag::Completed);
-        assert_eq!(context.exit.attempted, 1);
-        assert_eq!(context.chain_attempted, 1);
-        assert_eq!(context.remaining_budget, 1);
+        assert_eq!(context.exit.attempted, 3);
+        assert_eq!(context.remaining_budget, 2);
         assert_eq!(context.chain_transitions, 1);
-        assert_eq!(cpu.pc(), 0x3004);
+        assert_eq!(cpu.pc(), 0x300c);
         assert_eq!(cpu.register(1), 1);
+        assert_eq!(cpu.register(2), 1);
+        assert_eq!(cpu.register(3), 1);
+    }
+
+    #[test]
+    fn chainable_block_may_overshoot_and_materializes_attempted_once() {
+        let mut cached = Rv32DbtExecution::new(
+            Rv32DbtPolicy::Cached {
+                sets: 8,
+                cache_bytes: 4096,
+            },
+            16,
+            4096,
+        )
+        .unwrap();
+        let slots = cached.decoded_slots_mut();
+        for _ in 0..12 {
+            let word = addi(1, 1, 1);
+            slots.push(Rv32ResolvedInstruction::Valid {
+                word,
+                instruction: decode_product_word(word).unwrap(),
+            });
+        }
+        cached
+            .translate(0x4000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+        fill_word(&mut cached, addi(2, 2, 1));
+        cached
+            .translate(0x4030, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+        let prepared = cached
+            .lookup(0x4000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+        let mut cpu = Rv32imCpu::new(0x4000);
+        let mut context = DbtContext {
+            state: cpu.architectural_state_mut(),
+            ram_base: std::ptr::null_mut(),
+            ram_len: 0,
+            page_permissions: std::ptr::null(),
+            page_count: 0,
+            remaining_budget: 5,
+            reservation_valid: 0,
+            reservation_address: 0,
+            chain_transitions: 0,
+            exit: DbtExitRecord::default(),
+        };
+
+        let tag = unsafe { cached.execute(prepared, &mut context) }.unwrap();
+
+        assert_eq!(tag, DbtExitTag::Completed);
+        assert_eq!(context.exit.attempted, 12);
+        assert_eq!(cpu.pc(), 0x4030);
+        assert_eq!(cpu.register(1), 12);
         assert_eq!(cpu.register(2), 0);
-        assert_eq!(cpu.register(3), 0);
     }
 
     #[test]

@@ -228,7 +228,7 @@ fn resident_report_header_remains_stable() {
     );
     assert_eq!(
         PRODUCT_ACTIVE_REPORT_HEADER,
-        "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native"
+        "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native\tdbt_budget_overshoot\tdbt_max_budget_overshoot"
     );
 }
 

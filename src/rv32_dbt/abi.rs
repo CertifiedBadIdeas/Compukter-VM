@@ -24,7 +24,7 @@
 
 use crate::rv32im::Rv32ArchitecturalState;
 
-pub(crate) const DBT_ABI_VERSION: u32 = 2;
+pub(crate) const DBT_ABI_VERSION: u32 = 3;
 pub(crate) type DbtEntry = unsafe extern "C" fn(*mut DbtContext) -> u32;
 
 #[repr(u32)]
@@ -80,7 +80,6 @@ pub(crate) struct DbtContext {
     pub(crate) remaining_budget: u32,
     pub(crate) reservation_valid: u32,
     pub(crate) reservation_address: u32,
-    pub(crate) chain_attempted: u32,
     pub(crate) chain_transitions: u32,
     pub(crate) exit: DbtExitRecord,
 }
@@ -97,7 +96,6 @@ impl DbtContext {
         std::mem::offset_of!(Self, reservation_valid);
     pub(crate) const RESERVATION_ADDRESS_OFFSET: usize =
         std::mem::offset_of!(Self, reservation_address);
-    pub(crate) const CHAIN_ATTEMPTED_OFFSET: usize = std::mem::offset_of!(Self, chain_attempted);
     pub(crate) const CHAIN_TRANSITIONS_OFFSET: usize =
         std::mem::offset_of!(Self, chain_transitions);
     pub(crate) const EXIT_OFFSET: usize = std::mem::offset_of!(Self, exit);
@@ -109,7 +107,7 @@ mod tests {
 
     #[test]
     fn context_offsets_match_repr_c_layout() {
-        assert_eq!(DbtContext::ABI_VERSION, 2);
+        assert_eq!(DbtContext::ABI_VERSION, 3);
         assert_eq!(
             crate::rv32im::Rv32ArchitecturalState::ABI_VERSION,
             DbtContext::ABI_VERSION
@@ -125,10 +123,6 @@ mod tests {
         assert_eq!(
             DbtContext::EXIT_OFFSET,
             std::mem::offset_of!(DbtContext, exit)
-        );
-        assert_eq!(
-            DbtContext::CHAIN_ATTEMPTED_OFFSET,
-            std::mem::offset_of!(DbtContext, chain_attempted)
         );
         assert_eq!(
             DbtContext::CHAIN_TRANSITIONS_OFFSET,
