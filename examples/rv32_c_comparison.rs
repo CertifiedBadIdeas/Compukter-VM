@@ -82,7 +82,11 @@ enum CandidateKind {
     Predecoded,
     BlockCached,
     DirectDbt,
-    CachedDbt { sets: usize, cache_bytes: usize },
+    CachedDbt {
+        sets: usize,
+        cache_bytes: usize,
+        max_instructions: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -109,14 +113,16 @@ impl Candidate {
                 max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
                 scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
             }),
-            CandidateKind::CachedDbt { sets, cache_bytes } => {
-                Some(Rv32ExecutionBackendConfig::CachedDbt {
-                    sets,
-                    max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
-                    scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
-                    cache_bytes,
-                })
-            }
+            CandidateKind::CachedDbt {
+                sets,
+                cache_bytes,
+                max_instructions,
+            } => Some(Rv32ExecutionBackendConfig::CachedDbt {
+                sets,
+                max_instructions,
+                scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
+                cache_bytes,
+            }),
         }
     }
 }
@@ -127,11 +133,31 @@ const fn cached_dbt_candidate(
     sets: usize,
     cache_bytes: usize,
 ) -> Candidate {
+    cached_dbt_candidate_with_block_size(
+        name,
+        artifact_stem,
+        sets,
+        cache_bytes,
+        PRODUCT_DBT_MAX_INSTRUCTIONS,
+    )
+}
+
+const fn cached_dbt_candidate_with_block_size(
+    name: &'static str,
+    artifact_stem: &'static str,
+    sets: usize,
+    cache_bytes: usize,
+    max_instructions: usize,
+) -> Candidate {
     Candidate {
         name,
         mode: "product-machine-cached-dbt",
         artifact_stem: Some(artifact_stem),
-        kind: CandidateKind::CachedDbt { sets, cache_bytes },
+        kind: CandidateKind::CachedDbt {
+            sets,
+            cache_bytes,
+            max_instructions,
+        },
     }
 }
 
@@ -180,7 +206,7 @@ const COMMON_CANDIDATES: [Candidate; 7] = [
     },
 ];
 
-const DBT_MATRIX: [Candidate; 11] = [
+const DBT_MATRIX: [Candidate; 14] = [
     cached_dbt_candidate(
         "rv32-cached-dbt-16k",
         "cached-dbt-16k",
@@ -246,6 +272,27 @@ const DBT_MATRIX: [Candidate; 11] = [
         "cached-dbt-512-sets",
         512,
         128 * 1024,
+    ),
+    cached_dbt_candidate_with_block_size(
+        "rv32-cached-dbt-block-16",
+        "cached-dbt-block-16",
+        512,
+        128 * 1024,
+        16,
+    ),
+    cached_dbt_candidate_with_block_size(
+        "rv32-cached-dbt-block-32",
+        "cached-dbt-block-32",
+        512,
+        128 * 1024,
+        32,
+    ),
+    cached_dbt_candidate_with_block_size(
+        "rv32-cached-dbt-block-64",
+        "cached-dbt-block-64",
+        512,
+        128 * 1024,
+        64,
     ),
 ];
 

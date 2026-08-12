@@ -50,8 +50,8 @@ cargo run --manifest-path "$ROOT/Cargo.toml" --release \
     | tee "$BUILD_DIR/report.tsv"
 
 awk -F '\t' '
-    $1 ~ /^(native-clang|qemu-rv32-tcg|wasmtime-aot|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|rv32-cached-dbt-(16|32|64|128|256|512)k|rv32-cached-dbt-(16|64|128|256|512)-sets)$/ && $6 == "ee053d58" { count++ }
-    END { exit count == 18 ? 0 : 1 }
+    $1 ~ /^(native-clang|qemu-rv32-tcg|wasmtime-aot|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|rv32-cached-dbt-(16|32|64|128|256|512)k|rv32-cached-dbt-(16|64|128|256|512)-sets|rv32-cached-dbt-block-(16|32|64))$/ && $6 == "ee053d58" { count++ }
+    END { exit count == 21 ? 0 : 1 }
 ' "$BUILD_DIR/report.tsv"
 
 startup_ns="$(awk -F '\t' '$1 == "qemu_startup_median_ns" { print $2 }' "$BUILD_DIR/report.tsv")"
@@ -92,6 +92,10 @@ for cache_kib in 16 32 64 128 256 512; do
 done
 for sets in 16 64 128 256 512; do
     candidate="rv32-cached-dbt-${sets}-sets"
+    write_dbt_disassembly "$candidate"
+done
+for max_instructions in 16 32 64; do
+    candidate="rv32-cached-dbt-block-${max_instructions}"
     write_dbt_disassembly "$candidate"
 done
 
