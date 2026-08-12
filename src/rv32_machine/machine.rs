@@ -30,11 +30,6 @@ use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::DbtBlockMode;
 #[cfg(target_arch = "x86_64")]
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
-use crate::rv32_jit::abi::JitEntry;
-use crate::rv32_jit::arena::{CompiledBlockId, ExecutableCodeArena};
-use crate::rv32_jit::block::JitBlockInput;
-use crate::rv32_jit::cranelift::CraneliftBackend;
-use crate::rv32_jit::planner::{JitPlanner, JitPlannerConfig};
 #[cfg(target_arch = "x86_64")]
 use crate::rv32im::{decode_product_word, fill_decoded_block, DecodedInstruction, Load, Store};
 use crate::rv32im::{
@@ -64,14 +59,22 @@ pub enum Rv32ExecutionBackendConfig {
         scratch_bytes: usize,
         cache_bytes: usize,
     },
-    Jit {
-        sets: usize,
-        max_instructions: usize,
-        hotness_threshold: u32,
-        candidate_capacity: usize,
-        request_capacity: usize,
-        code_bytes: usize,
-    },
+}
+
+pub const DEFAULT_DBT_CACHE_SETS: usize = 256;
+pub const DEFAULT_DBT_MAX_INSTRUCTIONS: usize = 8;
+pub const DEFAULT_DBT_SCRATCH_BYTES: usize = 8 * 1024;
+pub const DEFAULT_DBT_CODE_BYTES: usize = 128 * 1024;
+
+impl Default for Rv32ExecutionBackendConfig {
+    fn default() -> Self {
+        Self::CachedDbt {
+            sets: DEFAULT_DBT_CACHE_SETS,
+            max_instructions: DEFAULT_DBT_MAX_INSTRUCTIONS,
+            scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+            cache_bytes: DEFAULT_DBT_CODE_BYTES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,14 +100,6 @@ pub struct Rv32TranslationStats {
     pub evictions: u64,
     pub blocks_built: u64,
     pub decoded_slots_built: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rv32JitStats {
-    pub prepared_blocks: u64,
-    pub dispatches: u64,
-    pub emitted_bytes: usize,
-    pub reserved_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,84 +161,10 @@ impl Rv32MachineExecutionError {
     }
 }
 
-struct Rv32CompiledJitBlock {
-    input: JitBlockInput,
-    id: CompiledBlockId,
-}
-
-struct Rv32JitExecution {
-    cache: BoundedDecodedBlockCache,
-    planner: JitPlanner,
-    backend: CraneliftBackend,
-    arena: ExecutableCodeArena,
-    compiled: Vec<Rv32CompiledJitBlock>,
-    prepared_blocks: u64,
-    dispatches: u64,
-}
-
-impl Rv32JitExecution {
-    fn new(
-        sets: usize,
-        max_instructions: usize,
-        planner: JitPlannerConfig,
-        code_bytes: usize,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            cache: BoundedDecodedBlockCache::new(sets, max_instructions)?,
-            planner: JitPlanner::new(planner)?,
-            backend: CraneliftBackend::new()?,
-            arena: ExecutableCodeArena::new(code_bytes).map_err(|error| error.to_string())?,
-            compiled: Vec::with_capacity(planner.candidate_capacity),
-            prepared_blocks: 0,
-            dispatches: 0,
-        })
-    }
-
-    fn prepare(&mut self, max_blocks: usize) -> Result<usize, String> {
-        let mut prepared = 0;
-        for input in self.planner.take_requests(max_blocks) {
-            let blob = self.backend.compile(&input)?;
-            let id = self.arena.stage(blob).map_err(|error| error.to_string())?;
-            self.arena.seal_batch().map_err(|error| error.to_string())?;
-            self.compiled.push(Rv32CompiledJitBlock { input, id });
-            self.prepared_blocks = self.prepared_blocks.saturating_add(1);
-            prepared += 1;
-        }
-        Ok(prepared)
-    }
-
-    fn entry(&mut self, pc: u32, remaining_budget: u64) -> Option<(JitEntry, u32)> {
-        let block = self
-            .compiled
-            .iter()
-            .find(|block| block.input.start_pc() == pc)?;
-        let instruction_count = block.input.slots().len() as u32;
-        if u64::from(instruction_count) > remaining_budget {
-            return None;
-        }
-        let address = self.arena.entry_address(block.id)?;
-        // SAFETY: the code arena publishes only Cranelift functions with the
-        // JitEntry ABI, and keeps their RX mappings alive for this call.
-        let entry = unsafe { std::mem::transmute::<*const u8, JitEntry>(address) };
-        self.dispatches = self.dispatches.saturating_add(1);
-        Some((entry, instruction_count))
-    }
-
-    fn stats(&self) -> Rv32JitStats {
-        Rv32JitStats {
-            prepared_blocks: self.prepared_blocks,
-            dispatches: self.dispatches,
-            emitted_bytes: self.arena.emitted_bytes(),
-            reserved_bytes: self.arena.reserved_bytes(),
-        }
-    }
-}
-
 enum Rv32ExecutionBackend {
     Cached(BoundedCachedRv32imProgram),
     Predecoded(PredecodedRv32imImage),
     BlockCached(BoundedDecodedBlockCache),
-    Jit(Rv32JitExecution),
     #[cfg(target_arch = "x86_64")]
     Dbt(Rv32DbtExecution),
 }
@@ -309,26 +230,6 @@ impl Rv32Machine {
                 BoundedDecodedBlockCache::new(sets, max_instructions)
                     .map_err(Rv32MachineBuildError::Backend)?,
             ),
-            Rv32ExecutionBackendConfig::Jit {
-                sets,
-                max_instructions,
-                hotness_threshold,
-                candidate_capacity,
-                request_capacity,
-                code_bytes,
-            } => Rv32ExecutionBackend::Jit(
-                Rv32JitExecution::new(
-                    sets,
-                    max_instructions,
-                    JitPlannerConfig {
-                        hotness_threshold,
-                        candidate_capacity,
-                        request_capacity,
-                    },
-                    code_bytes,
-                )
-                .map_err(Rv32MachineBuildError::Backend)?,
-            ),
             Rv32ExecutionBackendConfig::DirectDbt {
                 max_instructions,
                 scratch_bytes,
@@ -375,42 +276,12 @@ impl Rv32Machine {
     ) -> Result<Rv32MachineOutcome, Rv32MachineExecutionError> {
         match self.execution {
             Rv32ExecutionBackend::BlockCached(_) => self.run_block_cached(instruction_budget),
-            Rv32ExecutionBackend::Jit(_) => self.run_jit(instruction_budget),
             #[cfg(target_arch = "x86_64")]
             Rv32ExecutionBackend::Dbt(_) => self.run_dbt(instruction_budget),
             Rv32ExecutionBackend::Cached(_) | Rv32ExecutionBackend::Predecoded(_) => {
                 self.run_single_instruction(instruction_budget)
             }
         }
-    }
-
-    pub fn prepare_jit(&mut self, max_blocks: usize) -> Result<usize, Rv32MachineExecutionError> {
-        let pc = self.hart.pc();
-        let retired_total = self.hart.retired_instructions();
-        let Rv32ExecutionBackend::Jit(execution) = &mut self.execution else {
-            return Ok(0);
-        };
-        execution
-            .prepare(max_blocks)
-            .map_err(|message| Rv32MachineExecutionError {
-                pc,
-                retired_total,
-                message,
-            })
-    }
-
-    pub fn jit_stats(&self) -> Option<Rv32JitStats> {
-        match &self.execution {
-            Rv32ExecutionBackend::Jit(execution) => Some(execution.stats()),
-            _ => None,
-        }
-    }
-
-    fn jit_entry(&mut self, pc: u32, remaining_budget: u64) -> Option<(JitEntry, u32)> {
-        let Rv32ExecutionBackend::Jit(execution) = &mut self.execution else {
-            return None;
-        };
-        execution.entry(pc, remaining_budget)
     }
 
     fn run_single_instruction(
@@ -449,9 +320,6 @@ impl Rv32Machine {
                         .map_err(|message| self.execution_error(instruction_pc, message))?,
                     Rv32ExecutionBackend::BlockCached(_) => {
                         unreachable!("block backend uses the block execution loop")
-                    }
-                    Rv32ExecutionBackend::Jit(_) => {
-                        unreachable!("JIT backend uses the explicit JIT execution loop")
                     }
                     #[cfg(target_arch = "x86_64")]
                     Rv32ExecutionBackend::Dbt(_) => {
@@ -566,92 +434,6 @@ impl Rv32Machine {
                 self.control_device,
                 retired_before,
             ) {
-                return Ok(outcome);
-            }
-        }
-        Ok(Rv32MachineOutcome::BudgetExhausted {
-            retired_delta: self
-                .hart
-                .retired_instructions()
-                .saturating_sub(retired_before),
-            retired_total: self.hart.retired_instructions(),
-        })
-    }
-
-    fn run_jit(
-        &mut self,
-        instruction_budget: u64,
-    ) -> Result<Rv32MachineOutcome, Rv32MachineExecutionError> {
-        let retired_before = self.hart.retired_instructions();
-        if let Some(outcome) = self.terminal_outcome(retired_before) {
-            return Ok(outcome);
-        }
-        let mut attempted = 0;
-        while attempted < instruction_budget {
-            let instruction_pc = self.hart.pc();
-            if !instruction_pc.is_multiple_of(4) {
-                attempted += 1;
-                self.hart
-                    .take_instruction_address_misaligned(instruction_pc);
-            } else if self.executable_range_end(instruction_pc).is_none() {
-                attempted += 1;
-                self.hart.take_instruction_access_fault(instruction_pc);
-            } else if let Some((entry, expected_instructions)) =
-                self.jit_entry(instruction_pc, instruction_budget.saturating_sub(attempted))
-            {
-                let executed = self.hart.execute_jit_entry(entry);
-                if executed != expected_instructions {
-                    return Err(self.execution_error(
-                        instruction_pc,
-                        format!(
-                            "RV32 JIT block returned {executed} instructions, expected {expected_instructions}"
-                        ),
-                    ));
-                }
-                attempted = attempted.saturating_add(u64::from(executed));
-            } else {
-                let executable_end = self
-                    .executable_range_end(instruction_pc)
-                    .expect("executable PC has an owning ELF range");
-                let retired_total = self.hart.retired_instructions();
-                let (slot, input) = {
-                    let Rv32ExecutionBackend::Jit(execution) = &mut self.execution else {
-                        unreachable!("JIT loop requires JIT backend")
-                    };
-                    let block = match execution.cache.resolve(
-                        instruction_pc,
-                        executable_end,
-                        &self.address_space,
-                    ) {
-                        Ok(block) => block,
-                        Err(error) => {
-                            return Err(Rv32MachineExecutionError {
-                                pc: instruction_pc,
-                                retired_total,
-                                message: error.to_string(),
-                            });
-                        }
-                    };
-                    (
-                        block[0],
-                        JitBlockInput::supported_prefix(instruction_pc, block),
-                    )
-                };
-                if let Some(input) = input {
-                    let Rv32ExecutionBackend::Jit(execution) = &mut self.execution else {
-                        unreachable!("JIT loop requires JIT backend")
-                    };
-                    execution.planner.observe(input);
-                }
-                attempted += 1;
-                execute_slot(
-                    &mut self.hart,
-                    &mut self.address_space,
-                    instruction_pc,
-                    slot,
-                );
-            }
-            if let Some(outcome) = self.terminal_outcome(retired_before) {
                 return Ok(outcome);
             }
         }
@@ -923,9 +705,7 @@ impl Rv32Machine {
     pub fn cache_stats(&self) -> Option<Rv32imCacheStats> {
         match &self.execution {
             Rv32ExecutionBackend::Cached(cache) => Some(cache.stats()),
-            Rv32ExecutionBackend::Predecoded(_)
-            | Rv32ExecutionBackend::BlockCached(_)
-            | Rv32ExecutionBackend::Jit(_) => None,
+            Rv32ExecutionBackend::Predecoded(_) | Rv32ExecutionBackend::BlockCached(_) => None,
             #[cfg(target_arch = "x86_64")]
             Rv32ExecutionBackend::Dbt(_) => None,
         }
@@ -947,17 +727,6 @@ impl Rv32Machine {
             Rv32ExecutionBackend::Predecoded(_) => None,
             Rv32ExecutionBackend::BlockCached(cache) => {
                 let stats = cache.stats();
-                Some(Rv32TranslationStats {
-                    lookup_unit: Rv32TranslationLookupUnit::Block,
-                    hits: stats.hits,
-                    misses: stats.misses,
-                    evictions: stats.evictions,
-                    blocks_built: stats.blocks_built,
-                    decoded_slots_built: stats.decoded_slots_built,
-                })
-            }
-            Rv32ExecutionBackend::Jit(execution) => {
-                let stats = execution.cache.stats();
                 Some(Rv32TranslationStats {
                     lookup_unit: Rv32TranslationLookupUnit::Block,
                     hits: stats.hits,
@@ -991,9 +760,6 @@ impl Rv32Machine {
             Rv32ExecutionBackend::Cached(cache) => cache.retained_bytes(),
             Rv32ExecutionBackend::Predecoded(image) => image.retained_bytes(),
             Rv32ExecutionBackend::BlockCached(cache) => cache.retained_bytes(),
-            Rv32ExecutionBackend::Jit(execution) => {
-                execution.cache.retained_bytes() + execution.arena.reserved_bytes()
-            }
             #[cfg(target_arch = "x86_64")]
             Rv32ExecutionBackend::Dbt(execution) => execution.retained_bytes(),
         }

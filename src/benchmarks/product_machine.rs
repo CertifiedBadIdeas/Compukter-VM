@@ -21,7 +21,8 @@ use super::rv32::{mmio_control_program, rv32_workload, ProgramImage};
 use super::{native_checksum, BenchmarkWorkload, DATA_BASE};
 use crate::rv32_machine::{
     Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
-    Rv32TranslationStats, CONTROL_BASE, STATUS_HALTED,
+    Rv32TranslationStats, CONTROL_BASE, DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_BYTES,
+    DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_SCRATCH_BYTES, STATUS_HALTED,
 };
 use crate::rv32im::encoding::{addi, bne, csrrs, csrrw, ebreak, ecall, jal, materialize, mret, sw};
 use std::collections::HashMap;
@@ -38,9 +39,9 @@ pub const PRODUCT_RAM_BYTES: usize = 16 * 1024;
 pub const PRODUCT_CACHE_SETS: usize = 64;
 pub const PRODUCT_BLOCK_CACHE_SETS: usize = 32;
 pub const PRODUCT_BLOCK_MAX_INSTRUCTIONS: usize = 8;
-pub const PRODUCT_DBT_CACHE_SETS: usize = 32;
-pub const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = 8;
-pub const PRODUCT_DBT_CODE_BYTES: usize = 64 * 1024;
+pub const PRODUCT_DBT_CACHE_SETS: usize = DEFAULT_DBT_CACHE_SETS;
+pub const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = DEFAULT_DBT_MAX_INSTRUCTIONS;
+pub const PRODUCT_DBT_CODE_BYTES: usize = DEFAULT_DBT_CODE_BYTES;
 pub const PRODUCT_DEBUG_LIMIT: usize = 0;
 pub const PRODUCT_RESIDENT_REPORT_HEADER: &str = "backend\tpopulation\tconstruction_median_ns\tconstruction_p95_ns\tresident_live_bytes\tpeak_construction_bytes\tlive_bytes_per_machine\taggregate_ram_bytes\telf_bytes\texecutable_bytes\trw_initialized_bytes\tram_bytes\tdebug_limit\tcache_sets\tblock_cache_sets\tblock_max_instructions\tdbt_cache_sets\tdbt_max_instructions\tdbt_code_bytes";
 pub const PRODUCT_ACTIVE_REPORT_HEADER: &str = "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native";
@@ -57,14 +58,7 @@ pub enum ProductExecutionCandidate {
 
 impl ProductExecutionCandidate {
     pub const fn all() -> &'static [Self] {
-        &[
-            Self::NativeHost,
-            Self::Cached,
-            Self::Predecoded,
-            Self::BlockCached,
-            Self::DirectDbt,
-            Self::CachedDbt,
-        ]
+        &[Self::NativeHost, Self::DirectDbt, Self::CachedDbt]
     }
 
     pub const fn name(self) -> &'static str {
@@ -271,13 +265,7 @@ pub enum ProductMachineBackend {
 
 impl ProductMachineBackend {
     pub const fn all() -> &'static [Self] {
-        &[
-            Self::Cached,
-            Self::Predecoded,
-            Self::BlockCached,
-            Self::DirectDbt,
-            Self::CachedDbt,
-        ]
+        &[Self::DirectDbt, Self::CachedDbt]
     }
 
     pub const fn name(self) -> &'static str {
@@ -302,12 +290,12 @@ impl ProductMachineBackend {
             },
             Self::DirectDbt => Rv32ExecutionBackendConfig::DirectDbt {
                 max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
-                scratch_bytes: 8 * 1024,
+                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
             },
             Self::CachedDbt => Rv32ExecutionBackendConfig::CachedDbt {
                 sets: PRODUCT_DBT_CACHE_SETS,
                 max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
-                scratch_bytes: 8 * 1024,
+                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: PRODUCT_DBT_CODE_BYTES,
             },
         }
@@ -317,9 +305,9 @@ impl ProductMachineBackend {
 pub fn product_backend_order(
     group_index: usize,
     sample_index: usize,
-) -> [ProductMachineBackend; 5] {
+) -> [ProductMachineBackend; 2] {
     let all = ProductMachineBackend::all();
-    benchmark_rotating_order::<5>(group_index, sample_index).map(|index| all[index])
+    benchmark_rotating_order::<2>(group_index, sample_index).map(|index| all[index])
 }
 
 pub fn product_percentile(sorted_values: &[u128], percentile: usize) -> u128 {
