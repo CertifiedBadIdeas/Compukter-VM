@@ -56,12 +56,13 @@ pub enum Rv32ExecutionBackendConfig {
     },
     DirectDbt {
         max_instructions: usize,
-        code_bytes: usize,
+        scratch_bytes: usize,
     },
     CachedDbt {
         sets: usize,
         max_instructions: usize,
-        code_bytes: usize,
+        scratch_bytes: usize,
+        cache_bytes: usize,
     },
     Jit {
         sets: usize,
@@ -249,20 +250,22 @@ enum Rv32ExecutionBackend {
 
 enum Rv32DbtBackendBuild {
     Direct,
-    Cached { sets: usize },
+    Cached { sets: usize, cache_bytes: usize },
 }
 
 #[cfg(target_arch = "x86_64")]
 fn build_dbt_backend(
     build: Rv32DbtBackendBuild,
     max_instructions: usize,
-    code_bytes: usize,
+    scratch_bytes: usize,
 ) -> Result<Rv32ExecutionBackend, Rv32MachineBuildError> {
     let policy = match build {
         Rv32DbtBackendBuild::Direct => Rv32DbtPolicy::Direct,
-        Rv32DbtBackendBuild::Cached { sets } => Rv32DbtPolicy::Cached { sets },
+        Rv32DbtBackendBuild::Cached { sets, cache_bytes } => {
+            Rv32DbtPolicy::Cached { sets, cache_bytes }
+        }
     };
-    Rv32DbtExecution::new(policy, max_instructions, code_bytes)
+    Rv32DbtExecution::new(policy, max_instructions, scratch_bytes)
         .map(Rv32ExecutionBackend::Dbt)
         .map_err(|error| Rv32MachineBuildError::Backend(error.to_string()))
 }
@@ -271,7 +274,7 @@ fn build_dbt_backend(
 fn build_dbt_backend(
     _build: Rv32DbtBackendBuild,
     _max_instructions: usize,
-    _code_bytes: usize,
+    _scratch_bytes: usize,
 ) -> Result<Rv32ExecutionBackend, Rv32MachineBuildError> {
     Err(Rv32MachineBuildError::Backend(
         "RV32 direct DBT is unavailable on non-x86_64 hosts".to_string(),
@@ -328,16 +331,17 @@ impl Rv32Machine {
             ),
             Rv32ExecutionBackendConfig::DirectDbt {
                 max_instructions,
-                code_bytes,
-            } => build_dbt_backend(Rv32DbtBackendBuild::Direct, max_instructions, code_bytes)?,
+                scratch_bytes,
+            } => build_dbt_backend(Rv32DbtBackendBuild::Direct, max_instructions, scratch_bytes)?,
             Rv32ExecutionBackendConfig::CachedDbt {
                 sets,
                 max_instructions,
-                code_bytes,
+                scratch_bytes,
+                cache_bytes,
             } => build_dbt_backend(
-                Rv32DbtBackendBuild::Cached { sets },
+                Rv32DbtBackendBuild::Cached { sets, cache_bytes },
                 max_instructions,
-                code_bytes,
+                scratch_bytes,
             )?,
         };
         let (entry_point, ram, page_permissions, executable_ranges) = image.into_parts();

@@ -117,7 +117,16 @@ fn product_observation_reports_backend_owned_storage() {
         assert_eq!(stats.lookup_unit, Rv32TranslationLookupUnit::Block);
         assert!(stats.blocks_built > 0);
         assert!(stats.decoded_slots_built >= stats.blocks_built);
-        assert!(observation.translation_bytes > 64 * 1024);
+        match backend {
+            ProductMachineBackend::DirectDbt => {
+                assert!(observation.translation_bytes > 16 * 1024);
+                assert!(observation.translation_bytes < 64 * 1024);
+            }
+            ProductMachineBackend::CachedDbt => {
+                assert!(observation.translation_bytes > 128 * 1024);
+            }
+            _ => unreachable!(),
+        }
     }
 }
 

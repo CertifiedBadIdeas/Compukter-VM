@@ -34,7 +34,7 @@ use crate::rv32im::Rv32ResolvedInstruction;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rv32DbtPolicy {
     Direct,
-    Cached { sets: usize },
+    Cached { sets: usize, cache_bytes: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +97,7 @@ impl Rv32DbtExecution {
     pub(crate) fn new(
         policy: Rv32DbtPolicy,
         max_instructions: usize,
-        code_bytes: usize,
+        scratch_bytes: usize,
     ) -> Result<Self, DbtFault> {
         if max_instructions == 0 || max_instructions > u32::MAX as usize {
             return Err(Self::fault(
@@ -105,36 +105,42 @@ impl Rv32DbtExecution {
                 "DBT max instructions must be between 1 and u32::MAX",
             ));
         }
-        if code_bytes == 0 || !code_bytes.is_multiple_of(4096) {
+        if scratch_bytes == 0 || !scratch_bytes.is_multiple_of(4096) {
             return Err(Self::fault(
                 DbtFaultKind::Capacity,
-                "DBT executable bytes must be a positive multiple of 4096",
+                "DBT scratch bytes must be a positive multiple of 4096",
             ));
         }
-        if let Rv32DbtPolicy::Cached { sets } = policy {
+        if let Rv32DbtPolicy::Cached { sets, cache_bytes } = policy {
             if sets == 0 || sets > u32::MAX as usize {
                 return Err(Self::fault(
                     DbtFaultKind::Capacity,
                     "DBT cache sets must be between 1 and u32::MAX",
                 ));
             }
+            if cache_bytes == 0 || !cache_bytes.is_multiple_of(4096) {
+                return Err(Self::fault(
+                    DbtFaultKind::Capacity,
+                    "DBT cache bytes must be a positive multiple of 4096",
+                ));
+            }
         }
 
         let storage = match policy {
             Rv32DbtPolicy::Direct => Rv32DbtStorage::Direct {
-                scratch: ExecutableScratch::new(code_bytes)?,
+                scratch: ExecutableScratch::new(scratch_bytes)?,
                 serial: 0,
             },
-            Rv32DbtPolicy::Cached { sets } => Rv32DbtStorage::Cached {
-                cache: DirectDbtCodeCache::new(sets, code_bytes)?,
-                bounded_scratch: ExecutableScratch::new(code_bytes)?,
+            Rv32DbtPolicy::Cached { sets, cache_bytes } => Rv32DbtStorage::Cached {
+                cache: DirectDbtCodeCache::new(sets, cache_bytes)?,
+                bounded_scratch: ExecutableScratch::new(scratch_bytes)?,
                 scratch_serial: 0,
             },
         };
         Ok(Self {
             max_instructions,
             decoded: Vec::with_capacity(max_instructions),
-            workspace: DbtTranslationWorkspace::new(code_bytes, max_instructions)?,
+            workspace: DbtTranslationWorkspace::new(scratch_bytes, max_instructions)?,
             storage,
             translations: 0,
             publications: 0,
@@ -329,6 +335,8 @@ impl Rv32DbtExecution {
             evictions: cache_stats
                 .metadata_evictions
                 .saturating_add(cache_stats.overlap_invalidations),
+            metadata_evictions: cache_stats.metadata_evictions,
+            overlap_invalidations: cache_stats.overlap_invalidations,
             native_dispatches: self.native_dispatches,
             typed_slow_exits: self.typed_slow_exits,
             lowered_load_sites: self.lowered_load_sites,
@@ -388,7 +396,15 @@ mod tests {
         assert_eq!(direct.stats().translations, 2);
         assert_eq!(direct.stats().publications, 2);
 
-        let mut cached = Rv32DbtExecution::new(Rv32DbtPolicy::Cached { sets: 2 }, 8, 4096).unwrap();
+        let mut cached = Rv32DbtExecution::new(
+            Rv32DbtPolicy::Cached {
+                sets: 2,
+                cache_bytes: 4096,
+            },
+            8,
+            4096,
+        )
+        .unwrap();
         assert!(cached.lookup(0x1000, DbtBlockMode::Fast).is_none());
         fill_one(&mut cached);
         let published = cached.translate(0x1000, DbtBlockMode::Fast).unwrap();
@@ -400,8 +416,33 @@ mod tests {
     }
 
     #[test]
+    fn transient_scratch_and_persistent_cache_have_independent_capacities() {
+        let direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 8 * 1024).unwrap();
+        assert_eq!(direct.stats().reserved_bytes, 16 * 1024);
+
+        let cached = Rv32DbtExecution::new(
+            Rv32DbtPolicy::Cached {
+                sets: 2,
+                cache_bytes: 16 * 1024,
+            },
+            8,
+            8 * 1024,
+        )
+        .unwrap();
+        assert_eq!(cached.stats().reserved_bytes, 48 * 1024);
+    }
+
+    #[test]
     fn bounded_blocks_never_enter_the_persistent_cache() {
-        let mut cached = Rv32DbtExecution::new(Rv32DbtPolicy::Cached { sets: 2 }, 8, 4096).unwrap();
+        let mut cached = Rv32DbtExecution::new(
+            Rv32DbtPolicy::Cached {
+                sets: 2,
+                cache_bytes: 4096,
+            },
+            8,
+            4096,
+        )
+        .unwrap();
         fill_one(&mut cached);
         let second = cached.decoded_slots()[0];
         cached.decoded.push(second);
@@ -417,7 +458,15 @@ mod tests {
 
     #[test]
     fn cached_hits_retain_static_lowering_metadata() {
-        let mut cached = Rv32DbtExecution::new(Rv32DbtPolicy::Cached { sets: 2 }, 8, 4096).unwrap();
+        let mut cached = Rv32DbtExecution::new(
+            Rv32DbtPolicy::Cached {
+                sets: 2,
+                cache_bytes: 4096,
+            },
+            8,
+            4096,
+        )
+        .unwrap();
         fill_memory_pair(&mut cached);
         let published = cached.translate(0x1000, DbtBlockMode::Fast).unwrap();
         let hit = cached.lookup(0x1000, DbtBlockMode::Fast).unwrap();
@@ -489,7 +538,14 @@ mod tests {
         for result in [
             Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 0, 4096),
             Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 1),
-            Rv32DbtExecution::new(Rv32DbtPolicy::Cached { sets: 0 }, 8, 4096),
+            Rv32DbtExecution::new(
+                Rv32DbtPolicy::Cached {
+                    sets: 0,
+                    cache_bytes: 4096,
+                },
+                8,
+                4096,
+            ),
         ] {
             assert_eq!(result.err().unwrap().kind(), DbtFaultKind::Capacity);
         }

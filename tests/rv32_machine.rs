@@ -45,12 +45,13 @@ fn configs() -> [Rv32ExecutionBackendConfig; 5] {
         },
         Rv32ExecutionBackendConfig::DirectDbt {
             max_instructions: 8,
-            code_bytes: 4096,
+            scratch_bytes: 4096,
         },
         Rv32ExecutionBackendConfig::CachedDbt {
             sets: 32,
             max_instructions: 8,
-            code_bytes: 4096,
+            scratch_bytes: 4096,
+            cache_bytes: 4096,
         },
     ]
 }
@@ -321,7 +322,8 @@ fn cached_dbt_fence_i_revokes_the_previous_generation() {
             Rv32ExecutionBackendConfig::CachedDbt {
                 sets: 4,
                 max_instructions: 8,
-                code_bytes: 4096,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
             },
             0,
         ),
@@ -652,7 +654,7 @@ fn invalid_cache_and_ram_layouts_fail_before_machine_allocation() {
         config(
             Rv32ExecutionBackendConfig::DirectDbt {
                 max_instructions: 0,
-                code_bytes: 4096,
+                scratch_bytes: 4096,
             },
             8,
         )
@@ -664,7 +666,8 @@ fn invalid_cache_and_ram_layouts_fail_before_machine_allocation() {
             Rv32ExecutionBackendConfig::CachedDbt {
                 sets: 0,
                 max_instructions: 8,
-                code_bytes: 4096,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
             },
             8,
         )

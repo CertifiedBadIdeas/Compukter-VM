@@ -40,8 +40,8 @@ cargo run --manifest-path "$ROOT/Cargo.toml" --release \
     | tee "$BUILD_DIR/report.tsv"
 
 awk -F '\t' '
-    $1 ~ /^(native-clang|qemu-rv32-tcg|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|rv32-cached-dbt)$/ && $6 == "ee053d58" { count++ }
-    END { exit count == 7 ? 0 : 1 }
+    $1 ~ /^(native-clang|qemu-rv32-tcg|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|rv32-cached-dbt-(16|32|64|128|256|512)k)$/ && $6 == "ee053d58" { count++ }
+    END { exit count == 12 ? 0 : 1 }
 ' "$BUILD_DIR/report.tsv"
 
 startup_ns="$(awk -F '\t' '$1 == "qemu_startup_median_ns" { print $2 }' "$BUILD_DIR/report.tsv")"
@@ -56,7 +56,6 @@ cached_batch="$(awk -F '\t' '$1 == "rv32-cached" { print $5 }' "$BUILD_DIR/repor
 predecoded_batch="$(awk -F '\t' '$1 == "rv32-predecoded" { print $5 }' "$BUILD_DIR/report.tsv")"
 block_cached_batch="$(awk -F '\t' '$1 == "rv32-block-cached" { print $5 }' "$BUILD_DIR/report.tsv")"
 direct_dbt_batch="$(awk -F '\t' '$1 == "rv32-direct-dbt" { print $5 }' "$BUILD_DIR/report.tsv")"
-cached_dbt_batch="$(awk -F '\t' '$1 == "rv32-cached-dbt" { print $5 }' "$BUILD_DIR/report.tsv")"
 
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/qemu-batch-$qemu_batch.elf" \
     >"$BUILD_DIR/qemu-calibrated-disassembly.txt"
@@ -68,7 +67,10 @@ cached_dbt_batch="$(awk -F '\t' '$1 == "rv32-cached-dbt" { print $5 }' "$BUILD_D
     >"$BUILD_DIR/product-block-cached-calibrated-disassembly.txt"
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/product-batch-$direct_dbt_batch.elf" \
     >"$BUILD_DIR/product-direct-dbt-calibrated-disassembly.txt"
-"$RV32_C_OBJDUMP" -d "$BUILD_DIR/product-batch-$cached_dbt_batch.elf" \
-    >"$BUILD_DIR/product-cached-dbt-calibrated-disassembly.txt"
+for cache_kib in 16 32 64 128 256 512; do
+    cached_dbt_batch="$(awk -F '\t' -v candidate="rv32-cached-dbt-${cache_kib}k" '$1 == candidate { print $5 }' "$BUILD_DIR/report.tsv")"
+    "$RV32_C_OBJDUMP" -d "$BUILD_DIR/product-batch-$cached_dbt_batch.elf" \
+        >"$BUILD_DIR/product-cached-dbt-${cache_kib}k-calibrated-disassembly.txt"
+done
 
 echo "Focused RV32 C/QEMU comparison passed; artifacts: $BUILD_DIR"
