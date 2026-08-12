@@ -488,9 +488,9 @@ impl Rv32Machine {
                     };
                     execution.lookup(instruction_pc, execution.fast_mode())
                 };
-                let prepared = if cached
-                    .is_some_and(|prepared| u64::from(prepared.instruction_count()) <= remaining)
-                {
+                let prepared = if cached.is_some_and(|prepared| {
+                    prepared.is_cached() || u64::from(prepared.instruction_count()) <= remaining
+                }) {
                     cached.unwrap()
                 } else {
                     let fill_result = {
@@ -519,7 +519,9 @@ impl Rv32Machine {
                         let Rv32ExecutionBackend::Dbt(execution) = &self.execution else {
                             unreachable!("DBT loop requires the DBT backend")
                         };
-                        if execution.decoded_slots().len() as u64 <= remaining {
+                        if execution.fast_mode() == DbtBlockMode::ChainableThroughput
+                            || execution.decoded_slots().len() as u64 <= remaining
+                        {
                             execution.fast_mode()
                         } else {
                             DbtBlockMode::Bounded {
@@ -552,9 +554,18 @@ impl Rv32Machine {
                         }
                     })?
                 };
+                let overshoot = u64::from(exit.attempted).saturating_sub(remaining);
+                let max_overshoot = if prepared.is_cached() {
+                    let Rv32ExecutionBackend::Dbt(execution) = &self.execution else {
+                        unreachable!("DBT loop requires the DBT backend")
+                    };
+                    execution.max_instructions().saturating_sub(1) as u64
+                } else {
+                    0
+                };
                 if exit.attempted == 0
                     || (!prepared.is_cached() && exit.attempted > prepared.instruction_count())
-                    || u64::from(exit.attempted) > remaining
+                    || overshoot > max_overshoot
                     || exit.next_pc != self.hart.pc()
                 {
                     return Err(self.execution_error(
@@ -569,6 +580,12 @@ impl Rv32Machine {
                             self.hart.pc(),
                         ),
                     ));
+                }
+                if overshoot != 0 {
+                    let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
+                        unreachable!("DBT loop requires the DBT backend")
+                    };
+                    execution.record_budget_overshoot(overshoot as u32);
                 }
 
                 attempted = attempted.saturating_add(u64::from(exit.attempted));
@@ -874,7 +891,6 @@ fn create_dbt_context(
         remaining_budget: 0,
         reservation_valid,
         reservation_address,
-        chain_attempted: 0,
         chain_transitions: 0,
         exit: DbtExitRecord::default(),
     })
@@ -891,7 +907,6 @@ fn refresh_dbt_context(
     context.remaining_budget = remaining_budget.min(u64::from(u32::MAX)) as u32;
     context.reservation_valid = reservation_valid;
     context.reservation_address = reservation_address;
-    context.chain_attempted = 0;
     context.chain_transitions = 0;
     context.exit = DbtExitRecord::default();
 }

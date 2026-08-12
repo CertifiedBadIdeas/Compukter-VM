@@ -34,6 +34,8 @@ use crate::rv32im::{
     Store,
 };
 
+const EXECUTION_COUNTER: Gpr = Gpr::Rdi;
+
 pub(crate) struct DbtTranslationWorkspace {
     emitter: X64Emitter,
 }
@@ -92,8 +94,9 @@ impl DbtTranslationWorkspace {
     ) -> Result<TranslatedBlock<'a>, DbtFault> {
         self.emitter.reset();
         let mut out = &mut self.emitter;
-        emit_prologue(&mut out).map_err(|error| emit_fault(input.start_pc(), None, error))?;
         let chainable = matches!(input.mode(), DbtBlockMode::ChainableThroughput);
+        emit_prologue(&mut out, chainable)
+            .map_err(|error| emit_fault(input.start_pc(), None, error))?;
         let mut static_links = StaticLinkCollector::new();
         let mut cache = if chainable {
             RegisterCache::chainable()
@@ -458,7 +461,7 @@ fn emit_jalr(
     emit_exit_dynamic(cache, out, DbtExitTag::Completed, Gpr::Rdx, attempted, 0, 0)
 }
 
-fn emit_prologue(out: &mut X64Emitter) -> Result<(), EmitError> {
+fn emit_prologue(out: &mut X64Emitter, chainable: bool) -> Result<(), EmitError> {
     for register in [Gpr::Rbx, Gpr::Rbp, Gpr::R12, Gpr::R13, Gpr::R14, Gpr::R15] {
         out.push(register)?;
     }
@@ -474,14 +477,22 @@ fn emit_prologue(out: &mut X64Emitter) -> Result<(), EmitError> {
     out.mov_r64_m64(
         Gpr::R12,
         Mem::base_disp(Gpr::R15, DbtContext::PAGE_PERMISSIONS_OFFSET as i32),
-    )
+    )?;
+    if chainable {
+        out.mov_r32_m32(
+            EXECUTION_COUNTER,
+            Mem::base_disp(Gpr::R15, DbtContext::REMAINING_BUDGET_OFFSET as i32),
+        )?;
+        out.neg_r64(EXECUTION_COUNTER)?;
+    }
+    Ok(())
 }
 
 fn emit_fast_entry_guard(
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
     start_pc: u32,
-    instruction_count: u32,
+    _instruction_count: u32,
 ) -> Result<u32, EmitError> {
     let guard = out.new_label()?;
     let body = out.new_label()?;
@@ -490,12 +501,8 @@ fn emit_fast_entry_guard(
         u32::try_from(out.bytes().len()).map_err(|_| EmitError::BranchRange)?;
     add_context_u32(out, DbtContext::CHAIN_TRANSITIONS_OFFSET, 1)?;
     out.bind(guard)?;
-    out.mov_r32_m32(
-        Gpr::Rax,
-        Mem::base_disp(Gpr::R15, DbtContext::REMAINING_BUDGET_OFFSET as i32),
-    )?;
-    out.cmp_r32_imm32(Gpr::Rax, instruction_count as i32)?;
-    out.jcc(Condition::AboveEqual, body)?;
+    out.test_r64_r64(EXECUTION_COUNTER, EXECUTION_COUNTER)?;
+    out.jcc(Condition::Less, body)?;
     emit_exit(cache, out, DbtExitTag::Completed, start_pc, 0, 0, 0)?;
     out.bind(body)?;
     Ok(chain_entry_offset)
@@ -997,7 +1004,7 @@ fn emit_memory_exit(
         DbtContext::EXIT_OFFSET + DbtExitRecord::NEXT_PC_OFFSET,
         instruction_pc,
     )?;
-    write_cumulative_attempted(out, attempted)?;
+    write_cumulative_attempted(cache, out, attempted)?;
     write_u32(
         out,
         Gpr::R15,
@@ -1044,7 +1051,7 @@ fn emit_exit(
         DbtContext::EXIT_OFFSET + DbtExitRecord::NEXT_PC_OFFSET,
         next_pc,
     )?;
-    write_cumulative_attempted(out, attempted)?;
+    write_cumulative_attempted(cache, out, attempted)?;
     write_u32(
         out,
         Gpr::R15,
@@ -1085,8 +1092,7 @@ fn emit_completed_exit(
         cache.flush(out)?;
         write_u32(out, Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0)?;
         write_u32(out, Gpr::R14, Rv32ArchitecturalState::PC_OFFSET, next_pc)?;
-        add_context_u32(out, DbtContext::CHAIN_ATTEMPTED_OFFSET, attempted)?;
-        subtract_context_u32(out, DbtContext::REMAINING_BUDGET_OFFSET, attempted)?;
+        out.add_r64_imm32(EXECUTION_COUNTER, attempted as i32)?;
         let jump = out.patchable_jump()?;
         static_links.push(DbtStaticLink {
             target_pc: next_pc,
@@ -1133,7 +1139,7 @@ fn emit_exit_dynamic(
         ),
         next_pc,
     )?;
-    write_cumulative_attempted(out, attempted)?;
+    write_cumulative_attempted(cache, out, attempted)?;
     write_u32(
         out,
         Gpr::R15,
@@ -1180,17 +1186,20 @@ fn add_context_u32(out: &mut X64Emitter, offset: usize, value: u32) -> Result<()
     out.mov_m32_r32(Mem::base_disp(Gpr::R15, offset as i32), Gpr::Rax)
 }
 
-fn subtract_context_u32(out: &mut X64Emitter, offset: usize, value: u32) -> Result<(), EmitError> {
-    out.mov_r32_m32(Gpr::Rax, Mem::base_disp(Gpr::R15, offset as i32))?;
-    out.sub_r32_imm32(Gpr::Rax, value as i32)?;
-    out.mov_m32_r32(Mem::base_disp(Gpr::R15, offset as i32), Gpr::Rax)
-}
-
-fn write_cumulative_attempted(out: &mut X64Emitter, local_attempted: u32) -> Result<(), EmitError> {
-    out.mov_r32_m32(
-        Gpr::Rax,
-        Mem::base_disp(Gpr::R15, DbtContext::CHAIN_ATTEMPTED_OFFSET as i32),
-    )?;
+fn write_cumulative_attempted(
+    cache: &RegisterCache,
+    out: &mut X64Emitter,
+    local_attempted: u32,
+) -> Result<(), EmitError> {
+    if cache.is_chainable() {
+        out.mov_r32_m32(
+            Gpr::Rax,
+            Mem::base_disp(Gpr::R15, DbtContext::REMAINING_BUDGET_OFFSET as i32),
+        )?;
+        out.add_r64_r64(Gpr::Rax, EXECUTION_COUNTER)?;
+    } else {
+        out.mov_r32_imm32(Gpr::Rax, 0)?;
+    }
     if local_attempted != 0 {
         out.add_r32_imm32(Gpr::Rax, local_attempted as i32)?;
     }
@@ -1271,7 +1280,6 @@ mod tests {
             remaining_budget: input.slots().len() as u32,
             reservation_valid: 0,
             reservation_address: 0,
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
@@ -1318,7 +1326,6 @@ mod tests {
             remaining_budget: 1,
             reservation_valid: u32::from(reservation.is_some()),
             reservation_address: reservation.unwrap_or(0),
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
@@ -1576,7 +1583,6 @@ mod tests {
             remaining_budget: words.len() as u32,
             reservation_valid: 0,
             reservation_address: 0,
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
@@ -1618,7 +1624,6 @@ mod tests {
             remaining_budget: 2,
             reservation_valid: 0,
             reservation_address: 0,
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };
@@ -1885,7 +1890,6 @@ mod tests {
             remaining_budget,
             reservation_valid: 0,
             reservation_address: 0,
-            chain_attempted: 0,
             chain_transitions: 0,
             exit: DbtExitRecord::default(),
         };

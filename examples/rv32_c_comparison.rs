@@ -271,6 +271,8 @@ struct ProductDetails {
     dbt_overlap_invalidations: Option<u64>,
     dbt_native_dispatches: Option<u64>,
     dbt_chain_transitions: Option<u64>,
+    dbt_budget_overshoot: Option<u64>,
+    dbt_max_budget_overshoot: Option<u64>,
     dbt_links_established: Option<u64>,
     dbt_links_reset: Option<u64>,
     dbt_typed_slow_exits: Option<u64>,
@@ -448,7 +450,7 @@ fn run() -> Result<(), String> {
         }
     }
     println!(
-        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes"
+        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes\tdbt_budget_overshoot\tdbt_max_budget_overshoot"
     );
 
     let normalized = measurements
@@ -476,7 +478,7 @@ fn run() -> Result<(), String> {
         let mode = measurement.candidate.mode;
         let product_candidate = measurement.candidate.product_config().is_some();
         println!(
-            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             measurement.candidate.name,
             mode,
             ITERATIONS,
@@ -522,6 +524,8 @@ fn run() -> Result<(), String> {
             option_u64(measurement.details.dbt_reserved_bytes),
             option_u64(product_candidate.then_some(measurement.details.steady_allocations)),
             option_u64(product_candidate.then_some(measurement.details.steady_allocated_bytes)),
+            option_u64(measurement.details.dbt_budget_overshoot),
+            option_u64(measurement.details.dbt_max_budget_overshoot),
         );
     }
     Ok(())
@@ -727,6 +731,8 @@ fn run_product(
             dbt_publications: dbt.map(|value| value.publications),
             dbt_native_dispatches: dbt.map(|value| value.native_dispatches),
             dbt_chain_transitions: dbt.map(|value| value.chain_transitions),
+            dbt_budget_overshoot: dbt.map(|value| value.budget_overshoot),
+            dbt_max_budget_overshoot: dbt.map(|value| u64::from(value.max_budget_overshoot)),
             dbt_links_established: dbt.map(|value| value.links_established),
             dbt_links_reset: dbt.map(|value| value.links_reset),
             dbt_typed_slow_exits: dbt.map(|value| value.typed_slow_exits),
