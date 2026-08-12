@@ -120,6 +120,57 @@ impl ExecutableMapping {
         Ok(())
     }
 
+    pub(super) fn patch_rel32(
+        &mut self,
+        source_start: usize,
+        source_len: usize,
+        displacement_offset: usize,
+        target_offset: usize,
+    ) -> Result<(), DbtFault> {
+        let source_end = source_start.checked_add(source_len).ok_or_else(|| {
+            Self::fault(
+                DbtFaultKind::Capacity,
+                "native patch source range overflows host address space",
+            )
+        })?;
+        let displacement_end = displacement_offset.checked_add(4).ok_or_else(|| {
+            Self::fault(
+                DbtFaultKind::Capacity,
+                "native rel32 patch range overflows host address space",
+            )
+        })?;
+        if source_len == 0
+            || source_end > self.capacity
+            || displacement_offset < source_start
+            || displacement_end > source_end
+            || target_offset >= self.capacity
+        {
+            return Err(Self::fault(
+                DbtFaultKind::Capacity,
+                "native rel32 patch is outside its source block or executable mapping",
+            ));
+        }
+
+        let displacement = i64::try_from(target_offset)
+            .ok()
+            .and_then(|target| {
+                i64::try_from(displacement_end)
+                    .ok()
+                    .and_then(|end| target.checked_sub(end))
+            })
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| {
+                Self::fault(
+                    DbtFaultKind::Capacity,
+                    "native jump target is outside the rel32 range",
+                )
+            })?;
+        self.writable[displacement_offset..displacement_end]
+            .copy_from_slice(&displacement.to_le_bytes());
+        compiler_fence(Ordering::Release);
+        Ok(())
+    }
+
     pub(super) fn entry_address(&self, offset: usize) -> Option<*const u8> {
         if offset >= self.capacity {
             return None;
@@ -263,6 +314,38 @@ mod tests {
         assert_eq!(unsafe { execute(mapping.entry_address(0).unwrap()) }, 7);
         assert_eq!(unsafe { execute(mapping.entry_address(16).unwrap()) }, 9);
         assert!(mapping.publish_at(PAGE_BYTES - 2, &[0x90; 4]).is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn patches_and_resets_a_published_relative_jump() {
+        let mut mapping = ExecutableMapping::new(PAGE_BYTES).unwrap();
+        let mut code = vec![0x90; 22];
+        code[..11].copy_from_slice(&[
+            0xe9, 0, 0, 0, 0, // reset jump falls through to the local fallback
+            0xb8, 7, 0, 0, 0, 0xc3,
+        ]);
+        code[16..22].copy_from_slice(&[0xb8, 9, 0, 0, 0, 0xc3]);
+        mapping.publish_at(0, &code).unwrap();
+
+        let entry = mapping.entry_address(0).unwrap();
+        assert_eq!(unsafe { execute(entry) }, 7);
+
+        mapping.patch_rel32(0, 11, 1, 16).unwrap();
+        assert_eq!(unsafe { execute(entry) }, 9);
+
+        mapping.patch_rel32(0, 11, 1, 5).unwrap();
+        assert_eq!(unsafe { execute(entry) }, 7);
+    }
+
+    #[test]
+    fn patches_reject_ranges_outside_the_published_source() {
+        let mut mapping = ExecutableMapping::new(PAGE_BYTES).unwrap();
+        mapping.publish_at(16, &[0x90; 16]).unwrap();
+
+        assert!(mapping.patch_rel32(16, 16, 29, 16).is_err());
+        assert!(mapping.patch_rel32(16, 16, 17, PAGE_BYTES).is_err());
+        assert!(mapping.patch_rel32(PAGE_BYTES, 16, 1, 16).is_err());
     }
 
     #[test]

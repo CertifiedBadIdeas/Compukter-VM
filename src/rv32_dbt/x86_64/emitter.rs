@@ -137,6 +137,22 @@ impl Condition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Label(u32);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PatchableJump {
+    displacement_offset: u32,
+    reset_target_offset: u32,
+}
+
+impl PatchableJump {
+    pub(crate) const fn displacement_offset(self) -> u32 {
+        self.displacement_offset
+    }
+
+    pub(crate) const fn reset_target_offset(self) -> u32 {
+        self.reset_target_offset
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum EmitError {
     #[error("x86_64 emitter capacity must be positive")]
@@ -466,6 +482,20 @@ impl X64Emitter {
 
     pub(crate) fn jmp(&mut self, label: Label) -> Result<(), EmitError> {
         self.relative_branch(&[0xe9], label)
+    }
+
+    pub(crate) fn patchable_jump(&mut self) -> Result<PatchableJump, EmitError> {
+        self.ensure_capacity(5)?;
+        self.bytes.push(0xe9);
+        let displacement_offset =
+            u32::try_from(self.bytes.len()).map_err(|_| EmitError::BranchRange)?;
+        self.bytes.extend_from_slice(&[0; 4]);
+        let reset_target_offset =
+            u32::try_from(self.bytes.len()).map_err(|_| EmitError::BranchRange)?;
+        Ok(PatchableJump {
+            displacement_offset,
+            reset_target_offset,
+        })
     }
 
     pub(crate) fn jcc(&mut self, condition: Condition, label: Label) -> Result<(), EmitError> {
@@ -832,5 +862,19 @@ mod tests {
                 0xf7, 0xe0, 0x41, 0xf7, 0xe9, 0x41, 0xf7, 0xf2, 0x41, 0xf7, 0xfb, 0x99,
             ]
         );
+    }
+
+    #[test]
+    fn patchable_jump_resets_to_the_immediate_fallback() {
+        let mut out = X64Emitter::new(32, 4).unwrap();
+
+        let jump = out.patchable_jump().unwrap();
+        out.mov_r32_imm32(Gpr::Rax, 7).unwrap();
+        out.ret().unwrap();
+        let code = out.finish().unwrap();
+
+        assert_eq!(&code[..5], &[0xe9, 0, 0, 0, 0]);
+        assert_eq!(jump.displacement_offset(), 1);
+        assert_eq!(jump.reset_target_offset(), 5);
     }
 }
