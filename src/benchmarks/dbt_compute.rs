@@ -310,8 +310,8 @@ impl PreparedCachedDbtCompute32 {
                 ));
             }
             let key = DbtCacheKey::new(cpu.pc(), 0);
-            let handle = if let Some(handle) = self.cache.lookup(key) {
-                handle
+            let hit = if let Some(hit) = self.cache.lookup(key) {
+                hit
             } else {
                 fill_decoded_block(
                     cpu.pc(),
@@ -333,22 +333,16 @@ impl PreparedCachedDbtCompute32 {
                 translated_bytes = translated_bytes.saturating_add(compiled.code().len() as u64);
 
                 let publication_started = Instant::now();
-                let handle = self
+                let hit = self
                     .cache
                     .publish(key, &compiled)
                     .map_err(|error| error.to_string())?;
                 publication_nanos += publication_started.elapsed().as_nanos();
                 publications += 1;
-                handle
+                hit
             };
-            let instruction_count = self
-                .cache
-                .instruction_count(handle)
-                .ok_or_else(|| "cached DBT handle lost before entry".to_string())?;
-            let entry_address = self
-                .cache
-                .entry_address(handle)
-                .ok_or_else(|| "cached DBT entry is not executable".to_string())?;
+            let instruction_count = hit.instruction_count();
+            let entry_address = hit.entry();
             let mut context = DbtContext {
                 state: cpu.architectural_state_mut(),
                 ram_base: self.memory.as_mut_ptr(),

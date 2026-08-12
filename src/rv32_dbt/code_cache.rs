@@ -37,10 +37,19 @@ impl DbtCacheKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DbtCacheHandle {
-    set: u32,
-    way: u8,
-    serial: u64,
+pub(crate) struct DbtCacheHit {
+    entry: *const u8,
+    instruction_count: u32,
+}
+
+impl DbtCacheHit {
+    pub(crate) const fn entry(self) -> *const u8 {
+        self.entry
+    }
+
+    pub(crate) const fn instruction_count(self) -> u32 {
+        self.instruction_count
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,56 +68,58 @@ struct CacheEntry {
     offset: usize,
     length: usize,
     instruction_count: u32,
-    lowered_load_sites: u32,
-    lowered_store_sites: u32,
-    last_used: u64,
-    serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CacheSet {
+    ways: [CacheEntry; WAYS],
+    mru_way: u8,
 }
 
 pub(crate) struct DirectDbtCodeCache {
     mapping: ExecutableMapping,
-    sets: Vec<[CacheEntry; WAYS]>,
+    sets: Vec<CacheSet>,
+    set_mask: usize,
     write_cursor: usize,
-    clock: u64,
-    next_serial: u64,
     stats: DbtCodeCacheStats,
 }
 
 impl DirectDbtCodeCache {
     pub(crate) fn new(sets: usize, executable_bytes: usize) -> Result<Self, DbtFault> {
-        if sets == 0 || sets > u32::MAX as usize {
+        if sets == 0 || sets > u32::MAX as usize || !sets.is_power_of_two() {
             return Err(Self::fault(
                 DbtFaultKind::Capacity,
-                "DBT code cache requires between 1 and u32::MAX metadata sets",
+                "DBT code cache requires a power-of-two metadata set count between 1 and u32::MAX",
             ));
         }
         Ok(Self {
             mapping: ExecutableMapping::new(executable_bytes)?,
-            sets: vec![[CacheEntry::default(); WAYS]; sets],
+            sets: vec![CacheSet::default(); sets],
+            set_mask: sets - 1,
             write_cursor: 0,
-            clock: 0,
-            next_serial: 0,
             stats: DbtCodeCacheStats::default(),
         })
     }
 
-    pub(crate) fn lookup(&mut self, key: DbtCacheKey) -> Option<DbtCacheHandle> {
+    pub(crate) fn lookup(&mut self, key: DbtCacheKey) -> Option<DbtCacheHit> {
         let set = self.set_index(key);
         let way = self.sets[set]
+            .ways
             .iter()
             .position(|entry| entry.valid && entry.key == Some(key));
         let Some(way) = way else {
             self.stats.misses = self.stats.misses.saturating_add(1);
             return None;
         };
-        self.clock = self.clock.saturating_add(1);
-        let entry = &mut self.sets[set][way];
-        entry.last_used = self.clock;
+        self.sets[set].mru_way = way as u8;
+        let entry = &self.sets[set].ways[way];
+        let offset = entry.offset;
+        let instruction_count = entry.instruction_count;
+        let entry = self.mapping.entry_address(offset)?;
         self.stats.hits = self.stats.hits.saturating_add(1);
-        Some(DbtCacheHandle {
-            set: set as u32,
-            way: way as u8,
-            serial: entry.serial,
+        Some(DbtCacheHit {
+            entry,
+            instruction_count,
         })
     }
 
@@ -116,7 +127,7 @@ impl DirectDbtCodeCache {
         &mut self,
         key: DbtCacheKey,
         block: &TranslatedBlock<'_>,
-    ) -> Result<DbtCacheHandle, DbtFault> {
+    ) -> Result<DbtCacheHit, DbtFault> {
         if block.mode() != DbtBlockMode::Fast {
             return Err(Self::fault(
                 DbtFaultKind::Translation,
@@ -155,70 +166,34 @@ impl DirectDbtCodeCache {
 
         let set = self.set_index(key);
         let way = self.select_way(set);
-        if self.sets[set][way].valid {
+        if self.sets[set].ways[way].valid {
             self.stats.metadata_evictions = self.stats.metadata_evictions.saturating_add(1);
         }
-        self.clock = self.clock.saturating_add(1);
-        self.next_serial = self.next_serial.saturating_add(1);
-        let serial = self.next_serial;
-        self.sets[set][way] = CacheEntry {
+        self.sets[set].ways[way] = CacheEntry {
             valid: true,
             key: Some(key),
             offset,
             length: block.code().len(),
             instruction_count: block.instruction_count(),
-            lowered_load_sites: block.lowered_load_sites(),
-            lowered_store_sites: block.lowered_store_sites(),
-            last_used: self.clock,
-            serial,
         };
+        self.sets[set].mru_way = way as u8;
         self.write_cursor = end;
         self.stats.publications = self.stats.publications.saturating_add(1);
-        Ok(DbtCacheHandle {
-            set: set as u32,
-            way: way as u8,
-            serial,
+        let entry = self.mapping.entry_address(offset).ok_or_else(|| {
+            Self::fault(
+                DbtFaultKind::AbiInvariant,
+                "published DBT block has no executable entry address",
+            )
+        })?;
+        Ok(DbtCacheHit {
+            entry,
+            instruction_count: block.instruction_count(),
         })
-    }
-
-    pub(crate) fn entry_address(&self, handle: DbtCacheHandle) -> Option<*const u8> {
-        let entry = self
-            .sets
-            .get(handle.set as usize)?
-            .get(handle.way as usize)?;
-        if !entry.valid || entry.serial != handle.serial {
-            return None;
-        }
-        self.mapping.entry_address(entry.offset)
-    }
-
-    pub(crate) fn instruction_count(&self, handle: DbtCacheHandle) -> Option<u32> {
-        let entry = self
-            .sets
-            .get(handle.set as usize)?
-            .get(handle.way as usize)?;
-        (entry.valid && entry.serial == handle.serial).then_some(entry.instruction_count)
-    }
-
-    pub(crate) fn lowered_load_sites(&self, handle: DbtCacheHandle) -> Option<u32> {
-        let entry = self
-            .sets
-            .get(handle.set as usize)?
-            .get(handle.way as usize)?;
-        (entry.valid && entry.serial == handle.serial).then_some(entry.lowered_load_sites)
-    }
-
-    pub(crate) fn lowered_store_sites(&self, handle: DbtCacheHandle) -> Option<u32> {
-        let entry = self
-            .sets
-            .get(handle.set as usize)?
-            .get(handle.way as usize)?;
-        (entry.valid && entry.serial == handle.serial).then_some(entry.lowered_store_sites)
     }
 
     pub(crate) fn invalidate_all(&mut self) {
         for set in &mut self.sets {
-            for entry in set {
+            for entry in &mut set.ways {
                 entry.valid = false;
             }
         }
@@ -233,13 +208,13 @@ impl DirectDbtCodeCache {
     }
 
     pub(crate) fn metadata_bytes(&self) -> usize {
-        self.sets.len() * std::mem::size_of::<[CacheEntry; WAYS]>()
+        self.sets.len() * std::mem::size_of::<CacheSet>()
     }
 
     pub(crate) fn live_entry_bytes(&self) -> usize {
         self.sets
             .iter()
-            .flatten()
+            .flat_map(|set| set.ways.iter())
             .filter(|entry| entry.valid)
             .map(|entry| entry.length)
             .sum()
@@ -248,25 +223,19 @@ impl DirectDbtCodeCache {
     fn set_index(&self, key: DbtCacheKey) -> usize {
         let pc = u64::from(key.pc >> 2);
         let mixed = pc ^ key.generation ^ key.generation.rotate_left(23);
-        (mixed as usize) % self.sets.len()
+        (mixed as usize) & self.set_mask
     }
 
     fn select_way(&self, set: usize) -> usize {
         self.sets[set]
+            .ways
             .iter()
             .position(|entry| !entry.valid)
-            .unwrap_or_else(|| {
-                self.sets[set]
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(way, entry)| (entry.last_used, *way))
-                    .map(|(way, _)| way)
-                    .unwrap()
-            })
+            .unwrap_or_else(|| usize::from(self.sets[set].mru_way ^ 1))
     }
 
     fn invalidate_overlapping(&mut self, start: usize, end: usize) {
-        for entry in self.sets.iter_mut().flatten() {
+        for entry in self.sets.iter_mut().flat_map(|set| set.ways.iter_mut()) {
             if entry.valid && ranges_overlap(start, end, entry.offset, entry.offset + entry.length)
             {
                 entry.valid = false;
@@ -328,9 +297,13 @@ mod tests {
         let key = DbtCacheKey::new(0x1000, 7);
 
         assert!(cache.lookup(key).is_none());
-        let handle = cache.publish(key, &block(0x1000, &[0xc3])).unwrap();
+        let published = cache.publish(key, &block(0x1000, &[0xc3])).unwrap();
+        let hit = cache.lookup(key).unwrap();
 
-        assert_eq!(cache.lookup(key), Some(handle));
+        assert!(!published.entry().is_null());
+        assert_eq!(published.instruction_count(), 1);
+        assert_eq!(hit.entry(), published.entry());
+        assert_eq!(hit.instruction_count(), published.instruction_count());
         assert!(cache.lookup(DbtCacheKey::new(0x1000, 8)).is_none());
         assert_eq!(cache.stats().hits, 1);
         assert_eq!(cache.stats().misses, 2);
@@ -363,32 +336,45 @@ mod tests {
         let first = DbtCacheKey::new(0, 0);
         let second = DbtCacheKey::new(8, 0);
         let third = DbtCacheKey::new(16, 0);
+        let fourth = DbtCacheKey::new(24, 0);
 
-        let first_handle = cache.publish(first, &block(0, &[0xc3])).unwrap();
+        let first_hit = cache.publish(first, &block(0, &[0xc3])).unwrap();
         cache.publish(second, &block(8, &[0xc3])).unwrap();
-        assert_eq!(cache.lookup(first), Some(first_handle));
+        assert_eq!(cache.lookup(first), Some(first_hit));
         cache.publish(third, &block(16, &[0xc3])).unwrap();
 
         assert!(cache.lookup(first).is_some());
         assert!(cache.lookup(second).is_none());
         assert!(cache.lookup(third).is_some());
-        assert_eq!(cache.stats().metadata_evictions, 1);
+        cache.publish(fourth, &block(24, &[0xc3])).unwrap();
+
+        assert!(cache.lookup(first).is_none());
+        assert!(cache.lookup(third).is_some());
+        assert!(cache.lookup(fourth).is_some());
+        assert_eq!(cache.stats().metadata_evictions, 2);
     }
 
     #[test]
-    fn invalidation_revokes_handles_without_releasing_fixed_storage() {
+    fn rejects_non_power_of_two_set_count() {
+        assert_eq!(
+            DirectDbtCodeCache::new(3, PAGE_BYTES).err().unwrap().kind(),
+            DbtFaultKind::Capacity
+        );
+    }
+
+    #[test]
+    fn invalidation_revokes_lookup_without_releasing_fixed_storage() {
         let mut cache = DirectDbtCodeCache::new(2, PAGE_BYTES).unwrap();
         let key = DbtCacheKey::new(0, 0);
-        let handle = cache.publish(key, &block(0, &[0xc3])).unwrap();
+        let published = cache.publish(key, &block(0, &[0xc3])).unwrap();
         let metadata_bytes = cache.metadata_bytes();
 
-        assert!(cache.entry_address(handle).is_some());
-        assert_eq!(cache.instruction_count(handle), Some(1));
+        assert!(!published.entry().is_null());
+        assert_eq!(published.instruction_count(), 1);
         assert_eq!(cache.live_entry_bytes(), 1);
         cache.invalidate_all();
 
-        assert!(cache.entry_address(handle).is_none());
-        assert_eq!(cache.instruction_count(handle), None);
+        assert!(cache.lookup(key).is_none());
         assert_eq!(cache.live_entry_bytes(), 0);
         assert_eq!(cache.metadata_bytes(), metadata_bytes);
         assert_eq!(cache.reserved_bytes(), PAGE_BYTES * 2);
