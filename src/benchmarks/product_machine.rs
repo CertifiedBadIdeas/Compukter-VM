@@ -43,8 +43,18 @@ pub const PRODUCT_DBT_CACHE_SETS: usize = DEFAULT_DBT_CACHE_SETS;
 pub const PRODUCT_DBT_MAX_INSTRUCTIONS: usize = DEFAULT_DBT_MAX_INSTRUCTIONS;
 pub const PRODUCT_DBT_CODE_BYTES: usize = DEFAULT_DBT_CODE_BYTES;
 pub const PRODUCT_DEBUG_LIMIT: usize = 0;
+pub const PRODUCT_MACHINE_TARGET_NANOS: u128 = 5_000_000;
+pub const PRODUCT_MACHINE_MAX_BATCH: u64 = 1024;
 pub const PRODUCT_RESIDENT_REPORT_HEADER: &str = "backend\tpopulation\tconstruction_median_ns\tconstruction_p95_ns\tresident_live_bytes\tpeak_construction_bytes\tlive_bytes_per_machine\taggregate_ram_bytes\telf_bytes\texecutable_bytes\trw_initialized_bytes\tram_bytes\tdebug_limit\tcache_sets\tblock_cache_sets\tblock_max_instructions\tdbt_cache_sets\tdbt_max_instructions\tdbt_code_bytes";
 pub const PRODUCT_ACTIVE_REPORT_HEADER: &str = "workload\tcandidate\titerations\tchecksum\tbatch\tcold_ns\twarm_median_ns\twarm_p95_ns\toperations_per_second\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tram_bytes\texecutable_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes\tvs_native\tdbt_budget_overshoot\tdbt_max_budget_overshoot";
+
+pub fn product_machine_batch(elapsed_nanos: u128) -> u64 {
+    let required = PRODUCT_MACHINE_TARGET_NANOS.div_ceil(elapsed_nanos.max(1));
+    let batch = required
+        .next_power_of_two()
+        .min(u128::from(PRODUCT_MACHINE_MAX_BATCH));
+    batch as u64
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductExecutionCandidate {
@@ -471,6 +481,7 @@ impl ProductMachineWorkload {
     }
 }
 
+#[derive(Clone)]
 pub struct ProductMachineImage {
     workload: ProductMachineWorkload,
     iterations: u32,
@@ -544,6 +555,19 @@ impl ProductMachineImage {
         })
     }
 
+    pub fn prepare_batch(
+        &self,
+        backend: ProductMachineBackend,
+        batch: u64,
+    ) -> Result<Vec<PreparedProductMachine>, String> {
+        if batch == 0 || batch > PRODUCT_MACHINE_MAX_BATCH {
+            return Err(format!(
+                "product machine batch must be between 1 and {PRODUCT_MACHINE_MAX_BATCH}"
+            ));
+        }
+        (0..batch).map(|_| self.prepare(backend)).collect()
+    }
+
     pub fn elf_bytes(&self) -> &[u8] {
         &self.elf
     }
@@ -613,6 +637,16 @@ impl PreparedProductMachine {
             complete_machine: true,
         })
     }
+}
+
+pub fn execute_product_machine_batch(
+    machines: &mut [PreparedProductMachine],
+) -> Result<ProductMachineObservation, String> {
+    let mut last = None;
+    for machine in machines {
+        last = Some(machine.execute()?);
+    }
+    last.ok_or_else(|| "product machine execution batch must not be empty".to_string())
 }
 
 fn product_elf(
