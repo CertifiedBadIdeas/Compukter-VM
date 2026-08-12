@@ -156,6 +156,13 @@ impl Rv32DbtExecution {
         self.max_instructions
     }
 
+    pub(crate) const fn fast_mode(&self) -> DbtBlockMode {
+        match &self.storage {
+            Rv32DbtStorage::Direct { .. } => DbtBlockMode::DirectFast,
+            Rv32DbtStorage::Cached { .. } => DbtBlockMode::ChainableThroughput,
+        }
+    }
+
     pub(crate) fn decoded_slots_mut(&mut self) -> &mut Vec<Rv32ResolvedInstruction> {
         self.decoded.clear();
         &mut self.decoded
@@ -166,7 +173,7 @@ impl Rv32DbtExecution {
     }
 
     pub(crate) fn lookup(&mut self, pc: u32, mode: DbtBlockMode) -> Option<PreparedDbtBlock> {
-        if mode != DbtBlockMode::Fast {
+        if mode != DbtBlockMode::ChainableThroughput {
             return None;
         }
         let Rv32DbtStorage::Cached { cache, .. } = &mut self.storage else {
@@ -184,6 +191,14 @@ impl Rv32DbtExecution {
         pc: u32,
         mode: DbtBlockMode,
     ) -> Result<PreparedDbtBlock, DbtFault> {
+        if matches!(mode, DbtBlockMode::DirectFast | DbtBlockMode::ChainableThroughput)
+            && mode != self.fast_mode()
+        {
+            return Err(Self::fault(
+                DbtFaultKind::Translation,
+                "DBT fast block mode does not match its storage policy",
+            ));
+        }
         if self.decoded.is_empty() || self.decoded.len() > self.max_instructions {
             return Err(Self::fault(
                 DbtFaultKind::Translation,
@@ -218,8 +233,11 @@ impl Rv32DbtExecution {
                     serial: *scratch_serial,
                 }
             }
-            (Rv32DbtStorage::Cached { cache, .. }, DbtBlockMode::Fast) => PreparedLocation::Cache(
+            (Rv32DbtStorage::Cached { cache, .. }, DbtBlockMode::ChainableThroughput) => PreparedLocation::Cache(
                 cache.publish(DbtCacheKey::new(pc, self.generation), &block)?,
+            ),
+            (Rv32DbtStorage::Cached { .. }, DbtBlockMode::DirectFast) => unreachable!(
+                "DBT fast mode was validated before lowering"
             ),
         };
 
@@ -403,9 +421,9 @@ mod tests {
     fn direct_and_cached_policies_share_one_lowerer() {
         let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096).unwrap();
         fill_one(&mut direct);
-        let first = direct.translate(0x1000, DbtBlockMode::Fast).unwrap();
+        let first = direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
         fill_one(&mut direct);
-        let second = direct.translate(0x1000, DbtBlockMode::Fast).unwrap();
+        let second = direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
         assert_ne!(first, second);
         assert_eq!(direct.stats().translations, 2);
         assert_eq!(direct.stats().publications, 2);
@@ -419,10 +437,10 @@ mod tests {
             4096,
         )
         .unwrap();
-        assert!(cached.lookup(0x1000, DbtBlockMode::Fast).is_none());
+        assert!(cached.lookup(0x1000, DbtBlockMode::ChainableThroughput).is_none());
         fill_one(&mut cached);
-        let published = cached.translate(0x1000, DbtBlockMode::Fast).unwrap();
-        assert_eq!(cached.lookup(0x1000, DbtBlockMode::Fast), Some(published));
+        let published = cached.translate(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
+        assert_eq!(cached.lookup(0x1000, DbtBlockMode::ChainableThroughput), Some(published));
         assert_eq!(cached.stats().translations, 1);
         assert_eq!(cached.stats().publications, 1);
         assert_eq!(cached.stats().hits, 1);
@@ -464,7 +482,7 @@ mod tests {
             .translate(0x1000, DbtBlockMode::Bounded { max_attempts: 1 })
             .unwrap();
 
-        assert!(cached.lookup(0x1000, DbtBlockMode::Fast).is_none());
+        assert!(cached.lookup(0x1000, DbtBlockMode::ChainableThroughput).is_none());
         assert_eq!(cached.stats().translations, 1);
         assert_eq!(cached.stats().publications, 1);
         assert_eq!(cached.stats().misses, 1);
@@ -482,8 +500,8 @@ mod tests {
         )
         .unwrap();
         fill_memory_pair(&mut cached);
-        let published = cached.translate(0x1000, DbtBlockMode::Fast).unwrap();
-        let hit = cached.lookup(0x1000, DbtBlockMode::Fast).unwrap();
+        let published = cached.translate(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
+        let hit = cached.lookup(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
 
         assert_eq!(published.instruction_count(), 2);
         assert_eq!(hit.instruction_count(), 2);
@@ -496,9 +514,9 @@ mod tests {
     fn republishing_direct_scratch_revokes_the_previous_handle() {
         let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096).unwrap();
         fill_one(&mut direct);
-        let stale = direct.translate(0x1000, DbtBlockMode::Fast).unwrap();
+        let stale = direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
         fill_one(&mut direct);
-        direct.translate(0x1000, DbtBlockMode::Fast).unwrap();
+        direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
 
         let mut cpu = Rv32imCpu::new(0x1000);
         let mut context = DbtContext {
@@ -524,7 +542,7 @@ mod tests {
     fn owner_executes_a_live_handle_without_exposing_its_entry_pointer() {
         let mut direct = Rv32DbtExecution::new(Rv32DbtPolicy::Direct, 8, 4096).unwrap();
         fill_one(&mut direct);
-        let prepared = direct.translate(0x1000, DbtBlockMode::Fast).unwrap();
+        let prepared = direct.translate(0x1000, DbtBlockMode::DirectFast).unwrap();
         let mut cpu = Rv32imCpu::new(0x1000);
         let mut ram = [0_u8; 4096];
         let permissions = [0b111_u8];
@@ -562,12 +580,12 @@ mod tests {
         )
         .unwrap();
         fill_word(&mut cached, addi(1, 1, 1));
-        cached.translate(0x1000, DbtBlockMode::Fast).unwrap();
+        cached.translate(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
         fill_word(&mut cached, addi(2, 2, 1));
-        cached.translate(0x1004, DbtBlockMode::Fast).unwrap();
+        cached.translate(0x1004, DbtBlockMode::ChainableThroughput).unwrap();
 
         for (budget, expected_pc, expected_x2) in [(1, 0x1004, 0), (2, 0x1008, 1)] {
-            let prepared = cached.lookup(0x1000, DbtBlockMode::Fast).unwrap();
+            let prepared = cached.lookup(0x1000, DbtBlockMode::ChainableThroughput).unwrap();
             let mut cpu = Rv32imCpu::new(0x1000);
             let mut context = DbtContext {
                 state: cpu.architectural_state_mut(),
@@ -607,10 +625,10 @@ mod tests {
         )
         .unwrap();
         fill_word(&mut cached, addi(1, 1, 4));
-        cached.translate(0x2000, DbtBlockMode::Fast).unwrap();
+        cached.translate(0x2000, DbtBlockMode::ChainableThroughput).unwrap();
         fill_word(&mut cached, lw(2, 1, 0));
-        cached.translate(0x2004, DbtBlockMode::Fast).unwrap();
-        let prepared = cached.lookup(0x2000, DbtBlockMode::Fast).unwrap();
+        cached.translate(0x2004, DbtBlockMode::ChainableThroughput).unwrap();
+        let prepared = cached.lookup(0x2000, DbtBlockMode::ChainableThroughput).unwrap();
         let mut cpu = Rv32imCpu::new(0x2000);
         let mut context = DbtContext {
             state: cpu.architectural_state_mut(),
@@ -654,7 +672,7 @@ mod tests {
         )
         .unwrap();
         fill_word(&mut cached, addi(1, 1, 1));
-        cached.translate(0x3000, DbtBlockMode::Fast).unwrap();
+        cached.translate(0x3000, DbtBlockMode::ChainableThroughput).unwrap();
         let slots = cached.decoded_slots_mut();
         for word in [addi(2, 2, 1), addi(3, 3, 1)] {
             slots.push(Rv32ResolvedInstruction::Valid {
@@ -662,8 +680,8 @@ mod tests {
                 instruction: decode_product_word(word).unwrap(),
             });
         }
-        cached.translate(0x3004, DbtBlockMode::Fast).unwrap();
-        let prepared = cached.lookup(0x3000, DbtBlockMode::Fast).unwrap();
+        cached.translate(0x3004, DbtBlockMode::ChainableThroughput).unwrap();
+        let prepared = cached.lookup(0x3000, DbtBlockMode::ChainableThroughput).unwrap();
         let mut cpu = Rv32imCpu::new(0x3000);
         let mut context = DbtContext {
             state: cpu.architectural_state_mut(),

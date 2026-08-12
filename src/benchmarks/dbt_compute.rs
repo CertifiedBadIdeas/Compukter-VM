@@ -118,7 +118,7 @@ impl PreparedDirectDbtCompute32 {
             .map_err(|error| error.to_string())?;
 
             let translation_started = Instant::now();
-            let input = DbtBlockInput::new(cpu.pc(), &self.decoded, DbtBlockMode::Fast)?;
+            let input = DbtBlockInput::new(cpu.pc(), &self.decoded, DbtBlockMode::DirectFast)?;
             let compiled = self
                 .workspace
                 .lower(&input)
@@ -325,7 +325,11 @@ impl PreparedCachedDbtCompute32 {
                 .map_err(|error| error.to_string())?;
 
                 let translation_started = Instant::now();
-                let input = DbtBlockInput::new(cpu.pc(), &self.decoded, DbtBlockMode::Fast)?;
+                let input = DbtBlockInput::new(
+                    cpu.pc(),
+                    &self.decoded,
+                    DbtBlockMode::ChainableThroughput,
+                )?;
                 let compiled = self
                     .workspace
                     .lower(&input)

@@ -157,7 +157,7 @@ impl DirectDbtCodeCache {
         key: DbtCacheKey,
         block: &TranslatedBlock<'_>,
     ) -> Result<DbtCacheHit, DbtFault> {
-        if block.mode() != DbtBlockMode::Fast {
+        if block.mode() != DbtBlockMode::ChainableThroughput {
             return Err(Self::fault(
                 DbtFaultKind::Translation,
                 "only Fast DBT blocks may enter the persistent code cache",
@@ -471,7 +471,7 @@ mod tests {
             word,
             instruction: decode_product_word(word).unwrap(),
         }];
-        let input = DbtBlockInput::new(pc, &slots, DbtBlockMode::Fast).unwrap();
+        let input = DbtBlockInput::new(pc, &slots, DbtBlockMode::ChainableThroughput).unwrap();
         TranslatedBlock::new(&input, code, 0, 0, chain_entry_offset, links).unwrap()
     }
 
