@@ -25,7 +25,9 @@
 use super::emitter::{Condition, EmitError, Gpr, Mem, X64Emitter};
 use super::register_cache::RegisterCache;
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
-use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, TranslatedBlock};
+use crate::rv32_dbt::block::{
+    DbtBlockInput, DbtBlockMode, DbtLinkKind, DbtStaticLink, TranslatedBlock, MAX_STATIC_LINKS,
+};
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 use crate::rv32im::{
     Branch, DecodedInstruction, ImmOp, Load, Op, Rv32ArchitecturalState, Rv32ResolvedInstruction,
@@ -34,6 +36,36 @@ use crate::rv32im::{
 
 pub(crate) struct DbtTranslationWorkspace {
     emitter: X64Emitter,
+}
+
+struct StaticLinkCollector {
+    links: [DbtStaticLink; MAX_STATIC_LINKS],
+    len: usize,
+}
+
+impl StaticLinkCollector {
+    const fn new() -> Self {
+        Self {
+            links: [DbtStaticLink::EMPTY; MAX_STATIC_LINKS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, link: DbtStaticLink) -> Result<(), EmitError> {
+        let slot = self
+            .links
+            .get_mut(self.len)
+            .ok_or(EmitError::InvalidOperand(
+                "RV32 DBT block exceeded its static link capacity",
+            ))?;
+        *slot = link;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[DbtStaticLink] {
+        &self.links[..self.len]
+    }
 }
 
 impl DbtTranslationWorkspace {
@@ -61,6 +93,16 @@ impl DbtTranslationWorkspace {
         self.emitter.reset();
         let mut out = &mut self.emitter;
         emit_prologue(&mut out).map_err(|error| emit_fault(input.start_pc(), None, error))?;
+        let chain_entry_offset = u32::try_from(out.bytes().len()).map_err(|_| {
+            fault(
+                DbtFaultKind::Capacity,
+                input.start_pc(),
+                None,
+                "RV32 DBT chain entry offset exceeds u32",
+            )
+        })?;
+        let chainable = matches!(input.mode(), DbtBlockMode::Fast);
+        let mut static_links = StaticLinkCollector::new();
         let mut cache = RegisterCache::new();
         let mut terminal = None;
         let mut emitted_terminal = false;
@@ -112,14 +154,26 @@ impl DbtTranslationWorkspace {
                         &input.slots()[index + 1..],
                         &mut cache,
                         &mut out,
+                        chainable,
+                        &mut static_links,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     emitted_terminal = true;
                     break;
                 }
                 DecodedInstruction::Jal { rd, offset } => {
-                    emit_jal(rd, offset, pc, word, attempted, &mut cache, &mut out)
-                        .map_err(|error| emit_fault(pc, Some(word), error))?;
+                    emit_jal(
+                        rd,
+                        offset,
+                        pc,
+                        word,
+                        attempted,
+                        &mut cache,
+                        &mut out,
+                        chainable,
+                        &mut static_links,
+                    )
+                    .map_err(|error| emit_fault(pc, Some(word), error))?;
                     emitted_terminal = true;
                     break;
                 }
@@ -214,14 +268,14 @@ impl DbtTranslationWorkspace {
                 let next_pc = input
                     .start_pc()
                     .wrapping_add(input.slots().len() as u32 * 4);
-                emit_exit(
+                emit_completed_exit(
                     &mut cache,
                     &mut out,
-                    DbtExitTag::Completed,
                     next_pc,
                     input.slots().len() as u32,
-                    0,
-                    0,
+                    DbtLinkKind::Fallthrough,
+                    chainable,
+                    &mut static_links,
                 )
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
             }
@@ -229,8 +283,15 @@ impl DbtTranslationWorkspace {
         let code = out
             .finish()
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
-        TranslatedBlock::new(input, code, lowered_load_sites, lowered_store_sites)
-            .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))
+        TranslatedBlock::new(
+            input,
+            code,
+            lowered_load_sites,
+            lowered_store_sites,
+            chain_entry_offset,
+            static_links.as_slice(),
+        )
+        .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))
     }
 
     #[cfg(test)]
@@ -255,6 +316,8 @@ fn emit_branch(
     remaining: &[Rv32ResolvedInstruction],
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
+    chainable: bool,
+    static_links: &mut StaticLinkCollector,
 ) -> Result<(), EmitError> {
     let lhs = cache.read(rs1, remaining, &[], out)?;
     let rhs = cache.read(rs2, remaining, &[lhs], out)?;
@@ -270,27 +333,27 @@ fn emit_branch(
     };
     out.jcc(condition, taken)?;
     let mut fallthrough_cache = cache.clone();
-    emit_exit(
+    emit_completed_exit(
         &mut fallthrough_cache,
         out,
-        DbtExitTag::Completed,
         pc.wrapping_add(4),
         attempted,
-        0,
-        0,
+        DbtLinkKind::BranchNotTaken,
+        chainable,
+        static_links,
     )?;
     out.bind(taken)?;
     let target = pc.wrapping_add_signed(offset);
     let mut taken_cache = cache.clone();
     if target & 3 == 0 {
-        emit_exit(
+        emit_completed_exit(
             &mut taken_cache,
             out,
-            DbtExitTag::Completed,
             target,
             attempted,
-            0,
-            0,
+            DbtLinkKind::BranchTaken,
+            chainable,
+            static_links,
         )
     } else {
         emit_exit(
@@ -313,6 +376,8 @@ fn emit_jal(
     attempted: u32,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
+    chainable: bool,
+    static_links: &mut StaticLinkCollector,
 ) -> Result<(), EmitError> {
     let target = pc.wrapping_add_signed(offset);
     if target & 3 != 0 {
@@ -329,7 +394,15 @@ fn emit_jal(
     if let Some(dst) = cache.write(rd, &[], &[], out)? {
         out.mov_r32_imm32(dst, pc.wrapping_add(4))?;
     }
-    emit_exit(cache, out, DbtExitTag::Completed, target, attempted, 0, 0)
+    emit_completed_exit(
+        cache,
+        out,
+        target,
+        attempted,
+        DbtLinkKind::Jal,
+        chainable,
+        static_links,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -971,6 +1044,30 @@ fn emit_exit(
     emit_epilogue(out, tag)
 }
 
+fn emit_completed_exit(
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+    next_pc: u32,
+    attempted: u32,
+    kind: DbtLinkKind,
+    chainable: bool,
+    static_links: &mut StaticLinkCollector,
+) -> Result<(), EmitError> {
+    if chainable {
+        cache.flush(out)?;
+        write_u32(out, Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0)?;
+        write_u32(out, Gpr::R14, Rv32ArchitecturalState::PC_OFFSET, next_pc)?;
+        let jump = out.patchable_jump()?;
+        static_links.push(DbtStaticLink {
+            target_pc: next_pc,
+            displacement_offset: jump.displacement_offset(),
+            reset_target_offset: jump.reset_target_offset(),
+            kind,
+        })?;
+    }
+    emit_exit(cache, out, DbtExitTag::Completed, next_pc, attempted, 0, 0)
+}
+
 fn emit_exit_dynamic(
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
@@ -1065,7 +1162,7 @@ mod tests {
     use super::{emit_fault, DbtTranslationWorkspace};
     use crate::memory::MachineMemory;
     use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
-    use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
+    use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, DbtLinkKind};
     use crate::rv32_dbt::executable::ExecutableScratch;
     use crate::rv32_dbt::x86_64::emitter::EmitError;
     use crate::rv32_dbt::DbtFaultKind;
@@ -1273,6 +1370,58 @@ mod tests {
 
         assert_eq!(block.lowered_load_sites(), 1);
         assert_eq!(block.lowered_store_sites(), 1);
+    }
+
+    #[test]
+    fn static_chain_metadata_describes_only_fast_fixed_successors() {
+        let cases = [
+            (
+                0x1000,
+                slots(&[addi(1, 1, 1)]),
+                vec![(DbtLinkKind::Fallthrough, 0x1004)],
+            ),
+            (
+                0x2000,
+                slots(&[beq(1, 2, 12)]),
+                vec![
+                    (DbtLinkKind::BranchNotTaken, 0x2004),
+                    (DbtLinkKind::BranchTaken, 0x200c),
+                ],
+            ),
+            (
+                0x3000,
+                slots(&[jal(1, 16)]),
+                vec![(DbtLinkKind::Jal, 0x3010)],
+            ),
+            (0x4000, slots(&[jalr(1, 2, 0)]), vec![]),
+        ];
+
+        let mut workspace = DbtTranslationWorkspace::new(4096, 4).unwrap();
+        for (start_pc, slots, expected) in cases {
+            let input = DbtBlockInput::new(start_pc, &slots, DbtBlockMode::Fast).unwrap();
+            let block = workspace.lower(&input).unwrap();
+
+            assert!(block.chain_entry_offset() > 0);
+            assert!((block.chain_entry_offset() as usize) < block.code().len());
+            assert_eq!(
+                block
+                    .static_links()
+                    .iter()
+                    .map(|link| (link.kind, link.target_pc))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for link in block.static_links() {
+                assert!((link.displacement_offset as usize + 4) <= block.code().len());
+                assert!((link.reset_target_offset as usize) < block.code().len());
+            }
+        }
+
+        let slots = slots(&[addi(1, 1, 1), addi(2, 2, 1)]);
+        let input =
+            DbtBlockInput::new(0x5000, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
+        let block = workspace.lower(&input).unwrap();
+        assert!(block.static_links().is_empty());
     }
 
     #[test]
