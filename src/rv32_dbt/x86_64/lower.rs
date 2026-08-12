@@ -499,6 +499,7 @@ fn emit_fast_entry_guard(
     out.jmp(guard)?;
     let chain_entry_offset =
         u32::try_from(out.bytes().len()).map_err(|_| EmitError::BranchRange)?;
+    #[cfg(feature = "dbt-chain-stats")]
     add_context_u32(out, DbtContext::CHAIN_TRANSITIONS_OFFSET, 1)?;
     out.bind(guard)?;
     out.test_r64_r64(EXECUTION_COUNTER, EXECUTION_COUNTER)?;
@@ -1180,6 +1181,7 @@ fn write_u32(out: &mut X64Emitter, base: Gpr, offset: usize, value: u32) -> Resu
     out.mov_m32_r32(Mem::base_disp(base, offset as i32), Gpr::Rax)
 }
 
+#[cfg(feature = "dbt-chain-stats")]
 fn add_context_u32(out: &mut X64Emitter, offset: usize, value: u32) -> Result<(), EmitError> {
     out.mov_r32_m32(Gpr::Rax, Mem::base_disp(Gpr::R15, offset as i32))?;
     out.add_r32_imm32(Gpr::Rax, value as i32)?;

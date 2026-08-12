@@ -195,7 +195,8 @@ pub fn format_product_active_row(row: &ProductActiveTiming) -> String {
                 stats.map_or_else(unavailable, |value| value.blocks_built.to_string()),
                 stats.map_or_else(unavailable, |value| value.decoded_slots_built.to_string()),
                 dbt.map_or_else(unavailable, |value| value.native_dispatches.to_string()),
-                dbt.map_or_else(unavailable, |value| value.chain_transitions.to_string()),
+                dbt.and_then(|value| value.chain_transitions)
+                    .map_or_else(unavailable, |value| value.to_string()),
                 dbt.map_or_else(unavailable, |value| value.links_established.to_string()),
                 dbt.map_or_else(unavailable, |value| value.links_reset.to_string()),
                 machine.ram_bytes.to_string(),

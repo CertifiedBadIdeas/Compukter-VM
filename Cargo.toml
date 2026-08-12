@@ -6,6 +6,10 @@ edition = "2021"
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = []
+dbt-chain-stats = []
+
 [dependencies]
 rvsim = { version = "=0.2.2", default-features = false }
 thiserror = "1.0"

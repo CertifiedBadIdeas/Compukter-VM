@@ -730,7 +730,7 @@ fn run_product(
             dbt_translations: dbt.map(|value| value.translations),
             dbt_publications: dbt.map(|value| value.publications),
             dbt_native_dispatches: dbt.map(|value| value.native_dispatches),
-            dbt_chain_transitions: dbt.map(|value| value.chain_transitions),
+            dbt_chain_transitions: dbt.and_then(|value| value.chain_transitions),
             dbt_budget_overshoot: dbt.map(|value| value.budget_overshoot),
             dbt_max_budget_overshoot: dbt.map(|value| u64::from(value.max_budget_overshoot)),
             dbt_links_established: dbt.map(|value| value.links_established),

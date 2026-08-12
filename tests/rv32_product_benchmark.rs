@@ -139,7 +139,10 @@ fn product_observation_exposes_lazy_chain_counters() {
     )
     .unwrap();
     let direct = direct.execute().unwrap().dbt_stats.unwrap();
-    assert_eq!(direct.chain_transitions, 0);
+    #[cfg(not(feature = "dbt-chain-stats"))]
+    assert_eq!(direct.chain_transitions, None);
+    #[cfg(feature = "dbt-chain-stats")]
+    assert_eq!(direct.chain_transitions, Some(0));
     assert_eq!(direct.links_established, 0);
     assert_eq!(direct.links_reset, 0);
 
@@ -151,8 +154,49 @@ fn product_observation_exposes_lazy_chain_counters() {
     .unwrap();
     let cached = cached.execute().unwrap().dbt_stats.unwrap();
     assert!(cached.links_established > 0);
-    assert!(cached.chain_transitions > 0);
-    assert!(cached.native_dispatches < cached.chain_transitions);
+    #[cfg(not(feature = "dbt-chain-stats"))]
+    assert_eq!(cached.chain_transitions, None);
+    #[cfg(feature = "dbt-chain-stats")]
+    {
+        let transitions = cached.chain_transitions.unwrap();
+        assert!(transitions > 0);
+        assert!(cached.native_dispatches < transitions);
+    }
+}
+
+#[test]
+fn product_report_formats_optional_exact_chain_transitions() {
+    let mut prepared = PreparedProductMachine::new(
+        ProductMachineBackend::CachedDbt,
+        ProductMachineWorkload::Compute32,
+        32,
+    )
+    .unwrap();
+    let observation = prepared.execute().unwrap();
+    let chain_transitions = observation.dbt_stats.unwrap().chain_transitions;
+    let row = ProductActiveTiming {
+        candidate: ProductExecutionCandidate::CachedDbt,
+        workload: ProductMachineWorkload::Compute32,
+        iterations: 32,
+        checksum: observation.checksum,
+        batch: 1,
+        cold_nanos: 1.0,
+        warm_median_nanos: 1.0,
+        warm_p95_nanos: 1.0,
+        machine: Some(observation),
+        steady_allocations: 0,
+        steady_allocated_bytes: 0,
+        vs_native: 1.0,
+    };
+
+    let fields = format_product_active_row(&row)
+        .split('\t')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    match chain_transitions {
+        Some(value) => assert_eq!(fields[17], value.to_string()),
+        None => assert_eq!(fields[17], "-"),
+    }
 }
 
 #[test]

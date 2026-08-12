@@ -81,6 +81,7 @@ pub(crate) struct Rv32DbtExecution {
     context_initializations: u64,
     native_dispatches: u64,
     typed_slow_exits: u64,
+    #[cfg(feature = "dbt-chain-stats")]
     chain_transitions: u64,
     budget_overshoot: u64,
     max_budget_overshoot: u32,
@@ -145,6 +146,7 @@ impl Rv32DbtExecution {
             context_initializations: 0,
             native_dispatches: 0,
             typed_slow_exits: 0,
+            #[cfg(feature = "dbt-chain-stats")]
             chain_transitions: 0,
             budget_overshoot: 0,
             max_budget_overshoot: 0,
@@ -304,9 +306,12 @@ impl Rv32DbtExecution {
         let tag = DbtExitTag::try_from(raw_tag)
             .map_err(|message| Self::fault(DbtFaultKind::InvalidExit, message))?;
         self.native_dispatches = self.native_dispatches.saturating_add(1);
-        self.chain_transitions = self
-            .chain_transitions
-            .saturating_add(u64::from(context.chain_transitions));
+        #[cfg(feature = "dbt-chain-stats")]
+        {
+            self.chain_transitions = self
+                .chain_transitions
+                .saturating_add(u64::from(context.chain_transitions));
+        }
         if matches!(tag, DbtExitTag::SlowInstruction | DbtExitTag::MemoryAccess) {
             self.typed_slow_exits = self.typed_slow_exits.saturating_add(1);
         }
@@ -372,7 +377,10 @@ impl Rv32DbtExecution {
             context_initializations: self.context_initializations,
             native_dispatches: self.native_dispatches,
             typed_slow_exits: self.typed_slow_exits,
-            chain_transitions: self.chain_transitions,
+            #[cfg(feature = "dbt-chain-stats")]
+            chain_transitions: Some(self.chain_transitions),
+            #[cfg(not(feature = "dbt-chain-stats"))]
+            chain_transitions: None,
             budget_overshoot: self.budget_overshoot,
             max_budget_overshoot: self.max_budget_overshoot,
             links_established: cache_stats.links_established,
@@ -636,6 +644,9 @@ mod tests {
 
             assert_eq!(tag, DbtExitTag::Completed);
             assert_eq!(context.exit.attempted, budget);
+            #[cfg(not(feature = "dbt-chain-stats"))]
+            assert_eq!(context.chain_transitions, 0);
+            #[cfg(feature = "dbt-chain-stats")]
             assert_eq!(context.chain_transitions, 1);
             assert_eq!(cpu.pc(), expected_pc);
             assert_eq!(cpu.register(1), 1);
@@ -686,6 +697,9 @@ mod tests {
         assert_eq!(context.exit.instruction_pc, 0x2004);
         assert_eq!(context.exit.address, 4);
         assert_eq!(context.exit.access_size, 4);
+        #[cfg(not(feature = "dbt-chain-stats"))]
+        assert_eq!(context.chain_transitions, 0);
+        #[cfg(feature = "dbt-chain-stats")]
         assert_eq!(context.chain_transitions, 1);
         assert_eq!(context.reservation_valid, 1);
         assert_eq!(context.reservation_address, 0x80);
@@ -741,6 +755,9 @@ mod tests {
         assert_eq!(tag, DbtExitTag::Completed);
         assert_eq!(context.exit.attempted, 3);
         assert_eq!(context.remaining_budget, 2);
+        #[cfg(not(feature = "dbt-chain-stats"))]
+        assert_eq!(context.chain_transitions, 0);
+        #[cfg(feature = "dbt-chain-stats")]
         assert_eq!(context.chain_transitions, 1);
         assert_eq!(cpu.pc(), 0x300c);
         assert_eq!(cpu.register(1), 1);
