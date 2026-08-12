@@ -1091,8 +1091,6 @@ fn emit_completed_exit(
 ) -> Result<(), EmitError> {
     if chainable {
         cache.flush(out)?;
-        write_u32(out, Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0)?;
-        write_u32(out, Gpr::R14, Rv32ArchitecturalState::PC_OFFSET, next_pc)?;
         out.add_r64_imm32(EXECUTION_COUNTER, attempted as i32)?;
         let jump = out.patchable_jump()?;
         static_links.push(DbtStaticLink {
@@ -1232,12 +1230,12 @@ fn fault(kind: DbtFaultKind, pc: u32, word: Option<u32>, message: impl Into<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{emit_fault, DbtTranslationWorkspace};
+    use super::{emit_fault, write_u32, DbtTranslationWorkspace};
     use crate::memory::MachineMemory;
     use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
     use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, DbtLinkKind};
     use crate::rv32_dbt::executable::ExecutableScratch;
-    use crate::rv32_dbt::x86_64::emitter::EmitError;
+    use crate::rv32_dbt::x86_64::emitter::{EmitError, Gpr, X64Emitter};
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{
         decode_product_word,
@@ -1246,8 +1244,20 @@ mod tests {
             jal, jalr, lb, lbu, lh, lhu, lui, lw, mul, mulh, mulhsu, mulhu, or, ori, rem, remu, sb,
             sh, sll, slli, slt, slti, sltiu, sltu, sra, srai, srl, srli, sub, sw, xor, xori,
         },
-        Rv32ResolvedInstruction, Rv32imCpu,
+        Rv32ArchitecturalState, Rv32ResolvedInstruction, Rv32imCpu,
     };
+
+    fn write_u32_pattern(base: Gpr, offset: usize, value: u32) -> Vec<u8> {
+        let mut emitter = X64Emitter::new(32, 1).unwrap();
+        write_u32(&mut emitter, base, offset, value).unwrap();
+        emitter.finish().unwrap().to_vec()
+    }
+
+    fn pattern_count(code: &[u8], pattern: &[u8]) -> usize {
+        code.windows(pattern.len())
+            .filter(|window| *window == pattern)
+            .count()
+    }
 
     fn slots(words: &[u32]) -> Vec<Rv32ResolvedInstruction> {
         words
@@ -1498,6 +1508,24 @@ mod tests {
             DbtBlockInput::new(0x5000, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
         let block = workspace.lower(&input).unwrap();
         assert!(block.static_links().is_empty());
+    }
+
+    #[test]
+    fn linked_fallthrough_materializes_x0_and_pc_only_on_real_exits() {
+        let start_pc = 0x1000;
+        let words = slots(&[addi(1, 1, 1)]);
+        let input =
+            DbtBlockInput::new(start_pc, &words, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, words.len()).unwrap();
+
+        let block = workspace.lower(&input).unwrap();
+        let x0_write = write_u32_pattern(Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0);
+        let pc_write = write_u32_pattern(Gpr::R14, Rv32ArchitecturalState::PC_OFFSET, start_pc + 4);
+
+        // One x0 write belongs to the entry budget guard and one to the
+        // unlinked fallback. A successful linked edge needs neither.
+        assert_eq!(pattern_count(block.code(), &x0_write), 2);
+        assert_eq!(pattern_count(block.code(), &pc_write), 1);
     }
 
     #[test]
