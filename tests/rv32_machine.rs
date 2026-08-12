@@ -70,6 +70,38 @@ fn cached_dbt_is_the_default_execution_backend() {
 }
 
 #[test]
+fn cached_dbt_initializes_one_context_per_run_call() {
+    let elf = machine_program_elf(&[addi(1, 1, 1), jal(0, -4)]);
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 8,
+                max_instructions: 8,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+            },
+            0,
+        ),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        machine.run(16).unwrap(),
+        Rv32MachineOutcome::BudgetExhausted {
+            retired_delta: 16,
+            retired_total: 16,
+        }
+    ));
+    let first = machine.dbt_stats().unwrap();
+    assert!(first.native_dispatches > 1);
+    assert_eq!(first.context_initializations, 1);
+
+    machine.run(16).unwrap();
+    assert_eq!(machine.dbt_stats().unwrap().context_initializations, 2);
+}
+
+#[test]
 fn all_backends_run_from_elf_entry_under_budget_and_halt_through_mmio() {
     let elf = halting_machine_elf(b'R');
 

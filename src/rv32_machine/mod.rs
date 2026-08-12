@@ -47,6 +47,7 @@ pub struct Rv32DbtStats {
     pub evictions: u64,
     pub metadata_evictions: u64,
     pub overlap_invalidations: u64,
+    pub context_initializations: u64,
     pub native_dispatches: u64,
     pub typed_slow_exits: u64,
     pub lowered_load_sites: u64,

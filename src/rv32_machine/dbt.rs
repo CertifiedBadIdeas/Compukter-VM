@@ -25,7 +25,7 @@
 use super::Rv32DbtStats;
 use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
-use crate::rv32_dbt::code_cache::{DbtCacheHandle, DbtCacheKey, DirectDbtCodeCache};
+use crate::rv32_dbt::code_cache::{DbtCacheHit, DbtCacheKey, DirectDbtCodeCache};
 use crate::rv32_dbt::executable::ExecutableScratch;
 use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
@@ -40,28 +40,18 @@ pub(crate) enum Rv32DbtPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedLocation {
     Scratch { serial: u64 },
-    Cache(DbtCacheHandle),
+    Cache(DbtCacheHit),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreparedDbtBlock {
     location: PreparedLocation,
     instruction_count: u32,
-    lowered_load_sites: u32,
-    lowered_store_sites: u32,
 }
 
 impl PreparedDbtBlock {
     pub(crate) const fn instruction_count(self) -> u32 {
         self.instruction_count
-    }
-
-    pub(crate) const fn lowered_load_sites(self) -> u32 {
-        self.lowered_load_sites
-    }
-
-    pub(crate) const fn lowered_store_sites(self) -> u32 {
-        self.lowered_store_sites
     }
 }
 
@@ -84,6 +74,7 @@ pub(crate) struct Rv32DbtExecution {
     storage: Rv32DbtStorage,
     translations: u64,
     publications: u64,
+    context_initializations: u64,
     native_dispatches: u64,
     typed_slow_exits: u64,
     lowered_load_sites: u64,
@@ -112,10 +103,10 @@ impl Rv32DbtExecution {
             ));
         }
         if let Rv32DbtPolicy::Cached { sets, cache_bytes } = policy {
-            if sets == 0 || sets > u32::MAX as usize {
+            if sets == 0 || sets > u32::MAX as usize || !sets.is_power_of_two() {
                 return Err(Self::fault(
                     DbtFaultKind::Capacity,
-                    "DBT cache sets must be between 1 and u32::MAX",
+                    "DBT cache sets must be a power of two between 1 and u32::MAX",
                 ));
             }
             if cache_bytes == 0 || !cache_bytes.is_multiple_of(4096) {
@@ -144,6 +135,7 @@ impl Rv32DbtExecution {
             storage,
             translations: 0,
             publications: 0,
+            context_initializations: 0,
             native_dispatches: 0,
             typed_slow_exits: 0,
             lowered_load_sites: 0,
@@ -174,12 +166,10 @@ impl Rv32DbtExecution {
         let Rv32DbtStorage::Cached { cache, .. } = &mut self.storage else {
             return None;
         };
-        let handle = cache.lookup(DbtCacheKey::new(pc, self.generation))?;
+        let hit = cache.lookup(DbtCacheKey::new(pc, self.generation))?;
         Some(PreparedDbtBlock {
-            location: PreparedLocation::Cache(handle),
-            instruction_count: cache.instruction_count(handle)?,
-            lowered_load_sites: cache.lowered_load_sites(handle)?,
-            lowered_store_sites: cache.lowered_store_sites(handle)?,
+            location: PreparedLocation::Cache(hit),
+            instruction_count: hit.instruction_count(),
         })
     }
 
@@ -242,8 +232,6 @@ impl Rv32DbtExecution {
         Ok(PreparedDbtBlock {
             location,
             instruction_count,
-            lowered_load_sites,
-            lowered_store_sites,
         })
     }
 
@@ -268,9 +256,9 @@ impl Rv32DbtExecution {
                     ..
                 },
             ) if serial == *scratch_serial => bounded_scratch.entry_address(),
-            (PreparedLocation::Cache(handle), Rv32DbtStorage::Cached { cache, .. }) => {
-                cache.entry_address(handle)
-            }
+            // The per-machine dispatcher consumes cached descriptors immediately;
+            // it cannot publish or invalidate between lookup and this entry call.
+            (PreparedLocation::Cache(hit), Rv32DbtStorage::Cached { .. }) => Some(hit.entry()),
             _ => None,
         }
         .ok_or_else(|| {
@@ -288,6 +276,10 @@ impl Rv32DbtExecution {
             self.typed_slow_exits = self.typed_slow_exits.saturating_add(1);
         }
         Ok(tag)
+    }
+
+    pub(crate) fn record_context_initialization(&mut self) {
+        self.context_initializations = self.context_initializations.saturating_add(1);
     }
 
     pub(crate) fn invalidate_all(&mut self) {
@@ -337,6 +329,7 @@ impl Rv32DbtExecution {
                 .saturating_add(cache_stats.overlap_invalidations),
             metadata_evictions: cache_stats.metadata_evictions,
             overlap_invalidations: cache_stats.overlap_invalidations,
+            context_initializations: self.context_initializations,
             native_dispatches: self.native_dispatches,
             typed_slow_exits: self.typed_slow_exits,
             lowered_load_sites: self.lowered_load_sites,
@@ -472,8 +465,7 @@ mod tests {
         let hit = cached.lookup(0x1000, DbtBlockMode::Fast).unwrap();
 
         assert_eq!(published.instruction_count(), 2);
-        assert_eq!(published.lowered_load_sites(), 1);
-        assert_eq!(published.lowered_store_sites(), 1);
+        assert_eq!(hit.instruction_count(), 2);
         assert_eq!(hit, published);
         assert_eq!(cached.stats().lowered_load_sites, 1);
         assert_eq!(cached.stats().lowered_store_sites, 1);
@@ -541,6 +533,14 @@ mod tests {
             Rv32DbtExecution::new(
                 Rv32DbtPolicy::Cached {
                     sets: 0,
+                    cache_bytes: 4096,
+                },
+                8,
+                4096,
+            ),
+            Rv32DbtExecution::new(
+                Rv32DbtPolicy::Cached {
+                    sets: 3,
                     cache_bytes: 4096,
                 },
                 8,

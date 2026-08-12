@@ -455,6 +455,18 @@ impl Rv32Machine {
         if let Some(outcome) = self.terminal_outcome(retired_before) {
             return Ok(outcome);
         }
+        let mut context =
+            create_dbt_context(&mut self.hart, &mut self.address_space).map_err(|error| {
+                Rv32MachineExecutionError {
+                    pc: self.hart.pc(),
+                    retired_total: self.hart.retired_instructions(),
+                    message: error.to_string(),
+                }
+            })?;
+        let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
+            unreachable!("DBT loop requires the DBT backend")
+        };
+        execution.record_context_initialization();
         let mut attempted = 0_u64;
         while attempted < instruction_budget {
             let instruction_pc = self.hart.pc();
@@ -528,20 +540,16 @@ impl Rv32Machine {
                 };
 
                 let (tag, exit, reservation_valid, reservation_address) = {
+                    refresh_dbt_context(&mut self.hart, &mut context, remaining);
                     let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
                         unreachable!("DBT loop requires the DBT backend")
                     };
-                    execute_prepared_dbt(
-                        &mut self.hart,
-                        &mut self.address_space,
-                        execution,
-                        prepared,
-                        remaining,
-                    )
-                    .map_err(|error| Rv32MachineExecutionError {
-                        pc: instruction_pc,
-                        retired_total: self.hart.retired_instructions(),
-                        message: error.to_string(),
+                    execute_prepared_dbt(execution, prepared, &mut context).map_err(|error| {
+                        Rv32MachineExecutionError {
+                            pc: instruction_pc,
+                            retired_total: self.hart.retired_instructions(),
+                            message: error.to_string(),
+                        }
                     })?
                 };
                 if exit.attempted == 0
@@ -821,12 +829,24 @@ impl Rv32Machine {
 
 #[cfg(target_arch = "x86_64")]
 fn execute_prepared_dbt(
-    hart: &mut Rv32MachineHart,
-    address_space: &mut Rv32AddressSpace,
     execution: &mut Rv32DbtExecution,
     prepared: PreparedDbtBlock,
-    remaining_budget: u64,
+    context: &mut DbtContext,
 ) -> Result<(DbtExitTag, DbtExitRecord, u32, u32), DbtFault> {
+    let tag = unsafe { execution.execute(prepared, context) }?;
+    Ok((
+        tag,
+        context.exit,
+        context.reservation_valid,
+        context.reservation_address,
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn create_dbt_context(
+    hart: &mut Rv32MachineHart,
+    address_space: &mut Rv32AddressSpace,
+) -> Result<DbtContext, DbtFault> {
     let (state, reservation_valid, reservation_address) = hart.dbt_state();
     let view = address_space.direct_ram_view();
     let ram_len = u32::try_from(view.len()).map_err(|_| {
@@ -845,24 +865,31 @@ fn execute_prepared_dbt(
             "RV32 permission page count exceeds the DBT ABI",
         )
     })?;
-    let mut context = DbtContext {
+    Ok(DbtContext {
         state,
         ram_base: view.base(),
         ram_len,
         page_permissions: view.page_permissions(),
         page_count,
-        remaining_budget: remaining_budget.min(u64::from(u32::MAX)) as u32,
+        remaining_budget: 0,
         reservation_valid,
         reservation_address,
         exit: DbtExitRecord::default(),
-    };
-    let tag = unsafe { execution.execute(prepared, &mut context) }?;
-    Ok((
-        tag,
-        context.exit,
-        context.reservation_valid,
-        context.reservation_address,
-    ))
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn refresh_dbt_context(
+    hart: &mut Rv32MachineHart,
+    context: &mut DbtContext,
+    remaining_budget: u64,
+) {
+    let (state, reservation_valid, reservation_address) = hart.dbt_state();
+    debug_assert_eq!(context.state, state);
+    context.remaining_budget = remaining_budget.min(u64::from(u32::MAX)) as u32;
+    context.reservation_valid = reservation_valid;
+    context.reservation_address = reservation_address;
+    context.exit = DbtExitRecord::default();
 }
 
 #[cfg(target_arch = "x86_64")]
