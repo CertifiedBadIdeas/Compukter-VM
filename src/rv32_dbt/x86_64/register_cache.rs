@@ -28,11 +28,21 @@ use crate::rv32im::{
 };
 use std::cmp::Reverse;
 
-const HOST_POOL: [Gpr; 8] = [
+const DIRECT_HOST_POOL: [Gpr; 8] = [
     Gpr::Rbx,
     Gpr::Rbp,
     Gpr::Rsi,
     Gpr::Rdi,
+    Gpr::R8,
+    Gpr::R9,
+    Gpr::R10,
+    Gpr::R11,
+];
+
+const CHAINABLE_HOST_POOL: [Gpr; 7] = [
+    Gpr::Rbx,
+    Gpr::Rbp,
+    Gpr::Rsi,
     Gpr::R8,
     Gpr::R9,
     Gpr::R10,
@@ -48,13 +58,26 @@ struct Resident {
 
 #[derive(Clone)]
 pub(crate) struct RegisterCache {
-    entries: [Option<Resident>; HOST_POOL.len()],
+    host_pool: &'static [Gpr],
+    entries: [Option<Resident>; DIRECT_HOST_POOL.len()],
 }
 
 impl RegisterCache {
     pub(crate) const fn new() -> Self {
+        Self::direct()
+    }
+
+    pub(crate) const fn direct() -> Self {
         Self {
-            entries: [None; HOST_POOL.len()],
+            host_pool: &DIRECT_HOST_POOL,
+            entries: [None; DIRECT_HOST_POOL.len()],
+        }
+    }
+
+    pub(crate) const fn chainable() -> Self {
+        Self {
+            host_pool: &CHAINABLE_HOST_POOL,
+            entries: [None; DIRECT_HOST_POOL.len()],
         }
     }
 
@@ -73,7 +96,7 @@ impl RegisterCache {
             return Ok(resident.host);
         }
         let index = self.allocate(remaining, pinned, out)?;
-        let host = HOST_POOL[index];
+        let host = self.host_pool[index];
         out.mov_r32_m32(
             host,
             Mem::base_disp(
@@ -105,7 +128,7 @@ impl RegisterCache {
             return Ok(Some(resident.host));
         }
         let index = self.allocate(remaining, pinned, out)?;
-        let host = HOST_POOL[index];
+        let host = self.host_pool[index];
         self.entries[index] = Some(Resident {
             guest,
             host,
@@ -136,11 +159,14 @@ impl RegisterCache {
         pinned: &[Gpr],
         out: &mut X64Emitter,
     ) -> Result<usize, EmitError> {
-        if let Some(index) = self.entries.iter().position(Option::is_none) {
+        if let Some(index) = self.entries[..self.host_pool.len()]
+            .iter()
+            .position(Option::is_none)
+        {
             return Ok(index);
         }
         let index = self
-            .entries
+            .entries[..self.host_pool.len()]
             .iter()
             .enumerate()
             .filter_map(|(index, resident)| {
@@ -196,6 +222,11 @@ impl RegisterCache {
         guests.sort_unstable();
         guests
     }
+
+    #[cfg(test)]
+    const fn host_pool(&self) -> &'static [Gpr] {
+        self.host_pool
+    }
 }
 
 fn next_use(slots: &[Rv32ResolvedInstruction], guest: usize) -> Option<usize> {
@@ -245,6 +276,35 @@ mod tests {
             word,
             instruction: decode_product_word(word).unwrap(),
         }
+    }
+
+    #[test]
+    fn chainable_cache_reserves_only_rdi() {
+        assert_eq!(
+            RegisterCache::direct().host_pool(),
+            &[
+                Gpr::Rbx,
+                Gpr::Rbp,
+                Gpr::Rsi,
+                Gpr::Rdi,
+                Gpr::R8,
+                Gpr::R9,
+                Gpr::R10,
+                Gpr::R11,
+            ]
+        );
+        assert_eq!(
+            RegisterCache::chainable().host_pool(),
+            &[
+                Gpr::Rbx,
+                Gpr::Rbp,
+                Gpr::Rsi,
+                Gpr::R8,
+                Gpr::R9,
+                Gpr::R10,
+                Gpr::R11,
+            ]
+        );
     }
 
     #[test]

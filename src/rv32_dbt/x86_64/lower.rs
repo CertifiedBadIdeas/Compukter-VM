@@ -93,9 +93,13 @@ impl DbtTranslationWorkspace {
         self.emitter.reset();
         let mut out = &mut self.emitter;
         emit_prologue(&mut out).map_err(|error| emit_fault(input.start_pc(), None, error))?;
-        let chainable = matches!(input.mode(), DbtBlockMode::Fast);
+        let chainable = matches!(input.mode(), DbtBlockMode::ChainableThroughput);
         let mut static_links = StaticLinkCollector::new();
-        let mut cache = RegisterCache::new();
+        let mut cache = if chainable {
+            RegisterCache::chainable()
+        } else {
+            RegisterCache::direct()
+        };
         let chain_entry_offset = if chainable {
             emit_fast_entry_guard(
                 &mut cache,
@@ -119,7 +123,7 @@ impl DbtTranslationWorkspace {
         let mut lowered_load_sites = 0_u32;
         let mut lowered_store_sites = 0_u32;
         let bounded_limit = match input.mode() {
-            DbtBlockMode::Fast => None,
+            DbtBlockMode::DirectFast | DbtBlockMode::ChainableThroughput => None,
             DbtBlockMode::Bounded { max_attempts } => Some(max_attempts as usize),
         };
         for (index, slot) in input.slots().iter().copied().enumerate() {
@@ -1296,7 +1300,7 @@ mod tests {
         reservation: Option<u32>,
     ) -> (Rv32imCpu, DbtExitTag, DbtExitRecord, u32) {
         let slots = slots(&[word]);
-        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Fast).unwrap();
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
         let mut workspace = DbtTranslationWorkspace::new(4096, 1).unwrap();
         let block = workspace.lower(&input).unwrap();
         let mut scratch = ExecutableScratch::new(4096).unwrap();
@@ -1425,7 +1429,7 @@ mod tests {
     #[test]
     fn translated_block_reports_static_native_ram_sites() {
         let slots = slots(&[lw(3, 1, 0), sw(1, 2, 0), addi(4, 4, 1)]);
-        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Fast).unwrap();
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
         let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
 
         let block = workspace.lower(&input).unwrap();
@@ -1460,7 +1464,8 @@ mod tests {
 
         let mut workspace = DbtTranslationWorkspace::new(4096, 4).unwrap();
         for (start_pc, slots, expected) in cases {
-            let input = DbtBlockInput::new(start_pc, &slots, DbtBlockMode::Fast).unwrap();
+            let input =
+                DbtBlockInput::new(start_pc, &slots, DbtBlockMode::ChainableThroughput).unwrap();
             let block = workspace.lower(&input).unwrap();
 
             assert!(block.chain_entry_offset() > 0);
@@ -1534,7 +1539,7 @@ mod tests {
                 instruction: decode_product_word(word).unwrap(),
             })
             .collect::<Vec<_>>();
-        let input = DbtBlockInput::new(start_pc, &slots, DbtBlockMode::Fast).unwrap();
+        let input = DbtBlockInput::new(start_pc, &slots, DbtBlockMode::DirectFast).unwrap();
 
         let mut expected = Rv32imCpu::new(start_pc);
         let mut actual = Rv32imCpu::new(start_pc);
@@ -1597,7 +1602,7 @@ mod tests {
                 instruction: decode_product_word(word).unwrap(),
             })
             .collect::<Vec<_>>();
-        let input = DbtBlockInput::new(start_pc, &slots, DbtBlockMode::Fast).unwrap();
+        let input = DbtBlockInput::new(start_pc, &slots, DbtBlockMode::DirectFast).unwrap();
         let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
         let compiled = workspace.lower(&input).unwrap();
         let mut scratch = ExecutableScratch::new(4096).unwrap();
@@ -1646,7 +1651,7 @@ mod tests {
         for (encode, taken, not_taken) in cases {
             let word = encode(1, 2, 8);
             let slots = slots(&[word]);
-            let block = DbtBlockInput::new(0x3000, &slots, DbtBlockMode::Fast).unwrap();
+            let block = DbtBlockInput::new(0x3000, &slots, DbtBlockMode::DirectFast).unwrap();
 
             let (cpu, tag, exit, _) = execute(&block, &[(1, taken.0), (2, taken.1)]);
             assert_eq!(tag, DbtExitTag::Completed);
@@ -1665,7 +1670,7 @@ mod tests {
     #[test]
     fn jal_and_jalr_commit_links_and_targets_but_misalignment_exits_slow() {
         let jal_slots = slots(&[jal(5, 12)]);
-        let jal_block = DbtBlockInput::new(0x4000, &jal_slots, DbtBlockMode::Fast).unwrap();
+        let jal_block = DbtBlockInput::new(0x4000, &jal_slots, DbtBlockMode::DirectFast).unwrap();
         let (cpu, tag, exit, _) = execute(&jal_block, &[]);
         assert_eq!(tag, DbtExitTag::Completed);
         assert_eq!(cpu.register(5), 0x4004);
@@ -1673,7 +1678,7 @@ mod tests {
         assert_eq!(exit.attempted, 1);
 
         let jalr_slots = slots(&[jalr(6, 1, 5)]);
-        let jalr_block = DbtBlockInput::new(0x5000, &jalr_slots, DbtBlockMode::Fast).unwrap();
+        let jalr_block = DbtBlockInput::new(0x5000, &jalr_slots, DbtBlockMode::DirectFast).unwrap();
         let (cpu, tag, _, _) = execute(&jalr_block, &[(1, 0x6000)]);
         assert_eq!(tag, DbtExitTag::Completed);
         assert_eq!(cpu.register(6), 0x5004);
@@ -1681,7 +1686,7 @@ mod tests {
 
         let misaligned_jal_slots = slots(&[jal(7, 2)]);
         let misaligned_jal =
-            DbtBlockInput::new(0x7000, &misaligned_jal_slots, DbtBlockMode::Fast).unwrap();
+            DbtBlockInput::new(0x7000, &misaligned_jal_slots, DbtBlockMode::DirectFast).unwrap();
         let (cpu, tag, exit, _) = execute(&misaligned_jal, &[(7, 0xaaaa_5555)]);
         assert_eq!(tag, DbtExitTag::SlowInstruction);
         assert_eq!(cpu.register(7), 0xaaaa_5555);
@@ -1690,7 +1695,7 @@ mod tests {
 
         let misaligned_jalr_slots = slots(&[jalr(8, 1, 0)]);
         let misaligned_jalr =
-            DbtBlockInput::new(0x8000, &misaligned_jalr_slots, DbtBlockMode::Fast).unwrap();
+            DbtBlockInput::new(0x8000, &misaligned_jalr_slots, DbtBlockMode::DirectFast).unwrap();
         let (cpu, tag, _, _) = execute(&misaligned_jalr, &[(1, 0x9003), (8, 0x1234)]);
         assert_eq!(tag, DbtExitTag::SlowInstruction);
         assert_eq!(cpu.register(8), 0x1234);
@@ -1701,7 +1706,7 @@ mod tests {
     fn final_branch_counts_the_native_prefix_and_itself() {
         let words = [addi(3, 3, 1), bne(1, 2, 8)];
         let slots = slots(&words);
-        let block = DbtBlockInput::new(0xa000, &slots, DbtBlockMode::Fast).unwrap();
+        let block = DbtBlockInput::new(0xa000, &slots, DbtBlockMode::DirectFast).unwrap();
 
         let (cpu, tag, exit, _) = execute(&block, &[(1, 1), (2, 2), (3, 9)]);
 
@@ -1808,7 +1813,7 @@ mod tests {
             for &(lhs, rhs) in &pairs {
                 let word = encode(3, 1, 2);
                 let slots = slots(&[word]);
-                let block = DbtBlockInput::new(0xe000, &slots, DbtBlockMode::Fast).unwrap();
+                let block = DbtBlockInput::new(0xe000, &slots, DbtBlockMode::DirectFast).unwrap();
                 let (actual, tag, exit, _) =
                     execute(&block, &[(1, lhs), (2, rhs), (3, 0xfeed_face)]);
                 let mut expected = Rv32imCpu::new(0xe000);
@@ -1839,9 +1844,9 @@ mod tests {
     #[test]
     fn one_workspace_lowers_distinct_blocks_sequentially() {
         let add_slots = slots(&[addi(3, 1, 7)]);
-        let add_input = DbtBlockInput::new(0x1000, &add_slots, DbtBlockMode::Fast).unwrap();
+        let add_input = DbtBlockInput::new(0x1000, &add_slots, DbtBlockMode::DirectFast).unwrap();
         let mul_slots = slots(&[mul(3, 1, 2)]);
-        let mul_input = DbtBlockInput::new(0x2000, &mul_slots, DbtBlockMode::Fast).unwrap();
+        let mul_input = DbtBlockInput::new(0x2000, &mul_slots, DbtBlockMode::DirectFast).unwrap();
         let mut workspace = DbtTranslationWorkspace::new(4096, 8).unwrap();
         let mut scratch = ExecutableScratch::new(4096).unwrap();
         let capacities = workspace.buffer_capacities();

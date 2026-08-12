@@ -53,7 +53,8 @@ impl DbtStaticLink {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbtBlockMode {
-    Fast,
+    DirectFast,
+    ChainableThroughput,
     Bounded { max_attempts: u32 },
 }
 
@@ -138,8 +139,8 @@ impl<'a> TranslatedBlock<'a> {
                 static_links.len()
             ));
         }
-        if matches!(input.mode(), DbtBlockMode::Bounded { .. }) && !static_links.is_empty() {
-            return Err("RV32 DBT bounded blocks cannot expose static links".to_string());
+        if input.mode() != DbtBlockMode::ChainableThroughput && !static_links.is_empty() {
+            return Err("only RV32 DBT chainable blocks can expose static links".to_string());
         }
         for link in static_links {
             let displacement_end = (link.displacement_offset as usize)
@@ -213,14 +214,19 @@ mod tests {
     #[test]
     fn block_input_borrows_the_callers_slots() {
         let slots = [slot(), slot()];
-        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Fast).unwrap();
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
 
         assert!(std::ptr::eq(input.slots().as_ptr(), slots.as_ptr()));
     }
 
     #[test]
+    fn block_modes_distinguish_direct_and_chainable_fast_paths() {
+        assert_ne!(DbtBlockMode::DirectFast, DbtBlockMode::ChainableThroughput);
+    }
+
+    #[test]
     fn block_input_rejects_empty_and_invalid_bounded_modes() {
-        assert!(DbtBlockInput::new(0x1000, &[], DbtBlockMode::Fast).is_err());
+        assert!(DbtBlockInput::new(0x1000, &[], DbtBlockMode::DirectFast).is_err());
         let one_slot = [slot()];
         assert!(
             DbtBlockInput::new(0x1000, &one_slot, DbtBlockMode::Bounded { max_attempts: 0 },)
@@ -253,7 +259,7 @@ mod tests {
     #[test]
     fn translated_block_rejects_invalid_chain_metadata() {
         let slots = [slot(), slot()];
-        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Fast).unwrap();
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
         let code = [0xe9, 0, 0, 0, 0, 0xc3];
         let invalid = DbtStaticLink {
             target_pc: 0x1008,

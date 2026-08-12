@@ -486,7 +486,7 @@ impl Rv32Machine {
                     let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
                         unreachable!("DBT loop requires the DBT backend")
                     };
-                    execution.lookup(instruction_pc, DbtBlockMode::Fast)
+                    execution.lookup(instruction_pc, execution.fast_mode())
                 };
                 let prepared = if cached
                     .is_some_and(|prepared| u64::from(prepared.instruction_count()) <= remaining)
@@ -520,7 +520,7 @@ impl Rv32Machine {
                             unreachable!("DBT loop requires the DBT backend")
                         };
                         if execution.decoded_slots().len() as u64 <= remaining {
-                            DbtBlockMode::Fast
+                            execution.fast_mode()
                         } else {
                             DbtBlockMode::Bounded {
                                 max_attempts: remaining as u32,

@@ -367,6 +367,10 @@ impl X64Emitter {
         self.reg_reg(&[0x01], false, src, dst, false)
     }
 
+    pub(crate) fn add_r64_r64(&mut self, dst: Gpr, src: Gpr) -> Result<(), EmitError> {
+        self.reg_reg(&[0x01], true, src, dst, false)
+    }
+
     pub(crate) fn sub_r32_r32(&mut self, dst: Gpr, src: Gpr) -> Result<(), EmitError> {
         self.reg_reg(&[0x29], false, src, dst, false)
     }
@@ -391,8 +395,16 @@ impl X64Emitter {
         self.reg_reg(&[0x85], false, rhs, lhs, false)
     }
 
+    pub(crate) fn test_r64_r64(&mut self, lhs: Gpr, rhs: Gpr) -> Result<(), EmitError> {
+        self.reg_reg(&[0x85], true, rhs, lhs, false)
+    }
+
     pub(crate) fn add_r32_imm32(&mut self, dst: Gpr, value: i32) -> Result<(), EmitError> {
         self.group_imm32(dst, 0, value)
+    }
+
+    pub(crate) fn add_r64_imm32(&mut self, dst: Gpr, value: i32) -> Result<(), EmitError> {
+        self.group_imm32_wide(dst, 0, value, true)
     }
 
     pub(crate) fn sub_r32_imm32(&mut self, dst: Gpr, value: i32) -> Result<(), EmitError> {
@@ -413,6 +425,10 @@ impl X64Emitter {
 
     pub(crate) fn cmp_r32_imm32(&mut self, dst: Gpr, value: i32) -> Result<(), EmitError> {
         self.group_imm32(dst, 7, value)
+    }
+
+    pub(crate) fn neg_r64(&mut self, register: Gpr) -> Result<(), EmitError> {
+        self.group_register_wide(register, &[0xf7], 3, true)
     }
 
     pub(crate) fn shl_r32_imm8(&mut self, dst: Gpr, value: u8) -> Result<(), EmitError> {
@@ -550,8 +566,18 @@ impl X64Emitter {
     }
 
     fn group_imm32(&mut self, dst: Gpr, group: u8, value: i32) -> Result<(), EmitError> {
+        self.group_imm32_wide(dst, group, value, false)
+    }
+
+    fn group_imm32_wide(
+        &mut self,
+        dst: Gpr,
+        group: u8,
+        value: i32,
+        wide: bool,
+    ) -> Result<(), EmitError> {
         self.with_rollback(|out| {
-            out.emit_rex(false, false, false, dst.high(), false)?;
+            out.emit_rex(wide, false, false, dst.high(), false)?;
             out.emit_u8(0x81)?;
             out.emit_modrm(3, group, dst.low())?;
             out.emit_bytes(&value.to_le_bytes())
@@ -568,8 +594,18 @@ impl X64Emitter {
     }
 
     fn group_register(&mut self, register: Gpr, opcode: &[u8], group: u8) -> Result<(), EmitError> {
+        self.group_register_wide(register, opcode, group, false)
+    }
+
+    fn group_register_wide(
+        &mut self,
+        register: Gpr,
+        opcode: &[u8],
+        group: u8,
+        wide: bool,
+    ) -> Result<(), EmitError> {
         self.with_rollback(|out| {
-            out.emit_rex(false, false, false, register.high(), false)?;
+            out.emit_rex(wide, false, false, register.high(), false)?;
             out.emit_bytes(opcode)?;
             out.emit_modrm(3, group, register.low())
         })
@@ -687,6 +723,25 @@ impl X64Emitter {
 #[cfg(test)]
 mod tests {
     use super::{Condition, EmitError, Gpr, Mem, Scale, X64Emitter};
+
+    #[test]
+    fn emits_signed_64_bit_budget_counter_operations() {
+        let mut out = X64Emitter::new(64, 4).unwrap();
+        out.neg_r64(Gpr::Rdi).unwrap();
+        out.add_r64_imm32(Gpr::Rdi, 12).unwrap();
+        out.add_r64_r64(Gpr::Rax, Gpr::Rdi).unwrap();
+        out.test_r64_r64(Gpr::Rdi, Gpr::Rdi).unwrap();
+
+        assert_eq!(
+            out.finish().unwrap(),
+            [
+                0x48, 0xf7, 0xdf, // neg rdi
+                0x48, 0x81, 0xc7, 12, 0, 0, 0, // add rdi, 12
+                0x48, 0x01, 0xf8, // add rax, rdi
+                0x48, 0x85, 0xff, // test rdi, rdi
+            ]
+        );
+    }
 
     #[test]
     fn reset_reuses_every_bounded_buffer() {
