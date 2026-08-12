@@ -50,7 +50,7 @@ pub struct Rv32DbtStats {
     pub context_initializations: u64,
     pub native_dispatches: u64,
     pub typed_slow_exits: u64,
-    pub chain_transitions: u64,
+    pub chain_transitions: Option<u64>,
     pub budget_overshoot: u64,
     pub max_budget_overshoot: u32,
     pub links_established: u64,
