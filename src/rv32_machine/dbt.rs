@@ -103,6 +103,7 @@ pub(crate) struct Rv32DbtExecution {
     ram_len: u32,
     lowered_load_sites: u64,
     lowered_store_sites: u64,
+    local_self_backedge_sites: u64,
     emitted_bytes: u64,
     decoded_slots_built: u64,
     generation: u64,
@@ -195,6 +196,7 @@ impl Rv32DbtExecution {
             ram_len,
             lowered_load_sites: 0,
             lowered_store_sites: 0,
+            local_self_backedge_sites: 0,
             emitted_bytes: 0,
             decoded_slots_built: 0,
             generation: 0,
@@ -359,6 +361,7 @@ impl Rv32DbtExecution {
         let instruction_count = block.instruction_count();
         let lowered_load_sites = block.lowered_load_sites();
         let lowered_store_sites = block.lowered_store_sites();
+        let local_self_backedge_sites = block.local_self_backedge_sites();
         let emitted_bytes = block.code().len() as u64;
 
         #[cfg(feature = "dbt-translation-timing")]
@@ -426,6 +429,9 @@ impl Rv32DbtExecution {
         self.lowered_store_sites = self
             .lowered_store_sites
             .saturating_add(u64::from(lowered_store_sites));
+        self.local_self_backedge_sites = self
+            .local_self_backedge_sites
+            .saturating_add(u64::from(local_self_backedge_sites));
         self.emitted_bytes = self.emitted_bytes.saturating_add(emitted_bytes);
         self.decoded_slots_built = self
             .decoded_slots_built
@@ -617,6 +623,7 @@ impl Rv32DbtExecution {
             links_reset: cache_stats.links_reset,
             lowered_load_sites: self.lowered_load_sites,
             lowered_store_sites: self.lowered_store_sites,
+            local_self_backedge_sites: self.local_self_backedge_sites,
             decoded_slots_built: self.decoded_slots_built,
             emitted_bytes: self.emitted_bytes,
             alignment_padding_bytes: cache_stats.alignment_padding_bytes,

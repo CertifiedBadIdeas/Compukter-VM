@@ -310,6 +310,7 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
         source.contains("dbt_code_alignment\\tdbt_alignment_anchor\\tdbt_alignment_padding_bytes")
     );
     assert!(source.contains("dbt_live_code_bytes\\tdbt_code_prefix_bytes"));
+    assert!(source.contains("dbt_local_self_backedge_sites"));
     assert!(source.contains("artifact_stem: Some(\"block-cached\")"));
     assert!(source.contains("artifact_stem: Some(\"direct-dbt\")"));
     assert!(source.contains("cached-dbt-64k"));

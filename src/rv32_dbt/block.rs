@@ -136,6 +136,7 @@ pub(crate) struct TranslatedBlock<'a> {
     mode: DbtBlockMode,
     lowered_load_sites: u32,
     lowered_store_sites: u32,
+    local_self_backedge_sites: u32,
     chain_entry_offset: u32,
     static_links: [DbtStaticLink; MAX_STATIC_LINKS],
     static_link_count: u8,
@@ -284,6 +285,7 @@ impl<'a> TranslatedBlock<'a> {
             mode: input.mode(),
             lowered_load_sites,
             lowered_store_sites,
+            local_self_backedge_sites: 0,
             chain_entry_offset,
             static_links: stored_links,
             static_link_count: static_links.len() as u8,
@@ -315,6 +317,15 @@ impl<'a> TranslatedBlock<'a> {
 
     pub(crate) fn lowered_store_sites(&self) -> u32 {
         self.lowered_store_sites
+    }
+
+    pub(crate) fn with_local_self_backedge(mut self) -> Self {
+        self.local_self_backedge_sites = 1;
+        self
+    }
+
+    pub(crate) fn local_self_backedge_sites(&self) -> u32 {
+        self.local_self_backedge_sites
     }
 
     pub(crate) fn chain_entry_offset(&self) -> u32 {

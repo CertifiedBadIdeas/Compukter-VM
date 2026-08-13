@@ -484,9 +484,10 @@ impl DbtTranslationWorkspace {
         let code = out
             .finish()
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+        let local_self_backedge = local_loop_entry.is_some();
         #[cfg(feature = "dbt-execution-profile")]
         if profile_enabled {
-            return TranslatedBlock::new_profiled(
+            let block = TranslatedBlock::new_profiled(
                 input,
                 code,
                 lowered_load_sites,
@@ -496,9 +497,14 @@ impl DbtTranslationWorkspace {
                 cold_exits.as_slice(),
                 profile_relocations.as_slice(),
             )
-            .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message));
+            .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))?;
+            return Ok(if local_self_backedge {
+                block.with_local_self_backedge()
+            } else {
+                block
+            });
         }
-        TranslatedBlock::new(
+        let block = TranslatedBlock::new(
             input,
             code,
             lowered_load_sites,
@@ -507,7 +513,12 @@ impl DbtTranslationWorkspace {
             static_links.as_slice(),
             cold_exits.as_slice(),
         )
-        .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))
+        .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))?;
+        Ok(if local_self_backedge {
+            block.with_local_self_backedge()
+        } else {
+            block
+        })
     }
 
     #[cfg(test)]
@@ -1976,6 +1987,7 @@ mod tests {
             .static_links()
             .iter()
             .all(|link| link.target_pc != 0x1000));
+        assert_eq!(block.local_self_backedge_sites(), 1);
     }
 
     #[test]
@@ -1994,6 +2006,7 @@ mod tests {
             .static_links()
             .iter()
             .any(|link| link.target_pc == 0x1000 && link.kind == DbtLinkKind::BranchTaken));
+        assert_eq!(block.local_self_backedge_sites(), 0);
     }
 
     #[test]
