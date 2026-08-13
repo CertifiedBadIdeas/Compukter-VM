@@ -170,6 +170,8 @@ fn export(build_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to write {}: {error}", binary_path.display()))?;
     fs::write(build_dir.join("dbt-blocks.tsv"), block_report(&snapshot))
         .map_err(|error| format!("failed to write DBT block report: {error}"))?;
+    fs::write(build_dir.join("dbt-support.tsv"), support_report(&snapshot))
+        .map_err(|error| format!("failed to write DBT support report: {error}"))?;
     fs::write(
         build_dir.join("dbt-code-cache.S"),
         assembly_wrapper(&snapshot, &binary_path)?,
@@ -218,6 +220,20 @@ fn block_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
                 ));
             }
         }
+    }
+    output
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn support_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
+    let mut output = String::from("kind\toffset\tlength\n");
+    for support in &snapshot.support_code {
+        output.push_str(&format!(
+            "{}\t{}\t{}\n",
+            support_symbol(support.kind),
+            support.offset,
+            support.length
+        ));
     }
     output
 }
@@ -297,6 +313,9 @@ fn report(build_dir: &Path) -> Result<(), String> {
     let block_report = fs::read_to_string(build_dir.join("dbt-blocks.tsv"))
         .map_err(|error| format!("failed to read DBT block report: {error}"))?;
     let blocks = parse_block_report(&block_report)?;
+    let support_report = fs::read_to_string(build_dir.join("dbt-support.tsv"))
+        .map_err(|error| format!("failed to read DBT support report: {error}"))?;
+    let (support_offset, support_length) = parse_support_report(&support_report)?;
     let dbt_disassembly = fs::read_to_string(build_dir.join("dbt-disassembly.txt"))
         .map_err(|error| format!("failed to read DBT disassembly: {error}"))?;
     let native_disassembly = fs::read_to_string(build_dir.join("native-analysis-disassembly.txt"))
@@ -305,9 +324,13 @@ fn report(build_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to read Wasmtime disassembly: {error}"))?;
 
     let mut dbt_instructions = Vec::new();
-    let support_instructions =
-        parse_llvm_symbol(&dbt_disassembly, "dbt_support_completed_exit_stub")?;
-    let support_code_bytes = encoded_bytes(&support_instructions)?;
+    let support_instructions = parse_llvm_symbol_range(
+        &dbt_disassembly,
+        "dbt_support_completed_exit_stub",
+        u64::from(support_offset),
+        u64::from(support_length),
+    )?;
+    let support_code_bytes = u64::from(support_length);
     dbt_instructions.extend(support_instructions.iter().cloned());
     let mut hot_blocks = Vec::with_capacity(blocks.len());
     for block in &blocks {
@@ -485,6 +508,28 @@ fn parse_block_report(input: &str) -> Result<Vec<AuditBlock>, String> {
 }
 
 #[cfg(feature = "dbt-code-audit")]
+fn parse_support_report(input: &str) -> Result<(u32, u32), String> {
+    let rows = input.lines().skip(1).collect::<Vec<_>>();
+    if rows.len() != 1 {
+        return Err("DBT support report must contain exactly one range".to_string());
+    }
+    let columns = rows[0].split('\t').collect::<Vec<_>>();
+    if columns.len() != 3 || columns[0] != "dbt_support_completed_exit_stub" {
+        return Err("invalid DBT support row".to_string());
+    }
+    let offset = columns[1]
+        .parse::<u32>()
+        .map_err(|error| format!("invalid DBT support offset: {error}"))?;
+    let length = columns[2]
+        .parse::<u32>()
+        .map_err(|error| format!("invalid DBT support length: {error}"))?;
+    if length == 0 {
+        return Err("DBT support range is empty".to_string());
+    }
+    Ok((offset, length))
+}
+
+#[cfg(feature = "dbt-code-audit")]
 fn metric_row(
     system: &str,
     region: &str,
@@ -586,7 +631,9 @@ fn option_f64(value: Option<f64>) -> String {
 
 #[cfg(all(test, feature = "dbt-code-audit"))]
 mod tests {
-    use super::{assembly_wrapper, instruction_counts, metric_row, parse_block_report};
+    use super::{
+        assembly_wrapper, instruction_counts, metric_row, parse_block_report, parse_support_report,
+    };
     use compukter_vm::benchmarks::{DecodedHostInstruction, InstructionGroup};
     use compukter_vm::rv32_machine::{
         Rv32DbtCodeBlock, Rv32DbtCodeSnapshot, Rv32DbtSupportCodeKind, Rv32DbtSupportCodeRange,
@@ -665,5 +712,18 @@ mod tests {
 
         let overlap = "header\n00001000\t0\t0\t8\t0\t1\t-\t-\t-\t-\t-\n00001004\t0\t4\t8\t4\t1\t-\t-\t-\t-\t-\n";
         assert!(parse_block_report(overlap).is_err());
+    }
+
+    #[test]
+    fn support_report_requires_one_exact_nonempty_range() {
+        assert_eq!(
+            parse_support_report("kind\toffset\tlength\ndbt_support_completed_exit_stub\t0\t79\n"),
+            Ok((0, 79))
+        );
+        assert!(parse_support_report(
+            "kind\toffset\tlength\ndbt_support_completed_exit_stub\t0\t0\n"
+        )
+        .is_err());
+        assert!(parse_support_report("kind\toffset\tlength\n").is_err());
     }
 }
