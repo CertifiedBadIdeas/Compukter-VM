@@ -132,12 +132,40 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-const BASE_ALIGNMENTS: [usize; 4] = [16, 32, 64, 128];
 const ALIGNMENT_DBT_CACHE_SETS: usize = 512;
+
+#[derive(Clone, Copy)]
+struct AlignmentCandidate {
+    name: &'static str,
+    alignment: Rv32DbtCodeAlignment,
+}
+
+const ALIGNMENT_CANDIDATES: [AlignmentCandidate; 5] = [
+    AlignmentCandidate {
+        name: "block-base-16",
+        alignment: Rv32DbtCodeAlignment::BlockBase(16),
+    },
+    AlignmentCandidate {
+        name: "block-base-32",
+        alignment: Rv32DbtCodeAlignment::BlockBase(32),
+    },
+    AlignmentCandidate {
+        name: "block-base-64",
+        alignment: Rv32DbtCodeAlignment::BlockBase(64),
+    },
+    AlignmentCandidate {
+        name: "block-base-128",
+        alignment: Rv32DbtCodeAlignment::BlockBase(128),
+    },
+    AlignmentCandidate {
+        name: "chain-entry-32",
+        alignment: Rv32DbtCodeAlignment::ChainEntry(32),
+    },
+];
 
 struct AlignmentMeasurement {
     workload: ProductMachineWorkload,
-    alignment: usize,
+    candidate: AlignmentCandidate,
     batch: u64,
     construction_nanos: Vec<u128>,
     execution_nanos: Vec<u128>,
@@ -146,23 +174,24 @@ struct AlignmentMeasurement {
     steady_allocated_bytes: u64,
 }
 
-fn alignment_execution(alignment: usize) -> Rv32ExecutionBackendConfig {
+fn alignment_execution(alignment: Rv32DbtCodeAlignment) -> Rv32ExecutionBackendConfig {
     Rv32ExecutionBackendConfig::CachedDbt {
         sets: ALIGNMENT_DBT_CACHE_SETS,
         max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
         scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
         cache_bytes: PRODUCT_DBT_CODE_BYTES,
-        code_alignment: Rv32DbtCodeAlignment::BlockBase(alignment),
+        code_alignment: alignment,
     }
 }
 
 fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), String> {
-    let mut completed = Vec::with_capacity(ProductMachineWorkload::all().len() * 4);
+    let mut completed =
+        Vec::with_capacity(ProductMachineWorkload::all().len() * ALIGNMENT_CANDIDATES.len());
     for (workload_index, workload) in ProductMachineWorkload::all().iter().copied().enumerate() {
         let image = ProductMachineImage::new(workload, iterations)?;
-        let mut measurements = BASE_ALIGNMENTS.map(|alignment| AlignmentMeasurement {
+        let mut measurements = ALIGNMENT_CANDIDATES.map(|candidate| AlignmentMeasurement {
             workload,
-            alignment,
+            candidate,
             batch: 1,
             construction_nanos: Vec::with_capacity(warm_samples),
             execution_nanos: Vec::with_capacity(warm_samples),
@@ -174,7 +203,7 @@ fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), Strin
         for measurement in &mut measurements {
             let mut probe = image.prepare_with_execution(
                 ProductMachineBackend::CachedDbt,
-                alignment_execution(measurement.alignment),
+                alignment_execution(measurement.candidate.alignment),
             )?;
             let started = Instant::now();
             probe.execute()?;
@@ -182,12 +211,12 @@ fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), Strin
         }
 
         for sample_index in 0..warm_samples {
-            for candidate_index in benchmark_rotating_order::<4>(workload_index, sample_index) {
+            for candidate_index in benchmark_rotating_order::<5>(workload_index, sample_index) {
                 let measurement = &mut measurements[candidate_index];
                 let construction_started = Instant::now();
                 let mut machines = image.prepare_batch_with_execution(
                     ProductMachineBackend::CachedDbt,
-                    alignment_execution(measurement.alignment),
+                    alignment_execution(measurement.candidate.alignment),
                     measurement.batch,
                 )?;
                 measurement
@@ -215,9 +244,9 @@ fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), Strin
             measurement.execution_nanos.sort_unstable();
             if measurement.steady_allocations != 0 || measurement.steady_allocated_bytes != 0 {
                 return Err(format!(
-                    "{} block-base-{} allocated during execution: {} allocations, {} bytes",
+                    "{} {} allocated during execution: {} allocations, {} bytes",
                     measurement.workload.name(),
-                    measurement.alignment,
+                    measurement.candidate.name,
                     measurement.steady_allocations,
                     measurement.steady_allocated_bytes,
                 ));
@@ -244,14 +273,17 @@ fn print_alignment_report(
     println!("dbt_max_instructions\t{PRODUCT_DBT_MAX_INSTRUCTIONS}");
     println!("dbt_code_bytes\t{PRODUCT_DBT_CODE_BYTES}");
     println!(
-        "workload\tcandidate\titerations\tchecksum\tbatch\tconstruction_median_ns\tconstruction_p95_ns\twarm_median_ns\twarm_p95_ns\tvs_base_64\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_links_established\tdbt_emitted_bytes\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes\tdbt_reserved_bytes\ttranslation_bytes\tcache_evictions\tsteady_allocations\tsteady_allocated_bytes"
+        "workload\tcandidate\titerations\tchecksum\tbatch\tconstruction_median_ns\tconstruction_p95_ns\twarm_median_ns\twarm_p95_ns\tvs_base_32\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_links_established\tdbt_emitted_bytes\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes\tdbt_reserved_bytes\ttranslation_bytes\tcache_evictions\tsteady_allocations\tsteady_allocated_bytes"
     );
 
     for workload in ProductMachineWorkload::all() {
         let base = rows
             .iter()
-            .find(|row| row.workload == *workload && row.alignment == 64)
-            .ok_or_else(|| format!("missing block-base-64 row for {}", workload.name()))?;
+            .find(|row| {
+                row.workload == *workload
+                    && row.candidate.alignment == Rv32DbtCodeAlignment::BlockBase(32)
+            })
+            .ok_or_else(|| format!("missing block-base-32 row for {}", workload.name()))?;
         let base_median = normalized_percentile(&base.execution_nanos, 50, base.batch)?;
         for row in rows.iter().filter(|row| row.workload == *workload) {
             let observation = row
@@ -263,9 +295,9 @@ fn print_alignment_report(
                 .ok_or_else(|| "alignment row has no DBT statistics".to_string())?;
             let median = normalized_percentile(&row.execution_nanos, 50, row.batch)?;
             println!(
-                "{}\tblock-base-{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 row.workload.name(),
-                row.alignment,
+                row.candidate.name,
                 iterations,
                 observation.checksum,
                 row.batch,
@@ -292,18 +324,24 @@ fn print_alignment_report(
     }
 
     println!();
-    println!("candidate\texecution_geomean_vs_64");
-    for alignment in BASE_ALIGNMENTS {
+    println!("candidate\texecution_geomean_vs_base_32");
+    for sweep_candidate in ALIGNMENT_CANDIDATES {
         let ratios = ProductMachineWorkload::all()
             .iter()
             .map(|workload| {
                 let candidate = rows
                     .iter()
-                    .find(|row| row.workload == *workload && row.alignment == alignment)
+                    .find(|row| {
+                        row.workload == *workload
+                            && row.candidate.alignment == sweep_candidate.alignment
+                    })
                     .unwrap();
                 let base = rows
                     .iter()
-                    .find(|row| row.workload == *workload && row.alignment == 64)
+                    .find(|row| {
+                        row.workload == *workload
+                            && row.candidate.alignment == Rv32DbtCodeAlignment::BlockBase(32)
+                    })
                     .unwrap();
                 Ok(
                     normalized_percentile(&candidate.execution_nanos, 50, candidate.batch)?
@@ -311,7 +349,11 @@ fn print_alignment_report(
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
-        println!("block-base-{alignment}\t{:.6}", benchmark_geomean(&ratios)?);
+        println!(
+            "{}\t{:.6}",
+            sweep_candidate.name,
+            benchmark_geomean(&ratios)?
+        );
     }
     Ok(())
 }

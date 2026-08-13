@@ -95,6 +95,28 @@ It wins both product geomeans and both C runs, stays below every rejection
 threshold, retains the DBT advantage over QEMU, and consumes 1,248 fewer bytes
 of code-prefix capacity than 64-byte placement.
 
-This is only the base-alignment decision. The next phase compares this exact
-32-byte base layout with `ChainEntry(32)`; it does not open a full alignment
-matrix again.
+## Chain-Entry Follow-Up
+
+The focused follow-up added only `ChainEntry(32)` and compared it with the
+winning `BlockBase(32)` layout. It intentionally did not open a full
+base/entry cross-product. The product runs used the same command and sampling
+policy as above; the C gate contained 26 checksum-validated rows and used QEMU
+11.1.0 and Wasmtime 47.0.3.
+
+| Candidate | Product run 1 vs base 32 | Product run 2 vs base 32 | C run 1 ns/kernel | C run 1 vs QEMU | C run 2 ns/kernel | C run 2 vs QEMU |
+|---|---:|---:|---:|---:|---:|---:|
+| Block base 32 B | 1.000000x | 1.000000x | **447,849.411** | **0.878205x** | **448,902.634** | **0.875898x** |
+| Chain entry 32 B | 1.004884x | 1.007460x | 449,224.093 | 0.880900x | 449,885.941 | 0.877817x |
+
+`ChainEntry(32)` was slower in both product geomeans by 0.49% and 0.75%, and
+slower in both optimized-C runs by 0.31% and 0.22%. Both candidates retained
+zero steady allocations, the same 39,830 live code bytes, identical checksums,
+and no cache evictions. Aligning the chain entry saved only four bytes of
+padding and occupied prefix (1,443 / 41,352 bytes instead of 1,447 / 41,356).
+
+## Final Decision
+
+Keep `Rv32DbtCodeAlignment::BlockBase(32)` as the product default. The focused
+chain-entry alternative does not buy meaningful density and loses consistently
+in execution time. Both alignment anchors remain available as explicit policy
+options for future profiling and architecture experiments.

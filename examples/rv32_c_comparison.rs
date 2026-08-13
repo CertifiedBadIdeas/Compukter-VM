@@ -242,7 +242,7 @@ const COMMON_CANDIDATES: [Candidate; 7] = [
     },
 ];
 
-const DBT_MATRIX: [Candidate; 18] = [
+const DBT_MATRIX: [Candidate; 19] = [
     cached_dbt_candidate(
         "rv32-cached-dbt-16k",
         "cached-dbt-16k",
@@ -352,6 +352,14 @@ const DBT_MATRIX: [Candidate; 18] = [
         "rv32-cached-dbt-align-base-128",
         "cached-dbt-align-base-128",
         128,
+    ),
+    cached_dbt_candidate_with_block_size(
+        "rv32-cached-dbt-align-chain-32",
+        "cached-dbt-align-chain-32",
+        512,
+        128 * 1024,
+        16,
+        Rv32DbtCodeAlignment::ChainEntry(32),
     ),
 ];
 

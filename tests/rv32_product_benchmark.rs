@@ -31,6 +31,8 @@ use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32TranslationLookupUnit,
     DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_SCRATCH_BYTES,
 };
+use std::fs;
+use std::path::PathBuf;
 
 #[test]
 fn product_benchmark_tests_block_16_without_changing_the_vm_default() {
@@ -84,6 +86,21 @@ fn every_product_workload_executes_at_each_base_alignment() {
             assert!(stats.code_prefix_bytes >= stats.live_code_bytes);
         }
     }
+}
+
+#[test]
+fn alignment_sweep_adds_only_the_focused_chain_entry_candidate() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/rv32_machine_benchmarks.rs"),
+    )
+    .unwrap();
+
+    assert!(source.contains("chain-entry-32"));
+    assert!(source.contains("Rv32DbtCodeAlignment::ChainEntry(32)"));
+    assert_eq!(
+        source.matches("Rv32DbtCodeAlignment::ChainEntry(").count(),
+        1
+    );
 }
 
 #[test]
