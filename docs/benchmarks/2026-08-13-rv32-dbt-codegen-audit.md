@@ -93,3 +93,36 @@ bytes by at least 20% (to at most 45,199 bytes), preserves the checksum and all
 DBT correctness tests, and does not regress the 21-sample optimized C/QEMU DBT
 median by more than 1%. A speed improvement is desirable but not assumed from
 static size alone. Dynamic counters remain optional evidence.
+
+## Issue #20 result
+
+Decision: **KEEP** at revision `1551fa7`.
+
+The implementation gives every VM one immutable 82-byte Completed-exit stub.
+Each block keeps its path-specific register flush and a small trampoline that
+loads `next_pc` before jumping to the shared stub. Successful linked edges still
+jump directly to the next block. Audit-only relocation metadata verifies every
+cold jump without increasing the normal cache-entry layout, and the generated
+code report counts the support stub exactly once.
+
+| Metric | Baseline `61ce89f` | Accepted result | Change |
+|---|---:|---:|---:|
+| Live resident DBT code | 56,499 B | 39,912 B | -29.36% |
+| Emitted guest-block code | 56,499 B | 39,830 B | -29.50% |
+| Host instructions | 15,199 | 10,370 | -31.77% |
+| Block-16 median | 475,960 ns/kernel | 452,531 ns/kernel | -4.92% |
+| DBT / QEMU time | 0.870736x | 0.830787x | -4.59% |
+| DBT / native time | 7.725304x | 7.344253x | -4.93% |
+| Steady execution allocations | 0 | 0 | unchanged |
+
+The first outlined version exposed a front-end layout regression: keeping the
+hot entry path as a taken branch measured 571,271 ns/kernel. Making the hot body
+fall through reduced that to 499,682 ns/kernel. Aligning persistent guest-block
+entries to 64-byte host cache lines produced the accepted 452,531 ns/kernel
+result. The 64-byte alignment expands the final snapshot prefix to 42,604 bytes
+because alignment gaps preserve branch geometry; those gaps are excluded from
+live-code and instruction totals, while the reserved executable mapping remains
+278,528 bytes.
+
+The accepted audit checksum is `ee053d58`; its snapshot SHA-256 is
+`4b3bc39ed00a19ba7f88fd3f1993989d45ab9c4656602d6b7cfcb9396a088f9d`.
