@@ -265,9 +265,66 @@ fn assert_block_cache_evictions_allocate_nothing() {
     );
 }
 
+#[cfg(feature = "dbt-execution-profile")]
+fn assert_profiled_cached_dbt_steady_state_allocates_nothing() {
+    let words = [addi(1, 1, 1), jal(0, -4)];
+    let code = words
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, code))
+        .load(LoadSegment::rw_with_mem_size(0x3000, [], 0x1000))
+        .finish();
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        Rv32MachineConfig {
+            ram_size: 0x10_000,
+            debug_limit: 0,
+            execution: Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 32,
+                max_instructions: 8,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+            },
+        },
+    )
+    .unwrap();
+    machine.enable_dbt_execution_profile(64).unwrap();
+    machine.run(128).unwrap();
+
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    let outcome = machine.run(4096).unwrap();
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+
+    assert!(matches!(
+        outcome,
+        Rv32MachineOutcome::BudgetExhausted { .. }
+    ));
+    assert_eq!(
+        allocations, 0,
+        "profiled Cached DBT allocated in steady state"
+    );
+    assert_eq!(
+        allocated_bytes, 0,
+        "profiled Cached DBT allocated bytes in steady state"
+    );
+    assert!(!machine
+        .dbt_execution_profile()
+        .unwrap()
+        .unwrap()
+        .blocks
+        .is_empty());
+}
+
 #[test]
 fn steady_state_machine_paths_allocate_nothing() {
     assert_steady_state_trap_entry_and_return_allocate_nothing();
     assert_steady_state_atomic_increment_loop_allocates_nothing();
     assert_block_cache_evictions_allocate_nothing();
+    #[cfg(feature = "dbt-execution-profile")]
+    assert_profiled_cached_dbt_steady_state_allocates_nothing();
 }
