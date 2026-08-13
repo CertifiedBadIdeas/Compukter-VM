@@ -308,6 +308,19 @@ impl X64Emitter {
         })
     }
 
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn mov_r64_relocatable_imm64(&mut self, dst: Gpr) -> Result<u32, EmitError> {
+        let mut immediate_offset = 0;
+        self.with_rollback(|out| {
+            out.emit_rex(true, false, false, dst.high(), false)?;
+            out.emit_u8(0xb8 + dst.low())?;
+            immediate_offset =
+                u32::try_from(out.bytes.len()).map_err(|_| EmitError::BranchRange)?;
+            out.emit_bytes(&[0; 8])
+        })?;
+        Ok(immediate_offset)
+    }
+
     pub(crate) fn mov_r32_r32(&mut self, dst: Gpr, src: Gpr) -> Result<(), EmitError> {
         self.reg_reg(&[0x89], false, src, dst, false)
     }
@@ -418,6 +431,20 @@ impl X64Emitter {
 
     pub(crate) fn add_r64_imm32(&mut self, dst: Gpr, value: i32) -> Result<(), EmitError> {
         self.group_imm32_wide(dst, 0, value, true)
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn add_m64_imm8(&mut self, dst: Mem, value: i8) -> Result<(), EmitError> {
+        self.with_rollback(|out| {
+            if dst.index.is_some_and(|(index, _)| index == Gpr::Rsp) {
+                return Err(EmitError::InvalidOperand("RSP cannot be a SIB index"));
+            }
+            let index_high = dst.index.is_some_and(|(index, _)| index.high());
+            out.emit_rex(true, false, index_high, dst.base.high(), false)?;
+            out.emit_u8(0x83)?;
+            out.emit_memory_operand(0, dst)?;
+            out.emit_u8(value as u8)
+        })
     }
 
     pub(crate) fn sub_r32_imm32(&mut self, dst: Gpr, value: i32) -> Result<(), EmitError> {
@@ -740,6 +767,21 @@ impl X64Emitter {
 #[cfg(test)]
 mod tests {
     use super::{Condition, EmitError, Gpr, Mem, Scale, X64Emitter};
+
+    #[cfg(feature = "dbt-execution-profile")]
+    #[test]
+    fn emits_a_relocatable_profile_counter_increment() {
+        let mut out = X64Emitter::new(64, 8).unwrap();
+        let address = out.mov_r64_relocatable_imm64(Gpr::Rax).unwrap();
+        out.add_m64_imm8(Mem::base_disp(Gpr::Rax, 0), 1).unwrap();
+
+        assert_eq!(address, 2);
+        assert_eq!(
+            &out.bytes()[address as usize..address as usize + 8],
+            &[0; 8]
+        );
+        assert_eq!(&out.bytes()[10..], &[0x48, 0x83, 0x00, 0x01]);
+    }
 
     #[test]
     fn emits_signed_64_bit_budget_counter_operations() {

@@ -19,10 +19,14 @@
 
 #[cfg(feature = "dbt-code-audit")]
 use super::block::MAX_COLD_EXIT_RELOCATIONS;
+#[cfg(feature = "dbt-execution-profile")]
+use super::block::MAX_PROFILE_RELOCATIONS;
 use super::block::{DbtBlockMode, TranslatedBlock, MAX_STATIC_LINKS};
 use super::executable::ExecutableMapping;
 use super::x86_64::cold_exit::build_completed_exit_stub;
 use super::{DbtFault, DbtFaultKind};
+#[cfg(feature = "dbt-execution-profile")]
+use crate::rv32_dbt::profile::ExactDbtProfile;
 use crate::rv32_machine::{Rv32DbtCodeAlignment, DEFAULT_DBT_CODE_ALIGNMENT};
 #[cfg(feature = "dbt-code-audit")]
 use crate::rv32_machine::{
@@ -212,10 +216,39 @@ impl DirectDbtCodeCache {
         })
     }
 
+    #[cfg(not(feature = "dbt-execution-profile"))]
     pub(crate) fn publish(
         &mut self,
         key: DbtCacheKey,
         block: &TranslatedBlock<'_>,
+    ) -> Result<DbtCacheHit, DbtFault> {
+        self.publish_inner(key, block)
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn publish(
+        &mut self,
+        key: DbtCacheKey,
+        block: &TranslatedBlock<'_>,
+    ) -> Result<DbtCacheHit, DbtFault> {
+        self.publish_inner(key, block, None)
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn publish_profiled(
+        &mut self,
+        key: DbtCacheKey,
+        block: &TranslatedBlock<'_>,
+        profile: &mut ExactDbtProfile,
+    ) -> Result<DbtCacheHit, DbtFault> {
+        self.publish_inner(key, block, Some(profile))
+    }
+
+    fn publish_inner(
+        &mut self,
+        key: DbtCacheKey,
+        block: &TranslatedBlock<'_>,
+        #[cfg(feature = "dbt-execution-profile")] mut profile: Option<&mut ExactDbtProfile>,
     ) -> Result<DbtCacheHit, DbtFault> {
         if block.mode() != DbtBlockMode::ChainableThroughput {
             return Err(Self::fault(
@@ -240,6 +273,24 @@ impl DirectDbtCodeCache {
                 ),
             ));
         }
+
+        #[cfg(feature = "dbt-execution-profile")]
+        let resolved_profile_addresses = {
+            let relocations = block.profile_relocations();
+            let mut resolved = [None; MAX_PROFILE_RELOCATIONS];
+            if !relocations.is_empty() {
+                let profile = profile.as_deref_mut().ok_or_else(|| {
+                    Self::fault(
+                        DbtFaultKind::AbiInvariant,
+                        "profiled DBT block publication has no execution-profile storage",
+                    )
+                })?;
+                for (slot, relocation) in resolved.iter_mut().zip(relocations) {
+                    *slot = Some(profile.counter_for(relocation.key)?);
+                }
+            }
+            resolved
+        };
 
         let chain_entry_offset = block.chain_entry_offset();
         let (placement_cursor, offset) = publication_offset(
@@ -287,6 +338,25 @@ impl DirectDbtCodeCache {
             self.stats.metadata_evictions = self.stats.metadata_evictions.saturating_add(1);
         }
         self.mapping.publish_at(offset, block.code())?;
+        #[cfg(feature = "dbt-execution-profile")]
+        for (relocation, addresses) in block
+            .profile_relocations()
+            .iter()
+            .zip(resolved_profile_addresses.iter().flatten())
+        {
+            self.mapping.patch_u64(
+                offset,
+                block.code().len(),
+                offset + relocation.count_address_offset as usize,
+                addresses.count as usize as u64,
+            )?;
+            self.mapping.patch_u64(
+                offset,
+                block.code().len(),
+                offset + relocation.overflow_address_offset as usize,
+                addresses.overflows as usize as u64,
+            )?;
+        }
         for relocation in block.cold_exit_relocations() {
             self.mapping.patch_rel32(
                 offset,
@@ -763,6 +833,8 @@ mod tests {
     use crate::rv32_dbt::block::{
         DbtBlockInput, DbtBlockMode, DbtLinkKind, DbtStaticLink, TranslatedBlock,
     };
+    #[cfg(all(feature = "dbt-execution-profile", feature = "dbt-code-audit"))]
+    use crate::rv32_dbt::profile::{DbtProfileKey, ExactDbtProfile};
     #[cfg(feature = "dbt-code-audit")]
     use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
     use crate::rv32_dbt::DbtFaultKind;
@@ -772,6 +844,97 @@ mod tests {
     use std::collections::BTreeSet;
 
     const PAGE_BYTES: usize = 4096;
+
+    #[cfg(all(feature = "dbt-execution-profile", feature = "dbt-code-audit"))]
+    #[test]
+    fn profiled_publication_patches_stable_counter_addresses() {
+        use crate::rv32_dbt::block::DbtProfileRelocation;
+
+        let key = DbtCacheKey::new(0x1000, 0);
+        let profile_key = DbtProfileKey::Block { pc: 0x1000 };
+        let word = addi(1, 0, 1);
+        let slots = [Rv32ResolvedInstruction::Valid {
+            word,
+            instruction: decode_product_word(word).unwrap(),
+        }];
+        let input = DbtBlockInput::new(key.pc, &slots, DbtBlockMode::ChainableThroughput).unwrap();
+        let code = [0x90; 24];
+        let block = TranslatedBlock::new_profiled(
+            &input,
+            &code,
+            0,
+            0,
+            0,
+            &[],
+            &[],
+            &[DbtProfileRelocation {
+                key: profile_key,
+                count_address_offset: 2,
+                overflow_address_offset: 12,
+            }],
+        )
+        .unwrap();
+        let mut profile = ExactDbtProfile::new(4).unwrap();
+        let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
+
+        cache.publish_profiled(key, &block, &mut profile).unwrap();
+
+        let (set, way) = cache.find_entry(key).unwrap();
+        let offset = cache.sets[set].ways[way].offset;
+        let bytes = cache.mapping.snapshot_prefix(offset + code.len()).unwrap();
+        let addresses = profile.counter_for(profile_key).unwrap();
+        assert_eq!(
+            &bytes[offset + 2..offset + 10],
+            &(addresses.count as usize as u64).to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[offset + 12..offset + 20],
+            &(addresses.overflows as usize as u64).to_le_bytes()
+        );
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    #[test]
+    fn profile_capacity_failure_never_publishes_the_block() {
+        use crate::rv32_dbt::block::{DbtProfileRelocation, DbtStaticLink};
+        use crate::rv32_dbt::profile::{DbtProfileKey, ExactDbtProfile};
+
+        let key = DbtCacheKey::new(0x2000, 0);
+        let word = addi(1, 0, 1);
+        let slots = [Rv32ResolvedInstruction::Valid {
+            word,
+            instruction: decode_product_word(word).unwrap(),
+        }];
+        let input = DbtBlockInput::new(key.pc, &slots, DbtBlockMode::ChainableThroughput).unwrap();
+        let block = TranslatedBlock::new_profiled(
+            &input,
+            &[0x90; 48],
+            0,
+            0,
+            0,
+            &[] as &[DbtStaticLink],
+            &[],
+            &[
+                DbtProfileRelocation {
+                    key: DbtProfileKey::Block { pc: key.pc },
+                    count_address_offset: 2,
+                    overflow_address_offset: 12,
+                },
+                DbtProfileRelocation {
+                    key: DbtProfileKey::Block { pc: key.pc + 4 },
+                    count_address_offset: 22,
+                    overflow_address_offset: 32,
+                },
+            ],
+        )
+        .unwrap();
+        let mut profile = ExactDbtProfile::new(1).unwrap();
+        let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
+
+        assert!(cache.publish_profiled(key, &block, &mut profile).is_err());
+        assert!(cache.lookup(key).is_none());
+        assert_eq!(cache.stats().publications, 0);
+    }
 
     fn block(pc: u32, code: &[u8]) -> TranslatedBlock<'_> {
         block_with_links(pc, code, 0, &[])

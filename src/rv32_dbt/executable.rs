@@ -171,6 +171,41 @@ impl ExecutableMapping {
         Ok(())
     }
 
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(super) fn patch_u64(
+        &mut self,
+        source_start: usize,
+        source_len: usize,
+        immediate_offset: usize,
+        value: u64,
+    ) -> Result<(), DbtFault> {
+        let source_end = source_start.checked_add(source_len).ok_or_else(|| {
+            Self::fault(
+                DbtFaultKind::Capacity,
+                "native profile patch source range overflows host address space",
+            )
+        })?;
+        let immediate_end = immediate_offset.checked_add(8).ok_or_else(|| {
+            Self::fault(
+                DbtFaultKind::Capacity,
+                "native profile patch range overflows host address space",
+            )
+        })?;
+        if source_len == 0
+            || source_end > self.capacity
+            || immediate_offset < source_start
+            || immediate_end > source_end
+        {
+            return Err(Self::fault(
+                DbtFaultKind::Capacity,
+                "native profile patch is outside its source block or executable mapping",
+            ));
+        }
+        self.writable[immediate_offset..immediate_end].copy_from_slice(&value.to_le_bytes());
+        compiler_fence(Ordering::Release);
+        Ok(())
+    }
+
     pub(super) fn entry_address(&self, offset: usize) -> Option<*const u8> {
         if offset >= self.capacity {
             return None;
@@ -251,6 +286,22 @@ impl ExecutableScratch {
 #[cfg(test)]
 mod tests {
     use super::{ExecutableMapping, ExecutableScratch};
+
+    #[cfg(feature = "dbt-execution-profile")]
+    #[test]
+    fn patches_a_u64_only_inside_the_published_block() {
+        let mut mapping = ExecutableMapping::new(PAGE_BYTES).unwrap();
+        mapping.publish_at(32, &[0x90; 24]).unwrap();
+        mapping
+            .patch_u64(32, 24, 40, 0x1234_5678_9abc_def0)
+            .unwrap();
+        assert_eq!(
+            &mapping.writable[40..48],
+            &0x1234_5678_9abc_def0_u64.to_le_bytes()
+        );
+        assert!(mapping.patch_u64(32, 24, 28, 0).is_err());
+        assert!(mapping.patch_u64(32, 24, 52, 0).is_err());
+    }
     use crate::rv32_dbt::DbtFaultKind;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     use std::fs;

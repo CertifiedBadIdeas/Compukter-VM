@@ -22,10 +22,31 @@
     reason = "the direct x86_64 translator consumes block metadata in the next task"
 )]
 
+#[cfg(feature = "dbt-execution-profile")]
+use crate::rv32_dbt::profile::DbtProfileKey;
 use crate::rv32im::Rv32ResolvedInstruction;
 
 pub(crate) const MAX_STATIC_LINKS: usize = 2;
 pub(crate) const MAX_COLD_EXIT_RELOCATIONS: usize = MAX_STATIC_LINKS + 1;
+#[cfg(feature = "dbt-execution-profile")]
+pub(crate) const MAX_PROFILE_RELOCATIONS: usize = MAX_STATIC_LINKS + 1;
+
+#[cfg(feature = "dbt-execution-profile")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DbtProfileRelocation {
+    pub(crate) key: DbtProfileKey,
+    pub(crate) count_address_offset: u32,
+    pub(crate) overflow_address_offset: u32,
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+impl DbtProfileRelocation {
+    const EMPTY: Self = Self {
+        key: DbtProfileKey::Block { pc: 0 },
+        count_address_offset: 0,
+        overflow_address_offset: 0,
+    };
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DbtColdExitRelocation {
@@ -120,6 +141,10 @@ pub(crate) struct TranslatedBlock<'a> {
     static_link_count: u8,
     cold_exit_relocations: [DbtColdExitRelocation; MAX_COLD_EXIT_RELOCATIONS],
     cold_exit_relocation_count: u8,
+    #[cfg(feature = "dbt-execution-profile")]
+    profile_relocations: [DbtProfileRelocation; MAX_PROFILE_RELOCATIONS],
+    #[cfg(feature = "dbt-execution-profile")]
+    profile_relocation_count: u8,
     code: &'a [u8],
 }
 
@@ -132,6 +157,52 @@ impl<'a> TranslatedBlock<'a> {
         chain_entry_offset: u32,
         static_links: &[DbtStaticLink],
         cold_exit_relocations: &[DbtColdExitRelocation],
+    ) -> Result<Self, String> {
+        Self::new_inner(
+            input,
+            code,
+            lowered_load_sites,
+            lowered_store_sites,
+            chain_entry_offset,
+            static_links,
+            cold_exit_relocations,
+            #[cfg(feature = "dbt-execution-profile")]
+            &[],
+        )
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn new_profiled(
+        input: &DbtBlockInput<'_>,
+        code: &'a [u8],
+        lowered_load_sites: u32,
+        lowered_store_sites: u32,
+        chain_entry_offset: u32,
+        static_links: &[DbtStaticLink],
+        cold_exit_relocations: &[DbtColdExitRelocation],
+        profile_relocations: &[DbtProfileRelocation],
+    ) -> Result<Self, String> {
+        Self::new_inner(
+            input,
+            code,
+            lowered_load_sites,
+            lowered_store_sites,
+            chain_entry_offset,
+            static_links,
+            cold_exit_relocations,
+            profile_relocations,
+        )
+    }
+
+    fn new_inner(
+        input: &DbtBlockInput<'_>,
+        code: &'a [u8],
+        lowered_load_sites: u32,
+        lowered_store_sites: u32,
+        chain_entry_offset: u32,
+        static_links: &[DbtStaticLink],
+        cold_exit_relocations: &[DbtColdExitRelocation],
+        #[cfg(feature = "dbt-execution-profile")] profile_relocations: &[DbtProfileRelocation],
     ) -> Result<Self, String> {
         if code.is_empty() {
             return Err("RV32 DBT compiled block cannot be empty".to_string());
@@ -180,6 +251,33 @@ impl<'a> TranslatedBlock<'a> {
         }
         let mut stored_cold_exits = [DbtColdExitRelocation::default(); MAX_COLD_EXIT_RELOCATIONS];
         stored_cold_exits[..cold_exit_relocations.len()].copy_from_slice(cold_exit_relocations);
+        #[cfg(feature = "dbt-execution-profile")]
+        let stored_profile_relocations = {
+            if profile_relocations.len() > MAX_PROFILE_RELOCATIONS {
+                return Err(format!(
+                    "RV32 DBT block has {} profile relocations but supports at most {MAX_PROFILE_RELOCATIONS}",
+                    profile_relocations.len()
+                ));
+            }
+            for relocation in profile_relocations {
+                for offset in [
+                    relocation.count_address_offset,
+                    relocation.overflow_address_offset,
+                ] {
+                    let end = (offset as usize).checked_add(8).ok_or_else(|| {
+                        "RV32 DBT profile relocation range overflowed".to_string()
+                    })?;
+                    if end > code.len() {
+                        return Err(
+                            "RV32 DBT profile relocation lies outside emitted code".to_string()
+                        );
+                    }
+                }
+            }
+            let mut stored = [DbtProfileRelocation::EMPTY; MAX_PROFILE_RELOCATIONS];
+            stored[..profile_relocations.len()].copy_from_slice(profile_relocations);
+            stored
+        };
         Ok(Self {
             start_pc: input.start_pc(),
             instruction_count: input.slots().len() as u32,
@@ -191,6 +289,10 @@ impl<'a> TranslatedBlock<'a> {
             static_link_count: static_links.len() as u8,
             cold_exit_relocations: stored_cold_exits,
             cold_exit_relocation_count: cold_exit_relocations.len() as u8,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_relocations: stored_profile_relocations,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_relocation_count: profile_relocations.len() as u8,
             code,
         })
     }
@@ -227,6 +329,11 @@ impl<'a> TranslatedBlock<'a> {
         &self.cold_exit_relocations[..self.cold_exit_relocation_count as usize]
     }
 
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn profile_relocations(&self) -> &[DbtProfileRelocation] {
+        &self.profile_relocations[..self.profile_relocation_count as usize]
+    }
+
     pub(crate) fn code(&self) -> &[u8] {
         self.code
     }
@@ -234,10 +341,14 @@ impl<'a> TranslatedBlock<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dbt-execution-profile")]
+    use super::DbtProfileRelocation;
     use super::{
         DbtBlockInput, DbtBlockMode, DbtColdExitRelocation, DbtLinkKind, DbtStaticLink,
         TranslatedBlock,
     };
+    #[cfg(feature = "dbt-execution-profile")]
+    use crate::rv32_dbt::profile::DbtProfileKey;
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
 
     fn slot() -> Rv32ResolvedInstruction {
@@ -335,5 +446,24 @@ mod tests {
             }],
         )
         .is_err());
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    #[test]
+    fn profiled_block_keeps_bounded_counter_relocations() {
+        let slots = [Rv32ResolvedInstruction::Valid {
+            word: addi(1, 0, 1),
+            instruction: decode_product_word(addi(1, 0, 1)).unwrap(),
+        }];
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::ChainableThroughput).unwrap();
+        let relocation = DbtProfileRelocation {
+            key: DbtProfileKey::Block { pc: 0x1000 },
+            count_address_offset: 2,
+            overflow_address_offset: 12,
+        };
+        let block =
+            TranslatedBlock::new_profiled(&input, &[0x90; 24], 0, 0, 0, &[], &[], &[relocation])
+                .unwrap();
+        assert_eq!(block.profile_relocations(), &[relocation]);
     }
 }
