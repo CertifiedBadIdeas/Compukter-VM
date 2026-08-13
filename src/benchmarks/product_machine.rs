@@ -352,6 +352,7 @@ impl ProductMachineBackend {
                 max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
                 scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: PRODUCT_DBT_CODE_BYTES,
+                code_alignment: crate::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
             },
         }
     }

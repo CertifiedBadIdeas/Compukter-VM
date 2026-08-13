@@ -46,6 +46,7 @@ fn stock_toolchain_rv32ima_elf_executes_atomics_and_fences() {
             max_instructions: 8,
             scratch_bytes: 8 * 1024,
             cache_bytes: 64 * 1024,
+            code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
         },
     ] {
         let config = Rv32MachineConfig {

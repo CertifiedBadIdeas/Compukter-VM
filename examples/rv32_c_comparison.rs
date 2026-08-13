@@ -129,6 +129,7 @@ impl Candidate {
                 max_instructions,
                 scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
                 cache_bytes,
+                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
             }),
         }
     }
@@ -712,6 +713,7 @@ fn print_compilation_report(
         max_instructions: 16,
         scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
         cache_bytes: 128 * 1024,
+        code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
     };
     let mut construct_nanos = Vec::with_capacity(samples);
     let mut first_completion_nanos = Vec::with_capacity(samples);

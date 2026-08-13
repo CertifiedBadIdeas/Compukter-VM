@@ -42,6 +42,20 @@ use std::ops::Range;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rv32DbtCodeAlignment {
+    BlockBase(usize),
+    ChainEntry(usize),
+}
+
+impl Rv32DbtCodeAlignment {
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::BlockBase(bytes) | Self::ChainEntry(bytes) => bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rv32ExecutionBackendConfig {
     Cached {
         sets: usize,
@@ -60,6 +74,7 @@ pub enum Rv32ExecutionBackendConfig {
         max_instructions: usize,
         scratch_bytes: usize,
         cache_bytes: usize,
+        code_alignment: Rv32DbtCodeAlignment,
     },
 }
 
@@ -67,6 +82,7 @@ pub const DEFAULT_DBT_CACHE_SETS: usize = 256;
 pub const DEFAULT_DBT_MAX_INSTRUCTIONS: usize = 8;
 pub const DEFAULT_DBT_SCRATCH_BYTES: usize = 8 * 1024;
 pub const DEFAULT_DBT_CODE_BYTES: usize = 128 * 1024;
+pub const DEFAULT_DBT_CODE_ALIGNMENT: Rv32DbtCodeAlignment = Rv32DbtCodeAlignment::BlockBase(64);
 
 impl Default for Rv32ExecutionBackendConfig {
     fn default() -> Self {
@@ -75,6 +91,7 @@ impl Default for Rv32ExecutionBackendConfig {
             max_instructions: DEFAULT_DBT_MAX_INSTRUCTIONS,
             scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
             cache_bytes: DEFAULT_DBT_CODE_BYTES,
+            code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
         }
     }
 }
@@ -173,7 +190,11 @@ enum Rv32ExecutionBackend {
 
 enum Rv32DbtBackendBuild {
     Direct,
-    Cached { sets: usize, cache_bytes: usize },
+    Cached {
+        sets: usize,
+        cache_bytes: usize,
+        code_alignment: Rv32DbtCodeAlignment,
+    },
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -185,9 +206,15 @@ fn build_dbt_backend(
 ) -> Result<Rv32ExecutionBackend, Rv32MachineBuildError> {
     let policy = match build {
         Rv32DbtBackendBuild::Direct => Rv32DbtPolicy::Direct,
-        Rv32DbtBackendBuild::Cached { sets, cache_bytes } => {
-            Rv32DbtPolicy::Cached { sets, cache_bytes }
-        }
+        Rv32DbtBackendBuild::Cached {
+            sets,
+            cache_bytes,
+            code_alignment,
+        } => Rv32DbtPolicy::Cached {
+            sets,
+            cache_bytes,
+            code_alignment,
+        },
     };
     Rv32DbtExecution::new(policy, max_instructions, scratch_bytes, ram_len)
         .map(Rv32ExecutionBackend::Dbt)
@@ -251,8 +278,13 @@ impl Rv32Machine {
                 max_instructions,
                 scratch_bytes,
                 cache_bytes,
+                code_alignment,
             } => build_dbt_backend(
-                Rv32DbtBackendBuild::Cached { sets, cache_bytes },
+                Rv32DbtBackendBuild::Cached {
+                    sets,
+                    cache_bytes,
+                    code_alignment,
+                },
                 max_instructions,
                 scratch_bytes,
                 ram_len,
