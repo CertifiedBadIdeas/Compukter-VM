@@ -43,7 +43,22 @@ pub use platform::{CONTROL_BASE, DEBUG_BASE, STATUS_BOOTING, STATUS_HALTED, STAT
 pub struct Rv32DbtCodeSnapshot {
     pub generation: u64,
     pub used_bytes: Vec<u8>,
+    pub support_code: Vec<Rv32DbtSupportCodeRange>,
     pub blocks: Vec<Rv32DbtCodeBlock>,
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rv32DbtSupportCodeKind {
+    CompletedExitStub,
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rv32DbtSupportCodeRange {
+    pub kind: Rv32DbtSupportCodeKind,
+    pub offset: u32,
+    pub length: u32,
 }
 
 #[cfg(feature = "dbt-code-audit")]

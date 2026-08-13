@@ -126,6 +126,9 @@ fn cached_dbt_snapshot_owns_final_linked_code() {
     machine.run(16).unwrap();
     let snapshot = machine.dbt_code_snapshot().unwrap().unwrap();
     assert!(!snapshot.used_bytes.is_empty());
+    assert_eq!(snapshot.support_code.len(), 1);
+    assert_eq!(snapshot.support_code[0].offset, 0);
+    assert!(snapshot.support_code[0].length > 0);
     assert!(snapshot
         .blocks
         .windows(2)
