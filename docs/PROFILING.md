@@ -118,6 +118,28 @@ The decoded-block experiment, including the four-candidate product report,
 five-candidate C/QEMU report, memory cost, and keep/reject decision, is stored
 in [`2026-08-11-rv32-decoded-block-cache.md`](benchmarks/2026-08-11-rv32-decoded-block-cache.md).
 
+## DBT Generated-Code Audit
+
+Audit the resident Cached DBT machine code against the native analysis object
+and Wasmtime 47.0.3 AOT output with:
+
+```bash
+bash scripts/tests/rv32-c-codegen-audit.sh
+```
+
+The runner uses the shared optimized C workload and the product Cached DBT
+geometry: 512 sets, 16 guest instructions per block, 8 KiB scratch space, and
+a 128 KiB per-VM code cache. It exports the live cache bytes and block/edge
+metadata, produces LLVM-readable disassembly, and writes the comparative static
+metrics to `target/rv32-c-codegen-audit/codegen-report.tsv`. The native row is
+an analysis-only `benchmark_kernel` object built with `-O3 -march=native`
+without LTO because the executable's LTO build does not retain that symbol.
+
+Linux `perf stat` counters are an optional supplement in `perf-report.tsv`.
+Unavailable or restricted counters are reported explicitly and do not replace
+the deterministic static audit. Generated artifacts are local evidence and are
+not part of normal Cargo/Gradle verification or production builds.
+
 Committed Gate and XLEN outputs under `docs/benchmarks/` are immutable
 historical evidence. They are not active benchmark runners and do not select a
 supported product architecture. The accepted architecture decision is recorded

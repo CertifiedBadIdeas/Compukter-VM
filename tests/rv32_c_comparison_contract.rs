@@ -342,6 +342,23 @@ fn codegen_audit_report_contract_is_explicit() {
 }
 
 #[test]
+fn focused_codegen_audit_keeps_perf_optional() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/tests/rv32-c-codegen-audit.sh"),
+    )
+    .unwrap();
+
+    assert!(script.contains("compile-rv32-c-comparison.sh"));
+    assert!(script.contains("--features dbt-code-audit"));
+    assert!(script.contains("native-analysis.o"));
+    assert!(script.contains("--disassemble-symbols=benchmark_kernel"));
+    assert!(script.contains("dbt-code-cache.S"));
+    assert!(script.contains("codegen-report.tsv"));
+    assert!(script.contains("perf-report.tsv"));
+    assert!(script.contains("status\\tunavailable"));
+}
+
+#[test]
 fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     let source = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/tests/rv32-c-qemu-comparison.sh"),
