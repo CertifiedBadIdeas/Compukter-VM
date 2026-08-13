@@ -14,9 +14,41 @@ use std::path::PathBuf;
 
 use compukter_vm::benchmarks::{
     c_comparison_next_batch, c_comparison_qemu_target_nanos, c_comparison_timeout_nanos,
-    compile_equivalent_calls, optional_phase_rate, parse_c_comparison_result,
-    COMPILATION_PHASE_REPORT_HEADER,
+    classify_x86_instruction, compile_equivalent_calls, has_x86_memory_operand,
+    optional_phase_rate, parse_c_comparison_result, parse_llvm_symbol, parse_wasmtime_function,
+    InstructionGroup, COMPILATION_PHASE_REPORT_HEADER,
 };
+
+#[test]
+fn codegen_audit_parses_bounded_real_format_regions() {
+    let llvm = "0000000000001000 <benchmark_batch>:\n    1000: 89 04 86 movl %eax, (%rsi,%rax,4)\n    1003: c3 retq\n0000000000001010 <other>:\n    1010: c3 retq\n";
+    let native = parse_llvm_symbol(llvm, "benchmark_batch").unwrap();
+    assert_eq!(native.len(), 2);
+    assert_eq!(native[0].address, 0x1000);
+    assert_eq!(native[0].encoded_bytes, Some(3));
+    assert_eq!(native[0].mnemonic, "movl");
+    assert!(has_x86_memory_operand(&native[0].operands));
+
+    let wasmtime = "wasm[0]::function[0]::benchmark_batch:\n            vpmulld %xmm0, %xmm1, %xmm2\n            retq\nwasm[0]::function[1]::other:\n            retq\n";
+    let wasm = parse_wasmtime_function(wasmtime, "benchmark_batch").unwrap();
+    assert_eq!(wasm.len(), 2);
+    assert_eq!(
+        classify_x86_instruction(&wasm[0].mnemonic),
+        InstructionGroup::Vector
+    );
+    assert_eq!(classify_x86_instruction("movl"), InstructionGroup::Move);
+    assert!(parse_llvm_symbol(llvm, "missing").is_err());
+    assert!(parse_llvm_symbol(
+        "0000 <benchmark_batch>:\n0001 <benchmark_batch>:\n  1: c3 retq\n",
+        "benchmark_batch"
+    )
+    .is_err());
+    assert!(parse_wasmtime_function(
+        "wasm[0]::function[0]::benchmark_batch:\n",
+        "benchmark_batch"
+    )
+    .is_err());
+}
 
 #[test]
 fn compilation_report_math_rejects_ambiguous_denominators() {
@@ -293,6 +325,20 @@ fn codegen_audit_export_contract_is_explicit() {
     assert!(source.contains("dbt-code-cache.S"));
     assert!(source.contains("ee05_3d58"));
     assert!(source.contains("dbt_code_snapshot"));
+}
+
+#[test]
+fn codegen_audit_report_contract_is_explicit() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/rv32_c_codegen_audit.rs"),
+    )
+    .unwrap();
+
+    assert!(source.contains("\"report\""));
+    assert!(source.contains("codegen-report.tsv"));
+    assert!(source.contains("native-analysis-disassembly.txt"));
+    assert!(source.contains("wasmtime-aot-objdump.txt"));
+    assert!(source.contains("dbt_hot_blocks"));
 }
 
 #[test]

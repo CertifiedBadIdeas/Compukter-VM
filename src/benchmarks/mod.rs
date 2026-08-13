@@ -19,6 +19,7 @@
 
 mod c_comparison;
 #[cfg(target_arch = "x86_64")]
+mod codegen_audit;
 mod dbt_compute;
 mod decoder;
 mod native;
@@ -33,6 +34,10 @@ pub use c_comparison::{
     parse_c_comparison_result,
 };
 #[cfg(target_arch = "x86_64")]
+pub use codegen_audit::{
+    classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_wasmtime_function,
+    DecodedHostInstruction, InstructionGroup,
+};
 pub use dbt_compute::{
     CachedDbtComputeObservation, DirectDbtComputeObservation, PreparedCachedDbtCompute32,
     PreparedDirectDbtCompute32,
