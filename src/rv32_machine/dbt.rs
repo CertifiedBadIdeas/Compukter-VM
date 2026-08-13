@@ -161,9 +161,9 @@ impl Rv32DbtExecution {
             Rv32DbtPolicy::Cached {
                 sets,
                 cache_bytes,
-                code_alignment: _,
+                code_alignment,
             } => Rv32DbtStorage::Cached {
-                cache: DirectDbtCodeCache::new(sets, cache_bytes)?,
+                cache: DirectDbtCodeCache::new_with_alignment(sets, cache_bytes, code_alignment)?,
                 bounded_scratch: ExecutableScratch::new(scratch_bytes)?,
                 scratch_serial: 0,
             },
@@ -489,6 +489,7 @@ impl Rv32DbtExecution {
             lowered_store_sites: self.lowered_store_sites,
             decoded_slots_built: self.decoded_slots_built,
             emitted_bytes: self.emitted_bytes,
+            alignment_padding_bytes: cache_stats.alignment_padding_bytes,
             reserved_bytes,
             metadata_bytes,
             #[cfg(feature = "dbt-translation-timing")]

@@ -836,3 +836,40 @@ fn invalid_cache_and_ram_layouts_fail_before_machine_allocation() {
     )
     .is_err());
 }
+
+#[test]
+fn cached_dbt_rejects_invalid_code_alignments() {
+    let elf = machine_program_elf(&[jal(0, 0)]);
+    for code_alignment in [
+        Rv32DbtCodeAlignment::BlockBase(0),
+        Rv32DbtCodeAlignment::BlockBase(8),
+        Rv32DbtCodeAlignment::BlockBase(24),
+        Rv32DbtCodeAlignment::BlockBase(512),
+        Rv32DbtCodeAlignment::ChainEntry(0),
+        Rv32DbtCodeAlignment::ChainEntry(8),
+        Rv32DbtCodeAlignment::ChainEntry(24),
+        Rv32DbtCodeAlignment::ChainEntry(512),
+    ] {
+        let error = Rv32Machine::from_elf(
+            &elf,
+            config(
+                Rv32ExecutionBackendConfig::CachedDbt {
+                    sets: 8,
+                    max_instructions: 8,
+                    scratch_bytes: 4096,
+                    cache_bytes: 4096,
+                    code_alignment,
+                },
+                8,
+            ),
+        )
+        .err()
+        .expect("invalid Cached DBT alignment must fail construction");
+        assert!(
+            error
+                .to_string()
+                .contains("alignment must be a power of two between 16 and 256 bytes"),
+            "unexpected error for {code_alignment:?}: {error}"
+        );
+    }
+}

@@ -23,6 +23,7 @@ use super::block::{DbtBlockMode, TranslatedBlock, MAX_STATIC_LINKS};
 use super::executable::ExecutableMapping;
 use super::x86_64::cold_exit::build_completed_exit_stub;
 use super::{DbtFault, DbtFaultKind};
+use crate::rv32_machine::{Rv32DbtCodeAlignment, DEFAULT_DBT_CODE_ALIGNMENT};
 #[cfg(feature = "dbt-code-audit")]
 use crate::rv32_machine::{
     Rv32DbtCodeBlock, Rv32DbtCodeEdge, Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError,
@@ -30,7 +31,6 @@ use crate::rv32_machine::{
 };
 
 const WAYS: usize = 2;
-const CODE_ALIGNMENT: usize = 64;
 const GUEST_PAGE_BYTES: u32 = 4096;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,6 +70,7 @@ pub(crate) struct DbtCodeCacheStats {
     pub(crate) overlap_invalidations: u64,
     pub(crate) links_established: u64,
     pub(crate) links_reset: u64,
+    pub(crate) alignment_padding_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -129,22 +130,38 @@ pub(crate) struct DirectDbtCodeCache {
     completed_exit_stub_offset: usize,
     completed_exit_stub_len: usize,
     block_region_start: usize,
+    code_alignment: Rv32DbtCodeAlignment,
     stats: DbtCodeCacheStats,
 }
 
 impl DirectDbtCodeCache {
     pub(crate) fn new(sets: usize, executable_bytes: usize) -> Result<Self, DbtFault> {
+        Self::new_with_alignment(sets, executable_bytes, DEFAULT_DBT_CODE_ALIGNMENT)
+    }
+
+    pub(crate) fn new_with_alignment(
+        sets: usize,
+        executable_bytes: usize,
+        code_alignment: Rv32DbtCodeAlignment,
+    ) -> Result<Self, DbtFault> {
         if sets == 0 || sets > u32::MAX as usize || !sets.is_power_of_two() {
             return Err(Self::fault(
                 DbtFaultKind::Capacity,
                 "DBT code cache requires a power-of-two metadata set count between 1 and u32::MAX",
             ));
         }
+        let alignment_bytes = code_alignment.bytes();
+        if !alignment_bytes.is_power_of_two() || !(16..=256).contains(&alignment_bytes) {
+            return Err(Self::fault(
+                DbtFaultKind::Capacity,
+                "DBT code alignment must be a power of two between 16 and 256 bytes",
+            ));
+        }
         let mut mapping = ExecutableMapping::new(executable_bytes)?;
         let stub = build_completed_exit_stub()
             .map_err(|error| Self::fault(DbtFaultKind::Translation, error.to_string()))?;
         mapping.publish_at(0, &stub)?;
-        let block_region_start = align_up(stub.len(), CODE_ALIGNMENT);
+        let block_region_start = stub.len();
         if block_region_start >= executable_bytes {
             return Err(Self::fault(
                 DbtFaultKind::Capacity,
@@ -159,6 +176,7 @@ impl DirectDbtCodeCache {
             completed_exit_stub_offset: 0,
             completed_exit_stub_len: stub.len(),
             block_region_start,
+            code_alignment,
             stats: DbtCodeCacheStats::default(),
         })
     }
@@ -223,15 +241,42 @@ impl DirectDbtCodeCache {
             ));
         }
 
-        let aligned = align_up(self.write_cursor, CODE_ALIGNMENT);
-        let offset = if aligned
-            .checked_add(block.code().len())
-            .is_some_and(|end| end <= self.mapping.capacity())
-        {
-            aligned
-        } else {
-            self.block_region_start
-        };
+        let chain_entry_offset = block.chain_entry_offset();
+        let (placement_cursor, offset) = publication_offset(
+            self.write_cursor,
+            chain_entry_offset,
+            self.code_alignment,
+        )
+        .filter(|offset| {
+            offset
+                .checked_add(block.code().len())
+                .is_some_and(|end| end <= self.mapping.capacity())
+        })
+        .map(|offset| (self.write_cursor, offset))
+        .or_else(|| {
+            publication_offset(
+                self.block_region_start,
+                chain_entry_offset,
+                self.code_alignment,
+            )
+            .filter(|offset| {
+                offset
+                    .checked_add(block.code().len())
+                    .is_some_and(|end| end <= self.mapping.capacity())
+            })
+            .map(|offset| (self.block_region_start, offset))
+        })
+        .ok_or_else(|| {
+            Self::fault(
+                DbtFaultKind::Capacity,
+                format!(
+                    "native block requires {} bytes plus alignment padding but code cache block region is {} bytes",
+                    block.code().len(),
+                    block_capacity
+                ),
+            )
+        })?;
+        let alignment_padding = offset - placement_cursor;
         let end = offset + block.code().len();
         self.invalidate_overlapping(offset, end)?;
 
@@ -281,9 +326,13 @@ impl DirectDbtCodeCache {
         };
         self.sets[set].mru_way = way as u8;
         self.write_cursor = end;
-        self.stats.publications = self.stats.publications.saturating_add(1);
         self.link_outgoing(set, way)?;
         self.link_incoming(set, way)?;
+        self.stats.publications = self.stats.publications.saturating_add(1);
+        self.stats.alignment_padding_bytes = self
+            .stats
+            .alignment_padding_bytes
+            .saturating_add(alignment_padding as u64);
         let entry = self.mapping.entry_address(offset).ok_or_else(|| {
             Self::fault(
                 DbtFaultKind::AbiInvariant,
@@ -666,9 +715,28 @@ impl DirectDbtCodeCache {
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
+    align_up_checked(value, alignment).unwrap_or(usize::MAX)
+}
+
+fn align_up_checked(value: usize, alignment: usize) -> Option<usize> {
     value
         .checked_add(alignment - 1)
-        .map_or(usize::MAX, |value| value & !(alignment - 1))
+        .map(|value| value & !(alignment - 1))
+}
+
+fn publication_offset(
+    cursor: usize,
+    chain_entry_offset: u32,
+    alignment: Rv32DbtCodeAlignment,
+) -> Option<usize> {
+    let anchor_offset = match alignment {
+        Rv32DbtCodeAlignment::BlockBase(_) => 0,
+        Rv32DbtCodeAlignment::ChainEntry(_) => chain_entry_offset as usize,
+    };
+    cursor
+        .checked_add(anchor_offset)
+        .and_then(|anchor| align_up_checked(anchor, alignment.bytes()))
+        .and_then(|aligned| aligned.checked_sub(anchor_offset))
 }
 
 fn ranges_overlap(lhs_start: usize, lhs_end: usize, rhs_start: usize, rhs_end: usize) -> bool {
@@ -688,6 +756,7 @@ mod tests {
     #[cfg(feature = "dbt-code-audit")]
     use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
     use crate::rv32_dbt::DbtFaultKind;
+    use crate::rv32_machine::Rv32DbtCodeAlignment;
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
     #[cfg(feature = "dbt-code-audit")]
     use std::collections::BTreeSet;
@@ -926,6 +995,125 @@ mod tests {
     }
 
     #[test]
+    fn block_base_policy_aligns_every_callable_entry() {
+        let mut cache = DirectDbtCodeCache::new_with_alignment(
+            4,
+            PAGE_BYTES,
+            Rv32DbtCodeAlignment::BlockBase(128),
+        )
+        .unwrap();
+        let keys = [DbtCacheKey::new(0x1000, 0), DbtCacheKey::new(0x1004, 0)];
+
+        for key in keys {
+            cache.publish(key, &block(key.pc, &returning(7))).unwrap();
+            let (set, way) = cache.find_entry(key).unwrap();
+            assert_eq!(cache.sets[set].ways[way].offset % 128, 0);
+        }
+        assert!(cache.stats().alignment_padding_bytes > 0);
+    }
+
+    #[test]
+    fn chain_entry_policy_aligns_direct_link_targets() {
+        let mut cache = DirectDbtCodeCache::new_with_alignment(
+            4,
+            PAGE_BYTES,
+            Rv32DbtCodeAlignment::ChainEntry(32),
+        )
+        .unwrap();
+        let key = DbtCacheKey::new(0x1000, 0);
+
+        cache
+            .publish(key, &block_with_links(key.pc, &returning(7), 5, &[]))
+            .unwrap();
+        let (set, way) = cache.find_entry(key).unwrap();
+        let entry = cache.sets[set].ways[way];
+
+        assert_eq!((entry.offset + entry.chain_entry_offset as usize) % 32, 0);
+        assert!(cache.stats().alignment_padding_bytes > 0);
+    }
+
+    #[test]
+    fn wraparound_preserves_the_configured_alignment_anchor() {
+        for alignment in [
+            Rv32DbtCodeAlignment::BlockBase(128),
+            Rv32DbtCodeAlignment::ChainEntry(32),
+        ] {
+            let mut cache =
+                DirectDbtCodeCache::new_with_alignment(8, PAGE_BYTES, alignment).unwrap();
+            let code = vec![0x90; 1_500];
+
+            for index in 0..6_u32 {
+                let pc = 0x2000 + index * 4;
+                cache
+                    .publish(
+                        DbtCacheKey::new(pc, 0),
+                        &block_with_links(pc, &code, 5, &[]),
+                    )
+                    .unwrap();
+            }
+
+            for entry in cache
+                .sets
+                .iter()
+                .flat_map(|set| set.ways.iter())
+                .filter(|entry| entry.valid)
+            {
+                assert!(entry.offset >= cache.block_region_start());
+                let anchor = match alignment {
+                    Rv32DbtCodeAlignment::BlockBase(_) => entry.offset,
+                    Rv32DbtCodeAlignment::ChainEntry(_) => {
+                        entry.offset + entry.chain_entry_offset as usize
+                    }
+                };
+                assert_eq!(anchor % alignment.bytes(), 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn snapshot_validates_links_to_an_aligned_chain_entry() {
+        let mut cache = DirectDbtCodeCache::new_with_alignment(
+            8,
+            PAGE_BYTES,
+            Rv32DbtCodeAlignment::ChainEntry(32),
+        )
+        .unwrap();
+        let source_key = DbtCacheKey::new(0x3000, 0);
+        let target_key = DbtCacheKey::new(0x3004, 0);
+        let (source_code, link) = source_link(target_key.pc);
+
+        cache
+            .publish(
+                source_key,
+                &block_with_links(source_key.pc, &source_code, 5, &[link]),
+            )
+            .unwrap();
+        cache
+            .publish(
+                target_key,
+                &block_with_links(target_key.pc, &returning(9), 5, &[]),
+            )
+            .unwrap();
+
+        let snapshot = cache.snapshot(0).unwrap();
+        let target = snapshot
+            .blocks
+            .iter()
+            .find(|block| block.guest_pc == target_key.pc)
+            .unwrap();
+        assert_eq!(target.chain_entry_offset as usize % 32, 0);
+        assert!(snapshot
+            .blocks
+            .iter()
+            .find(|block| block.guest_pc == source_key.pc)
+            .unwrap()
+            .edges
+            .iter()
+            .any(|edge| edge.linked));
+    }
+
+    #[test]
     fn circular_overwrite_invalidates_only_overlapping_entries() {
         let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
         let first = DbtCacheKey::new(0, 0);
@@ -1159,7 +1347,8 @@ mod tests {
             .unwrap();
         assert_eq!(unsafe { execute(source.entry()) }, 9);
 
-        let filler_len = PAGE_BYTES - super::align_up(cache.write_cursor, super::CODE_ALIGNMENT);
+        let filler_len =
+            PAGE_BYTES - super::align_up(cache.write_cursor, cache.code_alignment.bytes());
         cache
             .publish(
                 DbtCacheKey::new(0x4048, 0),
