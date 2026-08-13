@@ -574,6 +574,7 @@ impl Rv32Machine {
                             error.address().unwrap_or(instruction_pc),
                         );
                         if let Some(outcome) = self.terminal_outcome(retired_before) {
+                            self.record_dbt_profile_terminal();
                             return Ok(outcome);
                         }
                         continue;
@@ -750,6 +751,7 @@ impl Rv32Machine {
                 }
             }
             if let Some(outcome) = self.terminal_outcome(retired_before) {
+                self.record_dbt_profile_terminal();
                 return Ok(outcome);
             }
         }
@@ -768,6 +770,14 @@ impl Rv32Machine {
             return Some(execution.stats());
         }
         None
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn record_dbt_profile_terminal(&mut self) {
+        #[cfg(feature = "dbt-execution-profile")]
+        if let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution {
+            execution.record_profile_terminal();
+        }
     }
 
     #[cfg(feature = "dbt-execution-profile")]
@@ -1001,6 +1011,8 @@ fn create_dbt_context(
         reservation_valid,
         reservation_address,
         chain_transitions: 0,
+        #[cfg(feature = "dbt-execution-profile")]
+        profile_exit_kind: crate::rv32_dbt::abi::DbtProfileExitKind::None,
         exit: DbtExitRecord::default(),
     })
 }
@@ -1017,6 +1029,10 @@ fn refresh_dbt_context(
     context.reservation_valid = reservation_valid;
     context.reservation_address = reservation_address;
     context.chain_transitions = 0;
+    #[cfg(feature = "dbt-execution-profile")]
+    {
+        context.profile_exit_kind = crate::rv32_dbt::abi::DbtProfileExitKind::None;
+    }
     context.exit = DbtExitRecord::default();
 }
 

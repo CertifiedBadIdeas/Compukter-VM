@@ -41,7 +41,7 @@ pub(crate) struct DbtProfileRelocation {
 
 #[cfg(feature = "dbt-execution-profile")]
 impl DbtProfileRelocation {
-    const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         key: DbtProfileKey::Block { pc: 0 },
         count_address_offset: 0,
         overflow_address_offset: 0,

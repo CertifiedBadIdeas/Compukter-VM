@@ -24,12 +24,20 @@
 
 use super::emitter::{Condition, EmitError, Gpr, Label, Mem, X64Emitter};
 use super::register_cache::RegisterCache;
+#[cfg(feature = "dbt-execution-profile")]
+use crate::rv32_dbt::abi::DbtProfileExitKind;
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{
     DbtBlockInput, DbtBlockMode, DbtColdExitRelocation, DbtLinkKind, DbtStaticLink,
     TranslatedBlock, MAX_COLD_EXIT_RELOCATIONS, MAX_STATIC_LINKS,
 };
+#[cfg(feature = "dbt-execution-profile")]
+use crate::rv32_dbt::block::{DbtProfileRelocation, MAX_PROFILE_RELOCATIONS};
+#[cfg(feature = "dbt-execution-profile")]
+use crate::rv32_dbt::profile::DbtProfileKey;
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
+#[cfg(feature = "dbt-execution-profile")]
+use crate::rv32_machine::Rv32DbtProfileEdgeKind;
 use crate::rv32im::{
     Branch, DecodedInstruction, ImmOp, Load, Op, Rv32ArchitecturalState, Rv32ResolvedInstruction,
     Store,
@@ -49,6 +57,38 @@ struct StaticLinkCollector {
 struct ColdExitCollector {
     relocations: [DbtColdExitRelocation; MAX_COLD_EXIT_RELOCATIONS],
     len: usize,
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+struct ProfileRelocationCollector {
+    relocations: [DbtProfileRelocation; MAX_PROFILE_RELOCATIONS],
+    len: usize,
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+impl ProfileRelocationCollector {
+    const fn new() -> Self {
+        Self {
+            relocations: [DbtProfileRelocation::EMPTY; MAX_PROFILE_RELOCATIONS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, relocation: DbtProfileRelocation) -> Result<(), EmitError> {
+        let slot = self
+            .relocations
+            .get_mut(self.len)
+            .ok_or(EmitError::InvalidOperand(
+                "RV32 DBT block exceeded its profile relocation capacity",
+            ))?;
+        *slot = relocation;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[DbtProfileRelocation] {
+        &self.relocations[..self.len]
+    }
 }
 
 impl ColdExitCollector {
@@ -126,6 +166,29 @@ impl DbtTranslationWorkspace {
         input: &DbtBlockInput<'_>,
         ram_len: u32,
     ) -> Result<TranslatedBlock<'a>, DbtFault> {
+        self.lower_inner(
+            input,
+            ram_len,
+            #[cfg(feature = "dbt-execution-profile")]
+            false,
+        )
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn lower_profiled<'a>(
+        &'a mut self,
+        input: &DbtBlockInput<'_>,
+        ram_len: u32,
+    ) -> Result<TranslatedBlock<'a>, DbtFault> {
+        self.lower_inner(input, ram_len, true)
+    }
+
+    fn lower_inner<'a>(
+        &'a mut self,
+        input: &DbtBlockInput<'_>,
+        ram_len: u32,
+        #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
+    ) -> Result<TranslatedBlock<'a>, DbtFault> {
         if ram_len == 0 {
             return Err(fault(
                 DbtFaultKind::Capacity,
@@ -141,6 +204,8 @@ impl DbtTranslationWorkspace {
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
         let mut static_links = StaticLinkCollector::new();
         let mut cold_exits = ColdExitCollector::new();
+        #[cfg(feature = "dbt-execution-profile")]
+        let mut profile_relocations = ProfileRelocationCollector::new();
         let mut cache = if chainable {
             RegisterCache::chainable()
         } else {
@@ -161,6 +226,17 @@ impl DbtTranslationWorkspace {
             })?;
             (offset, None)
         };
+        #[cfg(feature = "dbt-execution-profile")]
+        if profile_enabled {
+            emit_profile_increment(
+                &mut out,
+                DbtProfileKey::Block {
+                    pc: input.start_pc(),
+                },
+                &mut profile_relocations,
+            )
+            .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+        }
         let mut terminal = None;
         let mut emitted_terminal = false;
         let mut lowered_load_sites = 0_u32;
@@ -214,6 +290,12 @@ impl DbtTranslationWorkspace {
                         chainable,
                         &mut static_links,
                         &mut cold_exits,
+                        #[cfg(feature = "dbt-execution-profile")]
+                        profile_enabled,
+                        #[cfg(feature = "dbt-execution-profile")]
+                        input.start_pc(),
+                        #[cfg(feature = "dbt-execution-profile")]
+                        &mut profile_relocations,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     emitted_terminal = true;
@@ -231,6 +313,12 @@ impl DbtTranslationWorkspace {
                         chainable,
                         &mut static_links,
                         &mut cold_exits,
+                        #[cfg(feature = "dbt-execution-profile")]
+                        profile_enabled,
+                        #[cfg(feature = "dbt-execution-profile")]
+                        input.start_pc(),
+                        #[cfg(feature = "dbt-execution-profile")]
+                        &mut profile_relocations,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     emitted_terminal = true;
@@ -247,6 +335,8 @@ impl DbtTranslationWorkspace {
                         &input.slots()[index..],
                         &mut cache,
                         &mut out,
+                        #[cfg(feature = "dbt-execution-profile")]
+                        profile_enabled,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     emitted_terminal = true;
@@ -338,20 +428,44 @@ impl DbtTranslationWorkspace {
                     chainable,
                     &mut static_links,
                     &mut cold_exits,
+                    #[cfg(feature = "dbt-execution-profile")]
+                    profile_enabled,
+                    #[cfg(feature = "dbt-execution-profile")]
+                    input.start_pc(),
+                    #[cfg(feature = "dbt-execution-profile")]
+                    &mut profile_relocations,
                 )
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
             }
         }
         if let Some(cold_exit) = deferred_budget_exit {
             out.bind(cold_exit)
-                .and_then(|()| {
-                    emit_completed_trampoline(&mut out, input.start_pc(), &mut cold_exits)
-                })
+                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            #[cfg(feature = "dbt-execution-profile")]
+            if profile_enabled {
+                emit_profile_exit_kind(&mut out, DbtProfileExitKind::Budget)
+                    .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            }
+            emit_completed_trampoline(&mut out, input.start_pc(), &mut cold_exits)
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
         }
         let code = out
             .finish()
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+        #[cfg(feature = "dbt-execution-profile")]
+        if profile_enabled {
+            return TranslatedBlock::new_profiled(
+                input,
+                code,
+                lowered_load_sites,
+                lowered_store_sites,
+                chain_entry_offset,
+                static_links.as_slice(),
+                cold_exits.as_slice(),
+                profile_relocations.as_slice(),
+            )
+            .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message));
+        }
         TranslatedBlock::new(
             input,
             code,
@@ -389,6 +503,9 @@ fn emit_branch(
     chainable: bool,
     static_links: &mut StaticLinkCollector,
     cold_exits: &mut ColdExitCollector,
+    #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
+    #[cfg(feature = "dbt-execution-profile")] source_pc: u32,
+    #[cfg(feature = "dbt-execution-profile")] profile_relocations: &mut ProfileRelocationCollector,
 ) -> Result<(), EmitError> {
     let lhs = cache.read(rs1, remaining, &[], out)?;
     let rhs = cache.read(rs2, remaining, &[lhs], out)?;
@@ -413,6 +530,12 @@ fn emit_branch(
         chainable,
         static_links,
         cold_exits,
+        #[cfg(feature = "dbt-execution-profile")]
+        profile_enabled,
+        #[cfg(feature = "dbt-execution-profile")]
+        source_pc,
+        #[cfg(feature = "dbt-execution-profile")]
+        profile_relocations,
     )?;
     out.bind(taken)?;
     let target = pc.wrapping_add_signed(offset);
@@ -427,6 +550,12 @@ fn emit_branch(
             chainable,
             static_links,
             cold_exits,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_enabled,
+            #[cfg(feature = "dbt-execution-profile")]
+            source_pc,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_relocations,
         )
     } else {
         emit_exit(
@@ -452,6 +581,9 @@ fn emit_jal(
     chainable: bool,
     static_links: &mut StaticLinkCollector,
     cold_exits: &mut ColdExitCollector,
+    #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
+    #[cfg(feature = "dbt-execution-profile")] source_pc: u32,
+    #[cfg(feature = "dbt-execution-profile")] profile_relocations: &mut ProfileRelocationCollector,
 ) -> Result<(), EmitError> {
     let target = pc.wrapping_add_signed(offset);
     if target & 3 != 0 {
@@ -477,6 +609,12 @@ fn emit_jal(
         chainable,
         static_links,
         cold_exits,
+        #[cfg(feature = "dbt-execution-profile")]
+        profile_enabled,
+        #[cfg(feature = "dbt-execution-profile")]
+        source_pc,
+        #[cfg(feature = "dbt-execution-profile")]
+        profile_relocations,
     )
 }
 
@@ -491,6 +629,7 @@ fn emit_jalr(
     remaining: &[Rv32ResolvedInstruction],
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
+    #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
 ) -> Result<(), EmitError> {
     let base = cache.read(rs1, remaining, &[], out)?;
     out.mov_r32_r32(Gpr::Rax, base)?;
@@ -516,7 +655,21 @@ fn emit_jalr(
         out.mov_r32_imm32(dst, pc.wrapping_add(4))?;
     }
     out.mov_r32_r32(Gpr::Rdx, Gpr::Rax)?;
+    #[cfg(feature = "dbt-execution-profile")]
+    if profile_enabled {
+        emit_profile_exit_kind(out, DbtProfileExitKind::Jalr)?;
+    }
     emit_exit_dynamic(cache, out, DbtExitTag::Completed, Gpr::Rdx, attempted, 0, 0)
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+fn emit_profile_exit_kind(out: &mut X64Emitter, kind: DbtProfileExitKind) -> Result<(), EmitError> {
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::PROFILE_EXIT_KIND_OFFSET,
+        kind as u32,
+    )
 }
 
 fn emit_prologue(out: &mut X64Emitter, chainable: bool) -> Result<(), EmitError> {
@@ -1127,10 +1280,32 @@ fn emit_completed_exit(
     chainable: bool,
     static_links: &mut StaticLinkCollector,
     cold_exits: &mut ColdExitCollector,
+    #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
+    #[cfg(feature = "dbt-execution-profile")] source_pc: u32,
+    #[cfg(feature = "dbt-execution-profile")] profile_relocations: &mut ProfileRelocationCollector,
 ) -> Result<(), EmitError> {
     if chainable {
         cache.flush(out)?;
         out.add_r64_imm32(EXECUTION_COUNTER, attempted as i32)?;
+        #[cfg(feature = "dbt-execution-profile")]
+        if profile_enabled {
+            let edge_kind = match kind {
+                DbtLinkKind::BranchTaken => Rv32DbtProfileEdgeKind::Taken,
+                DbtLinkKind::Fallthrough | DbtLinkKind::BranchNotTaken => {
+                    Rv32DbtProfileEdgeKind::Fallthrough
+                }
+                DbtLinkKind::Jal => Rv32DbtProfileEdgeKind::Jump,
+            };
+            emit_profile_increment(
+                out,
+                DbtProfileKey::Edge {
+                    source_pc,
+                    target_pc: next_pc,
+                    kind: edge_kind,
+                },
+                profile_relocations,
+            )?;
+        }
         let jump = out.patchable_jump()?;
         static_links.push(DbtStaticLink {
             target_pc: next_pc,
@@ -1150,6 +1325,26 @@ fn emit_completed_exit(
         0,
         0,
     )
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+fn emit_profile_increment(
+    out: &mut X64Emitter,
+    key: DbtProfileKey,
+    relocations: &mut ProfileRelocationCollector,
+) -> Result<(), EmitError> {
+    let count_address_offset = out.mov_r64_relocatable_imm64(Gpr::Rax)?;
+    out.add_m64_imm8(Mem::base_disp(Gpr::Rax, 0), 1)?;
+    let done = out.new_label()?;
+    out.jcc(Condition::AboveEqual, done)?;
+    let overflow_address_offset = out.mov_r64_relocatable_imm64(Gpr::Rax)?;
+    out.add_m64_imm8(Mem::base_disp(Gpr::Rax, 0), 1)?;
+    out.bind(done)?;
+    relocations.push(DbtProfileRelocation {
+        key,
+        count_address_offset,
+        overflow_address_offset,
+    })
 }
 
 fn emit_completed_trampoline(
@@ -1284,6 +1479,8 @@ fn fault(kind: DbtFaultKind, pc: u32, word: Option<u32>, message: impl Into<Stri
 mod tests {
     use super::{emit_fault, write_u32, DbtTranslationWorkspace};
     use crate::memory::MachineMemory;
+    #[cfg(feature = "dbt-execution-profile")]
+    use crate::rv32_dbt::abi::DbtProfileExitKind;
     use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
     use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, DbtLinkKind};
     use crate::rv32_dbt::executable::ExecutableScratch;
@@ -1366,6 +1563,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
         let entry: DbtEntry = unsafe { std::mem::transmute(scratch.entry_address().unwrap()) };
@@ -1412,6 +1611,8 @@ mod tests {
             reservation_valid: u32::from(reservation.is_some()),
             reservation_address: reservation.unwrap_or(0),
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
         let entry: DbtEntry = unsafe { std::mem::transmute(scratch.entry_address().unwrap()) };
@@ -1799,6 +2000,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
         let entry: DbtEntry = unsafe { std::mem::transmute(scratch.entry_address().unwrap()) };
@@ -1860,6 +2063,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
         let entry: DbtEntry = unsafe { std::mem::transmute(scratch.entry_address().unwrap()) };
@@ -2126,6 +2331,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
         let entry: DbtEntry = unsafe { std::mem::transmute(scratch.entry_address().unwrap()) };

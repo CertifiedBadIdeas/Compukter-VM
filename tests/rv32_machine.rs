@@ -25,10 +25,14 @@ use compukter_vm::rv32_machine::{
     Rv32MachineOutcome, CONTROL_BASE, DEBUG_BASE, DEFAULT_DBT_CODE_ALIGNMENT, STATUS_BOOTING,
     STATUS_HALTED, STATUS_PANIC,
 };
+#[cfg(feature = "dbt-execution-profile")]
+use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
 use compukter_vm::rv32im::encoding::{
     addi, amoswap_w, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, lw, materialize, sb,
     sc_w, sh, sw,
 };
+#[cfg(feature = "dbt-execution-profile")]
+use compukter_vm::rv32im::encoding::{bne, jalr};
 use rv32_elf_support::{halting_machine_elf, machine_program_elf, Elf32Builder, LoadSegment};
 
 const CSR_MTVEC: u16 = 0x305;
@@ -604,6 +608,129 @@ fn exact_profile_rejects_unsupported_backends_and_geometry() {
     .unwrap();
     assert!(interpreted.enable_dbt_execution_profile(128).is_err());
     assert!(interpreted.dbt_execution_profile().is_err());
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+fn block_count(profile: &Rv32DbtExecutionProfile, pc: u32) -> u64 {
+    profile
+        .blocks
+        .iter()
+        .find(|block| block.pc == pc)
+        .map_or(0, |block| block.executions)
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+fn edge_count(
+    profile: &Rv32DbtExecutionProfile,
+    source_pc: u32,
+    target_pc: u32,
+    kind: Rv32DbtProfileEdgeKind,
+) -> u64 {
+    profile
+        .static_edges
+        .iter()
+        .find(|edge| {
+            edge.source_pc == source_pc && edge.target_pc == target_pc && edge.kind == kind
+        })
+        .map_or(0, |edge| edge.executions)
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn exact_profile_counts_initial_chained_and_static_edge_paths() {
+    let [control_hi, control_lo] = materialize(2, CONTROL_BASE);
+    let mut machine = cached_dbt_machine(
+        &[
+            addi(1, 0, 4),
+            addi(1, 1, -1),
+            bne(1, 0, -4),
+            control_hi,
+            control_lo,
+            sw(2, 0, 8),
+            addi(3, 0, STATUS_HALTED),
+            sw(2, 3, 0),
+        ],
+        32,
+    );
+    machine.enable_dbt_execution_profile(256).unwrap();
+
+    assert!(matches!(
+        machine.run(64).unwrap(),
+        Rv32MachineOutcome::Halted { .. }
+    ));
+    let profile = machine.dbt_execution_profile().unwrap().unwrap();
+    assert_eq!(block_count(&profile, 0x1000), 1);
+    assert_eq!(block_count(&profile, 0x1004), 3);
+    assert_eq!(
+        edge_count(&profile, 0x1000, 0x1004, Rv32DbtProfileEdgeKind::Taken),
+        1
+    );
+    assert_eq!(
+        edge_count(&profile, 0x1004, 0x1004, Rv32DbtProfileEdgeKind::Taken),
+        2
+    );
+    assert_eq!(
+        edge_count(
+            &profile,
+            0x1004,
+            0x100c,
+            Rv32DbtProfileEdgeKind::Fallthrough
+        ),
+        1
+    );
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn exact_profile_counts_dynamic_exit_categories() {
+    let [target_hi, target_lo] = materialize(1, 0x100c);
+    let [control_hi, control_lo] = materialize(2, CONTROL_BASE);
+    let mut machine = cached_dbt_machine(
+        &[
+            target_hi,
+            target_lo,
+            jalr(0, 1, 0),
+            control_hi,
+            control_lo,
+            sw(2, 0, 8),
+            addi(3, 0, STATUS_HALTED),
+            sw(2, 3, 0),
+        ],
+        32,
+    );
+    machine.enable_dbt_execution_profile(256).unwrap();
+
+    assert!(matches!(
+        machine.run(64).unwrap(),
+        Rv32MachineOutcome::Halted { .. }
+    ));
+    let exits = machine
+        .dbt_execution_profile()
+        .unwrap()
+        .unwrap()
+        .dynamic_exits;
+    assert_eq!(exits.jalr, 1);
+    assert_eq!(exits.memory_access, 2);
+    assert_eq!(exits.trap_or_terminal, 1);
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn exact_profile_counts_chained_budget_exit() {
+    let mut machine = cached_dbt_machine(&[jal(0, 0)], 16);
+    machine.enable_dbt_execution_profile(64).unwrap();
+
+    assert!(matches!(
+        machine.run(5).unwrap(),
+        Rv32MachineOutcome::BudgetExhausted {
+            retired_delta: 5,
+            ..
+        }
+    ));
+    let profile = machine.dbt_execution_profile().unwrap().unwrap();
+    assert_eq!(profile.dynamic_exits.budget, 1);
+    assert_eq!(profile.dynamic_exits.trap_or_terminal, 0);
+    assert_eq!(block_count(&profile, 0x1000), 5);
 }
 
 #[test]

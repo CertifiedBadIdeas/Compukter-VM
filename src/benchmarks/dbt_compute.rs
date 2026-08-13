@@ -142,6 +142,8 @@ impl PreparedDirectDbtCompute32 {
                 reservation_valid: 0,
                 reservation_address: 0,
                 chain_transitions: 0,
+                #[cfg(feature = "dbt-execution-profile")]
+                profile_exit_kind: crate::rv32_dbt::abi::DbtProfileExitKind::None,
                 exit: DbtExitRecord::default(),
             };
             let entry: DbtEntry = unsafe {
@@ -354,6 +356,8 @@ impl PreparedCachedDbtCompute32 {
                 reservation_valid: 0,
                 reservation_address: 0,
                 chain_transitions: 0,
+                #[cfg(feature = "dbt-execution-profile")]
+                profile_exit_kind: crate::rv32_dbt::abi::DbtProfileExitKind::None,
                 exit: DbtExitRecord::default(),
             };
             let entry: DbtEntry = unsafe { std::mem::transmute(entry_address) };

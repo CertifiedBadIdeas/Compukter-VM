@@ -50,6 +50,16 @@ impl TryFrom<u32> for DbtExitTag {
     }
 }
 
+#[cfg(feature = "dbt-execution-profile")]
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DbtProfileExitKind {
+    #[default]
+    None = 0,
+    Jalr = 1,
+    Budget = 2,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DbtExitRecord {
@@ -81,6 +91,8 @@ pub(crate) struct DbtContext {
     pub(crate) reservation_valid: u32,
     pub(crate) reservation_address: u32,
     pub(crate) chain_transitions: u32,
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) profile_exit_kind: DbtProfileExitKind,
     pub(crate) exit: DbtExitRecord,
 }
 
@@ -98,6 +110,9 @@ impl DbtContext {
         std::mem::offset_of!(Self, reservation_address);
     pub(crate) const CHAIN_TRANSITIONS_OFFSET: usize =
         std::mem::offset_of!(Self, chain_transitions);
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) const PROFILE_EXIT_KIND_OFFSET: usize =
+        std::mem::offset_of!(Self, profile_exit_kind);
     pub(crate) const EXIT_OFFSET: usize = std::mem::offset_of!(Self, exit);
 }
 
