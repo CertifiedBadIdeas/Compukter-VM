@@ -283,6 +283,19 @@ fn comparison_runner_exposes_distinct_compilation_phase_rows() {
 }
 
 #[test]
+fn codegen_audit_export_contract_is_explicit() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("examples/rv32_c_codegen_audit.rs")).unwrap();
+
+    assert!(source.contains("\"export\""));
+    assert!(source.contains("dbt-code-cache.bin"));
+    assert!(source.contains("dbt-blocks.tsv"));
+    assert!(source.contains("dbt-code-cache.S"));
+    assert!(source.contains("ee05_3d58"));
+    assert!(source.contains("dbt_code_snapshot"));
+}
+
+#[test]
 fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     let source = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/tests/rv32-c-qemu-comparison.sh"),
