@@ -600,6 +600,7 @@ fn emit_branch(
     let target = pc.wrapping_add_signed(offset);
     let mut taken_cache = cache.clone();
     if let Some(local_loop_entry) = local_loop_entry.filter(|_| target == source_pc) {
+        taken_cache.reconcile_local_loop(out)?;
         #[cfg(feature = "dbt-execution-profile")]
         if profile_enabled {
             emit_profile_increment(
