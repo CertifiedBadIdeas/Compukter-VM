@@ -80,6 +80,18 @@ struct Resident {
     dirty: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalLoopRegisterPlan {
+    guests: [usize; CHAINABLE_HOST_POOL.len()],
+    len: usize,
+}
+
+impl LocalLoopRegisterPlan {
+    pub(crate) fn guests(&self) -> &[usize] {
+        &self.guests[..self.len]
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RegisterCache {
     host_pool: &'static [Gpr],
@@ -107,6 +119,40 @@ impl RegisterCache {
 
     pub(crate) const fn is_chainable(&self) -> bool {
         self.host_pool.len() == CHAINABLE_HOST_POOL.len()
+    }
+
+    pub(crate) fn local_loop_plan(
+        slots: &[Rv32ResolvedInstruction],
+    ) -> Option<LocalLoopRegisterPlan> {
+        let referenced = slots.iter().copied().fold(0_u32, |mask, slot| {
+            let access = instruction_access(slot);
+            mask | access.reads | access.writes
+        }) & !1;
+        if referenced.count_ones() as usize > CHAINABLE_HOST_POOL.len() {
+            return None;
+        }
+        let mut guests = [0; CHAINABLE_HOST_POOL.len()];
+        let mut len = 0;
+        for guest in 1..32 {
+            if referenced & (1_u32 << guest) != 0 {
+                guests[len] = guest;
+                len += 1;
+            }
+        }
+        Some(LocalLoopRegisterPlan { guests, len })
+    }
+
+    pub(crate) fn preload_local_loop(
+        &mut self,
+        plan: LocalLoopRegisterPlan,
+        slots: &[Rv32ResolvedInstruction],
+        out: &mut X64Emitter,
+    ) -> Result<(), EmitError> {
+        debug_assert!(self.is_chainable());
+        for guest in plan.guests() {
+            self.read(*guest, slots, &[], out)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn read(
@@ -357,7 +403,7 @@ mod tests {
     use crate::rv32_dbt::x86_64::emitter::{Gpr, X64Emitter};
     use crate::rv32im::{
         decode_product_word,
-        encoding::{addi, ecall, jal, jalr, lw},
+        encoding::{addi, bne, ecall, jal, jalr, lw},
         Rv32ResolvedInstruction,
     };
 
@@ -395,6 +441,29 @@ mod tests {
                 Gpr::R11,
             ]
         );
+    }
+
+    #[test]
+    fn local_loop_plan_keeps_every_referenced_guest_resident() {
+        let slots = [
+            slot(addi(5, 0, 1)),
+            slot(lw(6, 5, 0)),
+            slot(addi(6, 6, 1)),
+            slot(bne(6, 7, -12)),
+        ];
+
+        let plan = RegisterCache::local_loop_plan(&slots).unwrap();
+
+        assert_eq!(plan.guests(), &[5, 6, 7]);
+    }
+
+    #[test]
+    fn local_loop_plan_rejects_more_guests_than_the_chainable_pool() {
+        let slots = (1..=8)
+            .map(|guest| slot(addi(guest, guest, 1)))
+            .collect::<Vec<_>>();
+
+        assert!(RegisterCache::local_loop_plan(&slots).is_none());
     }
 
     #[test]
