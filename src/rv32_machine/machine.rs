@@ -504,6 +504,8 @@ impl Rv32Machine {
                 }) {
                     cached.unwrap()
                 } else {
+                    #[cfg(feature = "dbt-translation-timing")]
+                    let decode_started = std::time::Instant::now();
                     let fill_result = {
                         let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
                             unreachable!("DBT loop requires the DBT backend")
@@ -516,6 +518,13 @@ impl Rv32Machine {
                             execution.decoded_slots_mut(),
                         )
                     };
+                    #[cfg(feature = "dbt-translation-timing")]
+                    {
+                        let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
+                            unreachable!("DBT loop requires the DBT backend")
+                        };
+                        execution.record_decode_nanos(decode_started.elapsed().as_nanos());
+                    }
                     if let Err(error) = fill_result {
                         attempted += 1;
                         self.hart.take_instruction_access_fault(
