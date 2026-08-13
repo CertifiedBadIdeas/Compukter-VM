@@ -13,6 +13,11 @@ use compukter_vm::benchmarks::{
     benchmark_normalize_nanos, c_comparison_next_batch, c_comparison_qemu_target_nanos,
     c_comparison_timeout_nanos, parse_c_comparison_result, product_percentile,
 };
+#[cfg(feature = "wasmtime-comparison")]
+use compukter_vm::benchmarks::{
+    benchmark_rotating_order, compile_equivalent_calls, optional_phase_rate,
+    COMPILATION_PHASE_REPORT_HEADER,
+};
 use compukter_vm::rv32_machine::{
     Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
 };
@@ -26,6 +31,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(feature = "wasmtime-comparison")]
+use wasmtime::{Config, Engine, Instance, Module, OptLevel, Store, TypedFunc};
 
 const ITERATIONS: u32 = 1000;
 const SEED: u32 = 0x1234_5678;
@@ -344,6 +351,19 @@ struct CandidateMeasurements {
     details: ProductDetails,
 }
 
+#[cfg(feature = "wasmtime-comparison")]
+struct CompilationPhaseMeasurement {
+    system: &'static str,
+    phase: &'static str,
+    nanos: Vec<u128>,
+    input_bytes: Option<u64>,
+    translated_blocks: Option<u64>,
+    guest_instructions: Option<u64>,
+    output_bytes: Option<u64>,
+    warm_nanos: Option<u128>,
+    amortized: bool,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("RV32 C comparison failed: {error}");
@@ -603,6 +623,31 @@ fn run() -> Result<(), String> {
             option_u64(measurement.details.dbt_max_budget_overshoot),
         );
     }
+    #[cfg(feature = "wasmtime-comparison")]
+    {
+        let dbt_index = candidates
+            .iter()
+            .position(|candidate| candidate.name == "rv32-cached-dbt-block-16")
+            .ok_or_else(|| "missing block-16 DBT comparison candidate".to_string())?;
+        print_compilation_report(
+            &wasmtime,
+            &linker,
+            &source_root,
+            &build_dir,
+            &wasm,
+            samples,
+            measurements[2]
+                .samples
+                .iter()
+                .map(|nanos| nanos / u128::from(measurements[2].batch))
+                .collect(),
+            measurements[dbt_index]
+                .samples
+                .iter()
+                .map(|nanos| nanos / u128::from(measurements[dbt_index].batch))
+                .collect(),
+        )?;
+    }
     Ok(())
 }
 
@@ -624,6 +669,412 @@ where
             None => return Ok(batch),
         }
     }
+}
+
+#[cfg(feature = "wasmtime-comparison")]
+#[allow(clippy::too_many_arguments)]
+fn print_compilation_report(
+    wasmtime_cli: &OsStr,
+    linker: &OsStr,
+    source_root: &Path,
+    build_dir: &Path,
+    wasm: &Path,
+    samples: usize,
+    wasmtime_process_warm_nanos: Vec<u128>,
+    dbt_warm_nanos: Vec<u128>,
+) -> Result<(), String> {
+    let cli_version = version_line(wasmtime_cli)?;
+    if cli_version.split_whitespace().nth(1) != Some("47.0.3") {
+        return Err(format!(
+            "embedded Wasmtime 47.0.3 does not match CLI version: {cli_version}"
+        ));
+    }
+    let wasm_bytes =
+        fs::read(wasm).map_err(|error| format!("failed to read {}: {error}", wasm.display()))?;
+    let mut config = Config::new();
+    config.cranelift_opt_level(OptLevel::Speed);
+    let engine = Engine::new(&config).map_err(|error| error.to_string())?;
+
+    let module = Module::new(&engine, &wasm_bytes).map_err(|error| error.to_string())?;
+    let mut compile_nanos = Vec::with_capacity(samples);
+    let mut instantiate_nanos = Vec::with_capacity(samples);
+    let mut first_call_nanos = Vec::with_capacity(samples);
+    const WARM_CALL_BATCH: u32 = 1024;
+    let (mut warm_store, warm_function) = embedded_instance(&engine, &module)?;
+    let mut warm_call_nanos = Vec::with_capacity(samples);
+    let mut cli_nanos = Vec::with_capacity(samples);
+    let mut cli_output_bytes = Vec::with_capacity(samples);
+    let product_elf = link_platform(linker, source_root, build_dir, "product", 1)?;
+    let product_bytes = fs::read(&product_elf)
+        .map_err(|error| format!("failed to read {}: {error}", product_elf.display()))?;
+    let dbt_config = Rv32ExecutionBackendConfig::CachedDbt {
+        sets: 512,
+        max_instructions: 16,
+        scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
+        cache_bytes: 128 * 1024,
+    };
+    let mut construct_nanos = Vec::with_capacity(samples);
+    let mut first_completion_nanos = Vec::with_capacity(samples);
+    let mut decode_nanos = Vec::with_capacity(samples);
+    let mut lower_nanos = Vec::with_capacity(samples);
+    let mut publish_nanos = Vec::with_capacity(samples);
+    let mut last_stats = None;
+    for sample in 0..samples {
+        for candidate in benchmark_rotating_order::<8>(0, sample) {
+            match candidate {
+                0 => {
+                    let started = Instant::now();
+                    let compiled =
+                        Module::new(&engine, &wasm_bytes).map_err(|error| error.to_string())?;
+                    compile_nanos.push(started.elapsed().as_nanos());
+                    std::hint::black_box(compiled);
+                }
+                1 => {
+                    let started = Instant::now();
+                    let mut store = Store::new(&engine, ());
+                    let instance = Instance::new(&mut store, &module, &[])
+                        .map_err(|error| error.to_string())?;
+                    instantiate_nanos.push(started.elapsed().as_nanos());
+                    std::hint::black_box(instance);
+                }
+                2 => {
+                    let (mut store, function) = embedded_instance(&engine, &module)?;
+                    let started = Instant::now();
+                    let checksum = function
+                        .call(&mut store, (ITERATIONS, SEED, 1))
+                        .map_err(|error| error.to_string())?
+                        as u32;
+                    first_call_nanos.push(started.elapsed().as_nanos());
+                    validate_checksum("embedded Wasmtime first call", checksum)?;
+                }
+                3 => {
+                    let started = Instant::now();
+                    let checksum = warm_function
+                        .call(&mut warm_store, (ITERATIONS, SEED, WARM_CALL_BATCH))
+                        .map_err(|error| error.to_string())?
+                        as u32;
+                    warm_call_nanos
+                        .push(started.elapsed().as_nanos() / u128::from(WARM_CALL_BATCH));
+                    validate_checksum("embedded Wasmtime warm call", checksum)?;
+                }
+                4 => {
+                    let output_path = build_dir.join(format!("module-cli-sample-{sample}.cwasm"));
+                    let started = Instant::now();
+                    let output = Command::new(wasmtime_cli)
+                        .args(["compile", "-O", "opt-level=2", "-o"])
+                        .arg(&output_path)
+                        .arg(wasm)
+                        .output()
+                        .map_err(|error| format!("failed to run Wasmtime CLI compiler: {error}"))?;
+                    let elapsed = started.elapsed().as_nanos();
+                    if !output.status.success() {
+                        return Err(format!(
+                            "Wasmtime CLI compilation failed with {}; stderr: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+                    let output_len = fs::metadata(&output_path)
+                        .map_err(|error| {
+                            format!("failed to inspect {}: {error}", output_path.display())
+                        })?
+                        .len();
+                    if output_len == 0 {
+                        return Err("Wasmtime CLI emitted an empty artifact".to_string());
+                    }
+                    cli_output_bytes.push(output_len);
+                    fs::remove_file(&output_path).map_err(|error| {
+                        format!("failed to remove {}: {error}", output_path.display())
+                    })?;
+                    cli_nanos.push(elapsed);
+                }
+                5 => {
+                    let started = Instant::now();
+                    let machine = Rv32Machine::from_elf(
+                        &product_bytes,
+                        Rv32MachineConfig {
+                            ram_size: PRODUCT_RAM_BYTES,
+                            debug_limit: 0,
+                            execution: dbt_config,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    construct_nanos.push(started.elapsed().as_nanos());
+                    std::hint::black_box(machine);
+                }
+                6 => {
+                    let started = Instant::now();
+                    let mut machine = Rv32Machine::from_elf(
+                        &product_bytes,
+                        Rv32MachineConfig {
+                            ram_size: PRODUCT_RAM_BYTES,
+                            debug_limit: 0,
+                            execution: dbt_config,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let outcome = machine.run(20_100_000).map_err(|error| error.to_string())?;
+                    first_completion_nanos.push(started.elapsed().as_nanos());
+                    let checksum = match outcome {
+                        Rv32MachineOutcome::Halted { exit_code, .. } => exit_code as u32,
+                        other => return Err(format!("cold Cached DBT did not halt: {other:?}")),
+                    };
+                    validate_checksum("cold Cached DBT", checksum)?;
+                }
+                7 => {
+                    let mut machine = Rv32Machine::from_elf(
+                        &product_bytes,
+                        Rv32MachineConfig {
+                            ram_size: PRODUCT_RAM_BYTES,
+                            debug_limit: 0,
+                            execution: dbt_config,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    machine.enable_dbt_translation_timing();
+                    let outcome = machine.run(20_100_000).map_err(|error| error.to_string())?;
+                    let checksum = match outcome {
+                        Rv32MachineOutcome::Halted { exit_code, .. } => exit_code as u32,
+                        other => return Err(format!("timed Cached DBT did not halt: {other:?}")),
+                    };
+                    validate_checksum("timed Cached DBT", checksum)?;
+                    let stats = machine
+                        .dbt_stats()
+                        .ok_or_else(|| "cold Cached DBT did not expose DBT stats".to_string())?;
+                    decode_nanos.push(u128::from(stats.decode_nanos));
+                    lower_nanos.push(u128::from(stats.lower_nanos));
+                    publish_nanos.push(u128::from(stats.publish_nanos));
+                    if stats.timed_translations != stats.translations {
+                        return Err("DBT phase timer did not cover every translation".to_string());
+                    }
+                    last_stats = Some(stats);
+                }
+                _ => unreachable!("rotating compilation candidate is in range"),
+            }
+        }
+    }
+    let cli_output_bytes = cli_output_bytes
+        .first()
+        .copied()
+        .filter(|first| cli_output_bytes.iter().all(|size| size == first))
+        .ok_or_else(|| "Wasmtime CLI output sizes were empty or inconsistent".to_string())?;
+    let wasmtime_embedded_warm_median = product_percentile(&warm_call_nanos, 50);
+    let wasmtime_process_warm_median = product_percentile(&wasmtime_process_warm_nanos, 50);
+    let dbt_warm_median = product_percentile(&dbt_warm_nanos, 50);
+    let stats = last_stats.unwrap();
+    let blocks = Some(stats.translations);
+    let instructions = Some(stats.decoded_slots_built);
+    let output_bytes = Some(stats.emitted_bytes);
+    let rows = vec![
+        phase(
+            "wasmtime-embedded",
+            "compile",
+            compile_nanos,
+            Some(wasm_bytes.len() as u64),
+            None,
+            None,
+            None,
+            Some(wasmtime_embedded_warm_median),
+            true,
+        ),
+        phase(
+            "wasmtime-embedded",
+            "instantiate",
+            instantiate_nanos,
+            None,
+            None,
+            None,
+            None,
+            Some(wasmtime_embedded_warm_median),
+            false,
+        ),
+        phase(
+            "wasmtime-embedded",
+            "first-call",
+            first_call_nanos,
+            None,
+            None,
+            None,
+            None,
+            Some(wasmtime_embedded_warm_median),
+            false,
+        ),
+        phase(
+            "wasmtime-embedded",
+            "warm-call",
+            warm_call_nanos,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        phase(
+            "wasmtime-cli",
+            "process-compile-serialize",
+            cli_nanos,
+            Some(wasm_bytes.len() as u64),
+            None,
+            None,
+            Some(cli_output_bytes),
+            Some(wasmtime_process_warm_median),
+            true,
+        ),
+        phase(
+            "rv32-cached-dbt",
+            "machine-construct",
+            construct_nanos,
+            Some(product_bytes.len() as u64),
+            None,
+            None,
+            None,
+            Some(dbt_warm_median),
+            false,
+        ),
+        phase(
+            "rv32-cached-dbt",
+            "first-completion",
+            first_completion_nanos,
+            Some(product_bytes.len() as u64),
+            blocks,
+            instructions,
+            output_bytes,
+            Some(dbt_warm_median),
+            false,
+        ),
+        phase(
+            "rv32-cached-dbt",
+            "decode",
+            decode_nanos,
+            None,
+            blocks,
+            instructions,
+            None,
+            Some(dbt_warm_median),
+            true,
+        ),
+        phase(
+            "rv32-cached-dbt",
+            "lower",
+            lower_nanos,
+            None,
+            blocks,
+            instructions,
+            output_bytes,
+            Some(dbt_warm_median),
+            true,
+        ),
+        phase(
+            "rv32-cached-dbt",
+            "publish",
+            publish_nanos,
+            None,
+            blocks,
+            instructions,
+            output_bytes,
+            Some(dbt_warm_median),
+            true,
+        ),
+        phase(
+            "rv32-cached-dbt",
+            "warm-execution",
+            dbt_warm_nanos,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+    ];
+
+    println!("\nCompilation and startup phase report");
+    println!("scope_note\tWasmtime compile covers the whole module; RV32 DBT phases cover only lazily reached blocks");
+    println!("{COMPILATION_PHASE_REPORT_HEADER}");
+    for row in rows {
+        println!("{}", format_compilation_phase(row)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasmtime-comparison")]
+fn embedded_instance(
+    engine: &Engine,
+    module: &Module,
+) -> Result<(Store<()>, TypedFunc<(u32, u32, u32), i32>), String> {
+    let mut store = Store::new(engine, ());
+    let instance = Instance::new(&mut store, module, &[]).map_err(|error| error.to_string())?;
+    let function = instance
+        .get_typed_func::<(u32, u32, u32), i32>(&mut store, "benchmark_batch")
+        .map_err(|error| error.to_string())?;
+    Ok((store, function))
+}
+
+#[cfg(feature = "wasmtime-comparison")]
+fn validate_checksum(owner: &str, checksum: u32) -> Result<(), String> {
+    if checksum != EXPECTED_CHECKSUM {
+        return Err(format!(
+            "{owner} checksum mismatch: expected {EXPECTED_CHECKSUM:08x}, actual {checksum:08x}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasmtime-comparison")]
+#[allow(clippy::too_many_arguments)]
+fn phase(
+    system: &'static str,
+    phase: &'static str,
+    nanos: Vec<u128>,
+    input_bytes: Option<u64>,
+    translated_blocks: Option<u64>,
+    guest_instructions: Option<u64>,
+    output_bytes: Option<u64>,
+    warm_nanos: Option<u128>,
+    amortized: bool,
+) -> CompilationPhaseMeasurement {
+    CompilationPhaseMeasurement {
+        system,
+        phase,
+        nanos,
+        input_bytes,
+        translated_blocks,
+        guest_instructions,
+        output_bytes,
+        warm_nanos,
+        amortized,
+    }
+}
+
+#[cfg(feature = "wasmtime-comparison")]
+fn format_compilation_phase(mut row: CompilationPhaseMeasurement) -> Result<String, String> {
+    row.nanos.sort_unstable();
+    let median = product_percentile(&row.nanos, 50);
+    let p95 = product_percentile(&row.nanos, 95);
+    let per_input = optional_phase_rate(median, row.input_bytes)?;
+    let per_instruction = optional_phase_rate(median, row.guest_instructions)?;
+    let cold_to_warm = row
+        .warm_nanos
+        .map(|warm| compile_equivalent_calls(median, warm))
+        .transpose()?;
+    let equivalent = if row.amortized { cold_to_warm } else { None };
+    Ok(format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        row.system,
+        row.phase,
+        row.nanos.len(),
+        median,
+        p95,
+        option_u64(row.input_bytes),
+        option_u64(row.translated_blocks),
+        option_u64(row.guest_instructions),
+        option_u64(row.output_bytes),
+        option_f64(per_input),
+        option_f64(per_instruction),
+        option_f64(cold_to_warm),
+        option_f64(equivalent),
+    ))
 }
 
 fn calibrate_product(
@@ -955,6 +1406,13 @@ fn option_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_string(), |value| value.to_string())
 }
 
+#[cfg(feature = "wasmtime-comparison")]
+fn option_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn version_line(program: &OsStr) -> Result<String, String> {
     let output = Command::new(program)
         .arg("--version")
@@ -989,4 +1447,54 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map(str::to_string)
         .ok_or_else(|| format!("sha256sum returned an invalid hash for {}", path.display()))
+}
+
+#[cfg(all(test, feature = "wasmtime-comparison"))]
+mod compilation_report_tests {
+    use super::{format_compilation_phase, phase};
+
+    #[test]
+    fn formatter_preserves_real_distribution_and_unavailable_rates() {
+        let formatted = format_compilation_phase(phase(
+            "rv32-cached-dbt",
+            "warm-execution",
+            vec![10, 20, 30],
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ))
+        .unwrap();
+        let columns = formatted.split('\t').collect::<Vec<_>>();
+
+        assert_eq!(columns[2], "3");
+        assert_eq!(columns[3], "20");
+        assert_eq!(columns[4], "30");
+        assert_eq!(&columns[5..], &["-"; 8]);
+    }
+
+    #[test]
+    fn lazy_phase_uses_guest_instructions_but_not_whole_elf_bytes() {
+        let formatted = format_compilation_phase(phase(
+            "rv32-cached-dbt",
+            "lower",
+            vec![1_000],
+            None,
+            Some(2),
+            Some(4),
+            Some(32),
+            Some(250),
+            true,
+        ))
+        .unwrap();
+        let columns = formatted.split('\t').collect::<Vec<_>>();
+
+        assert_eq!(columns[5], "-");
+        assert_eq!(columns[9], "-");
+        assert_eq!(columns[10], "250.000000");
+        assert_eq!(columns[11], "4.000000");
+        assert_eq!(columns[12], "4.000000");
+    }
 }

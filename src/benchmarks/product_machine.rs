@@ -279,6 +279,25 @@ pub fn benchmark_normalize_nanos(total: u128, batch: u64) -> Result<f64, String>
     Ok(total as f64 / batch as f64)
 }
 
+pub const COMPILATION_PHASE_REPORT_HEADER: &str = "system\tphase\tsamples\tmedian_ns\tp95_ns\tinput_bytes\ttranslated_blocks\tguest_instructions\toutput_bytes\tns_per_input_byte\tns_per_guest_instruction\tcold_to_warm\tequivalent_warm_calls";
+
+pub fn compile_equivalent_calls(compile_nanos: u128, warm_call_nanos: u128) -> Result<f64, String> {
+    if warm_call_nanos == 0 {
+        return Err("warm call duration must be positive".to_string());
+    }
+    Ok(compile_nanos as f64 / warm_call_nanos as f64)
+}
+
+pub fn optional_phase_rate(elapsed_nanos: u128, units: Option<u64>) -> Result<Option<f64>, String> {
+    let Some(units) = units else {
+        return Ok(None);
+    };
+    if units == 0 {
+        return Err("phase normalization units must be positive".to_string());
+    }
+    Ok(Some(elapsed_nanos as f64 / units as f64))
+}
+
 pub fn benchmark_geomean(values: &[f64]) -> Result<f64, String> {
     if values.is_empty()
         || values
