@@ -107,6 +107,33 @@ fn cached_dbt_initializes_one_context_per_run_call() {
 
 #[cfg(feature = "dbt-translation-timing")]
 #[test]
+fn dbt_phase_timing_is_disabled_by_default() {
+    let elf = machine_program_elf(&[addi(1, 1, 1), jal(0, -4)]);
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 8,
+                max_instructions: 8,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+            },
+            0,
+        ),
+    )
+    .unwrap();
+
+    machine.run(16).unwrap();
+    let stats = machine.dbt_stats().unwrap();
+    assert_eq!(stats.decode_nanos, 0);
+    assert_eq!(stats.lower_nanos, 0);
+    assert_eq!(stats.publish_nanos, 0);
+    assert_eq!(stats.timed_translations, 0);
+    assert!(stats.translations > 0);
+}
+
+#[cfg(feature = "dbt-translation-timing")]
+#[test]
 fn dbt_phase_timing_accounts_for_every_translation() {
     let elf = machine_program_elf(&[addi(1, 1, 1), jal(0, -4)]);
     let mut machine = Rv32Machine::from_elf(
@@ -123,6 +150,7 @@ fn dbt_phase_timing_accounts_for_every_translation() {
     )
     .unwrap();
 
+    machine.enable_dbt_translation_timing();
     machine.run(16).unwrap();
     let stats = machine.dbt_stats().unwrap();
     assert!(stats.decode_nanos > 0);

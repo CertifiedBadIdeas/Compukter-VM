@@ -14,8 +14,22 @@ use std::path::PathBuf;
 
 use compukter_vm::benchmarks::{
     c_comparison_next_batch, c_comparison_qemu_target_nanos, c_comparison_timeout_nanos,
-    parse_c_comparison_result,
+    compile_equivalent_calls, optional_phase_rate, parse_c_comparison_result,
+    COMPILATION_PHASE_REPORT_HEADER,
 };
+
+#[test]
+fn compilation_report_math_rejects_ambiguous_denominators() {
+    assert_eq!(compile_equivalent_calls(1_000, 250).unwrap(), 4.0);
+    assert!(compile_equivalent_calls(1_000, 0).is_err());
+    assert_eq!(optional_phase_rate(1_000, Some(4)).unwrap(), Some(250.0));
+    assert_eq!(optional_phase_rate(1_000, None).unwrap(), None);
+    assert!(optional_phase_rate(1_000, Some(0)).is_err());
+    assert_eq!(
+        COMPILATION_PHASE_REPORT_HEADER,
+        "system\tphase\tsamples\tmedian_ns\tp95_ns\tinput_bytes\ttranslated_blocks\tguest_instructions\toutput_bytes\tns_per_input_byte\tns_per_guest_instruction\tcold_to_warm\tequivalent_warm_calls"
+    );
+}
 use compukter_vm::rv32_machine::{
     Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
 };
@@ -31,12 +45,11 @@ fn comparison_feature_keeps_wasmtime_out_of_normal_builds() {
     let gate = fs::read_to_string(root.join("scripts/tests/rv32-c-qemu-comparison.sh")).unwrap();
 
     assert!(manifest.contains("dbt-translation-timing = []"));
-    assert!(manifest.contains(
-        "wasmtime-comparison = [\"dep:wasmtime\", \"dbt-translation-timing\"]"
-    ));
-    assert!(manifest.contains(
-        "wasmtime = { version = \"=47.0.3\", optional = true, default-features = false"
-    ));
+    assert!(
+        manifest.contains("wasmtime-comparison = [\"dep:wasmtime\", \"dbt-translation-timing\"]")
+    );
+    assert!(manifest
+        .contains("wasmtime = { version = \"=47.0.3\", optional = true, default-features = false"));
     assert!(gate.contains("--features wasmtime-comparison"));
 }
 
@@ -239,6 +252,34 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     assert!(source.contains("{stem}-calibrated-sha256"));
     assert!(!source.contains("Command::new(\"sh\")"));
     assert!(!source.contains("Command::new(\"bash\")"));
+}
+
+#[test]
+fn comparison_runner_exposes_distinct_compilation_phase_rows() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/rv32_c_comparison.rs"),
+    )
+    .unwrap();
+
+    for token in [
+        "\"wasmtime-embedded\"",
+        "\"compile\"",
+        "\"instantiate\"",
+        "\"first-call\"",
+        "\"warm-call\"",
+        "\"wasmtime-cli\"",
+        "\"process-compile-serialize\"",
+        "\"rv32-cached-dbt\"",
+        "\"machine-construct\"",
+        "\"first-completion\"",
+        "\"decode\"",
+        "\"lower\"",
+        "\"publish\"",
+        "\"warm-execution\"",
+    ] {
+        assert!(source.contains(token), "missing phase marker {token}");
+    }
+    assert!(source.contains("Module::new(&engine, &wasm_bytes)"));
 }
 
 #[test]
