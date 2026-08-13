@@ -26,6 +26,8 @@ pub(crate) mod abi;
 pub(crate) mod block;
 pub(crate) mod code_cache;
 pub(crate) mod executable;
+#[cfg(feature = "dbt-execution-profile")]
+pub(crate) mod profile;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
 

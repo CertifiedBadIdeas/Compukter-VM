@@ -38,6 +38,52 @@ pub use machine::{
 };
 pub use platform::{CONTROL_BASE, DEBUG_BASE, STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC};
 
+#[cfg(feature = "dbt-execution-profile")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rv32DbtProfileEdgeKind {
+    Taken,
+    Fallthrough,
+    Jump,
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rv32DbtProfileBlock {
+    pub pc: u32,
+    pub executions: u64,
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rv32DbtProfileEdge {
+    pub source_pc: u32,
+    pub target_pc: u32,
+    pub kind: Rv32DbtProfileEdgeKind,
+    pub executions: u64,
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rv32DbtDynamicExitCounts {
+    pub jalr: u64,
+    pub budget: u64,
+    pub slow_instruction: u64,
+    pub memory_access: u64,
+    pub trap_or_terminal: u64,
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rv32DbtExecutionProfile {
+    pub blocks: Vec<Rv32DbtProfileBlock>,
+    pub static_edges: Vec<Rv32DbtProfileEdge>,
+    pub dynamic_exits: Rv32DbtDynamicExitCounts,
+    pub capacity: usize,
+    pub used_records: usize,
+    pub retained_bytes: usize,
+    pub counter_overflowed: bool,
+}
+
 #[cfg(feature = "dbt-code-audit")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rv32DbtCodeSnapshot {

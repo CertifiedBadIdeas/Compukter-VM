@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 default = []
 dbt-chain-stats = []
 dbt-code-audit = []
+dbt-execution-profile = []
 dbt-translation-timing = []
 wasmtime-comparison = ["dep:wasmtime", "dbt-translation-timing"]
 
