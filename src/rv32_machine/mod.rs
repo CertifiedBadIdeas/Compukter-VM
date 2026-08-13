@@ -179,6 +179,7 @@ pub struct Rv32DbtStats {
     pub links_reset: u64,
     pub lowered_load_sites: u64,
     pub lowered_store_sites: u64,
+    pub local_self_backedge_sites: u64,
     pub decoded_slots_built: u64,
     pub emitted_bytes: u64,
     pub alignment_padding_bytes: u64,
