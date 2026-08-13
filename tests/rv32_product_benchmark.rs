@@ -23,15 +23,41 @@ use compukter_vm::benchmarks::{
     populate_product_ratios, product_backend_order, product_machine_batch, product_percentile,
     PreparedProductMachine, PreparedProductNative, ProductActiveTiming, ProductExecutionCandidate,
     ProductMachineBackend, ProductMachineImage, ProductMachineWorkload,
-    PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_MACHINE_MAX_BATCH,
-    PRODUCT_MACHINE_TARGET_NANOS, PRODUCT_RESIDENT_REPORT_HEADER,
+    PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES,
+    PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_MACHINE_MAX_BATCH, PRODUCT_MACHINE_TARGET_NANOS,
+    PRODUCT_RESIDENT_REPORT_HEADER,
 };
-use compukter_vm::rv32_machine::{Rv32TranslationLookupUnit, DEFAULT_DBT_MAX_INSTRUCTIONS};
+use compukter_vm::rv32_machine::{
+    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32TranslationLookupUnit,
+    DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_SCRATCH_BYTES,
+};
 
 #[test]
 fn product_benchmark_tests_block_16_without_changing_the_vm_default() {
     assert_eq!(PRODUCT_DBT_MAX_INSTRUCTIONS, 16);
     assert_eq!(DEFAULT_DBT_MAX_INSTRUCTIONS, 8);
+}
+
+#[test]
+fn product_image_accepts_an_explicit_execution_configuration() {
+    let image = ProductMachineImage::new(ProductMachineWorkload::Compute32, 32).unwrap();
+    let mut machine = image
+        .prepare_with_execution(
+            ProductMachineBackend::CachedDbt,
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: PRODUCT_DBT_CACHE_SETS,
+                max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+                cache_bytes: PRODUCT_DBT_CODE_BYTES,
+                code_alignment: Rv32DbtCodeAlignment::BlockBase(32),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        machine.execute().unwrap().workload,
+        ProductMachineWorkload::Compute32
+    );
 }
 
 #[test]

@@ -556,12 +556,20 @@ impl ProductMachineImage {
         &self,
         backend: ProductMachineBackend,
     ) -> Result<PreparedProductMachine, String> {
+        self.prepare_with_execution(backend, backend.config())
+    }
+
+    pub fn prepare_with_execution(
+        &self,
+        backend: ProductMachineBackend,
+        execution: Rv32ExecutionBackendConfig,
+    ) -> Result<PreparedProductMachine, String> {
         let machine = Rv32Machine::from_elf(
             &self.elf,
             Rv32MachineConfig {
                 ram_size: PRODUCT_RAM_BYTES,
                 debug_limit: PRODUCT_DEBUG_LIMIT,
-                execution: backend.config(),
+                execution,
             },
         )
         .map_err(|error| error.to_string())?;
