@@ -130,31 +130,39 @@ impl RegisterCache {
     ) -> Option<LocalLoopRegisterPlan> {
         let mut defined = 1_u32;
         let mut carried = 0_u32;
+        let mut referenced = 0_u32;
         let mut written = 0_u32;
         for slot in slots.iter().copied() {
             let access = instruction_access(slot);
             carried |= access.reads & !defined;
             defined |= access.writes;
+            referenced |= access.reads | access.writes;
             written |= access.writes;
         }
         carried &= !1;
-        let carried_count = carried.count_ones() as usize;
+        referenced &= !1;
+        let resident = if referenced.count_ones() as usize <= CHAINABLE_HOST_POOL.len() {
+            referenced
+        } else {
+            carried
+        };
+        let resident_count = resident.count_ones() as usize;
         let temporary_pressure = slots
             .iter()
             .copied()
             .map(instruction_access)
-            .map(|access| ((access.reads | access.writes) & !carried & !1).count_ones() as usize)
+            .map(|access| ((access.reads | access.writes) & !resident & !1).count_ones() as usize)
             .max()
             .unwrap_or(0);
-        if carried_count > CHAINABLE_HOST_POOL.len()
-            || carried_count.saturating_add(temporary_pressure) > CHAINABLE_HOST_POOL.len()
+        if resident_count > CHAINABLE_HOST_POOL.len()
+            || resident_count.saturating_add(temporary_pressure) > CHAINABLE_HOST_POOL.len()
         {
             return None;
         }
         let mut guests = [0; CHAINABLE_HOST_POOL.len()];
         let mut len = 0;
         for guest in 1..32 {
-            if carried & (1_u32 << guest) != 0 {
+            if resident & (1_u32 << guest) != 0 {
                 guests[len] = guest;
                 len += 1;
             }
@@ -162,7 +170,7 @@ impl RegisterCache {
         Some(LocalLoopRegisterPlan {
             guests,
             len,
-            written: written & carried,
+            written: written & resident,
         })
     }
 
@@ -502,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn local_loop_plan_keeps_only_values_read_before_their_first_write() {
+    fn local_loop_plan_retains_every_reference_when_the_complete_mapping_fits() {
         let slots = [
             slot(addi(5, 0, 1)),
             slot(lw(6, 5, 0)),
@@ -512,7 +520,7 @@ mod tests {
 
         let plan = RegisterCache::local_loop_plan(&slots).unwrap();
 
-        assert_eq!(plan.guests(), &[7]);
+        assert_eq!(plan.guests(), &[5, 6, 7]);
     }
 
     #[test]
