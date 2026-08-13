@@ -187,6 +187,20 @@ impl ExecutableMapping {
         self.capacity.saturating_mul(2)
     }
 
+    #[cfg(feature = "dbt-code-audit")]
+    pub(super) fn snapshot_prefix(&self, length: usize) -> Result<Vec<u8>, DbtFault> {
+        let bytes = self.executable.get(..length).ok_or_else(|| {
+            Self::fault(
+                DbtFaultKind::Capacity,
+                format!(
+                    "DBT snapshot length {length} exceeds capacity {}",
+                    self.capacity
+                ),
+            )
+        })?;
+        Ok(bytes.to_vec())
+    }
+
     #[cfg(test)]
     fn writable_address(&self) -> *const u8 {
         self.writable.as_ptr()

@@ -22,6 +22,8 @@ use super::dbt::{PreparedDbtBlock, Rv32DbtExecution, Rv32DbtPolicy};
 use super::hart::{Rv32HartStep, Rv32MachineHart};
 use super::platform::{self, ControlDevice, DebugDevice};
 use super::{Rv32AddressSpace, Rv32AddressSpaceError, Rv32DbtStats, Rv32ElfError, Rv32ElfLoader};
+#[cfg(feature = "dbt-code-audit")]
+use super::{Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError};
 use crate::bus::{MachineBus, MmioDeviceId};
 use crate::memory::{MemoryBus, MemoryFault};
 #[cfg(target_arch = "x86_64")]
@@ -734,6 +736,17 @@ impl Rv32Machine {
             return Some(execution.stats());
         }
         None
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    pub fn dbt_code_snapshot(
+        &self,
+    ) -> Result<Option<Rv32DbtCodeSnapshot>, Rv32DbtCodeSnapshotError> {
+        #[cfg(target_arch = "x86_64")]
+        if let Rv32ExecutionBackend::Dbt(execution) = &self.execution {
+            return execution.code_snapshot();
+        }
+        Ok(None)
     }
 
     #[cfg(feature = "dbt-translation-timing")]

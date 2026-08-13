@@ -38,6 +38,51 @@ pub use machine::{
 };
 pub use platform::{CONTROL_BASE, DEBUG_BASE, STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC};
 
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rv32DbtCodeSnapshot {
+    pub generation: u64,
+    pub used_bytes: Vec<u8>,
+    pub blocks: Vec<Rv32DbtCodeBlock>,
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rv32DbtCodeBlock {
+    pub guest_pc: u32,
+    pub generation: u64,
+    pub offset: u32,
+    pub length: u32,
+    pub chain_entry_offset: u32,
+    pub guest_instruction_count: u32,
+    pub edges: Vec<Rv32DbtCodeEdge>,
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rv32DbtCodeEdge {
+    pub target_pc: u32,
+    pub displacement_offset: u32,
+    pub reset_target_offset: u32,
+    pub linked: bool,
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct Rv32DbtCodeSnapshotError {
+    message: String,
+}
+
+#[cfg(feature = "dbt-code-audit")]
+impl Rv32DbtCodeSnapshotError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rv32DbtStats {
     pub translations: u64,
