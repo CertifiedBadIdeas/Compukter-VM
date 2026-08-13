@@ -318,6 +318,32 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     assert!(!source.contains("Command::new(\"bash\")"));
 }
 
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn comparison_runner_exposes_exact_profile_mode_and_report() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/rv32_c_comparison.rs"),
+    )
+    .unwrap();
+
+    for contract in [
+        "rv32_c_comparison profile BUILD_DIR ITERATIONS PROFILE_CAPACITY",
+        r"profile_summary\titerations\tchecksum\tinstrumented_ns\tcapacity\tused_records\tretained_bytes\tcounter_overflowed\tunique_blocks\tunique_static_edges",
+        r"hot_blocks\trank\tpc\texecutions\tshare\tcumulative_share",
+        r"hot_static_edges\trank\tsource_pc\ttarget_pc\tkind\texecutions\tshare\tcumulative_share",
+        r"coverage\tpercent\tblocks_required",
+        r"dynamic_exits\tjalr\tbudget\tslow_instruction\tmemory_access\ttrap_or_terminal",
+    ] {
+        assert!(
+            source.contains(contract),
+            "missing profile contract {contract}"
+        );
+    }
+    assert!(source.contains("enable_dbt_execution_profile"));
+    assert!(source.contains("dbt_execution_profile"));
+    assert!(source.contains("Rv32DbtCodeAlignment::BlockBase(32)"));
+}
+
 #[test]
 fn comparison_runner_exposes_distinct_compilation_phase_rows() {
     let source = fs::read_to_string(

@@ -22,6 +22,8 @@ use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig,
     Rv32MachineOutcome, DEFAULT_DBT_CODE_ALIGNMENT,
 };
+#[cfg(feature = "dbt-execution-profile")]
+use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::env;
@@ -436,6 +438,15 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "profile")
+    {
+        #[cfg(feature = "dbt-execution-profile")]
+        return run_execution_profile(&arguments[1..]);
+        #[cfg(not(feature = "dbt-execution-profile"))]
+        return Err("profile mode requires the dbt-execution-profile feature".to_string());
+    }
     if arguments.len() != 2 {
         return Err("usage: rv32_c_comparison BUILD_DIR WARM_SAMPLES".to_string());
     }
@@ -722,6 +733,188 @@ fn run() -> Result<(), String> {
                 .collect(),
         )?;
     }
+    Ok(())
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+fn run_execution_profile(arguments: &[OsString]) -> Result<(), String> {
+    if arguments.len() != 3 {
+        return Err(
+            "usage: rv32_c_comparison profile BUILD_DIR ITERATIONS PROFILE_CAPACITY".to_string(),
+        );
+    }
+    let build_dir = PathBuf::from(&arguments[0]);
+    let iterations = parse_profile_argument::<u32>(&arguments[1], "iterations")?;
+    if iterations != ITERATIONS {
+        return Err(format!(
+            "profile iterations must match the shared artifact oracle ({ITERATIONS})"
+        ));
+    }
+    let capacity = parse_profile_argument::<usize>(&arguments[2], "profile capacity")?;
+    let elf_path = build_dir.join("product.elf");
+    let elf = fs::read(&elf_path)
+        .map_err(|error| format!("failed to read {}: {error}", elf_path.display()))?;
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        Rv32MachineConfig {
+            ram_size: PRODUCT_RAM_BYTES,
+            debug_limit: 0,
+            execution: Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 512,
+                max_instructions: 16,
+                scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
+                cache_bytes: 128 * 1024,
+                code_alignment: Rv32DbtCodeAlignment::BlockBase(32),
+            },
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    machine
+        .enable_dbt_execution_profile(capacity)
+        .map_err(|error| error.to_string())?;
+
+    let started = Instant::now();
+    let outcome = machine.run(20_100_000).map_err(|error| error.to_string())?;
+    let instrumented_ns = started.elapsed().as_nanos();
+    let checksum = match outcome {
+        Rv32MachineOutcome::Halted { exit_code, .. } => exit_code as u32,
+        other => return Err(format!("profiled Cached DBT did not halt: {other:?}")),
+    };
+    validate_profile_checksum(checksum)?;
+    let profile = machine
+        .dbt_execution_profile()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "profiled Cached DBT returned no execution profile".to_string())?;
+    print_execution_profile(iterations, checksum, instrumented_ns, &profile)
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+fn parse_profile_argument<T>(argument: &OsStr, name: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    argument
+        .to_str()
+        .ok_or_else(|| format!("{name} is not UTF-8"))?
+        .parse::<T>()
+        .map_err(|error| format!("invalid {name}: {error}"))
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+fn validate_profile_checksum(checksum: u32) -> Result<(), String> {
+    if checksum != EXPECTED_CHECKSUM {
+        return Err(format!(
+            "profile checksum mismatch: expected {EXPECTED_CHECKSUM:08x}, actual {checksum:08x}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+fn print_execution_profile(
+    iterations: u32,
+    checksum: u32,
+    instrumented_ns: u128,
+    profile: &Rv32DbtExecutionProfile,
+) -> Result<(), String> {
+    if profile.counter_overflowed {
+        return Err("exact execution-profile counter overflowed".to_string());
+    }
+    if profile.blocks.is_empty() || profile.static_edges.is_empty() {
+        return Err("exact execution profile contains no blocks or static edges".to_string());
+    }
+    let total_blocks = profile
+        .blocks
+        .iter()
+        .try_fold(0_u128, |total, block| {
+            total.checked_add(u128::from(block.executions))
+        })
+        .ok_or_else(|| "block execution total overflowed".to_string())?;
+    let total_edges = profile
+        .static_edges
+        .iter()
+        .try_fold(0_u128, |total, edge| {
+            total.checked_add(u128::from(edge.executions))
+        })
+        .ok_or_else(|| "static-edge execution total overflowed".to_string())?;
+    if total_blocks == 0 || total_edges == 0 {
+        return Err("exact execution profile contains only zero counters".to_string());
+    }
+
+    println!("profile_summary\titerations\tchecksum\tinstrumented_ns\tcapacity\tused_records\tretained_bytes\tcounter_overflowed\tunique_blocks\tunique_static_edges");
+    println!(
+        "profile_summary\t{iterations}\t{checksum:08x}\t{instrumented_ns}\t{}\t{}\t{}\t{}\t{}\t{}",
+        profile.capacity,
+        profile.used_records,
+        profile.retained_bytes,
+        profile.counter_overflowed,
+        profile.blocks.len(),
+        profile.static_edges.len(),
+    );
+
+    println!("hot_blocks\trank\tpc\texecutions\tshare\tcumulative_share");
+    let mut cumulative = 0_u128;
+    for (index, block) in profile.blocks.iter().enumerate() {
+        cumulative += u128::from(block.executions);
+        println!(
+            "hot_blocks\t{}\t0x{:08x}\t{}\t{:.9}\t{:.9}",
+            index + 1,
+            block.pc,
+            block.executions,
+            block.executions as f64 / total_blocks as f64,
+            cumulative as f64 / total_blocks as f64,
+        );
+    }
+
+    println!(
+        "hot_static_edges\trank\tsource_pc\ttarget_pc\tkind\texecutions\tshare\tcumulative_share"
+    );
+    cumulative = 0;
+    for (index, edge) in profile.static_edges.iter().enumerate() {
+        cumulative += u128::from(edge.executions);
+        let kind = match edge.kind {
+            Rv32DbtProfileEdgeKind::Taken => "taken",
+            Rv32DbtProfileEdgeKind::Fallthrough => "fallthrough",
+            Rv32DbtProfileEdgeKind::Jump => "jump",
+        };
+        println!(
+            "hot_static_edges\t{}\t0x{:08x}\t0x{:08x}\t{}\t{}\t{:.9}\t{:.9}",
+            index + 1,
+            edge.source_pc,
+            edge.target_pc,
+            kind,
+            edge.executions,
+            edge.executions as f64 / total_edges as f64,
+            cumulative as f64 / total_edges as f64,
+        );
+    }
+
+    println!("coverage\tpercent\tblocks_required");
+    for percent in [50_u128, 90, 95, 99] {
+        let mut covered = 0_u128;
+        let required = profile
+            .blocks
+            .iter()
+            .position(|block| {
+                covered += u128::from(block.executions);
+                covered.saturating_mul(100) >= total_blocks.saturating_mul(percent)
+            })
+            .map(|index| index + 1)
+            .unwrap_or(profile.blocks.len());
+        println!("coverage\t{percent}\t{required}");
+    }
+
+    let exits = profile.dynamic_exits;
+    println!("dynamic_exits\tjalr\tbudget\tslow_instruction\tmemory_access\ttrap_or_terminal");
+    println!(
+        "dynamic_exits\t{}\t{}\t{}\t{}\t{}",
+        exits.jalr,
+        exits.budget,
+        exits.slow_instruction,
+        exits.memory_access,
+        exits.trap_or_terminal,
+    );
     Ok(())
 }
 
