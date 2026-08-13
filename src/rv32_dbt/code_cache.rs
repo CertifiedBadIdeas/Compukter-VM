@@ -19,6 +19,7 @@
 
 use super::block::{DbtBlockMode, TranslatedBlock, MAX_STATIC_LINKS};
 use super::executable::ExecutableMapping;
+use super::x86_64::cold_exit::build_completed_exit_stub;
 use super::{DbtFault, DbtFaultKind};
 #[cfg(feature = "dbt-code-audit")]
 use crate::rv32_machine::{
@@ -114,6 +115,9 @@ pub(crate) struct DirectDbtCodeCache {
     sets: Vec<CacheSet>,
     set_mask: usize,
     write_cursor: usize,
+    completed_exit_stub_offset: usize,
+    completed_exit_stub_len: usize,
+    block_region_start: usize,
     stats: DbtCodeCacheStats,
 }
 
@@ -125,13 +129,36 @@ impl DirectDbtCodeCache {
                 "DBT code cache requires a power-of-two metadata set count between 1 and u32::MAX",
             ));
         }
+        let mut mapping = ExecutableMapping::new(executable_bytes)?;
+        let stub = build_completed_exit_stub()
+            .map_err(|error| Self::fault(DbtFaultKind::Translation, error.to_string()))?;
+        mapping.publish_at(0, &stub)?;
+        let block_region_start = align_up(stub.len(), CODE_ALIGNMENT);
+        if block_region_start >= executable_bytes {
+            return Err(Self::fault(
+                DbtFaultKind::Capacity,
+                "DBT code cache cannot contain support code and a guest block",
+            ));
+        }
         Ok(Self {
-            mapping: ExecutableMapping::new(executable_bytes)?,
+            mapping,
             sets: vec![CacheSet::default(); sets],
             set_mask: sets - 1,
-            write_cursor: 0,
+            write_cursor: block_region_start,
+            completed_exit_stub_offset: 0,
+            completed_exit_stub_len: stub.len(),
+            block_region_start,
             stats: DbtCodeCacheStats::default(),
         })
+    }
+
+    pub(crate) fn completed_exit_stub_range(&self) -> std::ops::Range<usize> {
+        self.completed_exit_stub_offset
+            ..self.completed_exit_stub_offset + self.completed_exit_stub_len
+    }
+
+    pub(crate) const fn block_region_start(&self) -> usize {
+        self.block_region_start
     }
 
     pub(crate) fn lookup(&mut self, key: DbtCacheKey) -> Option<DbtCacheHit> {
@@ -173,13 +200,14 @@ impl DirectDbtCodeCache {
                 "DBT code-cache key PC disagrees with compiled block PC",
             ));
         }
-        if block.code().len() > self.mapping.capacity() {
+        let block_capacity = self.mapping.capacity() - self.block_region_start;
+        if block.code().len() > block_capacity {
             return Err(Self::fault(
                 DbtFaultKind::Capacity,
                 format!(
-                    "native block requires {} bytes but code cache capacity is {} bytes",
+                    "native block requires {} bytes but code cache block region is {} bytes",
                     block.code().len(),
-                    self.mapping.capacity()
+                    block_capacity
                 ),
             ));
         }
@@ -191,7 +219,7 @@ impl DirectDbtCodeCache {
         {
             aligned
         } else {
-            0
+            self.block_region_start
         };
         let end = offset + block.code().len();
         self.invalidate_overlapping(offset, end)?;
@@ -753,6 +781,31 @@ mod tests {
     }
 
     #[test]
+    fn code_cache_wrap_preserves_completed_exit_support_region() {
+        let mut cache = DirectDbtCodeCache::new(8, PAGE_BYTES).unwrap();
+        let support = cache.completed_exit_stub_range();
+        assert_eq!(support.start, 0);
+        assert!(support.end <= cache.block_region_start());
+
+        let code = vec![0x90; 1_500];
+        for index in 0..6_u32 {
+            cache
+                .publish(
+                    DbtCacheKey::new(0x1000 + index * 4, 0),
+                    &block(0x1000 + index * 4, &code),
+                )
+                .unwrap();
+        }
+
+        assert!(cache
+            .sets
+            .iter()
+            .flat_map(|set| set.ways.iter())
+            .filter(|entry| entry.valid)
+            .all(|entry| entry.offset >= cache.block_region_start()));
+    }
+
+    #[test]
     fn circular_overwrite_invalidates_only_overlapping_entries() {
         let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
         let first = DbtCacheKey::new(0, 0);
@@ -974,6 +1027,7 @@ mod tests {
     #[test]
     fn circular_overwrite_unlinks_a_destination_before_replacing_its_bytes() {
         let mut cache = DirectDbtCodeCache::new(16, PAGE_BYTES).unwrap();
+        let filler_len = PAGE_BYTES - cache.block_region_start() - 32;
         cache
             .publish(DbtCacheKey::new(0x4004, 0), &block(0x4004, &returning(9)))
             .unwrap();
@@ -989,7 +1043,7 @@ mod tests {
         cache
             .publish(
                 DbtCacheKey::new(0x4048, 0),
-                &block(0x4048, &vec![0x90; PAGE_BYTES - 32]),
+                &block(0x4048, &vec![0x90; filler_len]),
             )
             .unwrap();
         cache

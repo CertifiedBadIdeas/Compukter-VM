@@ -17,6 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+pub(crate) mod cold_exit;
 pub(crate) mod emitter;
 pub(crate) mod lower;
 pub(crate) mod register_cache;
