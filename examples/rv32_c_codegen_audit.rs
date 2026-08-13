@@ -16,8 +16,8 @@ use compukter_vm::benchmarks::{
 };
 #[cfg(feature = "dbt-code-audit")]
 use compukter_vm::rv32_machine::{
-    Rv32DbtCodeSnapshot, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig,
-    Rv32MachineOutcome, DEFAULT_DBT_SCRATCH_BYTES,
+    Rv32DbtCodeSnapshot, Rv32DbtSupportCodeKind, Rv32ExecutionBackendConfig, Rv32Machine,
+    Rv32MachineConfig, Rv32MachineOutcome, DEFAULT_DBT_SCRATCH_BYTES,
 };
 #[cfg(feature = "dbt-code-audit")]
 use std::env;
@@ -236,9 +236,30 @@ fn assembly_wrapper(snapshot: &Rv32DbtCodeSnapshot, binary_path: &Path) -> Resul
     let path = path.replace('\\', "\\\\").replace('"', "\\\"");
     let mut output = String::from(".section .text.dbt,\"ax\",@progbits\n.p2align 4\n");
     let mut cursor = 0_usize;
+    for support in &snapshot.support_code {
+        let offset = support.offset as usize;
+        let length = support.length as usize;
+        if length == 0 || offset < cursor {
+            return Err("DBT support-code ranges are empty, unsorted, or overlapping".to_string());
+        }
+        if offset > cursor {
+            output.push_str(&format!(
+                ".incbin \"{path}\", {cursor}, {}\n",
+                offset - cursor
+            ));
+        }
+        let symbol = support_symbol(support.kind);
+        output.push_str(&format!(
+            ".global {symbol}\n.type {symbol},@function\n{symbol}:\n.incbin \"{path}\", {offset}, {length}\n.size {symbol}, .-{symbol}\n"
+        ));
+        cursor = offset + length;
+    }
     for block in &snapshot.blocks {
         let offset = block.offset as usize;
         let length = block.length as usize;
+        if length == 0 || offset < cursor {
+            return Err("DBT block ranges overlap support code or each other".to_string());
+        }
         if offset > cursor {
             output.push_str(&format!(
                 ".incbin \"{path}\", {cursor}, {}\n",
@@ -265,6 +286,13 @@ fn assembly_wrapper(snapshot: &Rv32DbtCodeSnapshot, binary_path: &Path) -> Resul
 }
 
 #[cfg(feature = "dbt-code-audit")]
+const fn support_symbol(kind: Rv32DbtSupportCodeKind) -> &'static str {
+    match kind {
+        Rv32DbtSupportCodeKind::CompletedExitStub => "dbt_support_completed_exit_stub",
+    }
+}
+
+#[cfg(feature = "dbt-code-audit")]
 fn report(build_dir: &Path) -> Result<(), String> {
     let block_report = fs::read_to_string(build_dir.join("dbt-blocks.tsv"))
         .map_err(|error| format!("failed to read DBT block report: {error}"))?;
@@ -277,6 +305,10 @@ fn report(build_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to read Wasmtime disassembly: {error}"))?;
 
     let mut dbt_instructions = Vec::new();
+    let support_instructions =
+        parse_llvm_symbol(&dbt_disassembly, "dbt_support_completed_exit_stub")?;
+    let support_code_bytes = encoded_bytes(&support_instructions)?;
+    dbt_instructions.extend(support_instructions.iter().cloned());
     let mut hot_blocks = Vec::with_capacity(blocks.len());
     for block in &blocks {
         let symbol = format!("dbt_pc_{:08x}_off_{:08x}", block.guest_pc, block.offset);
@@ -301,7 +333,13 @@ fn report(build_dir: &Path) -> Result<(), String> {
             .then_with(|| lhs.offset.cmp(&rhs.offset))
     });
 
-    let dbt_code_bytes = blocks.iter().map(|block| u64::from(block.length)).sum();
+    let dbt_block_bytes = blocks
+        .iter()
+        .map(|block| u64::from(block.length))
+        .sum::<u64>();
+    let dbt_code_bytes = dbt_block_bytes
+        .checked_add(support_code_bytes)
+        .ok_or_else(|| "DBT resident byte total overflowed".to_string())?;
     let guest_instructions = blocks
         .iter()
         .map(|block| u64::from(block.guest_instructions))
@@ -319,14 +357,14 @@ fn report(build_dir: &Path) -> Result<(), String> {
         .map(|block| u64::from(block.length))
         .collect::<Vec<_>>();
     block_sizes.sort_unstable();
-    let block_mean = dbt_code_bytes as f64 / blocks.len() as f64;
+    let block_mean = dbt_block_bytes as f64 / blocks.len() as f64;
 
     let mut output = String::from(
         "system\tregion\tcode_bytes\thost_instructions\tguest_instructions\thost_per_guest\tbytes_per_guest\tlive_blocks\tblock_mean_bytes\tblock_p50_bytes\tblock_p95_bytes\tblock_max_bytes\tlinked_edges\tunlinked_edges\tmemory_operands\tmove\tconditional_branch\tunconditional_branch\tarithmetic_logical\tshift_rotate\tmultiply_divide\tcall_return\tvector\tother\n",
     );
     output.push_str(&metric_row(
         "rv32-cached-dbt",
-        "live-resident-blocks",
+        "live-resident-code",
         Some(dbt_code_bytes),
         &dbt_instructions,
         Some(guest_instructions),
@@ -382,6 +420,12 @@ fn report(build_dir: &Path) -> Result<(), String> {
             block.unlinked_edges
         ));
     }
+    output.push_str("\ndbt_support_code\n");
+    output.push_str("kind\tbytes\thost_instructions\n");
+    output.push_str(&format!(
+        "completed-exit-stub\t{support_code_bytes}\t{}\n",
+        support_instructions.len()
+    ));
     fs::write(build_dir.join("codegen-report.tsv"), &output)
         .map_err(|error| format!("failed to write codegen report: {error}"))?;
     print!("{output}");
@@ -544,7 +588,9 @@ fn option_f64(value: Option<f64>) -> String {
 mod tests {
     use super::{assembly_wrapper, instruction_counts, metric_row, parse_block_report};
     use compukter_vm::benchmarks::{DecodedHostInstruction, InstructionGroup};
-    use compukter_vm::rv32_machine::{Rv32DbtCodeBlock, Rv32DbtCodeSnapshot};
+    use compukter_vm::rv32_machine::{
+        Rv32DbtCodeBlock, Rv32DbtCodeSnapshot, Rv32DbtSupportCodeKind, Rv32DbtSupportCodeRange,
+    };
 
     #[test]
     fn assembly_preserves_gaps_and_live_block_ranges() {
@@ -554,6 +600,11 @@ mod tests {
         let snapshot = Rv32DbtCodeSnapshot {
             generation: 0,
             used_bytes: vec![0; 12],
+            support_code: vec![Rv32DbtSupportCodeRange {
+                kind: Rv32DbtSupportCodeKind::CompletedExitStub,
+                offset: 0,
+                length: 2,
+            }],
             blocks: vec![Rv32DbtCodeBlock {
                 guest_pc: 0x1000,
                 generation: 0,
@@ -565,7 +616,9 @@ mod tests {
             }],
         };
         let assembly = assembly_wrapper(&snapshot, &binary).unwrap();
-        assert!(assembly.contains(", 0, 4\n"));
+        assert!(assembly.contains("dbt_support_completed_exit_stub"));
+        assert!(assembly.contains(", 0, 2\n"));
+        assert!(assembly.contains(", 2, 2\n"));
         assert!(assembly.contains(", 4, 4\n"));
         assert!(assembly.contains(", 8, 4\n"));
     }

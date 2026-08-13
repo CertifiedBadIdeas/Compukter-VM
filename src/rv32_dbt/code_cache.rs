@@ -26,6 +26,7 @@ use super::{DbtFault, DbtFaultKind};
 #[cfg(feature = "dbt-code-audit")]
 use crate::rv32_machine::{
     Rv32DbtCodeBlock, Rv32DbtCodeEdge, Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError,
+    Rv32DbtSupportCodeKind, Rv32DbtSupportCodeRange,
 };
 
 const WAYS: usize = 2;
@@ -349,7 +350,24 @@ impl DirectDbtCodeCache {
             .collect::<Vec<_>>();
         entries.sort_unstable_by_key(|entry| (entry.offset, entry.key.pc));
 
-        let mut previous_end = 0_usize;
+        let support_end = self
+            .completed_exit_stub_offset
+            .checked_add(self.completed_exit_stub_len)
+            .ok_or_else(|| Rv32DbtCodeSnapshotError::new("DBT support-code range overflows"))?;
+        if self.completed_exit_stub_len == 0 || support_end > self.mapping.capacity() {
+            return Err(Rv32DbtCodeSnapshotError::new(
+                "invalid completed-exit support-code range",
+            ));
+        }
+        let support_code = vec![Rv32DbtSupportCodeRange {
+            kind: Rv32DbtSupportCodeKind::CompletedExitStub,
+            offset: u32::try_from(self.completed_exit_stub_offset)
+                .map_err(|_| Rv32DbtCodeSnapshotError::new("DBT support offset exceeds u32"))?,
+            length: u32::try_from(self.completed_exit_stub_len)
+                .map_err(|_| Rv32DbtCodeSnapshotError::new("DBT support length exceeds u32"))?,
+        }];
+        let mut previous_end = support_end;
+        let mut cold_exit_displacements = Vec::new();
         let mut blocks = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.key.generation != generation {
@@ -401,6 +419,20 @@ impl DirectDbtCodeCache {
                     linked: link.linked,
                 });
             }
+            for displacement in &entry.cold_exit_displacements[..entry.cold_exit_count as usize] {
+                let displacement = entry
+                    .offset
+                    .checked_add(*displacement as usize)
+                    .filter(|offset| {
+                        offset
+                            .checked_add(4)
+                            .is_some_and(|end| end <= entry.offset + entry.length)
+                    })
+                    .ok_or_else(|| {
+                        Rv32DbtCodeSnapshotError::new("invalid DBT cold-exit displacement")
+                    })?;
+                cold_exit_displacements.push(displacement);
+            }
             blocks.push(Rv32DbtCodeBlock {
                 guest_pc: entry.key.pc,
                 generation: entry.key.generation,
@@ -450,9 +482,26 @@ impl DirectDbtCodeCache {
                 }
             }
         }
+        for displacement_offset in cold_exit_displacements {
+            let displacement_end = displacement_offset + 4;
+            let displacement = i32::from_le_bytes(
+                used_bytes[displacement_offset..displacement_end]
+                    .try_into()
+                    .expect("validated DBT cold-exit displacement range"),
+            );
+            let resolved = i64::try_from(displacement_end)
+                .ok()
+                .and_then(|origin| origin.checked_add(i64::from(displacement)));
+            if resolved != Some(self.completed_exit_stub_offset as i64) {
+                return Err(Rv32DbtCodeSnapshotError::new(
+                    "DBT cold-exit relocation does not resolve to the completed-exit stub",
+                ));
+            }
+        }
         Ok(Rv32DbtCodeSnapshot {
             generation,
             used_bytes,
+            support_code,
             blocks,
         })
     }
@@ -636,6 +685,8 @@ mod tests {
     use crate::rv32_dbt::block::{
         DbtBlockInput, DbtBlockMode, DbtLinkKind, DbtStaticLink, TranslatedBlock,
     };
+    #[cfg(feature = "dbt-code-audit")]
+    use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
     #[cfg(feature = "dbt-code-audit")]
@@ -774,6 +825,33 @@ mod tests {
                 source.offset + record.displacement_offset as usize,
                 source.offset + record.reset_target_offset as usize,
             )
+            .unwrap();
+
+        assert!(cache.snapshot(0).is_err());
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn snapshot_rejects_cold_exit_that_no_longer_targets_shared_stub() {
+        let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
+        let key = DbtCacheKey::new(0x1000, 0);
+        let word = addi(1, 1, 1);
+        let slots = [Rv32ResolvedInstruction::Valid {
+            word,
+            instruction: decode_product_word(word).unwrap(),
+        }];
+        let input = DbtBlockInput::new(key.pc, &slots, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(PAGE_BYTES, slots.len()).unwrap();
+        let translated = workspace.lower(&input, PAGE_BYTES as u32).unwrap();
+        assert!(!translated.cold_exit_relocations().is_empty());
+        cache.publish(key, &translated).unwrap();
+
+        let (set, way) = cache.find_entry(key).unwrap();
+        let entry = cache.sets[set].ways[way];
+        let displacement = entry.offset + entry.cold_exit_displacements[0] as usize;
+        cache
+            .mapping
+            .patch_rel32(entry.offset, entry.length, displacement, entry.offset)
             .unwrap();
 
         assert!(cache.snapshot(0).is_err());

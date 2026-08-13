@@ -356,6 +356,7 @@ fn codegen_audit_report_contract_is_explicit() {
     assert!(source.contains("native-analysis-disassembly.txt"));
     assert!(source.contains("wasmtime-aot-objdump.txt"));
     assert!(source.contains("dbt_hot_blocks"));
+    assert!(source.contains("dbt_support_code"));
 }
 
 #[test]
