@@ -778,13 +778,25 @@ mod tests {
                 reservation_valid: 0,
                 reservation_address: 0,
                 chain_transitions: 0,
-                exit: DbtExitRecord::default(),
+                exit: DbtExitRecord {
+                    next_pc: u32::MAX,
+                    attempted: u32::MAX,
+                    instruction_pc: u32::MAX,
+                    instruction_word: u32::MAX,
+                    address: u32::MAX,
+                    access_size: u32::MAX,
+                },
             };
 
             let tag = unsafe { cached.execute(prepared, &mut context) }.unwrap();
 
             assert_eq!(tag, DbtExitTag::Completed);
             assert_eq!(context.exit.attempted, budget);
+            assert_eq!(context.exit.next_pc, expected_pc);
+            assert_eq!(context.exit.instruction_pc, 0);
+            assert_eq!(context.exit.instruction_word, 0);
+            assert_eq!(context.exit.address, 0);
+            assert_eq!(context.exit.access_size, 0);
             #[cfg(not(feature = "dbt-chain-stats"))]
             assert_eq!(context.chain_transitions, 0);
             #[cfg(feature = "dbt-chain-stats")]

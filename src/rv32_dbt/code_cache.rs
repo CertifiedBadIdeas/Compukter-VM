@@ -17,6 +17,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#[cfg(feature = "dbt-code-audit")]
+use super::block::MAX_COLD_EXIT_RELOCATIONS;
 use super::block::{DbtBlockMode, TranslatedBlock, MAX_STATIC_LINKS};
 use super::executable::ExecutableMapping;
 use super::x86_64::cold_exit::build_completed_exit_stub;
@@ -87,6 +89,10 @@ struct CacheEntry {
     chain_entry_offset: u32,
     links: [CacheLink; MAX_STATIC_LINKS],
     link_count: u8,
+    #[cfg(feature = "dbt-code-audit")]
+    cold_exit_displacements: [u32; MAX_COLD_EXIT_RELOCATIONS],
+    #[cfg(feature = "dbt-code-audit")]
+    cold_exit_count: u8,
 }
 
 impl Default for CacheEntry {
@@ -100,6 +106,10 @@ impl Default for CacheEntry {
             chain_entry_offset: 0,
             links: [CacheLink::default(); MAX_STATIC_LINKS],
             link_count: 0,
+            #[cfg(feature = "dbt-code-audit")]
+            cold_exit_displacements: [0; MAX_COLD_EXIT_RELOCATIONS],
+            #[cfg(feature = "dbt-code-audit")]
+            cold_exit_count: 0,
         }
     }
 }
@@ -231,11 +241,28 @@ impl DirectDbtCodeCache {
             self.stats.metadata_evictions = self.stats.metadata_evictions.saturating_add(1);
         }
         self.mapping.publish_at(offset, block.code())?;
+        for relocation in block.cold_exit_relocations() {
+            self.mapping.patch_rel32(
+                offset,
+                block.code().len(),
+                offset + relocation.displacement_offset as usize,
+                self.completed_exit_stub_offset,
+            )?;
+        }
         let mut links = [CacheLink::default(); MAX_STATIC_LINKS];
         for (stored, descriptor) in links.iter_mut().zip(block.static_links()) {
             stored.target_pc = descriptor.target_pc;
             stored.displacement_offset = descriptor.displacement_offset;
             stored.reset_target_offset = descriptor.reset_target_offset;
+        }
+        #[cfg(feature = "dbt-code-audit")]
+        let mut cold_exit_displacements = [0; MAX_COLD_EXIT_RELOCATIONS];
+        #[cfg(feature = "dbt-code-audit")]
+        for (stored, relocation) in cold_exit_displacements
+            .iter_mut()
+            .zip(block.cold_exit_relocations())
+        {
+            *stored = relocation.displacement_offset;
         }
         self.sets[set].ways[way] = CacheEntry {
             valid: true,
@@ -246,6 +273,10 @@ impl DirectDbtCodeCache {
             chain_entry_offset: block.chain_entry_offset(),
             links,
             link_count: block.static_links().len() as u8,
+            #[cfg(feature = "dbt-code-audit")]
+            cold_exit_displacements,
+            #[cfg(feature = "dbt-code-audit")]
+            cold_exit_count: block.cold_exit_relocations().len() as u8,
         };
         self.sets[set].mru_way = way as u8;
         self.write_cursor = end;
@@ -1077,6 +1108,9 @@ mod tests {
         let link = std::mem::size_of::<super::CacheLink>();
         let entry = std::mem::size_of::<super::CacheEntry>();
         assert!(link <= 16, "CacheLink is {link} bytes");
+        #[cfg(not(feature = "dbt-code-audit"))]
         assert!(entry <= 80, "CacheEntry is {entry} bytes");
+        #[cfg(feature = "dbt-code-audit")]
+        assert!(entry <= 96, "audit CacheEntry is {entry} bytes");
     }
 }
