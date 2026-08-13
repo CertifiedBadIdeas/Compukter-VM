@@ -15,7 +15,7 @@ checksum `ee053d58`.
 ## Environment and command
 
 ```text
-source revision: 44408bbd6f83401a2f737daeb2b6d8f4d1bbf82c
+source revision: ca9ff8e0a3bdca2729148b301b662fcf5c8f0817
 Linux lazyhat-station 7.1.6-zen1-1-zen x86_64
 CPU: AMD Ryzen 9 9950X3D, 16 cores / 32 threads
 rustc 1.95.0, LLVM 21.1.8
