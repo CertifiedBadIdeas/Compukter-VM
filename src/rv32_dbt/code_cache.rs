@@ -385,6 +385,16 @@ impl DirectDbtCodeCache {
             .sum()
     }
 
+    pub(crate) fn code_prefix_bytes(&self) -> usize {
+        self.sets
+            .iter()
+            .flat_map(|set| set.ways.iter())
+            .filter(|entry| entry.valid)
+            .filter_map(|entry| entry.offset.checked_add(entry.length))
+            .max()
+            .unwrap_or(self.completed_exit_stub_offset + self.completed_exit_stub_len)
+    }
+
     #[cfg(feature = "dbt-code-audit")]
     pub(crate) fn snapshot(
         &self,

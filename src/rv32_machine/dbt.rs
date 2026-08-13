@@ -448,22 +448,32 @@ impl Rv32DbtExecution {
     }
 
     pub(crate) fn stats(&self) -> Rv32DbtStats {
-        let (cache_stats, reserved_bytes, metadata_bytes) = match &self.storage {
-            Rv32DbtStorage::Direct { scratch, .. } => {
-                (Default::default(), scratch.reserved_bytes(), 0)
-            }
-            Rv32DbtStorage::Cached {
-                cache,
-                bounded_scratch,
-                ..
-            } => (
-                cache.stats(),
-                cache
-                    .reserved_bytes()
-                    .saturating_add(bounded_scratch.reserved_bytes()),
-                cache.metadata_bytes(),
-            ),
-        };
+        let (cache_stats, reserved_bytes, metadata_bytes, live_code_bytes, code_prefix_bytes) =
+            match &self.storage {
+                Rv32DbtStorage::Direct { scratch, .. } => {
+                    let emitted = scratch.emitted_bytes();
+                    (
+                        Default::default(),
+                        scratch.reserved_bytes(),
+                        0,
+                        emitted,
+                        emitted,
+                    )
+                }
+                Rv32DbtStorage::Cached {
+                    cache,
+                    bounded_scratch,
+                    ..
+                } => (
+                    cache.stats(),
+                    cache
+                        .reserved_bytes()
+                        .saturating_add(bounded_scratch.reserved_bytes()),
+                    cache.metadata_bytes(),
+                    cache.live_entry_bytes(),
+                    cache.code_prefix_bytes(),
+                ),
+            };
         Rv32DbtStats {
             translations: self.translations,
             publications: self.publications,
@@ -490,6 +500,8 @@ impl Rv32DbtExecution {
             decoded_slots_built: self.decoded_slots_built,
             emitted_bytes: self.emitted_bytes,
             alignment_padding_bytes: cache_stats.alignment_padding_bytes,
+            live_code_bytes,
+            code_prefix_bytes,
             reserved_bytes,
             metadata_bytes,
             #[cfg(feature = "dbt-translation-timing")]

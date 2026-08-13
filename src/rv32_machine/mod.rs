@@ -120,6 +120,8 @@ pub struct Rv32DbtStats {
     pub decoded_slots_built: u64,
     pub emitted_bytes: u64,
     pub alignment_padding_bytes: u64,
+    pub live_code_bytes: usize,
+    pub code_prefix_bytes: usize,
     pub reserved_bytes: usize,
     pub metadata_bytes: usize,
     #[cfg(feature = "dbt-translation-timing")]

@@ -588,12 +588,23 @@ impl ProductMachineImage {
         backend: ProductMachineBackend,
         batch: u64,
     ) -> Result<Vec<PreparedProductMachine>, String> {
+        self.prepare_batch_with_execution(backend, backend.config(), batch)
+    }
+
+    pub fn prepare_batch_with_execution(
+        &self,
+        backend: ProductMachineBackend,
+        execution: Rv32ExecutionBackendConfig,
+        batch: u64,
+    ) -> Result<Vec<PreparedProductMachine>, String> {
         if batch == 0 || batch > PRODUCT_MACHINE_MAX_BATCH {
             return Err(format!(
                 "product machine batch must be between 1 and {PRODUCT_MACHINE_MAX_BATCH}"
             ));
         }
-        (0..batch).map(|_| self.prepare(backend)).collect()
+        (0..batch)
+            .map(|_| self.prepare_with_execution(backend, execution))
+            .collect()
     }
 
     pub fn elf_bytes(&self) -> &[u8] {
