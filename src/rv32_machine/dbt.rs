@@ -368,10 +368,22 @@ impl Rv32DbtExecution {
                     serial: *scratch_serial,
                 }
             }
+            #[cfg(not(feature = "dbt-execution-profile"))]
             (Rv32DbtStorage::Cached { cache, .. }, DbtBlockMode::ChainableThroughput) => {
                 PreparedLocation::Cache(
                     cache.publish(DbtCacheKey::new(pc, self.generation), &block)?,
                 )
+            }
+            #[cfg(feature = "dbt-execution-profile")]
+            (Rv32DbtStorage::Cached { cache, profile, .. }, DbtBlockMode::ChainableThroughput) => {
+                PreparedLocation::Cache(match profile {
+                    Some(profile) => cache.publish_profiled(
+                        DbtCacheKey::new(pc, self.generation),
+                        &block,
+                        profile,
+                    )?,
+                    None => cache.publish(DbtCacheKey::new(pc, self.generation), &block)?,
+                })
             }
             (Rv32DbtStorage::Cached { .. }, DbtBlockMode::DirectFast) => {
                 unreachable!("DBT fast mode was validated before lowering")
