@@ -55,6 +55,16 @@ pub(crate) struct ExactDbtProfile {
     slots: Box<[ProfileSlot]>,
     used: usize,
     dynamic_exits: Rv32DbtDynamicExitCounts,
+    dynamic_counter_overflowed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DbtProfileDynamicExit {
+    Jalr,
+    Budget,
+    SlowInstruction,
+    MemoryAccess,
+    TrapOrTerminal,
 }
 
 impl ExactDbtProfile {
@@ -72,7 +82,23 @@ impl ExactDbtProfile {
             slots,
             used: 0,
             dynamic_exits: Rv32DbtDynamicExitCounts::default(),
+            dynamic_counter_overflowed: false,
         })
+    }
+
+    pub(crate) fn record_dynamic_exit(&mut self, kind: DbtProfileDynamicExit) {
+        let counter = match kind {
+            DbtProfileDynamicExit::Jalr => &mut self.dynamic_exits.jalr,
+            DbtProfileDynamicExit::Budget => &mut self.dynamic_exits.budget,
+            DbtProfileDynamicExit::SlowInstruction => &mut self.dynamic_exits.slow_instruction,
+            DbtProfileDynamicExit::MemoryAccess => &mut self.dynamic_exits.memory_access,
+            DbtProfileDynamicExit::TrapOrTerminal => &mut self.dynamic_exits.trap_or_terminal,
+        };
+        if let Some(next) = counter.checked_add(1) {
+            *counter = next;
+        } else {
+            self.dynamic_counter_overflowed = true;
+        }
     }
 
     pub(crate) fn counter_for(
@@ -102,7 +128,7 @@ impl ExactDbtProfile {
     pub(crate) fn snapshot(&self) -> Rv32DbtExecutionProfile {
         let mut blocks = Vec::new();
         let mut static_edges = Vec::new();
-        let mut counter_overflowed = false;
+        let mut counter_overflowed = self.dynamic_counter_overflowed;
         for slot in &self.slots {
             let Some(key) = slot.key else { continue };
             // Native profile code cannot run concurrently with this immutable VM snapshot.

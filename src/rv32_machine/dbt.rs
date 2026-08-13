@@ -28,12 +28,14 @@ use super::Rv32DbtStats;
 use super::{Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError};
 #[cfg(feature = "dbt-execution-profile")]
 use super::{Rv32DbtExecutionProfile, Rv32DbtProfileError};
+#[cfg(feature = "dbt-execution-profile")]
+use crate::rv32_dbt::abi::DbtProfileExitKind;
 use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
 use crate::rv32_dbt::code_cache::{DbtCacheHit, DbtCacheKey, DirectDbtCodeCache};
 use crate::rv32_dbt::executable::ExecutableScratch;
 #[cfg(feature = "dbt-execution-profile")]
-use crate::rv32_dbt::profile::ExactDbtProfile;
+use crate::rv32_dbt::profile::{DbtProfileDynamicExit, ExactDbtProfile};
 use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 use crate::rv32im::Rv32ResolvedInstruction;
@@ -336,6 +338,21 @@ impl Rv32DbtExecution {
         let lower_started = self
             .translation_timing_enabled
             .then(std::time::Instant::now);
+        #[cfg(feature = "dbt-execution-profile")]
+        let profile_enabled = matches!(
+            &self.storage,
+            Rv32DbtStorage::Cached {
+                profile: Some(_),
+                ..
+            }
+        ) && mode == DbtBlockMode::ChainableThroughput;
+        #[cfg(feature = "dbt-execution-profile")]
+        let block = if profile_enabled {
+            self.workspace.lower_profiled(&input, self.ram_len)?
+        } else {
+            self.workspace.lower(&input, self.ram_len)?
+        };
+        #[cfg(not(feature = "dbt-execution-profile"))]
         let block = self.workspace.lower(&input, self.ram_len)?;
         #[cfg(feature = "dbt-translation-timing")]
         let lower_nanos = lower_started.map(|started| started.elapsed().as_nanos());
@@ -474,7 +491,42 @@ impl Rv32DbtExecution {
         if matches!(tag, DbtExitTag::SlowInstruction | DbtExitTag::MemoryAccess) {
             self.typed_slow_exits = self.typed_slow_exits.saturating_add(1);
         }
+        #[cfg(feature = "dbt-execution-profile")]
+        if let Rv32DbtStorage::Cached {
+            profile: Some(profile),
+            ..
+        } = &mut self.storage
+        {
+            let kind = match tag {
+                DbtExitTag::Completed if context.profile_exit_kind == DbtProfileExitKind::Jalr => {
+                    Some(DbtProfileDynamicExit::Jalr)
+                }
+                DbtExitTag::Completed
+                    if context.profile_exit_kind == DbtProfileExitKind::Budget =>
+                {
+                    Some(DbtProfileDynamicExit::Budget)
+                }
+                DbtExitTag::BudgetExhausted => Some(DbtProfileDynamicExit::Budget),
+                DbtExitTag::SlowInstruction => Some(DbtProfileDynamicExit::SlowInstruction),
+                DbtExitTag::MemoryAccess => Some(DbtProfileDynamicExit::MemoryAccess),
+                DbtExitTag::Completed => None,
+            };
+            if let Some(kind) = kind {
+                profile.record_dynamic_exit(kind);
+            }
+        }
         Ok(tag)
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn record_profile_terminal(&mut self) {
+        if let Rv32DbtStorage::Cached {
+            profile: Some(profile),
+            ..
+        } = &mut self.storage
+        {
+            profile.record_dynamic_exit(DbtProfileDynamicExit::TrapOrTerminal);
+        }
     }
 
     pub(crate) fn record_context_initialization(&mut self) {
@@ -596,6 +648,8 @@ fn saturating_nanos(nanos: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{Rv32DbtExecution, Rv32DbtPolicy};
+    #[cfg(feature = "dbt-execution-profile")]
+    use crate::rv32_dbt::abi::DbtProfileExitKind;
     use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
     use crate::rv32_dbt::block::DbtBlockMode;
     use crate::rv32_dbt::DbtFaultKind;
@@ -777,6 +831,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
         let error = unsafe { direct.execute(stale, &mut context) }.unwrap_err();
@@ -803,6 +859,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
 
@@ -830,6 +888,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
 
@@ -876,6 +936,8 @@ mod tests {
                 reservation_valid: 0,
                 reservation_address: 0,
                 chain_transitions: 0,
+                #[cfg(feature = "dbt-execution-profile")]
+                profile_exit_kind: DbtProfileExitKind::None,
                 exit: DbtExitRecord {
                     next_pc: u32::MAX,
                     attempted: u32::MAX,
@@ -942,6 +1004,8 @@ mod tests {
             reservation_valid: 1,
             reservation_address: 0x80,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
 
@@ -1004,6 +1068,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
 
@@ -1064,6 +1130,8 @@ mod tests {
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: DbtProfileExitKind::None,
             exit: DbtExitRecord::default(),
         };
 
