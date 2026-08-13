@@ -25,6 +25,22 @@ fn workload_root() -> PathBuf {
 }
 
 #[test]
+fn comparison_feature_keeps_wasmtime_out_of_normal_builds() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let gate = fs::read_to_string(root.join("scripts/tests/rv32-c-qemu-comparison.sh")).unwrap();
+
+    assert!(manifest.contains("dbt-translation-timing = []"));
+    assert!(manifest.contains(
+        "wasmtime-comparison = [\"dep:wasmtime\", \"dbt-translation-timing\"]"
+    ));
+    assert!(manifest.contains(
+        "wasmtime = { version = \"=47.0.3\", optional = true, default-features = false"
+    ));
+    assert!(gate.contains("--features wasmtime-comparison"));
+}
+
+#[test]
 fn portable_c_kernel_has_one_platform_neutral_entrypoint() {
     let header = fs::read_to_string(workload_root().join("kernel.h")).unwrap();
     let source = fs::read_to_string(workload_root().join("kernel.c")).unwrap();
