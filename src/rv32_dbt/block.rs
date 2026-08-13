@@ -25,6 +25,12 @@
 use crate::rv32im::Rv32ResolvedInstruction;
 
 pub(crate) const MAX_STATIC_LINKS: usize = 2;
+pub(crate) const MAX_COLD_EXIT_RELOCATIONS: usize = MAX_STATIC_LINKS + 1;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DbtColdExitRelocation {
+    pub(crate) displacement_offset: u32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbtLinkKind {
@@ -112,6 +118,8 @@ pub(crate) struct TranslatedBlock<'a> {
     chain_entry_offset: u32,
     static_links: [DbtStaticLink; MAX_STATIC_LINKS],
     static_link_count: u8,
+    cold_exit_relocations: [DbtColdExitRelocation; MAX_COLD_EXIT_RELOCATIONS],
+    cold_exit_relocation_count: u8,
     code: &'a [u8],
 }
 
@@ -123,6 +131,7 @@ impl<'a> TranslatedBlock<'a> {
         lowered_store_sites: u32,
         chain_entry_offset: u32,
         static_links: &[DbtStaticLink],
+        cold_exit_relocations: &[DbtColdExitRelocation],
     ) -> Result<Self, String> {
         if code.is_empty() {
             return Err("RV32 DBT compiled block cannot be empty".to_string());
@@ -142,6 +151,15 @@ impl<'a> TranslatedBlock<'a> {
         if input.mode() != DbtBlockMode::ChainableThroughput && !static_links.is_empty() {
             return Err("only RV32 DBT chainable blocks can expose static links".to_string());
         }
+        if cold_exit_relocations.len() > MAX_COLD_EXIT_RELOCATIONS {
+            return Err(format!(
+                "RV32 DBT block has {} cold exits but supports at most {MAX_COLD_EXIT_RELOCATIONS}",
+                cold_exit_relocations.len()
+            ));
+        }
+        if input.mode() != DbtBlockMode::ChainableThroughput && !cold_exit_relocations.is_empty() {
+            return Err("only RV32 DBT chainable blocks can expose cold exits".to_string());
+        }
         for link in static_links {
             let displacement_end = (link.displacement_offset as usize)
                 .checked_add(4)
@@ -152,6 +170,16 @@ impl<'a> TranslatedBlock<'a> {
         }
         let mut stored_links = [DbtStaticLink::EMPTY; MAX_STATIC_LINKS];
         stored_links[..static_links.len()].copy_from_slice(static_links);
+        for relocation in cold_exit_relocations {
+            let displacement_end = (relocation.displacement_offset as usize)
+                .checked_add(4)
+                .ok_or_else(|| "RV32 DBT cold exit displacement range overflowed".to_string())?;
+            if displacement_end > code.len() {
+                return Err("RV32 DBT cold exit relocation lies outside emitted code".to_string());
+            }
+        }
+        let mut stored_cold_exits = [DbtColdExitRelocation::default(); MAX_COLD_EXIT_RELOCATIONS];
+        stored_cold_exits[..cold_exit_relocations.len()].copy_from_slice(cold_exit_relocations);
         Ok(Self {
             start_pc: input.start_pc(),
             instruction_count: input.slots().len() as u32,
@@ -161,6 +189,8 @@ impl<'a> TranslatedBlock<'a> {
             chain_entry_offset,
             static_links: stored_links,
             static_link_count: static_links.len() as u8,
+            cold_exit_relocations: stored_cold_exits,
+            cold_exit_relocation_count: cold_exit_relocations.len() as u8,
             code,
         })
     }
@@ -193,6 +223,10 @@ impl<'a> TranslatedBlock<'a> {
         &self.static_links[..self.static_link_count as usize]
     }
 
+    pub(crate) fn cold_exit_relocations(&self) -> &[DbtColdExitRelocation] {
+        &self.cold_exit_relocations[..self.cold_exit_relocation_count as usize]
+    }
+
     pub(crate) fn code(&self) -> &[u8] {
         self.code
     }
@@ -200,7 +234,10 @@ impl<'a> TranslatedBlock<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DbtBlockInput, DbtBlockMode, DbtLinkKind, DbtStaticLink, TranslatedBlock};
+    use super::{
+        DbtBlockInput, DbtBlockMode, DbtColdExitRelocation, DbtLinkKind, DbtStaticLink,
+        TranslatedBlock,
+    };
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
 
     fn slot() -> Rv32ResolvedInstruction {
@@ -244,7 +281,7 @@ mod tests {
         let input =
             DbtBlockInput::new(0x1000, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
         let code = [0xc3];
-        let block = TranslatedBlock::new(&input, &code, 3, 2, 0, &[]).unwrap();
+        let block = TranslatedBlock::new(&input, &code, 3, 2, 0, &[], &[]).unwrap();
 
         assert_eq!(block.start_pc(), 0x1000);
         assert_eq!(block.instruction_count(), 2);
@@ -268,7 +305,35 @@ mod tests {
             kind: DbtLinkKind::Fallthrough,
         };
 
-        assert!(TranslatedBlock::new(&input, &code, 0, 0, 6, &[]).is_err());
-        assert!(TranslatedBlock::new(&input, &code, 0, 0, 0, &[invalid]).is_err());
+        assert!(TranslatedBlock::new(&input, &code, 0, 0, 6, &[], &[]).is_err());
+        assert!(TranslatedBlock::new(&input, &code, 0, 0, 0, &[invalid], &[]).is_err());
+    }
+
+    #[test]
+    fn cold_exit_relocations_are_chainable_and_bounded_by_code() {
+        let slots = [slot()];
+        let chainable =
+            DbtBlockInput::new(0x1000, &slots, DbtBlockMode::ChainableThroughput).unwrap();
+        let direct = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
+        let code = [0xe9, 0, 0, 0, 0, 0xc3];
+        let cold = [DbtColdExitRelocation {
+            displacement_offset: 1,
+        }];
+
+        let block = TranslatedBlock::new(&chainable, &code, 0, 0, 0, &[], &cold).unwrap();
+        assert_eq!(block.cold_exit_relocations(), &cold);
+        assert!(TranslatedBlock::new(&direct, &code, 0, 0, 0, &[], &cold).is_err());
+        assert!(TranslatedBlock::new(
+            &chainable,
+            &code,
+            0,
+            0,
+            0,
+            &[],
+            &[DbtColdExitRelocation {
+                displacement_offset: 3,
+            }],
+        )
+        .is_err());
     }
 }

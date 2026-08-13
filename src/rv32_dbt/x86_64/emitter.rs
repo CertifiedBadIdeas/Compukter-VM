@@ -527,6 +527,10 @@ impl X64Emitter {
         })
     }
 
+    pub(crate) fn external_jump(&mut self) -> Result<u32, EmitError> {
+        Ok(self.patchable_jump()?.displacement_offset())
+    }
+
     pub(crate) fn jcc(&mut self, condition: Condition, label: Label) -> Result<(), EmitError> {
         self.relative_branch(&[0x0f, 0x80 + condition.code()], label)
     }
@@ -956,5 +960,15 @@ mod tests {
         assert_eq!(&code[..5], &[0xe9, 0, 0, 0, 0]);
         assert_eq!(jump.displacement_offset(), 1);
         assert_eq!(jump.reset_target_offset(), 5);
+    }
+
+    #[test]
+    fn external_jump_exposes_its_publish_time_displacement() {
+        let mut out = X64Emitter::new(16, 1).unwrap();
+
+        let displacement = out.external_jump().unwrap();
+
+        assert_eq!(displacement, 1);
+        assert_eq!(out.finish().unwrap(), [0xe9, 0, 0, 0, 0]);
     }
 }

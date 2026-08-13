@@ -318,6 +318,7 @@ impl DbtTranslationWorkspace {
             lowered_store_sites,
             chain_entry_offset,
             static_links.as_slice(),
+            &[],
         )
         .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))
     }
