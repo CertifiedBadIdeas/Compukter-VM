@@ -555,6 +555,57 @@ fn config(execution: Rv32ExecutionBackendConfig, debug_limit: usize) -> Rv32Mach
     }
 }
 
+#[cfg(feature = "dbt-execution-profile")]
+fn cached_dbt_machine(words: &[u32], sets: usize) -> Rv32Machine {
+    let elf = machine_program_elf(words);
+    Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets,
+                max_instructions: 8,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+            },
+            0,
+        ),
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn exact_profile_must_be_enabled_once_before_translation() {
+    let mut machine = cached_dbt_machine(&[addi(1, 1, 1), jal(0, -4)], 8);
+    machine.enable_dbt_execution_profile(128).unwrap();
+    assert!(machine.enable_dbt_execution_profile(128).is_err());
+    machine.run(1).unwrap();
+    let snapshot = machine.dbt_execution_profile().unwrap().unwrap();
+    assert_eq!(snapshot.capacity, 128);
+
+    let mut late = cached_dbt_machine(&[addi(1, 1, 1), jal(0, -4)], 8);
+    late.run(1).unwrap();
+    assert!(late.enable_dbt_execution_profile(128).is_err());
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn exact_profile_rejects_unsupported_backends_and_geometry() {
+    for capacity in [0, 3] {
+        let mut machine = cached_dbt_machine(&[jal(0, 0)], 8);
+        assert!(machine.enable_dbt_execution_profile(capacity).is_err());
+    }
+    let elf = machine_program_elf(&[jal(0, 0)]);
+    let mut interpreted = Rv32Machine::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 16 }, 0),
+    )
+    .unwrap();
+    assert!(interpreted.enable_dbt_execution_profile(128).is_err());
+    assert!(interpreted.dbt_execution_profile().is_err());
+}
+
 #[test]
 fn all_backends_turn_execution_from_rw_memory_into_bounded_traps() {
     let elf = machine_program_elf(&[jal(0, 0x2000)]);
