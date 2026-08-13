@@ -55,7 +55,7 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked --offline \
     --features dbt-code-audit --example rv32_c_codegen_audit
 
 PERF_REPORT="$BUILD_DIR/perf-report.tsv"
-printf 'system\tstatus\tcycles\tinstructions\tipc\tbranches\tbranch_misses\tcache_misses\n' >"$PERF_REPORT"
+printf 'system\tstatus\tcycles\tinstructions\tipc\tbranches\tbranch_misses\tcache_misses\tcommand\n' >"$PERF_REPORT"
 perf_value() {
     local raw="$1"
     local event="$2"
@@ -82,7 +82,7 @@ perf_measure() {
     if [[ "$(<"$BUILD_DIR/perf-$system.stdout")" != "$expected" ]]; then
         return 1
     fi
-    local cycles instructions branches branch_misses cache_misses ipc
+    local cycles instructions branches branch_misses cache_misses ipc command
     cycles="$(perf_value "$raw" cycles)"
     instructions="$(perf_value "$raw" instructions)"
     branches="$(perf_value "$raw" branches)"
@@ -93,9 +93,11 @@ perf_measure() {
         ipc="$(awk -v cycles="$cycles" -v instructions="$instructions" \
             'BEGIN { printf "%.6f", instructions / cycles }')"
     fi
-    printf '%s\tavailable\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf -v command '%q ' "$@"
+    command="${command% }"
+    printf '%s\tavailable\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$system" "$cycles" "$instructions" "$ipc" "$branches" "$branch_misses" \
-        "$cache_misses" >>"$PERF_REPORT"
+        "$cache_misses" "$command" >>"$PERF_REPORT"
 }
 
 PERF_REASON=""
@@ -116,7 +118,7 @@ elif ! perf_measure native $'CK_RESULT\tee053d58' \
 fi
 if [[ -n "$PERF_REASON" ]]; then
     PERF_REASON="$(printf '%s' "$PERF_REASON" | tr '\t\n' '  ')"
-    printf 'system\tstatus\tcycles\tinstructions\tipc\tbranches\tbranch_misses\tcache_misses\nstatus\tunavailable\t-\t-\t-\t-\t-\t-\nreason\t%s\t-\t-\t-\t-\t-\t-\n' \
+    printf 'system\tstatus\tcycles\tinstructions\tipc\tbranches\tbranch_misses\tcache_misses\tcommand\nstatus\tunavailable\t-\t-\t-\t-\t-\t-\t-\nreason\t%s\t-\t-\t-\t-\t-\t-\t-\n' \
         "$PERF_REASON" >"$PERF_REPORT"
 fi
 

@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use compukter_vm::benchmarks::{
     c_comparison_next_batch, c_comparison_qemu_target_nanos, c_comparison_timeout_nanos,
     classify_x86_instruction, compile_equivalent_calls, has_x86_memory_operand,
-    optional_phase_rate, parse_c_comparison_result, parse_llvm_symbol, parse_wasmtime_function,
-    InstructionGroup, COMPILATION_PHASE_REPORT_HEADER,
+    optional_phase_rate, parse_c_comparison_result, parse_llvm_symbol, parse_llvm_symbol_range,
+    parse_wasmtime_function, InstructionGroup, COMPILATION_PHASE_REPORT_HEADER,
 };
 
 #[test]
@@ -37,6 +37,7 @@ fn codegen_audit_parses_bounded_real_format_regions() {
         InstructionGroup::Vector
     );
     assert_eq!(classify_x86_instruction("movl"), InstructionGroup::Move);
+    assert!(has_x86_memory_operand("%fs:0x28, %rax"));
     assert!(parse_llvm_symbol(llvm, "missing").is_err());
     assert!(parse_llvm_symbol(
         "0000 <benchmark_batch>:\n0001 <benchmark_batch>:\n  1: c3 retq\n",
@@ -48,6 +49,22 @@ fn codegen_audit_parses_bounded_real_format_regions() {
         "benchmark_batch"
     )
     .is_err());
+}
+
+#[test]
+fn codegen_audit_excludes_alignment_bytes_after_a_live_symbol_range() {
+    let llvm = "0000000000000010 <dbt_pc_00001000_off_00000010>:\n\
+                    10: 31 c0                         xorl %eax, %eax\n\
+                    12: c3                            retq\n\
+                    13: 00 00                         addb %al, (%rax)\n\
+                0000000000000020 <next>:\n\
+                    20: c3                            retq\n";
+
+    let instructions =
+        parse_llvm_symbol_range(llvm, "dbt_pc_00001000_off_00000010", 0x10, 3).unwrap();
+    assert_eq!(instructions.len(), 2);
+    assert_eq!(instructions.last().unwrap().address, 0x12);
+    assert!(parse_llvm_symbol_range(llvm, "dbt_pc_00001000_off_00000010", 0x10, 1).is_err());
 }
 
 #[test]
@@ -355,6 +372,7 @@ fn focused_codegen_audit_keeps_perf_optional() {
     assert!(script.contains("dbt-code-cache.S"));
     assert!(script.contains("codegen-report.tsv"));
     assert!(script.contains("perf-report.tsv"));
+    assert!(script.contains("cache_misses\\tcommand"));
     assert!(script.contains("status\\tunavailable"));
 }
 

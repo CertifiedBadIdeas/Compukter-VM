@@ -43,14 +43,15 @@ This does not affect the deterministic static audit.
 
 | Region | Code bytes | Host instructions | Guest instructions | Host/guest | Memory operands | Moves | Vector |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Cached DBT live blocks | 56,499 | 15,318 | 879 | 17.427 | 5,354 | 11,423 | 0 |
-| Native `benchmark_kernel`, O3 no-LTO | 4,140 | 806 | — | — | 212 | 193 | 223 |
+| Cached DBT live blocks | 56,499 | 15,199 | 879 | 17.291 | 5,235 | 11,423 | 0 |
+| Native `benchmark_kernel`, O3 no-LTO | 4,140 | 806 | — | — | 214 | 193 | 223 |
 | Wasmtime AOT `benchmark_batch` | — | 1,029 | — | — | 440 | 271 | 254 |
 
 The DBT snapshot contains 89 live blocks, 119 linked edges, and three unlinked
 edges. Block sizes are 635 bytes mean, 432 bytes p50, 1,653 bytes p95, and
-3,273 bytes maximum. Moves account for 74.6% of all statically emitted DBT
-instructions.
+3,273 bytes maximum. Moves account for 75.2% of all statically emitted DBT
+instructions. Disassembly is bounded by each block's exact live byte range;
+alignment gaps preserved for branch geometry are excluded from every count.
 
 The comparison boundaries differ deliberately. DBT includes guards, exits,
 and transitions. The native object excludes the executable's LTO boundary,

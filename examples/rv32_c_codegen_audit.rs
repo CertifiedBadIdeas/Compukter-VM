@@ -11,8 +11,8 @@
 
 #[cfg(feature = "dbt-code-audit")]
 use compukter_vm::benchmarks::{
-    classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_wasmtime_function,
-    DecodedHostInstruction, InstructionGroup, PRODUCT_RAM_BYTES,
+    classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_llvm_symbol_range,
+    parse_wasmtime_function, DecodedHostInstruction, InstructionGroup, PRODUCT_RAM_BYTES,
 };
 #[cfg(feature = "dbt-code-audit")]
 use compukter_vm::rv32_machine::{
@@ -280,7 +280,12 @@ fn report(build_dir: &Path) -> Result<(), String> {
     let mut hot_blocks = Vec::with_capacity(blocks.len());
     for block in &blocks {
         let symbol = format!("dbt_pc_{:08x}_off_{:08x}", block.guest_pc, block.offset);
-        let instructions = parse_llvm_symbol(&dbt_disassembly, &symbol)?;
+        let instructions = parse_llvm_symbol_range(
+            &dbt_disassembly,
+            &symbol,
+            u64::from(block.offset),
+            u64::from(block.length),
+        )?;
         hot_blocks.push((block.clone(), instructions.len() as u64));
         dbt_instructions.extend(instructions);
     }
