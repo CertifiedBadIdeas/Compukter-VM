@@ -26,7 +26,8 @@ use super::emitter::{Condition, EmitError, Gpr, Mem, X64Emitter};
 use super::register_cache::RegisterCache;
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{
-    DbtBlockInput, DbtBlockMode, DbtLinkKind, DbtStaticLink, TranslatedBlock, MAX_STATIC_LINKS,
+    DbtBlockInput, DbtBlockMode, DbtColdExitRelocation, DbtLinkKind, DbtStaticLink,
+    TranslatedBlock, MAX_COLD_EXIT_RELOCATIONS, MAX_STATIC_LINKS,
 };
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 use crate::rv32im::{
@@ -43,6 +44,38 @@ pub(crate) struct DbtTranslationWorkspace {
 struct StaticLinkCollector {
     links: [DbtStaticLink; MAX_STATIC_LINKS],
     len: usize,
+}
+
+struct ColdExitCollector {
+    relocations: [DbtColdExitRelocation; MAX_COLD_EXIT_RELOCATIONS],
+    len: usize,
+}
+
+impl ColdExitCollector {
+    const fn new() -> Self {
+        Self {
+            relocations: [DbtColdExitRelocation {
+                displacement_offset: 0,
+            }; MAX_COLD_EXIT_RELOCATIONS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, relocation: DbtColdExitRelocation) -> Result<(), EmitError> {
+        let slot = self
+            .relocations
+            .get_mut(self.len)
+            .ok_or(EmitError::InvalidOperand(
+                "RV32 DBT block exceeded its cold exit capacity",
+            ))?;
+        *slot = relocation;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[DbtColdExitRelocation] {
+        &self.relocations[..self.len]
+    }
 }
 
 impl StaticLinkCollector {
@@ -107,6 +140,7 @@ impl DbtTranslationWorkspace {
         emit_prologue(&mut out, chainable)
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
         let mut static_links = StaticLinkCollector::new();
+        let mut cold_exits = ColdExitCollector::new();
         let mut cache = if chainable {
             RegisterCache::chainable()
         } else {
@@ -118,6 +152,7 @@ impl DbtTranslationWorkspace {
                 &mut out,
                 input.start_pc(),
                 input.slots().len() as u32,
+                &mut cold_exits,
             )
             .map_err(|error| emit_fault(input.start_pc(), None, error))?
         } else {
@@ -182,6 +217,7 @@ impl DbtTranslationWorkspace {
                         &mut out,
                         chainable,
                         &mut static_links,
+                        &mut cold_exits,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     emitted_terminal = true;
@@ -198,6 +234,7 @@ impl DbtTranslationWorkspace {
                         &mut out,
                         chainable,
                         &mut static_links,
+                        &mut cold_exits,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     emitted_terminal = true;
@@ -304,6 +341,7 @@ impl DbtTranslationWorkspace {
                     DbtLinkKind::Fallthrough,
                     chainable,
                     &mut static_links,
+                    &mut cold_exits,
                 )
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
             }
@@ -318,7 +356,7 @@ impl DbtTranslationWorkspace {
             lowered_store_sites,
             chain_entry_offset,
             static_links.as_slice(),
-            &[],
+            cold_exits.as_slice(),
         )
         .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))
     }
@@ -347,6 +385,7 @@ fn emit_branch(
     out: &mut X64Emitter,
     chainable: bool,
     static_links: &mut StaticLinkCollector,
+    cold_exits: &mut ColdExitCollector,
 ) -> Result<(), EmitError> {
     let lhs = cache.read(rs1, remaining, &[], out)?;
     let rhs = cache.read(rs2, remaining, &[lhs], out)?;
@@ -370,6 +409,7 @@ fn emit_branch(
         DbtLinkKind::BranchNotTaken,
         chainable,
         static_links,
+        cold_exits,
     )?;
     out.bind(taken)?;
     let target = pc.wrapping_add_signed(offset);
@@ -383,6 +423,7 @@ fn emit_branch(
             DbtLinkKind::BranchTaken,
             chainable,
             static_links,
+            cold_exits,
         )
     } else {
         emit_exit(
@@ -407,6 +448,7 @@ fn emit_jal(
     out: &mut X64Emitter,
     chainable: bool,
     static_links: &mut StaticLinkCollector,
+    cold_exits: &mut ColdExitCollector,
 ) -> Result<(), EmitError> {
     let target = pc.wrapping_add_signed(offset);
     if target & 3 != 0 {
@@ -431,6 +473,7 @@ fn emit_jal(
         DbtLinkKind::Jal,
         chainable,
         static_links,
+        cold_exits,
     )
 }
 
@@ -505,6 +548,7 @@ fn emit_fast_entry_guard(
     out: &mut X64Emitter,
     start_pc: u32,
     _instruction_count: u32,
+    cold_exits: &mut ColdExitCollector,
 ) -> Result<u32, EmitError> {
     let guard = out.new_label()?;
     let body = out.new_label()?;
@@ -516,7 +560,8 @@ fn emit_fast_entry_guard(
     out.bind(guard)?;
     out.test_r64_r64(EXECUTION_COUNTER, EXECUTION_COUNTER)?;
     out.jcc(Condition::Less, body)?;
-    emit_exit(cache, out, DbtExitTag::Completed, start_pc, 0, 0, 0)?;
+    cache.flush(out)?;
+    emit_completed_trampoline(out, start_pc, cold_exits)?;
     out.bind(body)?;
     Ok(chain_entry_offset)
 }
@@ -1087,6 +1132,7 @@ fn emit_completed_exit(
     kind: DbtLinkKind,
     chainable: bool,
     static_links: &mut StaticLinkCollector,
+    cold_exits: &mut ColdExitCollector,
 ) -> Result<(), EmitError> {
     if chainable {
         cache.flush(out)?;
@@ -1098,6 +1144,8 @@ fn emit_completed_exit(
             reset_target_offset: jump.reset_target_offset(),
             kind,
         })?;
+        emit_completed_trampoline(out, next_pc, cold_exits)?;
+        return Ok(());
     }
     emit_exit(
         cache,
@@ -1108,6 +1156,17 @@ fn emit_completed_exit(
         0,
         0,
     )
+}
+
+fn emit_completed_trampoline(
+    out: &mut X64Emitter,
+    next_pc: u32,
+    cold_exits: &mut ColdExitCollector,
+) -> Result<(), EmitError> {
+    out.mov_r32_imm32(Gpr::Rdx, next_pc)?;
+    cold_exits.push(DbtColdExitRelocation {
+        displacement_offset: out.external_jump()?,
+    })
 }
 
 fn emit_exit_dynamic(
@@ -1601,6 +1660,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 expected
             );
+            assert_eq!(block.cold_exit_relocations().len(), expected.len() + 1);
             for link in block.static_links() {
                 assert!((link.displacement_offset as usize + 4) <= block.code().len());
                 assert!((link.reset_target_offset as usize) < block.code().len());
@@ -1612,6 +1672,7 @@ mod tests {
             DbtBlockInput::new(0x5000, &slots, DbtBlockMode::Bounded { max_attempts: 1 }).unwrap();
         let block = workspace.lower(&input, 4096).unwrap();
         assert!(block.static_links().is_empty());
+        assert!(block.cold_exit_relocations().is_empty());
     }
 
     #[test]
@@ -1626,10 +1687,10 @@ mod tests {
         let x0_write = write_u32_pattern(Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0);
         let pc_write = write_u32_pattern(Gpr::R14, Rv32ArchitecturalState::PC_OFFSET, start_pc + 4);
 
-        // One x0 write belongs to the entry budget guard and one to the
-        // unlinked fallback. A successful linked edge needs neither.
-        assert_eq!(pattern_count(block.code(), &x0_write), 2);
-        assert_eq!(pattern_count(block.code(), &pc_write), 1);
+        // Completed materialization belongs to the shared support stub, not
+        // the successful linked path or its local cold trampoline.
+        assert_eq!(pattern_count(block.code(), &x0_write), 0);
+        assert_eq!(pattern_count(block.code(), &pc_write), 0);
     }
 
     #[test]
