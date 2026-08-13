@@ -97,6 +97,7 @@ impl LocalLoopRegisterPlan {
 pub(crate) struct RegisterCache {
     host_pool: &'static [Gpr],
     entries: [Option<Resident>; DIRECT_HOST_POOL.len()],
+    protected_guests: u32,
 }
 
 impl RegisterCache {
@@ -108,6 +109,7 @@ impl RegisterCache {
         Self {
             host_pool: &DIRECT_HOST_POOL,
             entries: [None; DIRECT_HOST_POOL.len()],
+            protected_guests: 0,
         }
     }
 
@@ -115,6 +117,7 @@ impl RegisterCache {
         Self {
             host_pool: &CHAINABLE_HOST_POOL,
             entries: [None; DIRECT_HOST_POOL.len()],
+            protected_guests: 0,
         }
     }
 
@@ -125,26 +128,33 @@ impl RegisterCache {
     pub(crate) fn local_loop_plan(
         slots: &[Rv32ResolvedInstruction],
     ) -> Option<LocalLoopRegisterPlan> {
-        let access = slots
+        let mut defined = 1_u32;
+        let mut carried = 0_u32;
+        let mut written = 0_u32;
+        for slot in slots.iter().copied() {
+            let access = instruction_access(slot);
+            carried |= access.reads & !defined;
+            defined |= access.writes;
+            written |= access.writes;
+        }
+        carried &= !1;
+        let carried_count = carried.count_ones() as usize;
+        let temporary_pressure = slots
             .iter()
             .copied()
-            .fold(RegisterAccess::default(), |combined, slot| {
-                let access = instruction_access(slot);
-                RegisterAccess {
-                    reads: combined.reads | access.reads,
-                    writes: combined.writes | access.writes,
-                    may_exit_before_write: combined.may_exit_before_write
-                        || access.may_exit_before_write,
-                }
-            });
-        let referenced = (access.reads | access.writes) & !1;
-        if referenced.count_ones() as usize > CHAINABLE_HOST_POOL.len() {
+            .map(instruction_access)
+            .map(|access| ((access.reads | access.writes) & !carried & !1).count_ones() as usize)
+            .max()
+            .unwrap_or(0);
+        if carried_count > CHAINABLE_HOST_POOL.len()
+            || carried_count.saturating_add(temporary_pressure) > CHAINABLE_HOST_POOL.len()
+        {
             return None;
         }
         let mut guests = [0; CHAINABLE_HOST_POOL.len()];
         let mut len = 0;
         for guest in 1..32 {
-            if referenced & (1_u32 << guest) != 0 {
+            if carried & (1_u32 << guest) != 0 {
                 guests[len] = guest;
                 len += 1;
             }
@@ -152,7 +162,7 @@ impl RegisterCache {
         Some(LocalLoopRegisterPlan {
             guests,
             len,
-            written: access.writes & !1,
+            written: written & carried,
         })
     }
 
@@ -163,6 +173,10 @@ impl RegisterCache {
         out: &mut X64Emitter,
     ) -> Result<(), EmitError> {
         debug_assert!(self.is_chainable());
+        self.protected_guests = plan
+            .guests()
+            .iter()
+            .fold(0_u32, |mask, guest| mask | (1_u32 << guest));
         for guest in plan.guests() {
             self.read(*guest, slots, &[], out)?;
             if plan.written & (1_u32 << guest) != 0 {
@@ -247,6 +261,28 @@ impl RegisterCache {
         Ok(())
     }
 
+    pub(crate) fn reconcile_local_loop(&mut self, out: &mut X64Emitter) -> Result<(), EmitError> {
+        for entry in &mut self.entries[..self.host_pool.len()] {
+            let Some(resident) = *entry else {
+                continue;
+            };
+            if self.protected_guests & (1_u32 << resident.guest) != 0 {
+                continue;
+            }
+            if resident.dirty {
+                out.mov_m32_r32(
+                    Mem::base_disp(
+                        Gpr::R14,
+                        Rv32ArchitecturalState::register_offset(resident.guest) as i32,
+                    ),
+                    resident.host,
+                )?;
+            }
+            *entry = None;
+        }
+        Ok(())
+    }
+
     fn allocate(
         &mut self,
         remaining: &[Rv32ResolvedInstruction],
@@ -265,16 +301,18 @@ impl RegisterCache {
             .filter_map(|(index, resident)| {
                 let resident = resident.unwrap();
                 let future = future_value(remaining, resident.guest);
-                (!pinned.contains(&resident.host)).then_some((
-                    index,
-                    matches!(future, FutureValue::Dead(_)),
-                    match future {
-                        FutureValue::Read(distance) | FutureValue::Dead(distance) => distance,
-                        FutureValue::Unused => usize::MAX,
-                    },
-                    !resident.dirty,
-                    Reverse(resident.guest),
-                ))
+                (!pinned.contains(&resident.host)
+                    && self.protected_guests & (1_u32 << resident.guest) == 0)
+                    .then_some((
+                        index,
+                        matches!(future, FutureValue::Dead(_)),
+                        match future {
+                            FutureValue::Read(distance) | FutureValue::Dead(distance) => distance,
+                            FutureValue::Unused => usize::MAX,
+                        },
+                        !resident.dirty,
+                        Reverse(resident.guest),
+                    ))
             })
             .max_by_key(|(_, dead, distance, clean, guest)| (*dead, *distance, *clean, *guest))
             .map(|(index, _, _, _, _)| index)
@@ -423,7 +461,7 @@ mod tests {
     use crate::rv32_dbt::x86_64::emitter::{Gpr, X64Emitter};
     use crate::rv32im::{
         decode_product_word,
-        encoding::{addi, bne, ecall, jal, jalr, lw},
+        encoding::{add, addi, bne, ecall, jal, jalr, lw, slli, sw},
         Rv32ResolvedInstruction,
     };
 
@@ -464,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn local_loop_plan_keeps_every_referenced_guest_resident() {
+    fn local_loop_plan_keeps_only_values_read_before_their_first_write() {
         let slots = [
             slot(addi(5, 0, 1)),
             slot(lw(6, 5, 0)),
@@ -474,7 +512,7 @@ mod tests {
 
         let plan = RegisterCache::local_loop_plan(&slots).unwrap();
 
-        assert_eq!(plan.guests(), &[5, 6, 7]);
+        assert_eq!(plan.guests(), &[7]);
     }
 
     #[test]
@@ -484,6 +522,98 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(RegisterCache::local_loop_plan(&slots).is_none());
+    }
+
+    #[test]
+    fn local_loop_plan_accepts_nine_references_with_five_carried_values() {
+        let slots = [
+            slot(lw(20, 5, 0)),
+            slot(lw(24, 28, 0)),
+            slot(addi(5, 5, 4)),
+            slot(addi(28, 28, 4)),
+            slot(slli(25, 20, 5)),
+            slot(slli(26, 24, 4)),
+            slot(add(20, 20, 14)),
+            slot(add(24, 26, 24)),
+            slot(add(20, 25, 20)),
+            slot(add(20, 20, 24)),
+            slot(sw(18, 20, 0)),
+            slot(addi(18, 18, 4)),
+            slot(bne(5, 15, -48)),
+        ];
+
+        let plan = RegisterCache::local_loop_plan(&slots).unwrap();
+
+        assert_eq!(plan.guests(), &[5, 14, 15, 18, 28]);
+    }
+
+    #[test]
+    fn local_loop_plan_rejects_more_per_instruction_temporaries_than_free_hosts() {
+        let slots = [
+            slot(addi(1, 1, 1)),
+            slot(addi(2, 2, 1)),
+            slot(addi(3, 3, 1)),
+            slot(addi(4, 4, 1)),
+            slot(addi(5, 5, 1)),
+            slot(addi(20, 0, 1)),
+            slot(addi(21, 0, 2)),
+            slot(addi(22, 0, 3)),
+            slot(add(20, 21, 22)),
+            slot(bne(1, 2, -36)),
+        ];
+
+        assert!(RegisterCache::local_loop_plan(&slots).is_none());
+    }
+
+    #[test]
+    fn loop_carried_hosts_survive_temporary_register_pressure() {
+        let slots = [
+            slot(lw(20, 5, 0)),
+            slot(lw(24, 28, 0)),
+            slot(add(25, 20, 14)),
+            slot(add(26, 24, 15)),
+            slot(sw(18, 26, 0)),
+            slot(bne(5, 15, -20)),
+        ];
+        let plan = RegisterCache::local_loop_plan(&slots).unwrap();
+        let mut cache = RegisterCache::chainable();
+        let mut out = X64Emitter::new(512, slots.len()).unwrap();
+        cache.preload_local_loop(plan, &slots, &mut out).unwrap();
+
+        for guest in [20, 24, 25] {
+            cache.read(guest, &[], &[], &mut out).unwrap();
+        }
+
+        for guest in plan.guests() {
+            assert!(
+                cache.resident(*guest).is_some(),
+                "carried x{guest} was evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn local_loop_reconciliation_materializes_and_discards_only_temporaries() {
+        let slots = [
+            slot(lw(20, 5, 0)),
+            slot(addi(5, 5, 4)),
+            slot(sw(18, 20, 0)),
+            slot(bne(5, 15, -12)),
+        ];
+        let plan = RegisterCache::local_loop_plan(&slots).unwrap();
+        let mut cache = RegisterCache::chainable();
+        let mut out = X64Emitter::new(512, slots.len()).unwrap();
+        cache.preload_local_loop(plan, &slots, &mut out).unwrap();
+        cache.write(20, &[], &[], &mut out).unwrap();
+        let before = out.bytes().len();
+
+        cache.reconcile_local_loop(&mut out).unwrap();
+
+        assert!(out.bytes().len() > before);
+        assert!(cache.resident(20).is_none());
+        for guest in plan.guests() {
+            assert!(cache.resident(*guest).is_some());
+        }
     }
 
     #[test]
