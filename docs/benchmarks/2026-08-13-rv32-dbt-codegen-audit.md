@@ -98,7 +98,7 @@ static size alone. Dynamic counters remain optional evidence.
 
 Decision: **KEEP** at revision `1551fa7`.
 
-The implementation gives every VM one immutable 82-byte Completed-exit stub.
+The implementation gives every VM one immutable 79-byte Completed-exit stub.
 Each block keeps its path-specific register flush and a small trampoline that
 loads `next_pc` before jumping to the shared stub. Successful linked edges still
 jump directly to the next block. Audit-only relocation metadata verifies every
@@ -107,9 +107,9 @@ code report counts the support stub exactly once.
 
 | Metric | Baseline `61ce89f` | Accepted result | Change |
 |---|---:|---:|---:|
-| Live resident DBT code | 56,499 B | 39,912 B | -29.36% |
+| Live resident DBT code | 56,499 B | 39,909 B | -29.36% |
 | Emitted guest-block code | 56,499 B | 39,830 B | -29.50% |
-| Host instructions | 15,199 | 10,370 | -31.77% |
+| Host instructions | 15,199 | 10,369 | -31.78% |
 | Block-16 median | 475,960 ns/kernel | 452,531 ns/kernel | -4.92% |
 | DBT / QEMU time | 0.870736x | 0.830787x | -4.59% |
 | DBT / native time | 7.725304x | 7.344253x | -4.93% |

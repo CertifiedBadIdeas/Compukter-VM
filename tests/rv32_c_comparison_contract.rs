@@ -339,6 +339,7 @@ fn codegen_audit_export_contract_is_explicit() {
     assert!(source.contains("\"export\""));
     assert!(source.contains("dbt-code-cache.bin"));
     assert!(source.contains("dbt-blocks.tsv"));
+    assert!(source.contains("dbt-support.tsv"));
     assert!(source.contains("dbt-code-cache.S"));
     assert!(source.contains("ee05_3d58"));
     assert!(source.contains("dbt_code_snapshot"));
