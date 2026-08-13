@@ -733,6 +733,66 @@ fn exact_profile_counts_chained_budget_exit() {
     assert_eq!(block_count(&profile, 0x1000), 5);
 }
 
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn exact_profile_survives_cache_eviction_and_retranslation() {
+    let mut machine = cached_dbt_machine(&[jal(0, 8), jal(0, -4), jal(0, -4)], 1);
+    machine.enable_dbt_execution_profile(64).unwrap();
+
+    assert!(matches!(
+        machine.run(12).unwrap(),
+        Rv32MachineOutcome::BudgetExhausted { .. }
+    ));
+    let stats = machine.dbt_stats().unwrap();
+    assert!(stats.evictions > 0);
+    assert!(stats.translations > 3);
+    let profile = machine.dbt_execution_profile().unwrap().unwrap();
+    assert_eq!(block_count(&profile, 0x1000), 4);
+    assert_eq!(block_count(&profile, 0x1004), 4);
+    assert_eq!(block_count(&profile, 0x1008), 4);
+    assert_eq!(profile.blocks.len(), 3);
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn exact_profile_survives_fence_i_generation_invalidation() {
+    let mut machine = cached_dbt_machine(&[fence_i(), jal(0, -4)], 4);
+    machine.enable_dbt_execution_profile(64).unwrap();
+
+    machine.run(2).unwrap();
+    let before = machine.dbt_execution_profile().unwrap().unwrap();
+    assert_eq!(block_count(&before, 0x1000), 1);
+    assert_eq!(block_count(&before, 0x1004), 1);
+
+    machine.run(2).unwrap();
+    let after = machine.dbt_execution_profile().unwrap().unwrap();
+    assert_eq!(block_count(&after, 0x1000), 2);
+    assert_eq!(block_count(&after, 0x1004), 2);
+    assert_eq!(after.blocks.len(), 2);
+    assert!(machine.dbt_stats().unwrap().translations > 2);
+}
+
+#[cfg(all(feature = "dbt-execution-profile", feature = "dbt-code-audit"))]
+#[test]
+fn disabled_profile_keeps_cached_dbt_code_identical() {
+    let words = [addi(1, 1, 1), jal(0, -4)];
+    let mut first = cached_dbt_machine(&words, 8);
+    let mut second = cached_dbt_machine(&words, 8);
+    first.run(16).unwrap();
+    second.run(16).unwrap();
+
+    let first_snapshot = first.dbt_code_snapshot().unwrap().unwrap();
+    let second_snapshot = second.dbt_code_snapshot().unwrap().unwrap();
+    assert_eq!(first_snapshot, second_snapshot);
+
+    let mut profiled = cached_dbt_machine(&words, 8);
+    profiled.enable_dbt_execution_profile(64).unwrap();
+    profiled.run(16).unwrap();
+    let profiled_snapshot = profiled.dbt_code_snapshot().unwrap().unwrap();
+    assert!(profiled_snapshot.used_bytes.len() > first_snapshot.used_bytes.len());
+    assert!(profiled.dbt_stats().unwrap().emitted_bytes > first.dbt_stats().unwrap().emitted_bytes);
+}
+
 #[test]
 fn all_backends_turn_execution_from_rw_memory_into_bounded_traps() {
     let elf = machine_program_elf(&[jal(0, 0x2000)]);
