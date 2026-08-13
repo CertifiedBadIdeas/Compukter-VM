@@ -506,9 +506,14 @@ fn cached_dbt_fence_i_revokes_the_previous_generation() {
 
 #[test]
 fn cached_dbt_local_self_branch_flushes_loop_state_before_memory_fault() {
-    let [address_hi, address_lo] = materialize(1, 0x0000_fffc);
-    let [limit_hi, limit_lo] = materialize(2, 0x0001_0004);
+    let [vector_hi, vector_lo] = materialize(4, 0x102c);
+    let [control_hi, control_lo] = materialize(10, CONTROL_BASE);
+    let [address_hi, address_lo] = materialize(1, 0x0000_3ffc);
+    let [limit_hi, limit_lo] = materialize(2, 0x0000_4004);
     let elf = machine_program_elf(&[
+        vector_hi,
+        vector_lo,
+        csrrw(0, CSR_MTVEC, 4),
         address_hi,
         address_lo,
         limit_hi,
@@ -517,6 +522,11 @@ fn cached_dbt_local_self_branch_flushes_loop_state_before_memory_fault() {
         lw(3, 1, 0),
         addi(1, 1, 4),
         bne(1, 2, -8),
+        control_hi,
+        control_lo,
+        sw(10, 1, 8),
+        addi(11, 0, STATUS_HALTED),
+        sw(10, 11, 0),
     ]);
     let mut interpreted =
         Rv32Machine::from_elf(&elf, config(Rv32ExecutionBackendConfig::Predecoded, 0)).unwrap();
@@ -535,9 +545,34 @@ fn cached_dbt_local_self_branch_flushes_loop_state_before_memory_fault() {
     )
     .unwrap();
 
-    let expected = interpreted.run(12).unwrap();
-    let actual = dbt.run(12).unwrap();
+    let run_to_halt = |machine: &mut Rv32Machine| {
+        for _ in 0..4 {
+            let outcome = machine.run(20).unwrap();
+            if matches!(outcome, Rv32MachineOutcome::Halted { .. }) {
+                return outcome;
+            }
+        }
+        panic!(
+            "machine did not reach the fault handler: pc={:#010x}, retired={}, status={}",
+            machine.pc(),
+            machine.retired_instructions(),
+            machine.control_status()
+        );
+    };
+    let expected = run_to_halt(&mut interpreted);
+    let actual = run_to_halt(&mut dbt);
 
+    assert!(
+        matches!(
+            expected,
+            Rv32MachineOutcome::Halted {
+                exit_code: 0x0000_4000,
+                ..
+            }
+        ),
+        "unexpected reference outcome: {expected:?}"
+    );
+    assert_eq!(dbt.dbt_stats().unwrap().local_self_backedge_sites, 1);
     assert_eq!(actual, expected);
     assert_eq!(dbt.pc(), interpreted.pc());
     assert_eq!(
