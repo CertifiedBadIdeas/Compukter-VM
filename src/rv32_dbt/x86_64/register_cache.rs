@@ -604,11 +604,21 @@ mod tests {
     fn local_loop_reconciliation_materializes_and_discards_only_temporaries() {
         let slots = [
             slot(lw(20, 5, 0)),
+            slot(lw(24, 28, 0)),
             slot(addi(5, 5, 4)),
+            slot(addi(28, 28, 4)),
+            slot(slli(25, 20, 5)),
+            slot(slli(26, 24, 4)),
+            slot(add(20, 20, 14)),
+            slot(add(24, 26, 24)),
+            slot(add(20, 25, 20)),
+            slot(add(20, 20, 24)),
             slot(sw(18, 20, 0)),
-            slot(bne(5, 15, -12)),
+            slot(addi(18, 18, 4)),
+            slot(bne(5, 15, -48)),
         ];
         let plan = RegisterCache::local_loop_plan(&slots).unwrap();
+        assert!(!plan.guests().contains(&20));
         let mut cache = RegisterCache::chainable();
         let mut out = X64Emitter::new(512, slots.len()).unwrap();
         cache.preload_local_loop(plan, &slots, &mut out).unwrap();
