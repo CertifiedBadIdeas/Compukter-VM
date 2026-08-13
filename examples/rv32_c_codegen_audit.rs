@@ -64,21 +64,68 @@ fn main() {
 #[cfg(feature = "dbt-code-audit")]
 fn run() -> Result<(), String> {
     let mut args = env::args_os().skip(1);
-    let command = args
-        .next()
-        .ok_or_else(|| "usage: rv32_c_codegen_audit export BUILD_DIR".to_string())?;
-    let build_dir = PathBuf::from(
-        args.next()
-            .ok_or_else(|| "usage: rv32_c_codegen_audit export BUILD_DIR".to_string())?,
-    );
-    if args.next().is_some() {
-        return Err("usage: rv32_c_codegen_audit export BUILD_DIR".to_string());
-    }
+    let command = args.next().ok_or_else(usage)?;
+    let build_dir = PathBuf::from(args.next().ok_or_else(usage)?);
     match command.to_str() {
+        Some("export") | Some("report") if args.next().is_some() => Err(usage()),
         Some("export") => export(&build_dir),
         Some("report") => report(&build_dir),
-        _ => Err("usage: rv32_c_codegen_audit <export|report> BUILD_DIR".to_string()),
+        Some("execute") => {
+            let batch = args
+                .next()
+                .ok_or_else(usage)?
+                .to_str()
+                .ok_or_else(|| "batch is not UTF-8".to_string())?
+                .parse::<u64>()
+                .map_err(|error| format!("invalid batch: {error}"))?;
+            if batch == 0 || args.next().is_some() {
+                return Err(usage());
+            }
+            execute(&build_dir, batch)
+        }
+        _ => Err(usage()),
     }
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn usage() -> String {
+    "usage: rv32_c_codegen_audit <export|report> BUILD_DIR | execute BUILD_DIR BATCH".to_string()
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn execute(build_dir: &Path, batch: u64) -> Result<(), String> {
+    let elf_path = build_dir.join("product-audit-batch.elf");
+    let elf = fs::read(&elf_path)
+        .map_err(|error| format!("failed to read {}: {error}", elf_path.display()))?;
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        Rv32MachineConfig {
+            ram_size: PRODUCT_RAM_BYTES,
+            debug_limit: 0,
+            execution: Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 512,
+                max_instructions: 16,
+                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+                cache_bytes: 128 * 1024,
+            },
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let budget = batch
+        .checked_mul(5_000_000)
+        .ok_or_else(|| "instruction budget overflowed".to_string())?;
+    let outcome = machine.run(budget).map_err(|error| error.to_string())?;
+    let checksum = match outcome {
+        Rv32MachineOutcome::Halted { exit_code, .. } => exit_code as u32,
+        other => return Err(format!("audit workload did not halt: {other:?}")),
+    };
+    if checksum != EXPECTED_CHECKSUM {
+        return Err(format!(
+            "audit workload checksum mismatch: expected {EXPECTED_CHECKSUM:08x}, actual {checksum:08x}"
+        ));
+    }
+    println!("CK_RESULT\t{checksum:08x}");
+    Ok(())
 }
 
 #[cfg(feature = "dbt-code-audit")]
