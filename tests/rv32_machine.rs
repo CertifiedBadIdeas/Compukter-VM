@@ -105,6 +105,32 @@ fn cached_dbt_initializes_one_context_per_run_call() {
     assert_eq!(machine.dbt_stats().unwrap().context_initializations, 2);
 }
 
+#[cfg(feature = "dbt-translation-timing")]
+#[test]
+fn dbt_phase_timing_accounts_for_every_translation() {
+    let elf = machine_program_elf(&[addi(1, 1, 1), jal(0, -4)]);
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 8,
+                max_instructions: 8,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+            },
+            0,
+        ),
+    )
+    .unwrap();
+
+    machine.run(16).unwrap();
+    let stats = machine.dbt_stats().unwrap();
+    assert!(stats.decode_nanos > 0);
+    assert!(stats.lower_nanos > 0);
+    assert!(stats.publish_nanos > 0);
+    assert_eq!(stats.timed_translations, stats.translations);
+}
+
 #[test]
 fn cached_dbt_finishes_one_block_past_budget_without_debt() {
     let mut words = vec![addi(1, 1, 1); 11];

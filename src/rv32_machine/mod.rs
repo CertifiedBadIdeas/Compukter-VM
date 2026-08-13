@@ -61,4 +61,12 @@ pub struct Rv32DbtStats {
     pub emitted_bytes: u64,
     pub reserved_bytes: usize,
     pub metadata_bytes: usize,
+    #[cfg(feature = "dbt-translation-timing")]
+    pub decode_nanos: u64,
+    #[cfg(feature = "dbt-translation-timing")]
+    pub lower_nanos: u64,
+    #[cfg(feature = "dbt-translation-timing")]
+    pub publish_nanos: u64,
+    #[cfg(feature = "dbt-translation-timing")]
+    pub timed_translations: u64,
 }

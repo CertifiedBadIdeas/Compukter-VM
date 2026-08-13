@@ -91,6 +91,14 @@ pub(crate) struct Rv32DbtExecution {
     emitted_bytes: u64,
     decoded_slots_built: u64,
     generation: u64,
+    #[cfg(feature = "dbt-translation-timing")]
+    decode_nanos: u64,
+    #[cfg(feature = "dbt-translation-timing")]
+    lower_nanos: u64,
+    #[cfg(feature = "dbt-translation-timing")]
+    publish_nanos: u64,
+    #[cfg(feature = "dbt-translation-timing")]
+    timed_translations: u64,
 }
 
 impl Rv32DbtExecution {
@@ -164,6 +172,14 @@ impl Rv32DbtExecution {
             emitted_bytes: 0,
             decoded_slots_built: 0,
             generation: 0,
+            #[cfg(feature = "dbt-translation-timing")]
+            decode_nanos: 0,
+            #[cfg(feature = "dbt-translation-timing")]
+            lower_nanos: 0,
+            #[cfg(feature = "dbt-translation-timing")]
+            publish_nanos: 0,
+            #[cfg(feature = "dbt-translation-timing")]
+            timed_translations: 0,
         })
     }
 
@@ -185,6 +201,11 @@ impl Rv32DbtExecution {
 
     pub(crate) fn decoded_slots(&self) -> &[Rv32ResolvedInstruction] {
         &self.decoded
+    }
+
+    #[cfg(feature = "dbt-translation-timing")]
+    pub(crate) fn record_decode_nanos(&mut self, nanos: u128) {
+        self.decode_nanos = self.decode_nanos.saturating_add(saturating_nanos(nanos));
     }
 
     pub(crate) fn lookup(&mut self, pc: u32, mode: DbtBlockMode) -> Option<PreparedDbtBlock> {
@@ -224,12 +245,18 @@ impl Rv32DbtExecution {
         }
         let input = DbtBlockInput::new(pc, &self.decoded, mode)
             .map_err(|message| Self::fault(DbtFaultKind::Translation, message))?;
+        #[cfg(feature = "dbt-translation-timing")]
+        let lower_started = std::time::Instant::now();
         let block = self.workspace.lower(&input, self.ram_len)?;
+        #[cfg(feature = "dbt-translation-timing")]
+        let lower_nanos = lower_started.elapsed().as_nanos();
         let instruction_count = block.instruction_count();
         let lowered_load_sites = block.lowered_load_sites();
         let lowered_store_sites = block.lowered_store_sites();
         let emitted_bytes = block.code().len() as u64;
 
+        #[cfg(feature = "dbt-translation-timing")]
+        let publish_started = std::time::Instant::now();
         let location = match (&mut self.storage, mode) {
             (Rv32DbtStorage::Direct { scratch, serial }, _) => {
                 scratch.publish(block.code())?;
@@ -259,6 +286,17 @@ impl Rv32DbtExecution {
                 unreachable!("DBT fast mode was validated before lowering")
             }
         };
+
+        #[cfg(feature = "dbt-translation-timing")]
+        {
+            self.lower_nanos = self
+                .lower_nanos
+                .saturating_add(saturating_nanos(lower_nanos));
+            self.publish_nanos = self
+                .publish_nanos
+                .saturating_add(saturating_nanos(publish_started.elapsed().as_nanos()));
+            self.timed_translations = self.timed_translations.saturating_add(1);
+        }
 
         self.translations = self.translations.saturating_add(1);
         self.publications = self.publications.saturating_add(1);
@@ -409,12 +447,25 @@ impl Rv32DbtExecution {
             emitted_bytes: self.emitted_bytes,
             reserved_bytes,
             metadata_bytes,
+            #[cfg(feature = "dbt-translation-timing")]
+            decode_nanos: self.decode_nanos,
+            #[cfg(feature = "dbt-translation-timing")]
+            lower_nanos: self.lower_nanos,
+            #[cfg(feature = "dbt-translation-timing")]
+            publish_nanos: self.publish_nanos,
+            #[cfg(feature = "dbt-translation-timing")]
+            timed_translations: self.timed_translations,
         }
     }
 
     fn fault(kind: DbtFaultKind, message: impl Into<String>) -> DbtFault {
         DbtFault::new(kind, 0, None, message)
     }
+}
+
+#[cfg(feature = "dbt-translation-timing")]
+fn saturating_nanos(nanos: u128) -> u64 {
+    nanos.min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
