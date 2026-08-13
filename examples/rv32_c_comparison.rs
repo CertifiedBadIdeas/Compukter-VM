@@ -19,7 +19,8 @@ use compukter_vm::benchmarks::{
     COMPILATION_PHASE_REPORT_HEADER,
 };
 use compukter_vm::rv32_machine::{
-    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
+    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig,
+    Rv32MachineOutcome, DEFAULT_DBT_CODE_ALIGNMENT,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -93,6 +94,7 @@ enum CandidateKind {
         sets: usize,
         cache_bytes: usize,
         max_instructions: usize,
+        code_alignment: Rv32DbtCodeAlignment,
     },
 }
 
@@ -124,13 +126,21 @@ impl Candidate {
                 sets,
                 cache_bytes,
                 max_instructions,
+                code_alignment,
             } => Some(Rv32ExecutionBackendConfig::CachedDbt {
                 sets,
                 max_instructions,
                 scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
                 cache_bytes,
-                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+                code_alignment,
             }),
+        }
+    }
+
+    const fn dbt_alignment(self) -> Option<Rv32DbtCodeAlignment> {
+        match self.kind {
+            CandidateKind::CachedDbt { code_alignment, .. } => Some(code_alignment),
+            _ => None,
         }
     }
 }
@@ -147,6 +157,7 @@ const fn cached_dbt_candidate(
         sets,
         cache_bytes,
         PRODUCT_DBT_MAX_INSTRUCTIONS,
+        DEFAULT_DBT_CODE_ALIGNMENT,
     )
 }
 
@@ -156,6 +167,7 @@ const fn cached_dbt_candidate_with_block_size(
     sets: usize,
     cache_bytes: usize,
     max_instructions: usize,
+    code_alignment: Rv32DbtCodeAlignment,
 ) -> Candidate {
     Candidate {
         name,
@@ -165,8 +177,24 @@ const fn cached_dbt_candidate_with_block_size(
             sets,
             cache_bytes,
             max_instructions,
+            code_alignment,
         },
     }
+}
+
+const fn cached_dbt_alignment_candidate(
+    name: &'static str,
+    artifact_stem: &'static str,
+    alignment: usize,
+) -> Candidate {
+    cached_dbt_candidate_with_block_size(
+        name,
+        artifact_stem,
+        512,
+        128 * 1024,
+        16,
+        Rv32DbtCodeAlignment::BlockBase(alignment),
+    )
 }
 
 const COMMON_CANDIDATES: [Candidate; 7] = [
@@ -214,7 +242,7 @@ const COMMON_CANDIDATES: [Candidate; 7] = [
     },
 ];
 
-const DBT_MATRIX: [Candidate; 14] = [
+const DBT_MATRIX: [Candidate; 18] = [
     cached_dbt_candidate(
         "rv32-cached-dbt-16k",
         "cached-dbt-16k",
@@ -287,6 +315,7 @@ const DBT_MATRIX: [Candidate; 14] = [
         512,
         128 * 1024,
         16,
+        DEFAULT_DBT_CODE_ALIGNMENT,
     ),
     cached_dbt_candidate_with_block_size(
         "rv32-cached-dbt-block-32",
@@ -294,6 +323,7 @@ const DBT_MATRIX: [Candidate; 14] = [
         512,
         128 * 1024,
         32,
+        DEFAULT_DBT_CODE_ALIGNMENT,
     ),
     cached_dbt_candidate_with_block_size(
         "rv32-cached-dbt-block-64",
@@ -301,6 +331,27 @@ const DBT_MATRIX: [Candidate; 14] = [
         512,
         128 * 1024,
         64,
+        DEFAULT_DBT_CODE_ALIGNMENT,
+    ),
+    cached_dbt_alignment_candidate(
+        "rv32-cached-dbt-align-base-16",
+        "cached-dbt-align-base-16",
+        16,
+    ),
+    cached_dbt_alignment_candidate(
+        "rv32-cached-dbt-align-base-32",
+        "cached-dbt-align-base-32",
+        32,
+    ),
+    cached_dbt_alignment_candidate(
+        "rv32-cached-dbt-align-base-64",
+        "cached-dbt-align-base-64",
+        64,
+    ),
+    cached_dbt_alignment_candidate(
+        "rv32-cached-dbt-align-base-128",
+        "cached-dbt-align-base-128",
+        128,
     ),
 ];
 
@@ -338,6 +389,9 @@ struct ProductDetails {
     dbt_lowered_load_sites: Option<u64>,
     dbt_lowered_store_sites: Option<u64>,
     dbt_emitted_bytes: Option<u64>,
+    dbt_alignment_padding_bytes: Option<u64>,
+    dbt_live_code_bytes: Option<u64>,
+    dbt_code_prefix_bytes: Option<u64>,
     dbt_reserved_bytes: Option<u64>,
     translation_bytes: usize,
     executable_bytes: usize,
@@ -508,7 +562,7 @@ fn run() -> Result<(), String> {
     println!("iterations\t{ITERATIONS}");
     println!("seed\t0x{SEED:08x}");
     println!("warm_samples\t{samples}");
-    println!("dbt_matrix\tcache+sets");
+    println!("dbt_matrix\tcache+sets+alignment");
     println!("qemu_startup_samples\t{STARTUP_SAMPLES}");
     println!("qemu_startup_median_ns\t{startup_median}");
     println!("qemu_target_ns\t{qemu_target}");
@@ -540,7 +594,7 @@ fn run() -> Result<(), String> {
         }
     }
     println!(
-        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\tvs_wasmtime\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes\tdbt_budget_overshoot\tdbt_max_budget_overshoot"
+        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\tvs_wasmtime\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes\tdbt_budget_overshoot\tdbt_max_budget_overshoot\tdbt_code_alignment\tdbt_alignment_anchor\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes"
     );
 
     let normalized = measurements
@@ -573,7 +627,7 @@ fn run() -> Result<(), String> {
         let mode = measurement.candidate.mode;
         let product_candidate = measurement.candidate.product_config().is_some();
         println!(
-            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             measurement.candidate.name,
             mode,
             ITERATIONS,
@@ -622,6 +676,17 @@ fn run() -> Result<(), String> {
             option_u64(product_candidate.then_some(measurement.details.steady_allocated_bytes)),
             option_u64(measurement.details.dbt_budget_overshoot),
             option_u64(measurement.details.dbt_max_budget_overshoot),
+            measurement
+                .candidate
+                .dbt_alignment()
+                .map_or_else(|| "-".to_string(), |value| value.bytes().to_string()),
+            measurement.candidate.dbt_alignment().map_or("-", |value| match value {
+                Rv32DbtCodeAlignment::BlockBase(_) => "block-base",
+                Rv32DbtCodeAlignment::ChainEntry(_) => "chain-entry",
+            }),
+            option_u64(measurement.details.dbt_alignment_padding_bytes),
+            option_u64(measurement.details.dbt_live_code_bytes),
+            option_u64(measurement.details.dbt_code_prefix_bytes),
         );
     }
     #[cfg(feature = "wasmtime-comparison")]
@@ -1334,6 +1399,9 @@ fn run_product(
             dbt_lowered_load_sites: dbt.map(|value| value.lowered_load_sites),
             dbt_lowered_store_sites: dbt.map(|value| value.lowered_store_sites),
             dbt_emitted_bytes: dbt.map(|value| value.emitted_bytes),
+            dbt_alignment_padding_bytes: dbt.map(|value| value.alignment_padding_bytes),
+            dbt_live_code_bytes: dbt.map(|value| value.live_code_bytes as u64),
+            dbt_code_prefix_bytes: dbt.map(|value| value.code_prefix_bytes as u64),
             dbt_reserved_bytes: dbt.map(|value| value.reserved_bytes as u64),
             translation_bytes: machine.translation_bytes(),
             executable_bytes: machine.executable_bytes(),

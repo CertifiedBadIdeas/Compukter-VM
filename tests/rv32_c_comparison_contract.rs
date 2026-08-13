@@ -277,11 +277,14 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     for max_instructions in [16, 32, 64] {
         assert!(source.contains(&format!("rv32-cached-dbt-block-{max_instructions}")));
     }
+    for alignment in [16, 32, 64, 128] {
+        assert!(source.contains(&format!("rv32-cached-dbt-align-base-{alignment}")));
+    }
     assert!(!source.contains("rv32-cached-dbt-32-sets"));
     assert!(!source.contains("rv32-cached-dbt-block-4"));
-    assert!(source.contains("const DBT_MATRIX: [Candidate; 14]"));
+    assert!(source.contains("const DBT_MATRIX: [Candidate; 18]"));
     assert!(source.contains("usage: rv32_c_comparison BUILD_DIR WARM_SAMPLES"));
-    assert!(source.contains("dbt_matrix\\tcache+sets"));
+    assert!(source.contains("dbt_matrix\\tcache+sets+alignment"));
     assert!(!source.contains("cache|sets"));
     assert!(source.contains("product-machine-block-cached"));
     assert!(source.contains("lookup_unit\\tcache_hits\\tcache_misses\\tcache_evictions"));
@@ -296,6 +299,10 @@ fn comparison_runner_keeps_qemu_system_tcg_explicit_and_report_stable() {
     ));
     assert!(source.contains("steady_allocations\\tsteady_allocated_bytes"));
     assert!(source.contains("dbt_budget_overshoot\\tdbt_max_budget_overshoot"));
+    assert!(
+        source.contains("dbt_code_alignment\\tdbt_alignment_anchor\\tdbt_alignment_padding_bytes")
+    );
+    assert!(source.contains("dbt_live_code_bytes\\tdbt_code_prefix_bytes"));
     assert!(source.contains("artifact_stem: Some(\"block-cached\")"));
     assert!(source.contains("artifact_stem: Some(\"direct-dbt\")"));
     assert!(source.contains("cached-dbt-64k"));
@@ -395,7 +402,7 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("rv32-block-cached"));
     assert!(source.contains("rv32-direct-dbt"));
     assert!(source.contains("rv32-cached-dbt"));
-    assert!(source.contains("count == 21"));
+    assert!(source.contains("count == 25"));
     assert!(source.contains("wasmtime-aot"));
     assert!(source.contains("module.cwasm"));
     assert!(source.contains("product-block-cached-calibrated-disassembly.txt"));
@@ -404,6 +411,8 @@ fn focused_qemu_gate_is_not_hidden_behind_a_normal_verification_fallback() {
     assert!(source.contains("for sets in 16 64 128 256 512"));
     assert!(source.contains("for max_instructions in 16 32 64"));
     assert!(source.contains("rv32-cached-dbt-block-${max_instructions}"));
+    assert!(source.contains("for alignment in 16 32 64 128"));
+    assert!(source.contains("rv32-cached-dbt-align-base-${alignment}"));
     assert!(source.contains("product-${candidate}-calibrated-disassembly.txt"));
     assert!(!source.contains("|| true"));
     assert!(!source.contains("qemu-riscv32"));
