@@ -10,7 +10,10 @@
  */
 
 #[cfg(feature = "dbt-code-audit")]
-use compukter_vm::benchmarks::PRODUCT_RAM_BYTES;
+use compukter_vm::benchmarks::{
+    classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_wasmtime_function,
+    DecodedHostInstruction, InstructionGroup, PRODUCT_RAM_BYTES,
+};
 #[cfg(feature = "dbt-code-audit")]
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeSnapshot, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig,
@@ -22,6 +25,24 @@ use std::env;
 use std::fs;
 #[cfg(feature = "dbt-code-audit")]
 use std::path::{Path, PathBuf};
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone)]
+struct AuditBlock {
+    guest_pc: u32,
+    offset: u32,
+    length: u32,
+    guest_instructions: u32,
+    linked_edges: u32,
+    unlinked_edges: u32,
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Default)]
+struct InstructionCounts {
+    groups: [u64; 9],
+    memory_operands: u64,
+}
 
 #[cfg(feature = "dbt-code-audit")]
 const EXPECTED_CHECKSUM: u32 = 0xee05_3d58;
@@ -50,10 +71,14 @@ fn run() -> Result<(), String> {
         args.next()
             .ok_or_else(|| "usage: rv32_c_codegen_audit export BUILD_DIR".to_string())?,
     );
-    if args.next().is_some() || command != "export" {
+    if args.next().is_some() {
         return Err("usage: rv32_c_codegen_audit export BUILD_DIR".to_string());
     }
-    export(&build_dir)
+    match command.to_str() {
+        Some("export") => export(&build_dir),
+        Some("report") => report(&build_dir),
+        _ => Err("usage: rv32_c_codegen_audit <export|report> BUILD_DIR".to_string()),
+    }
 }
 
 #[cfg(feature = "dbt-code-audit")]
@@ -192,9 +217,281 @@ fn assembly_wrapper(snapshot: &Rv32DbtCodeSnapshot, binary_path: &Path) -> Resul
     Ok(output)
 }
 
+#[cfg(feature = "dbt-code-audit")]
+fn report(build_dir: &Path) -> Result<(), String> {
+    let block_report = fs::read_to_string(build_dir.join("dbt-blocks.tsv"))
+        .map_err(|error| format!("failed to read DBT block report: {error}"))?;
+    let blocks = parse_block_report(&block_report)?;
+    let dbt_disassembly = fs::read_to_string(build_dir.join("dbt-disassembly.txt"))
+        .map_err(|error| format!("failed to read DBT disassembly: {error}"))?;
+    let native_disassembly = fs::read_to_string(build_dir.join("native-analysis-disassembly.txt"))
+        .map_err(|error| format!("failed to read native analysis disassembly: {error}"))?;
+    let wasmtime_disassembly = fs::read_to_string(build_dir.join("wasmtime-aot-objdump.txt"))
+        .map_err(|error| format!("failed to read Wasmtime disassembly: {error}"))?;
+
+    let mut dbt_instructions = Vec::new();
+    let mut hot_blocks = Vec::with_capacity(blocks.len());
+    for block in &blocks {
+        let symbol = format!("dbt_pc_{:08x}_off_{:08x}", block.guest_pc, block.offset);
+        let instructions = parse_llvm_symbol(&dbt_disassembly, &symbol)?;
+        hot_blocks.push((block.clone(), instructions.len() as u64));
+        dbt_instructions.extend(instructions);
+    }
+    let native_instructions = parse_llvm_symbol(&native_disassembly, "benchmark_kernel")?;
+    let wasmtime_instructions = parse_wasmtime_function(&wasmtime_disassembly, "benchmark_batch")?;
+
+    hot_blocks.sort_by(|(lhs, lhs_host), (rhs, rhs_host)| {
+        let lhs_ratio = *lhs_host as f64 / f64::from(lhs.guest_instructions);
+        let rhs_ratio = *rhs_host as f64 / f64::from(rhs.guest_instructions);
+        rhs_ratio
+            .total_cmp(&lhs_ratio)
+            .then_with(|| rhs_host.cmp(lhs_host))
+            .then_with(|| lhs.offset.cmp(&rhs.offset))
+    });
+
+    let dbt_code_bytes = blocks.iter().map(|block| u64::from(block.length)).sum();
+    let guest_instructions = blocks
+        .iter()
+        .map(|block| u64::from(block.guest_instructions))
+        .sum();
+    let linked_edges = blocks
+        .iter()
+        .map(|block| u64::from(block.linked_edges))
+        .sum();
+    let unlinked_edges = blocks
+        .iter()
+        .map(|block| u64::from(block.unlinked_edges))
+        .sum();
+    let mut block_sizes = blocks
+        .iter()
+        .map(|block| u64::from(block.length))
+        .collect::<Vec<_>>();
+    block_sizes.sort_unstable();
+    let block_mean = dbt_code_bytes as f64 / blocks.len() as f64;
+
+    let mut output = String::from(
+        "system\tregion\tcode_bytes\thost_instructions\tguest_instructions\thost_per_guest\tbytes_per_guest\tlive_blocks\tblock_mean_bytes\tblock_p50_bytes\tblock_p95_bytes\tblock_max_bytes\tlinked_edges\tunlinked_edges\tmemory_operands\tmove\tconditional_branch\tunconditional_branch\tarithmetic_logical\tshift_rotate\tmultiply_divide\tcall_return\tvector\tother\n",
+    );
+    output.push_str(&metric_row(
+        "rv32-cached-dbt",
+        "live-resident-blocks",
+        Some(dbt_code_bytes),
+        &dbt_instructions,
+        Some(guest_instructions),
+        Some(blocks.len() as u64),
+        Some(block_mean),
+        Some(percentile(&block_sizes, 50)),
+        Some(percentile(&block_sizes, 95)),
+        block_sizes.last().copied(),
+        Some(linked_edges),
+        Some(unlinked_edges),
+    ));
+    output.push_str(&metric_row(
+        "native-analysis-object",
+        "benchmark_kernel-O3-no-LTO",
+        Some(encoded_bytes(&native_instructions)?),
+        &native_instructions,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    output.push_str(&metric_row(
+        "wasmtime-aot",
+        "benchmark_batch",
+        None,
+        &wasmtime_instructions,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    output.push_str("\ndbt_hot_blocks\n");
+    output.push_str("rank\tguest_pc\toffset\tbytes\tguest_instructions\thost_instructions\thost_per_guest\tlinked_edges\tunlinked_edges\n");
+    for (rank, (block, host_instructions)) in hot_blocks.iter().enumerate() {
+        output.push_str(&format!(
+            "{}\t{:08x}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\n",
+            rank + 1,
+            block.guest_pc,
+            block.offset,
+            block.length,
+            block.guest_instructions,
+            host_instructions,
+            *host_instructions as f64 / f64::from(block.guest_instructions),
+            block.linked_edges,
+            block.unlinked_edges
+        ));
+    }
+    fs::write(build_dir.join("codegen-report.tsv"), &output)
+        .map_err(|error| format!("failed to write codegen report: {error}"))?;
+    print!("{output}");
+    Ok(())
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn parse_block_report(input: &str) -> Result<Vec<AuditBlock>, String> {
+    let mut blocks = Vec::<AuditBlock>::new();
+    for line in input.lines().skip(1) {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() != 11 {
+            return Err(format!("invalid DBT block row: {line}"));
+        }
+        let guest_pc = u32::from_str_radix(columns[0], 16)
+            .map_err(|error| format!("invalid guest PC: {error}"))?;
+        let offset = columns[2]
+            .parse::<u32>()
+            .map_err(|error| format!("invalid block offset: {error}"))?;
+        if blocks
+            .last()
+            .is_none_or(|block| block.guest_pc != guest_pc || block.offset != offset)
+        {
+            blocks.push(AuditBlock {
+                guest_pc,
+                offset,
+                length: columns[3]
+                    .parse()
+                    .map_err(|error| format!("invalid block length: {error}"))?,
+                guest_instructions: columns[5]
+                    .parse()
+                    .map_err(|error| format!("invalid guest instruction count: {error}"))?,
+                linked_edges: 0,
+                unlinked_edges: 0,
+            });
+        }
+        if columns[10] == "1" {
+            blocks.last_mut().unwrap().linked_edges += 1;
+        } else if columns[10] == "0" {
+            blocks.last_mut().unwrap().unlinked_edges += 1;
+        } else if columns[10] != "-" {
+            return Err(format!("invalid linked state: {}", columns[10]));
+        }
+    }
+    if blocks.is_empty() {
+        return Err("DBT block report contains no blocks".to_string());
+    }
+    if !blocks.windows(2).all(|pair| {
+        pair[0]
+            .offset
+            .checked_add(pair[0].length)
+            .is_some_and(|end| end <= pair[1].offset)
+    }) {
+        return Err("DBT block rows are unsorted or overlapping".to_string());
+    }
+    Ok(blocks)
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn metric_row(
+    system: &str,
+    region: &str,
+    code_bytes: Option<u64>,
+    instructions: &[DecodedHostInstruction],
+    guest_instructions: Option<u64>,
+    live_blocks: Option<u64>,
+    block_mean: Option<f64>,
+    block_p50: Option<u64>,
+    block_p95: Option<u64>,
+    block_max: Option<u64>,
+    linked_edges: Option<u64>,
+    unlinked_edges: Option<u64>,
+) -> String {
+    let counts = instruction_counts(instructions);
+    let host = instructions.len() as u64;
+    let host_per_guest = guest_instructions.map(|guest| host as f64 / guest as f64);
+    let bytes_per_guest = code_bytes
+        .zip(guest_instructions)
+        .map(|(bytes, guest)| bytes as f64 / guest as f64);
+    format!(
+        "{system}\t{region}\t{}\t{host}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        option_u64(code_bytes),
+        option_u64(guest_instructions),
+        option_f64(host_per_guest),
+        option_f64(bytes_per_guest),
+        option_u64(live_blocks),
+        option_f64(block_mean),
+        option_u64(block_p50),
+        option_u64(block_p95),
+        option_u64(block_max),
+        option_u64(linked_edges),
+        option_u64(unlinked_edges),
+        counts.memory_operands,
+        counts.groups[0],
+        counts.groups[1],
+        counts.groups[2],
+        counts.groups[3],
+        counts.groups[4],
+        counts.groups[5],
+        counts.groups[6],
+        counts.groups[7],
+        counts.groups[8],
+    )
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn instruction_counts(instructions: &[DecodedHostInstruction]) -> InstructionCounts {
+    let mut counts = InstructionCounts::default();
+    for instruction in instructions {
+        if has_x86_memory_operand(&instruction.operands) {
+            counts.memory_operands += 1;
+        }
+        let index = match classify_x86_instruction(&instruction.mnemonic) {
+            InstructionGroup::Move => 0,
+            InstructionGroup::ConditionalBranch => 1,
+            InstructionGroup::UnconditionalBranch => 2,
+            InstructionGroup::ArithmeticLogical => 3,
+            InstructionGroup::ShiftRotate => 4,
+            InstructionGroup::MultiplyDivide => 5,
+            InstructionGroup::CallReturn => 6,
+            InstructionGroup::Vector => 7,
+            InstructionGroup::Other => 8,
+        };
+        counts.groups[index] += 1;
+    }
+    counts
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn encoded_bytes(instructions: &[DecodedHostInstruction]) -> Result<u64, String> {
+    instructions.iter().try_fold(0_u64, |total, instruction| {
+        instruction
+            .encoded_bytes
+            .ok_or_else(|| "LLVM instruction is missing encoded bytes".to_string())
+            .and_then(|bytes| {
+                total
+                    .checked_add(bytes as u64)
+                    .ok_or_else(|| "encoded byte total overflowed".to_string())
+            })
+    })
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn percentile(sorted: &[u64], percentile: usize) -> u64 {
+    let index = (sorted.len() * percentile).div_ceil(100).saturating_sub(1);
+    sorted[index]
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn option_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn option_f64(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| format!("{value:.6}"))
+}
+
 #[cfg(all(test, feature = "dbt-code-audit"))]
 mod tests {
-    use super::assembly_wrapper;
+    use super::{assembly_wrapper, instruction_counts, metric_row, parse_block_report};
+    use compukter_vm::benchmarks::{DecodedHostInstruction, InstructionGroup};
     use compukter_vm::rv32_machine::{Rv32DbtCodeBlock, Rv32DbtCodeSnapshot};
 
     #[test]
@@ -219,5 +516,49 @@ mod tests {
         assert!(assembly.contains(", 0, 4\n"));
         assert!(assembly.contains(", 4, 4\n"));
         assert!(assembly.contains(", 8, 4\n"));
+    }
+
+    #[test]
+    fn report_counts_every_instruction_once_and_rejects_overlaps() {
+        let instructions = vec![
+            DecodedHostInstruction {
+                address: 0,
+                encoded_bytes: Some(2),
+                mnemonic: "movl".to_string(),
+                operands: "%eax, (%rdi)".to_string(),
+            },
+            DecodedHostInstruction {
+                address: 2,
+                encoded_bytes: Some(1),
+                mnemonic: "retq".to_string(),
+                operands: String::new(),
+            },
+        ];
+        let counts = instruction_counts(&instructions);
+        assert_eq!(counts.groups.iter().sum::<u64>(), 2);
+        assert_eq!(counts.groups[InstructionGroup::Move as usize], 1);
+        assert_eq!(counts.memory_operands, 1);
+        assert_eq!(
+            metric_row(
+                "x",
+                "y",
+                Some(3),
+                &instructions,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .split('\t')
+            .count(),
+            24
+        );
+
+        let overlap = "header\n00001000\t0\t0\t8\t0\t1\t-\t-\t-\t-\t-\n00001004\t0\t4\t8\t4\t1\t-\t-\t-\t-\t-\n";
+        assert!(parse_block_report(overlap).is_err());
     }
 }
