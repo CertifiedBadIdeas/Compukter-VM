@@ -26,10 +26,14 @@ use super::Rv32DbtCodeAlignment;
 use super::Rv32DbtStats;
 #[cfg(feature = "dbt-code-audit")]
 use super::{Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError};
+#[cfg(feature = "dbt-execution-profile")]
+use super::{Rv32DbtExecutionProfile, Rv32DbtProfileError};
 use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
 use crate::rv32_dbt::code_cache::{DbtCacheHit, DbtCacheKey, DirectDbtCodeCache};
 use crate::rv32_dbt::executable::ExecutableScratch;
+#[cfg(feature = "dbt-execution-profile")]
+use crate::rv32_dbt::profile::ExactDbtProfile;
 use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 use crate::rv32im::Rv32ResolvedInstruction;
@@ -75,6 +79,8 @@ enum Rv32DbtStorage {
         cache: DirectDbtCodeCache,
         bounded_scratch: ExecutableScratch,
         scratch_serial: u64,
+        #[cfg(feature = "dbt-execution-profile")]
+        profile: Option<ExactDbtProfile>,
     },
 }
 
@@ -166,6 +172,8 @@ impl Rv32DbtExecution {
                 cache: DirectDbtCodeCache::new_with_alignment(sets, cache_bytes, code_alignment)?,
                 bounded_scratch: ExecutableScratch::new(scratch_bytes)?,
                 scratch_serial: 0,
+                #[cfg(feature = "dbt-execution-profile")]
+                profile: None,
             },
         };
         Ok(Self {
@@ -203,6 +211,45 @@ impl Rv32DbtExecution {
 
     pub(crate) const fn max_instructions(&self) -> usize {
         self.max_instructions
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn enable_execution_profile(
+        &mut self,
+        capacity: usize,
+    ) -> Result<(), Rv32DbtProfileError> {
+        if self.translations != 0 {
+            return Err(Rv32DbtProfileError::new(
+                "DBT execution profiling must be enabled before the first translation",
+            ));
+        }
+        let Rv32DbtStorage::Cached { profile, .. } = &mut self.storage else {
+            return Err(Rv32DbtProfileError::new(
+                "DBT execution profiling requires the Cached DBT backend",
+            ));
+        };
+        if profile.is_some() {
+            return Err(Rv32DbtProfileError::new(
+                "DBT execution profiling is already enabled",
+            ));
+        }
+        *profile = Some(
+            ExactDbtProfile::new(capacity)
+                .map_err(|error| Rv32DbtProfileError::new(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub(crate) fn execution_profile(
+        &self,
+    ) -> Result<Option<Rv32DbtExecutionProfile>, Rv32DbtProfileError> {
+        let Rv32DbtStorage::Cached { profile, .. } = &self.storage else {
+            return Err(Rv32DbtProfileError::new(
+                "DBT execution profiling requires the Cached DBT backend",
+            ));
+        };
+        Ok(profile.as_ref().map(ExactDbtProfile::snapshot))
     }
 
     #[cfg(feature = "dbt-code-audit")]
@@ -436,7 +483,7 @@ impl Rv32DbtExecution {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         let stats = self.stats();
-        stats
+        let retained = stats
             .reserved_bytes
             .saturating_add(stats.metadata_bytes)
             .saturating_add(
@@ -444,7 +491,16 @@ impl Rv32DbtExecution {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Rv32ResolvedInstruction>()),
             )
-            .saturating_add(self.workspace.retained_bytes())
+            .saturating_add(self.workspace.retained_bytes());
+        #[cfg(feature = "dbt-execution-profile")]
+        let retained = retained.saturating_add(match &self.storage {
+            Rv32DbtStorage::Cached {
+                profile: Some(profile),
+                ..
+            } => profile.retained_bytes(),
+            _ => 0,
+        });
+        retained
     }
 
     pub(crate) fn stats(&self) -> Rv32DbtStats {

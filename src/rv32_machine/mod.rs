@@ -84,6 +84,22 @@ pub struct Rv32DbtExecutionProfile {
     pub counter_overflowed: bool,
 }
 
+#[cfg(feature = "dbt-execution-profile")]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct Rv32DbtProfileError {
+    message: String,
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+impl Rv32DbtProfileError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 #[cfg(feature = "dbt-code-audit")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rv32DbtCodeSnapshot {

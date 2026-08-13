@@ -147,7 +147,7 @@ impl ExactDbtProfile {
         }
     }
 
-    fn retained_bytes(&self) -> usize {
+    pub(crate) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(
             self.slots
                 .len()

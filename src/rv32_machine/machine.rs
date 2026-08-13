@@ -770,6 +770,33 @@ impl Rv32Machine {
         None
     }
 
+    #[cfg(feature = "dbt-execution-profile")]
+    pub fn enable_dbt_execution_profile(
+        &mut self,
+        capacity: usize,
+    ) -> Result<(), super::Rv32DbtProfileError> {
+        #[cfg(target_arch = "x86_64")]
+        if let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution {
+            return execution.enable_execution_profile(capacity);
+        }
+        Err(super::Rv32DbtProfileError::new(
+            "DBT execution profiling requires the Cached DBT backend",
+        ))
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    pub fn dbt_execution_profile(
+        &self,
+    ) -> Result<Option<super::Rv32DbtExecutionProfile>, super::Rv32DbtProfileError> {
+        #[cfg(target_arch = "x86_64")]
+        if let Rv32ExecutionBackend::Dbt(execution) = &self.execution {
+            return execution.execution_profile();
+        }
+        Err(super::Rv32DbtProfileError::new(
+            "DBT execution profiling requires the Cached DBT backend",
+        ))
+    }
+
     #[cfg(feature = "dbt-code-audit")]
     pub fn dbt_code_snapshot(
         &self,
