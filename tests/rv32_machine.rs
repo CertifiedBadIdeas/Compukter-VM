@@ -105,6 +105,60 @@ fn cached_dbt_initializes_one_context_per_run_call() {
     assert_eq!(machine.dbt_stats().unwrap().context_initializations, 2);
 }
 
+#[cfg(feature = "dbt-code-audit")]
+#[test]
+fn cached_dbt_snapshot_owns_final_linked_code() {
+    let elf = machine_program_elf(&[addi(1, 1, 1), jal(0, -4)]);
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 8,
+                max_instructions: 8,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+            },
+            0,
+        ),
+    )
+    .unwrap();
+
+    machine.run(16).unwrap();
+    let snapshot = machine.dbt_code_snapshot().unwrap().unwrap();
+    assert!(!snapshot.used_bytes.is_empty());
+    assert!(snapshot
+        .blocks
+        .windows(2)
+        .all(|pair| pair[0].offset < pair[1].offset));
+    assert!(snapshot
+        .blocks
+        .iter()
+        .flat_map(|block| &block.edges)
+        .any(|edge| edge.linked));
+
+    drop(machine);
+    assert!(snapshot.blocks.iter().all(|block| {
+        usize::try_from(block.offset)
+            .ok()
+            .zip(usize::try_from(block.length).ok())
+            .and_then(|(offset, length)| offset.checked_add(length))
+            .is_some_and(|end| end <= snapshot.used_bytes.len())
+    }));
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[test]
+fn non_dbt_backend_has_no_code_snapshot() {
+    let elf = machine_program_elf(&[jal(0, 0)]);
+    let machine = Rv32Machine::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+    )
+    .unwrap();
+
+    assert!(machine.dbt_code_snapshot().unwrap().is_none());
+}
+
 #[cfg(feature = "dbt-translation-timing")]
 #[test]
 fn dbt_phase_timing_is_disabled_by_default() {

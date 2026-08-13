@@ -20,6 +20,10 @@
 use super::block::{DbtBlockMode, TranslatedBlock, MAX_STATIC_LINKS};
 use super::executable::ExecutableMapping;
 use super::{DbtFault, DbtFaultKind};
+#[cfg(feature = "dbt-code-audit")]
+use crate::rv32_machine::{
+    Rv32DbtCodeBlock, Rv32DbtCodeEdge, Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError,
+};
 
 const WAYS: usize = 2;
 const CODE_ALIGNMENT: usize = 16;
@@ -272,6 +276,97 @@ impl DirectDbtCodeCache {
             .sum()
     }
 
+    #[cfg(feature = "dbt-code-audit")]
+    pub(crate) fn snapshot(
+        &self,
+        generation: u64,
+    ) -> Result<Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError> {
+        let mut entries = self
+            .sets
+            .iter()
+            .flat_map(|set| set.ways.iter())
+            .filter(|entry| entry.valid)
+            .copied()
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|entry| (entry.offset, entry.key.pc));
+
+        let mut previous_end = 0_usize;
+        let mut blocks = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.key.generation != generation {
+                return Err(Rv32DbtCodeSnapshotError::new(format!(
+                    "live DBT block generation {} differs from current {generation}",
+                    entry.key.generation
+                )));
+            }
+            let end = entry.offset.checked_add(entry.length).ok_or_else(|| {
+                Rv32DbtCodeSnapshotError::new("live DBT block range overflows host address space")
+            })?;
+            if entry.length == 0 || end > self.mapping.capacity() || entry.offset < previous_end {
+                return Err(Rv32DbtCodeSnapshotError::new(format!(
+                    "invalid live DBT block range {}..{end}",
+                    entry.offset
+                )));
+            }
+            let chain_entry = entry
+                .offset
+                .checked_add(entry.chain_entry_offset as usize)
+                .filter(|offset| *offset < end)
+                .ok_or_else(|| Rv32DbtCodeSnapshotError::new("invalid DBT chain entry offset"))?;
+            let mut edges = Vec::with_capacity(entry.link_count as usize);
+            for link in &entry.links[..entry.link_count as usize] {
+                let displacement = entry
+                    .offset
+                    .checked_add(link.displacement_offset as usize)
+                    .filter(|offset| {
+                        offset
+                            .checked_add(4)
+                            .is_some_and(|end| end <= entry.offset + entry.length)
+                    })
+                    .ok_or_else(|| {
+                        Rv32DbtCodeSnapshotError::new("invalid DBT link displacement")
+                    })?;
+                let reset = entry
+                    .offset
+                    .checked_add(link.reset_target_offset as usize)
+                    .filter(|offset| *offset < end)
+                    .ok_or_else(|| Rv32DbtCodeSnapshotError::new("invalid DBT reset target"))?;
+                edges.push(Rv32DbtCodeEdge {
+                    target_pc: link.target_pc,
+                    displacement_offset: u32::try_from(displacement).map_err(|_| {
+                        Rv32DbtCodeSnapshotError::new("DBT displacement exceeds u32")
+                    })?,
+                    reset_target_offset: u32::try_from(reset).map_err(|_| {
+                        Rv32DbtCodeSnapshotError::new("DBT reset target exceeds u32")
+                    })?,
+                    linked: link.linked,
+                });
+            }
+            blocks.push(Rv32DbtCodeBlock {
+                guest_pc: entry.key.pc,
+                generation: entry.key.generation,
+                offset: u32::try_from(entry.offset)
+                    .map_err(|_| Rv32DbtCodeSnapshotError::new("DBT offset exceeds u32"))?,
+                length: u32::try_from(entry.length)
+                    .map_err(|_| Rv32DbtCodeSnapshotError::new("DBT length exceeds u32"))?,
+                chain_entry_offset: u32::try_from(chain_entry)
+                    .map_err(|_| Rv32DbtCodeSnapshotError::new("DBT chain entry exceeds u32"))?,
+                guest_instruction_count: entry.instruction_count,
+                edges,
+            });
+            previous_end = end;
+        }
+        let used_bytes = self
+            .mapping
+            .snapshot_prefix(previous_end)
+            .map_err(|error| Rv32DbtCodeSnapshotError::new(error.to_string()))?;
+        Ok(Rv32DbtCodeSnapshot {
+            generation,
+            used_bytes,
+            blocks,
+        })
+    }
+
     fn set_index(&self, key: DbtCacheKey) -> usize {
         let pc = u64::from(key.pc >> 2);
         let mixed = pc ^ key.generation ^ key.generation.rotate_left(23);
@@ -453,6 +548,8 @@ mod tests {
     };
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
+    #[cfg(feature = "dbt-code-audit")]
+    use std::collections::BTreeSet;
 
     const PAGE_BYTES: usize = 4096;
 
@@ -496,6 +593,66 @@ mod tests {
     unsafe fn execute(entry: *const u8) -> u32 {
         let entry: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(entry) };
         unsafe { entry() }
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn snapshot_contains_only_live_entries_and_resolved_link_bytes() {
+        let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
+        let source_key = DbtCacheKey::new(0x1000, 0);
+        let target_key = DbtCacheKey::new(0x1004, 0);
+        let eviction_keys = [0x1008, 0x1018, 0x1028].map(|pc| DbtCacheKey::new(pc, 0));
+        let (source_code, link) = source_link(target_key.pc);
+
+        cache
+            .publish(
+                source_key,
+                &block_with_links(0x1000, &source_code, 5, &[link]),
+            )
+            .unwrap();
+        cache
+            .publish(target_key, &block(0x1004, &returning(9)))
+            .unwrap();
+        for (index, key) in eviction_keys.into_iter().enumerate() {
+            cache
+                .publish(key, &block(key.pc, &returning(11 + index as u32)))
+                .unwrap();
+        }
+
+        let snapshot = cache.snapshot(0).unwrap();
+        let pcs = snapshot
+            .blocks
+            .iter()
+            .map(|block| block.guest_pc)
+            .collect::<BTreeSet<_>>();
+        assert!(pcs.contains(&source_key.pc));
+        assert!(pcs.contains(&target_key.pc));
+        assert_eq!(
+            pcs.intersection(&BTreeSet::from(eviction_keys.map(|key| key.pc)))
+                .count(),
+            2
+        );
+
+        if let (Some(source), Some(target)) = (
+            snapshot
+                .blocks
+                .iter()
+                .find(|block| block.guest_pc == source_key.pc),
+            snapshot
+                .blocks
+                .iter()
+                .find(|block| block.guest_pc == target_key.pc),
+        ) {
+            let edge = source.edges.iter().find(|edge| edge.linked).unwrap();
+            let displacement_offset = edge.displacement_offset as usize;
+            let displacement = i32::from_le_bytes(
+                snapshot.used_bytes[displacement_offset..displacement_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let resolved = (displacement_offset + 4) as i64 + i64::from(displacement);
+            assert_eq!(resolved, i64::from(target.chain_entry_offset));
+        }
     }
 
     fn bounded_block(pc: u32) -> TranslatedBlock<'static> {

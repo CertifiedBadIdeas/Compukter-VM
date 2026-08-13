@@ -23,6 +23,8 @@
 )]
 
 use super::Rv32DbtStats;
+#[cfg(feature = "dbt-code-audit")]
+use super::{Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError};
 use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
 use crate::rv32_dbt::code_cache::{DbtCacheHit, DbtCacheKey, DirectDbtCodeCache};
@@ -189,6 +191,16 @@ impl Rv32DbtExecution {
 
     pub(crate) const fn max_instructions(&self) -> usize {
         self.max_instructions
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    pub(crate) fn code_snapshot(
+        &self,
+    ) -> Result<Option<Rv32DbtCodeSnapshot>, Rv32DbtCodeSnapshotError> {
+        match &self.storage {
+            Rv32DbtStorage::Direct { .. } => Ok(None),
+            Rv32DbtStorage::Cached { cache, .. } => cache.snapshot(self.generation).map(Some),
+        }
     }
 
     pub(crate) const fn fast_mode(&self) -> DbtBlockMode {
