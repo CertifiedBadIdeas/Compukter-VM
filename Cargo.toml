@@ -9,12 +9,15 @@ crate-type = ["rlib"]
 [features]
 default = []
 dbt-chain-stats = []
+dbt-translation-timing = []
+wasmtime-comparison = ["dep:wasmtime", "dbt-translation-timing"]
 
 [dependencies]
 rvsim = { version = "=0.2.2", default-features = false }
 thiserror = "1.0"
 memmap2 = "=0.9.9"
 libc = "=0.2.189"
+wasmtime = { version = "=47.0.3", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [profile.release]
 codegen-units = 1

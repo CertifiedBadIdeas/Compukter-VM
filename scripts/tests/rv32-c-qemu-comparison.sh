@@ -41,11 +41,13 @@ fi
 
 RV32_C_PRODUCT_ELF="$BUILD_DIR/product.elf" \
     cargo test --manifest-path "$ROOT/Cargo.toml" \
+    --features wasmtime-comparison \
     --test rv32_c_comparison_contract \
     product_c_artifact_matches_the_fixed_native_and_qemu_oracle \
     --locked --offline -- --ignored --exact
 
 cargo run --manifest-path "$ROOT/Cargo.toml" --release \
+    --features wasmtime-comparison \
     --example rv32_c_comparison --locked --offline -- "$BUILD_DIR" 21 \
     | tee "$BUILD_DIR/report.tsv"
 
