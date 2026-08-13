@@ -766,7 +766,7 @@ mod tests {
     #[cfg(feature = "dbt-code-audit")]
     use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
     use crate::rv32_dbt::DbtFaultKind;
-    use crate::rv32_machine::Rv32DbtCodeAlignment;
+    use crate::rv32_machine::{Rv32DbtCodeAlignment, DEFAULT_DBT_CODE_ALIGNMENT};
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
     #[cfg(feature = "dbt-code-audit")]
     use std::collections::BTreeSet;
@@ -994,14 +994,17 @@ mod tests {
     }
 
     #[test]
-    fn published_guest_blocks_start_on_host_cache_lines() {
+    fn published_guest_blocks_honor_the_default_alignment() {
         let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
         let key = DbtCacheKey::new(0x1000, 0);
 
         cache.publish(key, &block(key.pc, &returning(7))).unwrap();
         let (set, way) = cache.find_entry(key).unwrap();
 
-        assert_eq!(cache.sets[set].ways[way].offset % 64, 0);
+        assert_eq!(
+            cache.sets[set].ways[way].offset % DEFAULT_DBT_CODE_ALIGNMENT.bytes(),
+            0
+        );
     }
 
     #[test]
