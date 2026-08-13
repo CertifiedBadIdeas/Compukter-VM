@@ -84,6 +84,7 @@ struct Resident {
 pub(crate) struct LocalLoopRegisterPlan {
     guests: [usize; CHAINABLE_HOST_POOL.len()],
     len: usize,
+    written: u32,
 }
 
 impl LocalLoopRegisterPlan {
@@ -124,10 +125,19 @@ impl RegisterCache {
     pub(crate) fn local_loop_plan(
         slots: &[Rv32ResolvedInstruction],
     ) -> Option<LocalLoopRegisterPlan> {
-        let referenced = slots.iter().copied().fold(0_u32, |mask, slot| {
-            let access = instruction_access(slot);
-            mask | access.reads | access.writes
-        }) & !1;
+        let access = slots
+            .iter()
+            .copied()
+            .fold(RegisterAccess::default(), |combined, slot| {
+                let access = instruction_access(slot);
+                RegisterAccess {
+                    reads: combined.reads | access.reads,
+                    writes: combined.writes | access.writes,
+                    may_exit_before_write: combined.may_exit_before_write
+                        || access.may_exit_before_write,
+                }
+            });
+        let referenced = (access.reads | access.writes) & !1;
         if referenced.count_ones() as usize > CHAINABLE_HOST_POOL.len() {
             return None;
         }
@@ -139,7 +149,11 @@ impl RegisterCache {
                 len += 1;
             }
         }
-        Some(LocalLoopRegisterPlan { guests, len })
+        Some(LocalLoopRegisterPlan {
+            guests,
+            len,
+            written: access.writes & !1,
+        })
     }
 
     pub(crate) fn preload_local_loop(
@@ -151,6 +165,12 @@ impl RegisterCache {
         debug_assert!(self.is_chainable());
         for guest in plan.guests() {
             self.read(*guest, slots, &[], out)?;
+            if plan.written & (1_u32 << guest) != 0 {
+                self.entries[self.index_of(*guest).unwrap()]
+                    .as_mut()
+                    .unwrap()
+                    .dirty = true;
+            }
         }
         Ok(())
     }
