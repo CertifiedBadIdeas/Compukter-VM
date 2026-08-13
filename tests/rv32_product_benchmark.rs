@@ -61,6 +61,32 @@ fn product_image_accepts_an_explicit_execution_configuration() {
 }
 
 #[test]
+fn every_product_workload_executes_at_each_base_alignment() {
+    for workload in ProductMachineWorkload::all() {
+        let image = ProductMachineImage::new(*workload, 4).unwrap();
+        for bytes in [16, 32, 64, 128] {
+            let execution = Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 512,
+                max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+                cache_bytes: PRODUCT_DBT_CODE_BYTES,
+                code_alignment: Rv32DbtCodeAlignment::BlockBase(bytes),
+            };
+            let mut machines = image
+                .prepare_batch_with_execution(ProductMachineBackend::CachedDbt, execution, 1)
+                .unwrap();
+            let observation = execute_product_machine_batch(&mut machines).unwrap();
+
+            assert_eq!(observation.workload, *workload);
+            let stats = observation.dbt_stats.unwrap();
+            assert!(stats.alignment_padding_bytes > 0);
+            assert!(stats.live_code_bytes > 0);
+            assert!(stats.code_prefix_bytes >= stats.live_code_bytes);
+        }
+    }
+}
+
+#[test]
 fn all_vm_backends_use_identical_strict_elf() {
     for workload in ProductMachineWorkload::all() {
         let image = ProductMachineImage::new(*workload, 17).unwrap();

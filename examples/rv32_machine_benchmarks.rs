@@ -27,6 +27,9 @@ use compukter_vm::benchmarks::{
     PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS,
     PRODUCT_DEBUG_LIMIT, PRODUCT_RAM_BYTES, PRODUCT_RESIDENT_REPORT_HEADER,
 };
+use compukter_vm::rv32_machine::{
+    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, DEFAULT_DBT_SCRATCH_BYTES,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -98,7 +101,21 @@ fn grow_live(bytes: usize) {
 
 fn main() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
-    let iterations = parse_positive("iterations", arguments.next())?;
+    let first = arguments
+        .next()
+        .ok_or_else(|| "missing iterations or mode".to_string())?;
+    if first == "alignment-sweep" {
+        let iterations = parse_positive("iterations", arguments.next())?;
+        let warm_samples = parse_positive("warm_samples", arguments.next())?.max(21) as usize;
+        if arguments.next().is_some() {
+            return Err(
+                "usage: rv32_machine_benchmarks alignment-sweep <iterations> <warm_samples>"
+                    .to_string(),
+            );
+        }
+        return run_alignment_sweep(iterations, warm_samples);
+    }
+    let iterations = parse_positive("iterations", Some(first))?;
     let warm_samples = parse_positive("warm_samples", arguments.next())?.max(21) as usize;
     let resident_samples = parse_positive("resident_samples", arguments.next())?.max(7) as usize;
     if arguments.next().is_some() {
@@ -112,6 +129,190 @@ fn main() -> Result<(), String> {
     print_active_report(iterations, warm_samples, &active);
     let resident = measure_resident(iterations, resident_samples)?;
     print_resident_report(iterations, resident_samples, &resident);
+    Ok(())
+}
+
+const BASE_ALIGNMENTS: [usize; 4] = [16, 32, 64, 128];
+const ALIGNMENT_DBT_CACHE_SETS: usize = 512;
+
+struct AlignmentMeasurement {
+    workload: ProductMachineWorkload,
+    alignment: usize,
+    batch: u64,
+    construction_nanos: Vec<u128>,
+    execution_nanos: Vec<u128>,
+    observation: Option<ProductMachineObservation>,
+    steady_allocations: u64,
+    steady_allocated_bytes: u64,
+}
+
+fn alignment_execution(alignment: usize) -> Rv32ExecutionBackendConfig {
+    Rv32ExecutionBackendConfig::CachedDbt {
+        sets: ALIGNMENT_DBT_CACHE_SETS,
+        max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+        scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+        cache_bytes: PRODUCT_DBT_CODE_BYTES,
+        code_alignment: Rv32DbtCodeAlignment::BlockBase(alignment),
+    }
+}
+
+fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), String> {
+    let mut completed = Vec::with_capacity(ProductMachineWorkload::all().len() * 4);
+    for (workload_index, workload) in ProductMachineWorkload::all().iter().copied().enumerate() {
+        let image = ProductMachineImage::new(workload, iterations)?;
+        let mut measurements = BASE_ALIGNMENTS.map(|alignment| AlignmentMeasurement {
+            workload,
+            alignment,
+            batch: 1,
+            construction_nanos: Vec::with_capacity(warm_samples),
+            execution_nanos: Vec::with_capacity(warm_samples),
+            observation: None,
+            steady_allocations: 0,
+            steady_allocated_bytes: 0,
+        });
+
+        for measurement in &mut measurements {
+            let mut probe = image.prepare_with_execution(
+                ProductMachineBackend::CachedDbt,
+                alignment_execution(measurement.alignment),
+            )?;
+            let started = Instant::now();
+            probe.execute()?;
+            measurement.batch = product_machine_batch(started.elapsed().as_nanos());
+        }
+
+        for sample_index in 0..warm_samples {
+            for candidate_index in benchmark_rotating_order::<4>(workload_index, sample_index) {
+                let measurement = &mut measurements[candidate_index];
+                let construction_started = Instant::now();
+                let mut machines = image.prepare_batch_with_execution(
+                    ProductMachineBackend::CachedDbt,
+                    alignment_execution(measurement.alignment),
+                    measurement.batch,
+                )?;
+                measurement
+                    .construction_nanos
+                    .push(construction_started.elapsed().as_nanos());
+
+                ALLOCATIONS.store(0, Ordering::Relaxed);
+                ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+                let execution_started = Instant::now();
+                let observation = execute_product_machine_batch(&mut machines)?;
+                measurement
+                    .execution_nanos
+                    .push(execution_started.elapsed().as_nanos());
+                let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+                let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+                measurement.steady_allocations = measurement.steady_allocations.max(allocations);
+                measurement.steady_allocated_bytes =
+                    measurement.steady_allocated_bytes.max(allocated_bytes);
+                measurement.observation = Some(observation);
+            }
+        }
+
+        for measurement in &mut measurements {
+            measurement.construction_nanos.sort_unstable();
+            measurement.execution_nanos.sort_unstable();
+            if measurement.steady_allocations != 0 || measurement.steady_allocated_bytes != 0 {
+                return Err(format!(
+                    "{} block-base-{} allocated during execution: {} allocations, {} bytes",
+                    measurement.workload.name(),
+                    measurement.alignment,
+                    measurement.steady_allocations,
+                    measurement.steady_allocated_bytes,
+                ));
+            }
+        }
+        completed.extend(measurements);
+    }
+    print_alignment_report(iterations, warm_samples, &completed)
+}
+
+fn normalized_percentile(values: &[u128], percentile: usize, batch: u64) -> Result<f64, String> {
+    benchmark_normalize_nanos(product_percentile(values, percentile), batch)
+}
+
+fn print_alignment_report(
+    iterations: u32,
+    warm_samples: usize,
+    rows: &[AlignmentMeasurement],
+) -> Result<(), String> {
+    println!("RV32 Cached DBT code-alignment sweep");
+    println!("iterations\t{iterations}");
+    println!("warm_samples\t{warm_samples}");
+    println!("dbt_cache_sets\t{ALIGNMENT_DBT_CACHE_SETS}");
+    println!("dbt_max_instructions\t{PRODUCT_DBT_MAX_INSTRUCTIONS}");
+    println!("dbt_code_bytes\t{PRODUCT_DBT_CODE_BYTES}");
+    println!(
+        "workload\tcandidate\titerations\tchecksum\tbatch\tconstruction_median_ns\tconstruction_p95_ns\twarm_median_ns\twarm_p95_ns\tvs_base_64\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_links_established\tdbt_emitted_bytes\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes\tdbt_reserved_bytes\ttranslation_bytes\tcache_evictions\tsteady_allocations\tsteady_allocated_bytes"
+    );
+
+    for workload in ProductMachineWorkload::all() {
+        let base = rows
+            .iter()
+            .find(|row| row.workload == *workload && row.alignment == 64)
+            .ok_or_else(|| format!("missing block-base-64 row for {}", workload.name()))?;
+        let base_median = normalized_percentile(&base.execution_nanos, 50, base.batch)?;
+        for row in rows.iter().filter(|row| row.workload == *workload) {
+            let observation = row
+                .observation
+                .as_ref()
+                .ok_or_else(|| "alignment row has no observation".to_string())?;
+            let stats = observation
+                .dbt_stats
+                .ok_or_else(|| "alignment row has no DBT statistics".to_string())?;
+            let median = normalized_percentile(&row.execution_nanos, 50, row.batch)?;
+            println!(
+                "{}\tblock-base-{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.workload.name(),
+                row.alignment,
+                iterations,
+                observation.checksum,
+                row.batch,
+                normalized_percentile(&row.construction_nanos, 50, row.batch)?,
+                normalized_percentile(&row.construction_nanos, 95, row.batch)?,
+                median,
+                normalized_percentile(&row.execution_nanos, 95, row.batch)?,
+                median / base_median,
+                stats.translations,
+                stats.publications,
+                stats.native_dispatches,
+                stats.links_established,
+                stats.emitted_bytes,
+                stats.alignment_padding_bytes,
+                stats.live_code_bytes,
+                stats.code_prefix_bytes,
+                stats.reserved_bytes,
+                observation.translation_bytes,
+                stats.evictions,
+                row.steady_allocations,
+                row.steady_allocated_bytes,
+            );
+        }
+    }
+
+    println!();
+    println!("candidate\texecution_geomean_vs_64");
+    for alignment in BASE_ALIGNMENTS {
+        let ratios = ProductMachineWorkload::all()
+            .iter()
+            .map(|workload| {
+                let candidate = rows
+                    .iter()
+                    .find(|row| row.workload == *workload && row.alignment == alignment)
+                    .unwrap();
+                let base = rows
+                    .iter()
+                    .find(|row| row.workload == *workload && row.alignment == 64)
+                    .unwrap();
+                Ok(
+                    normalized_percentile(&candidate.execution_nanos, 50, candidate.batch)?
+                        / normalized_percentile(&base.execution_nanos, 50, base.batch)?,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        println!("block-base-{alignment}\t{:.6}", benchmark_geomean(&ratios)?);
+    }
     Ok(())
 }
 
