@@ -211,6 +211,11 @@ impl DbtTranslationWorkspace {
         } else {
             RegisterCache::direct()
         };
+        let local_loop_plan = chainable
+            .then(|| local_self_branch_target(input))
+            .flatten()
+            .filter(|target| *target == input.start_pc())
+            .and_then(|_| RegisterCache::local_loop_plan(input.slots()));
         let (chain_entry_offset, deferred_budget_exit) = if chainable {
             let (offset, cold_exit) = emit_fast_entry_guard(&mut out)
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
@@ -226,6 +231,19 @@ impl DbtTranslationWorkspace {
             })?;
             (offset, None)
         };
+        let local_loop_entry = if let Some(plan) = local_loop_plan {
+            cache
+                .preload_local_loop(plan, input.slots(), &mut out)
+                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            let entry = out
+                .new_label()
+                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            out.bind(entry)
+                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            Some(entry)
+        } else {
+            None
+        };
         #[cfg(feature = "dbt-execution-profile")]
         if profile_enabled {
             emit_profile_increment(
@@ -239,6 +257,7 @@ impl DbtTranslationWorkspace {
         }
         let mut terminal = None;
         let mut emitted_terminal = false;
+        let mut deferred_local_budget_exit = None;
         let mut lowered_load_sites = 0_u32;
         let mut lowered_store_sites = 0_u32;
         let bounded_limit = match input.mode() {
@@ -290,10 +309,11 @@ impl DbtTranslationWorkspace {
                         chainable,
                         &mut static_links,
                         &mut cold_exits,
+                        local_loop_entry,
+                        &mut deferred_local_budget_exit,
+                        input.start_pc(),
                         #[cfg(feature = "dbt-execution-profile")]
                         profile_enabled,
-                        #[cfg(feature = "dbt-execution-profile")]
-                        input.start_pc(),
                         #[cfg(feature = "dbt-execution-profile")]
                         &mut profile_relocations,
                     )
@@ -449,6 +469,18 @@ impl DbtTranslationWorkspace {
             emit_completed_trampoline(&mut out, input.start_pc(), &mut cold_exits)
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
         }
+        if let Some((cold_exit, mut exit_cache)) = deferred_local_budget_exit {
+            out.bind(cold_exit)
+                .and_then(|()| exit_cache.flush(&mut out))
+                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            #[cfg(feature = "dbt-execution-profile")]
+            if profile_enabled {
+                emit_profile_exit_kind(&mut out, DbtProfileExitKind::Budget)
+                    .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            }
+            emit_completed_trampoline(&mut out, input.start_pc(), &mut cold_exits)
+                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+        }
         let code = out
             .finish()
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
@@ -488,6 +520,20 @@ impl DbtTranslationWorkspace {
     }
 }
 
+fn local_self_branch_target(input: &DbtBlockInput<'_>) -> Option<u32> {
+    let index = input.slots().len().checked_sub(1)?;
+    let pc = input.start_pc().wrapping_add(index as u32 * 4);
+    let Rv32ResolvedInstruction::Valid {
+        instruction: DecodedInstruction::Branch { offset, .. },
+        ..
+    } = input.slots()[index]
+    else {
+        return None;
+    };
+    let target = pc.wrapping_add_signed(offset);
+    (target & 3 == 0).then_some(target)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_branch(
     kind: Branch,
@@ -503,8 +549,10 @@ fn emit_branch(
     chainable: bool,
     static_links: &mut StaticLinkCollector,
     cold_exits: &mut ColdExitCollector,
+    local_loop_entry: Option<Label>,
+    deferred_local_budget_exit: &mut Option<(Label, RegisterCache)>,
+    source_pc: u32,
     #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
-    #[cfg(feature = "dbt-execution-profile")] source_pc: u32,
     #[cfg(feature = "dbt-execution-profile")] profile_relocations: &mut ProfileRelocationCollector,
 ) -> Result<(), EmitError> {
     let lhs = cache.read(rs1, remaining, &[], out)?;
@@ -540,6 +588,27 @@ fn emit_branch(
     out.bind(taken)?;
     let target = pc.wrapping_add_signed(offset);
     let mut taken_cache = cache.clone();
+    if let Some(local_loop_entry) = local_loop_entry.filter(|_| target == source_pc) {
+        #[cfg(feature = "dbt-execution-profile")]
+        if profile_enabled {
+            emit_profile_increment(
+                out,
+                DbtProfileKey::Edge {
+                    source_pc,
+                    target_pc: target,
+                    kind: Rv32DbtProfileEdgeKind::Taken,
+                },
+                profile_relocations,
+            )?;
+        }
+        out.add_r64_imm32(EXECUTION_COUNTER, attempted as i32)?;
+        out.test_r64_r64(EXECUTION_COUNTER, EXECUTION_COUNTER)?;
+        let cold_exit = out.new_label()?;
+        out.jcc(Condition::GreaterEqual, cold_exit)?;
+        out.jmp(local_loop_entry)?;
+        *deferred_local_budget_exit = Some((cold_exit, taken_cache));
+        return Ok(());
+    }
     if target & 3 == 0 {
         emit_completed_exit(
             &mut taken_cache,
@@ -1894,6 +1963,37 @@ mod tests {
             .cold_exit_relocations()
             .iter()
             .any(|relocation| relocation.displacement_offset as usize + 4 == block.code().len()));
+    }
+
+    #[test]
+    fn eligible_self_branch_uses_no_patchable_self_link() {
+        let words = slots(&[addi(1, 1, 1), bne(1, 2, -4)]);
+        let input = DbtBlockInput::new(0x1000, &words, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, 8).unwrap();
+        let block = workspace.lower(&input, 4096).unwrap();
+
+        assert!(block
+            .static_links()
+            .iter()
+            .all(|link| link.target_pc != 0x1000));
+    }
+
+    #[test]
+    fn oversized_self_branch_keeps_the_normal_patchable_link() {
+        let mut words = (1..=8)
+            .map(|guest| addi(guest, guest, 1))
+            .collect::<Vec<_>>();
+        words.push(bne(1, 2, -32));
+        let words = slots(&words);
+        let input = DbtBlockInput::new(0x1000, &words, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, 16).unwrap();
+
+        let block = workspace.lower(&input, 4096).unwrap();
+
+        assert!(block
+            .static_links()
+            .iter()
+            .any(|link| link.target_pc == 0x1000 && link.kind == DbtLinkKind::BranchTaken));
     }
 
     #[test]

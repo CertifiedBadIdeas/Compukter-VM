@@ -27,12 +27,12 @@ use compukter_vm::rv32_machine::{
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
-use compukter_vm::rv32im::encoding::{
-    addi, amoswap_w, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, lw, materialize, sb,
-    sc_w, sh, sw,
-};
 #[cfg(feature = "dbt-execution-profile")]
-use compukter_vm::rv32im::encoding::{bne, jalr};
+use compukter_vm::rv32im::encoding::jalr;
+use compukter_vm::rv32im::encoding::{
+    addi, amoswap_w, bne, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, lw, materialize,
+    sb, sc_w, sh, sw,
+};
 use rv32_elf_support::{halting_machine_elf, machine_program_elf, Elf32Builder, LoadSegment};
 
 const CSR_MTVEC: u16 = 0x305;
@@ -505,6 +505,48 @@ fn cached_dbt_fence_i_revokes_the_previous_generation() {
 }
 
 #[test]
+fn cached_dbt_local_self_branch_flushes_loop_state_before_memory_fault() {
+    let [address_hi, address_lo] = materialize(1, 0x0000_fffc);
+    let [limit_hi, limit_lo] = materialize(2, 0x0001_0004);
+    let elf = machine_program_elf(&[
+        address_hi,
+        address_lo,
+        limit_hi,
+        limit_lo,
+        jal(0, 4),
+        lw(3, 1, 0),
+        addi(1, 1, 4),
+        bne(1, 2, -8),
+    ]);
+    let mut interpreted =
+        Rv32Machine::from_elf(&elf, config(Rv32ExecutionBackendConfig::Predecoded, 0)).unwrap();
+    let mut dbt = Rv32Machine::from_elf(
+        &elf,
+        config(
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 32,
+                max_instructions: 8,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+            },
+            0,
+        ),
+    )
+    .unwrap();
+
+    let expected = interpreted.run(12).unwrap();
+    let actual = dbt.run(12).unwrap();
+
+    assert_eq!(actual, expected);
+    assert_eq!(dbt.pc(), interpreted.pc());
+    assert_eq!(
+        dbt.retired_instructions(),
+        interpreted.retired_instructions()
+    );
+}
+
+#[test]
 fn all_backends_trap_atomic_mmio_without_device_side_effects() {
     let [debug_hi, debug_lo] = materialize(1, DEBUG_BASE);
     let elf = machine_program_elf(&[
@@ -678,6 +720,30 @@ fn exact_profile_counts_initial_chained_and_static_edge_paths() {
         ),
         1
     );
+}
+
+#[cfg(feature = "dbt-execution-profile")]
+#[test]
+fn exact_profile_local_self_branch_stops_before_next_body_at_budget() {
+    let mut machine = cached_dbt_machine(&[addi(1, 0, 4), addi(1, 1, -1), bne(1, 0, -4)], 32);
+    machine.enable_dbt_execution_profile(128).unwrap();
+
+    assert_eq!(
+        machine.run(7).unwrap(),
+        Rv32MachineOutcome::BudgetExhausted {
+            retired_delta: 7,
+            retired_total: 7,
+        }
+    );
+    assert_eq!(machine.pc(), 0x1004);
+    let profile = machine.dbt_execution_profile().unwrap().unwrap();
+    assert_eq!(block_count(&profile, 0x1000), 1);
+    assert_eq!(block_count(&profile, 0x1004), 2);
+    assert_eq!(
+        edge_count(&profile, 0x1004, 0x1004, Rv32DbtProfileEdgeKind::Taken),
+        2
+    );
+    assert_eq!(profile.dynamic_exits.budget, 1);
 }
 
 #[cfg(feature = "dbt-execution-profile")]
