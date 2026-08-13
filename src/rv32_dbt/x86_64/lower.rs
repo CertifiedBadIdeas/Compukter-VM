@@ -22,7 +22,7 @@
     reason = "the direct DBT machine dispatcher consumes lowering in a later issue #17 task"
 )]
 
-use super::emitter::{Condition, EmitError, Gpr, Mem, X64Emitter};
+use super::emitter::{Condition, EmitError, Gpr, Label, Mem, X64Emitter};
 use super::register_cache::RegisterCache;
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{
@@ -146,24 +146,20 @@ impl DbtTranslationWorkspace {
         } else {
             RegisterCache::direct()
         };
-        let chain_entry_offset = if chainable {
-            emit_fast_entry_guard(
-                &mut cache,
-                &mut out,
-                input.start_pc(),
-                input.slots().len() as u32,
-                &mut cold_exits,
-            )
-            .map_err(|error| emit_fault(input.start_pc(), None, error))?
+        let (chain_entry_offset, deferred_budget_exit) = if chainable {
+            let (offset, cold_exit) = emit_fast_entry_guard(&mut out)
+                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            (offset, Some(cold_exit))
         } else {
-            u32::try_from(out.bytes().len()).map_err(|_| {
+            let offset = u32::try_from(out.bytes().len()).map_err(|_| {
                 fault(
                     DbtFaultKind::Capacity,
                     input.start_pc(),
                     None,
                     "RV32 DBT chain entry offset exceeds u32",
                 )
-            })?
+            })?;
+            (offset, None)
         };
         let mut terminal = None;
         let mut emitted_terminal = false;
@@ -345,6 +341,13 @@ impl DbtTranslationWorkspace {
                 )
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
             }
+        }
+        if let Some(cold_exit) = deferred_budget_exit {
+            out.bind(cold_exit)
+                .and_then(|()| {
+                    emit_completed_trampoline(&mut out, input.start_pc(), &mut cold_exits)
+                })
+                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
         }
         let code = out
             .finish()
@@ -543,15 +546,9 @@ fn emit_prologue(out: &mut X64Emitter, chainable: bool) -> Result<(), EmitError>
     Ok(())
 }
 
-fn emit_fast_entry_guard(
-    cache: &mut RegisterCache,
-    out: &mut X64Emitter,
-    start_pc: u32,
-    _instruction_count: u32,
-    cold_exits: &mut ColdExitCollector,
-) -> Result<u32, EmitError> {
+fn emit_fast_entry_guard(out: &mut X64Emitter) -> Result<(u32, Label), EmitError> {
     let guard = out.new_label()?;
-    let body = out.new_label()?;
+    let cold_exit = out.new_label()?;
     out.jmp(guard)?;
     let chain_entry_offset =
         u32::try_from(out.bytes().len()).map_err(|_| EmitError::BranchRange)?;
@@ -559,11 +556,8 @@ fn emit_fast_entry_guard(
     add_context_u32(out, DbtContext::CHAIN_TRANSITIONS_OFFSET, 1)?;
     out.bind(guard)?;
     out.test_r64_r64(EXECUTION_COUNTER, EXECUTION_COUNTER)?;
-    out.jcc(Condition::Less, body)?;
-    cache.flush(out)?;
-    emit_completed_trampoline(out, start_pc, cold_exits)?;
-    out.bind(body)?;
-    Ok(chain_entry_offset)
+    out.jcc(Condition::GreaterEqual, cold_exit)?;
+    Ok((chain_entry_offset, cold_exit))
 }
 
 fn lower_instruction(
@@ -1673,6 +1667,32 @@ mod tests {
         let block = workspace.lower(&input, 4096).unwrap();
         assert!(block.static_links().is_empty());
         assert!(block.cold_exit_relocations().is_empty());
+    }
+
+    #[test]
+    fn chain_entry_falls_through_hot_body_and_defers_budget_exit() {
+        let slots = slots(&[addi(1, 1, 1)]);
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
+
+        let block = workspace.lower(&input, 4096).unwrap();
+        let hot_guard = block
+            .code()
+            .windows(2)
+            .position(|bytes| bytes == [0x0f, 0x8d])
+            .expect("chain entry must branch to cold code on a non-negative budget counter");
+        let first_cold_jump = block
+            .cold_exit_relocations()
+            .iter()
+            .map(|relocation| relocation.displacement_offset as usize)
+            .min()
+            .unwrap();
+
+        assert!(hot_guard < first_cold_jump);
+        assert!(block
+            .cold_exit_relocations()
+            .iter()
+            .any(|relocation| relocation.displacement_offset as usize + 4 == block.code().len()));
     }
 
     #[test]

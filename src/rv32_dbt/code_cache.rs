@@ -30,7 +30,7 @@ use crate::rv32_machine::{
 };
 
 const WAYS: usize = 2;
-const CODE_ALIGNMENT: usize = 16;
+const CODE_ALIGNMENT: usize = 64;
 const GUEST_PAGE_BYTES: u32 = 4096;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -915,6 +915,17 @@ mod tests {
     }
 
     #[test]
+    fn published_guest_blocks_start_on_host_cache_lines() {
+        let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
+        let key = DbtCacheKey::new(0x1000, 0);
+
+        cache.publish(key, &block(key.pc, &returning(7))).unwrap();
+        let (set, way) = cache.find_entry(key).unwrap();
+
+        assert_eq!(cache.sets[set].ways[way].offset % 64, 0);
+    }
+
+    #[test]
     fn circular_overwrite_invalidates_only_overlapping_entries() {
         let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
         let first = DbtCacheKey::new(0, 0);
@@ -1136,7 +1147,6 @@ mod tests {
     #[test]
     fn circular_overwrite_unlinks_a_destination_before_replacing_its_bytes() {
         let mut cache = DirectDbtCodeCache::new(16, PAGE_BYTES).unwrap();
-        let filler_len = PAGE_BYTES - cache.block_region_start() - 32;
         cache
             .publish(DbtCacheKey::new(0x4004, 0), &block(0x4004, &returning(9)))
             .unwrap();
@@ -1149,6 +1159,7 @@ mod tests {
             .unwrap();
         assert_eq!(unsafe { execute(source.entry()) }, 9);
 
+        let filler_len = PAGE_BYTES - super::align_up(cache.write_cursor, super::CODE_ALIGNMENT);
         cache
             .publish(
                 DbtCacheKey::new(0x4048, 0),
