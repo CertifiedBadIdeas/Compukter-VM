@@ -51,6 +51,19 @@ cargo run --manifest-path "$ROOT/Cargo.toml" --release \
     --example rv32_c_comparison --locked --offline -- "$BUILD_DIR" 21 \
     | tee "$BUILD_DIR/report.tsv"
 
+cargo run --manifest-path "$ROOT/Cargo.toml" --release \
+    --features dbt-execution-profile,wasmtime-comparison \
+    --example rv32_c_comparison --locked --offline -- \
+    profile "$BUILD_DIR" 1000 4096 \
+    | tee "$BUILD_DIR/execution-profile.tsv"
+
+awk -F '\t' '
+    $1 == "profile_summary" && $2 == "1000" && $3 == "ee053d58" && $8 == "false" && $9 > 0 && $10 > 0 { summary++ }
+    $1 == "coverage" && $2 ~ /^(50|90|95|99)$/ && $3 > 0 { coverage++ }
+    $1 == "dynamic_exits" && $2 ~ /^[0-9]+$/ { exits++ }
+    END { exit summary == 1 && coverage == 4 && exits == 1 ? 0 : 1 }
+' "$BUILD_DIR/execution-profile.tsv"
+
 awk -F '\t' '
     $1 ~ /^(native-clang|qemu-rv32-tcg|wasmtime-aot|rv32-cached|rv32-predecoded|rv32-block-cached|rv32-direct-dbt|rv32-cached-dbt-(16|32|64|128|256|512)k|rv32-cached-dbt-(16|64|128|256|512)-sets|rv32-cached-dbt-block-(16|32|64)|rv32-cached-dbt-align-base-(16|32|64|128)|rv32-cached-dbt-align-chain-32)$/ && $6 == "ee053d58" { count++ }
     END { exit count == 26 ? 0 : 1 }
