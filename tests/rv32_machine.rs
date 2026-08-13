@@ -30,8 +30,8 @@ use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32im::encoding::jalr;
 use compukter_vm::rv32im::encoding::{
-    addi, amoswap_w, bne, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, lw, materialize,
-    sb, sc_w, sh, sw,
+    add, addi, amoswap_w, bne, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, lw,
+    materialize, sb, sc_w, sh, slli, sw,
 };
 use rv32_elf_support::{halting_machine_elf, machine_program_elf, Elf32Builder, LoadSegment};
 
@@ -579,6 +579,93 @@ fn cached_dbt_local_self_branch_flushes_loop_state_before_memory_fault() {
         dbt.retired_instructions(),
         interpreted.retired_instructions()
     );
+}
+
+#[test]
+fn cached_dbt_reconciles_temporary_state_before_a_later_loop_fault() {
+    let [vector_hi, vector_lo] = materialize(4, 0x2000);
+    let [address_hi, address_lo] = materialize(5, 0x3ffc);
+    let [second_hi, second_lo] = materialize(28, 0x3ffc);
+    let [destination_hi, destination_lo] = materialize(18, 0x3000);
+    let [limit_hi, limit_lo] = materialize(15, 0x4004);
+    let main = [
+        vector_hi,
+        vector_lo,
+        csrrw(0, CSR_MTVEC, 4),
+        address_hi,
+        address_lo,
+        second_hi,
+        second_lo,
+        destination_hi,
+        destination_lo,
+        limit_hi,
+        limit_lo,
+        addi(14, 0, 1),
+        addi(6, 0, 123),
+        sw(5, 6, 0),
+        lw(20, 5, 0),
+        lw(24, 28, 0),
+        addi(5, 5, 4),
+        addi(28, 28, 4),
+        slli(25, 20, 5),
+        slli(26, 24, 4),
+        add(20, 20, 14),
+        add(24, 26, 24),
+        add(20, 25, 20),
+        add(20, 20, 24),
+        sw(18, 20, 0),
+        addi(18, 18, 4),
+        bne(5, 15, -48),
+    ];
+    let [control_hi, control_lo] = materialize(10, CONTROL_BASE);
+    let handler = [
+        control_hi,
+        control_lo,
+        sw(10, 20, 8),
+        addi(11, 0, STATUS_HALTED),
+        sw(10, 11, 0),
+    ];
+    let words = |words: &[u32]| {
+        words
+            .iter()
+            .copied()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, words(&main)))
+        .load(LoadSegment::rx(0x2000, words(&handler)))
+        .load(LoadSegment::rw_with_mem_size(0x3000, [], 0x1000))
+        .finish();
+    let run = |execution| {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 0)).unwrap();
+        for _ in 0..4 {
+            let outcome = machine.run(64).unwrap();
+            if matches!(outcome, Rv32MachineOutcome::Halted { .. }) {
+                return (outcome, machine.dbt_stats());
+            }
+        }
+        panic!("machine did not reach the loop fault handler");
+    };
+
+    let (expected, _) = run(Rv32ExecutionBackendConfig::Predecoded);
+    let (actual, stats) = run(Rv32ExecutionBackendConfig::CachedDbt {
+        sets: 32,
+        max_instructions: 16,
+        scratch_bytes: 4096,
+        cache_bytes: 4096,
+        code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+    });
+
+    assert!(matches!(
+        expected,
+        Rv32MachineOutcome::Halted {
+            exit_code: 6151,
+            ..
+        }
+    ));
+    assert_eq!(stats.unwrap().local_self_backedge_sites, 1);
+    assert_eq!(actual, expected);
 }
 
 #[test]
