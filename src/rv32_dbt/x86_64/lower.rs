@@ -807,7 +807,9 @@ fn lower_register(
         }
         return Ok(());
     }
-    if dst == rhs && dst != lhs {
+    if dst == rhs && matches!(op, Op::Add | Op::Xor | Op::Or | Op::And) {
+        emit_binary(op, dst, lhs, out)?;
+    } else if dst == rhs && dst != lhs {
         out.mov_r32_r32(Gpr::Rax, lhs)?;
         emit_binary(op, Gpr::Rax, rhs, out)?;
         out.mov_r32_r32(dst, Gpr::Rax)?;
@@ -1726,6 +1728,26 @@ mod tests {
         assert_eq!(context.exit.attempted, words.len() as u32);
         assert_eq!(actual.architectural_state(), expected.architectural_state());
         assert_eq!(actual.register(0), 0);
+    }
+
+    #[test]
+    fn commutative_destination_alias_avoids_the_rax_roundtrip() {
+        fn translated_len(word: u32) -> usize {
+            let slots = slots(&[word]);
+            let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
+            let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
+            workspace.lower(&input, 4096).unwrap().code().len()
+        }
+
+        assert!(translated_len(add(2, 1, 2)) < translated_len(sub(2, 1, 2)));
+
+        let words = slots(&[add(2, 1, 2)]);
+        let input = DbtBlockInput::new(0x1000, &words, DbtBlockMode::DirectFast).unwrap();
+        let (cpu, tag, exit, _) = execute(&input, &[(1, 19), (2, 23)]);
+        assert_eq!(tag, DbtExitTag::Completed);
+        assert_eq!(exit.attempted, 1);
+        assert_eq!(cpu.register(1), 19);
+        assert_eq!(cpu.register(2), 42);
     }
 
     #[test]
