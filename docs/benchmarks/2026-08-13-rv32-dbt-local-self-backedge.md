@@ -2,6 +2,14 @@
 
 Issue: [#17](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/17)
 
+> **Correctness erratum:** the measurements in this document predate commit
+> `6bad248`, which fixed architectural register materialization when a later
+> local-loop iteration faults before rewriting a loop-carried value. Keep these
+> numbers as the historical result of the original slice, but do not use them as
+> a correctness-preserving performance baseline. The corrected baseline and the
+> retained loop-carried extension are recorded in
+> [the follow-up result](2026-08-13-rv32-dbt-loop-carried-self-backedge.md).
+
 ## Decision
 
 **KEEP.** Preserving the register cache across eligible same-block backedges improved the selected 16-instruction Cached DBT by 14.7% and 14.5% in two independent 21-sample runs. The shared C checksum remained `ee053d58`, translations and host dispatches were unchanged, and the generated-code cost was 66 bytes across the reached program.
