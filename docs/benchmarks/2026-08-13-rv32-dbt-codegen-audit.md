@@ -60,9 +60,9 @@ Wasmtime rows therefore provide code-shape references, not normalized ratios.
 
 ## Highest expansion and root cause
 
-Four one-instruction conditional-branch blocks at guest PCs `0x4fc`, `0x55c`,
-`0x5bc`, and `0x4a0` each contain 99 host instructions in 350 bytes. Five more
-one-instruction branches contain 98 host instructions in 352 bytes.
+Nine one-instruction conditional-branch blocks contain 98 host instructions
+each. Four at guest PCs `0x4fc`, `0x55c`, `0x5bc`, and `0x4a0` occupy 350
+bytes; the other five, led by the top-ranked `0x4b4`, occupy 352 bytes.
 
 At `0x4fc`, the guest instruction is `bnez t3, 0x524`. Its 350-byte host block
 contains:
