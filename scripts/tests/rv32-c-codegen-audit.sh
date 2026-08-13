@@ -63,7 +63,9 @@ perf_value() {
         $3 == event {
             gsub(/,/, "", $1)
             if ($1 ~ /^[0-9]+$/) print $1; else print "-"
+            found = 1
         }
+        END { if (!found) print "-" }
     ' "$raw"
 }
 perf_measure() {
