@@ -21,8 +21,9 @@
 mod rv32_elf_support;
 
 use compukter_vm::rv32_machine::{
-    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome, CONTROL_BASE,
-    DEBUG_BASE, STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC,
+    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig,
+    Rv32MachineOutcome, CONTROL_BASE, DEBUG_BASE, DEFAULT_DBT_CODE_ALIGNMENT, STATUS_BOOTING,
+    STATUS_HALTED, STATUS_PANIC,
 };
 use compukter_vm::rv32im::encoding::{
     addi, amoswap_w, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, lw, materialize, sb,
@@ -52,6 +53,7 @@ fn configs() -> [Rv32ExecutionBackendConfig; 5] {
             max_instructions: 8,
             scratch_bytes: 4096,
             cache_bytes: 4096,
+            code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
         },
     ]
 }
@@ -59,12 +61,17 @@ fn configs() -> [Rv32ExecutionBackendConfig; 5] {
 #[test]
 fn cached_dbt_is_the_default_execution_backend() {
     assert_eq!(
+        DEFAULT_DBT_CODE_ALIGNMENT,
+        Rv32DbtCodeAlignment::BlockBase(64)
+    );
+    assert_eq!(
         Rv32ExecutionBackendConfig::default(),
         Rv32ExecutionBackendConfig::CachedDbt {
             sets: 256,
             max_instructions: 8,
             scratch_bytes: 8 * 1024,
             cache_bytes: 128 * 1024,
+            code_alignment: Rv32DbtCodeAlignment::BlockBase(64),
         }
     );
 }
@@ -80,6 +87,7 @@ fn cached_dbt_initializes_one_context_per_run_call() {
                 max_instructions: 8,
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
             },
             0,
         ),
@@ -117,6 +125,7 @@ fn cached_dbt_snapshot_owns_final_linked_code() {
                 max_instructions: 8,
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
             },
             0,
         ),
@@ -174,6 +183,7 @@ fn dbt_phase_timing_is_disabled_by_default() {
                 max_instructions: 8,
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
             },
             0,
         ),
@@ -201,6 +211,7 @@ fn dbt_phase_timing_accounts_for_every_translation() {
                 max_instructions: 8,
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
             },
             0,
         ),
@@ -229,6 +240,7 @@ fn cached_dbt_finishes_one_block_past_budget_without_debt() {
                 max_instructions: 16,
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
             },
             0,
         ),
@@ -472,6 +484,7 @@ fn cached_dbt_fence_i_revokes_the_previous_generation() {
                 max_instructions: 8,
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
             },
             0,
         ),
@@ -816,6 +829,7 @@ fn invalid_cache_and_ram_layouts_fail_before_machine_allocation() {
                 max_instructions: 8,
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
             },
             8,
         )

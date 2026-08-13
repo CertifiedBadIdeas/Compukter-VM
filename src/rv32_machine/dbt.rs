@@ -22,6 +22,7 @@
     reason = "the machine dispatcher consumes the per-VM DBT owner in the next issue #17 task"
 )]
 
+use super::Rv32DbtCodeAlignment;
 use super::Rv32DbtStats;
 #[cfg(feature = "dbt-code-audit")]
 use super::{Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError};
@@ -36,7 +37,11 @@ use crate::rv32im::Rv32ResolvedInstruction;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rv32DbtPolicy {
     Direct,
-    Cached { sets: usize, cache_bytes: usize },
+    Cached {
+        sets: usize,
+        cache_bytes: usize,
+        code_alignment: Rv32DbtCodeAlignment,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +135,10 @@ impl Rv32DbtExecution {
                 "DBT scratch bytes must be a positive multiple of 4096",
             ));
         }
-        if let Rv32DbtPolicy::Cached { sets, cache_bytes } = policy {
+        if let Rv32DbtPolicy::Cached {
+            sets, cache_bytes, ..
+        } = policy
+        {
             if sets == 0 || sets > u32::MAX as usize || !sets.is_power_of_two() {
                 return Err(Self::fault(
                     DbtFaultKind::Capacity,
@@ -150,7 +158,11 @@ impl Rv32DbtExecution {
                 scratch: ExecutableScratch::new(scratch_bytes)?,
                 serial: 0,
             },
-            Rv32DbtPolicy::Cached { sets, cache_bytes } => Rv32DbtStorage::Cached {
+            Rv32DbtPolicy::Cached {
+                sets,
+                cache_bytes,
+                code_alignment: _,
+            } => Rv32DbtStorage::Cached {
                 cache: DirectDbtCodeCache::new(sets, cache_bytes)?,
                 bounded_scratch: ExecutableScratch::new(scratch_bytes)?,
                 scratch_serial: 0,
@@ -566,6 +578,7 @@ mod tests {
             Rv32DbtPolicy::Cached {
                 sets: 2,
                 cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
             },
             8,
             4096,
@@ -598,6 +611,7 @@ mod tests {
             Rv32DbtPolicy::Cached {
                 sets: 2,
                 cache_bytes: 16 * 1024,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
             },
             8,
             8 * 1024,
@@ -613,6 +627,7 @@ mod tests {
             Rv32DbtPolicy::Cached {
                 sets: 2,
                 cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
             },
             8,
             4096,
@@ -640,6 +655,7 @@ mod tests {
             Rv32DbtPolicy::Cached {
                 sets: 2,
                 cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
             },
             8,
             4096,
@@ -748,6 +764,7 @@ mod tests {
             Rv32DbtPolicy::Cached {
                 sets: 8,
                 cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
             },
             8,
             4096,
@@ -813,6 +830,7 @@ mod tests {
             Rv32DbtPolicy::Cached {
                 sets: 8,
                 cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
             },
             8,
             4096,
@@ -870,6 +888,7 @@ mod tests {
             Rv32DbtPolicy::Cached {
                 sets: 8,
                 cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
             },
             8,
             4096,
@@ -928,6 +947,7 @@ mod tests {
             Rv32DbtPolicy::Cached {
                 sets: 8,
                 cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
             },
             16,
             4096,
@@ -984,6 +1004,7 @@ mod tests {
                 Rv32DbtPolicy::Cached {
                     sets: 0,
                     cache_bytes: 4096,
+                    code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
                 },
                 8,
                 4096,
@@ -993,6 +1014,7 @@ mod tests {
                 Rv32DbtPolicy::Cached {
                     sets: 3,
                     cache_bytes: 4096,
+                    code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
                 },
                 8,
                 4096,

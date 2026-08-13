@@ -31,10 +31,10 @@ pub use elf::{
     Rv32ElfError, Rv32ElfErrorKind, Rv32ElfLoader, Rv32LoadedImage, Rv32PagePermissions,
 };
 pub use machine::{
-    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineBuildError, Rv32MachineConfig,
-    Rv32MachineExecutionError, Rv32MachineOutcome, Rv32TranslationLookupUnit, Rv32TranslationStats,
-    DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_BYTES, DEFAULT_DBT_MAX_INSTRUCTIONS,
-    DEFAULT_DBT_SCRATCH_BYTES,
+    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineBuildError,
+    Rv32MachineConfig, Rv32MachineExecutionError, Rv32MachineOutcome, Rv32TranslationLookupUnit,
+    Rv32TranslationStats, DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_ALIGNMENT,
+    DEFAULT_DBT_CODE_BYTES, DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_SCRATCH_BYTES,
 };
 pub use platform::{CONTROL_BASE, DEBUG_BASE, STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC};
 

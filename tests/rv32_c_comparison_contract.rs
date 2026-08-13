@@ -186,6 +186,7 @@ fn product_c_artifact_matches_the_fixed_native_and_qemu_oracle() {
             max_instructions: 8,
             scratch_bytes: 8 * 1024,
             cache_bytes: 64 * 1024,
+            code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
         },
     ] {
         let mut machine = Rv32Machine::from_elf(

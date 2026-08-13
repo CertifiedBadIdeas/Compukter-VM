@@ -110,6 +110,7 @@ fn assert_steady_state_trap_entry_and_return_allocate_nothing() {
             max_instructions: 8,
             scratch_bytes: 4096,
             cache_bytes: 4096,
+            code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
         },
     ] {
         let mut machine = Rv32Machine::from_elf(
@@ -180,6 +181,7 @@ fn assert_steady_state_atomic_increment_loop_allocates_nothing() {
             max_instructions: 8,
             scratch_bytes: 4096,
             cache_bytes: 4096,
+            code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
         },
     ] {
         let mut machine = Rv32Machine::from_elf(
