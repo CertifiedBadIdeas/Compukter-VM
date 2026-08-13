@@ -35,8 +35,8 @@ pub use c_comparison::{
 };
 #[cfg(target_arch = "x86_64")]
 pub use codegen_audit::{
-    classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_wasmtime_function,
-    DecodedHostInstruction, InstructionGroup,
+    classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_llvm_symbol_range,
+    parse_wasmtime_function, DecodedHostInstruction, InstructionGroup,
 };
 pub use dbt_compute::{
     CachedDbtComputeObservation, DirectDbtComputeObservation, PreparedCachedDbtCompute32,

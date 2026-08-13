@@ -360,6 +360,37 @@ impl DirectDbtCodeCache {
             .mapping
             .snapshot_prefix(previous_end)
             .map_err(|error| Rv32DbtCodeSnapshotError::new(error.to_string()))?;
+        for block in &blocks {
+            for edge in block.edges.iter().filter(|edge| edge.linked) {
+                let target = blocks
+                    .iter()
+                    .find(|target| {
+                        target.guest_pc == edge.target_pc && target.generation == block.generation
+                    })
+                    .ok_or_else(|| {
+                        Rv32DbtCodeSnapshotError::new(format!(
+                            "linked DBT edge from {:#010x} has no live target {:#010x}",
+                            block.guest_pc, edge.target_pc
+                        ))
+                    })?;
+                let displacement_offset = edge.displacement_offset as usize;
+                let displacement_end = displacement_offset + 4;
+                let displacement = i32::from_le_bytes(
+                    used_bytes[displacement_offset..displacement_end]
+                        .try_into()
+                        .expect("validated DBT displacement range"),
+                );
+                let resolved = i64::try_from(displacement_end)
+                    .ok()
+                    .and_then(|origin| origin.checked_add(i64::from(displacement)));
+                if resolved != Some(i64::from(target.chain_entry_offset)) {
+                    return Err(Rv32DbtCodeSnapshotError::new(format!(
+                        "linked DBT edge from {:#010x} does not resolve to live target {:#010x}",
+                        block.guest_pc, edge.target_pc
+                    )));
+                }
+            }
+        }
         Ok(Rv32DbtCodeSnapshot {
             generation,
             used_bytes,
@@ -653,6 +684,40 @@ mod tests {
             let resolved = (displacement_offset + 4) as i64 + i64::from(displacement);
             assert_eq!(resolved, i64::from(target.chain_entry_offset));
         }
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn snapshot_rejects_link_metadata_that_disagrees_with_executable_bytes() {
+        let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
+        let source_key = DbtCacheKey::new(0x1000, 0);
+        let target_key = DbtCacheKey::new(0x1004, 0);
+        let (source_code, link) = source_link(target_key.pc);
+        cache
+            .publish(
+                source_key,
+                &block_with_links(source_key.pc, &source_code, 5, &[link]),
+            )
+            .unwrap();
+        cache
+            .publish(target_key, &block(target_key.pc, &returning(9)))
+            .unwrap();
+
+        let (source_set, source_way) = cache.find_entry(source_key).unwrap();
+        let source = cache.sets[source_set].ways[source_way];
+        let record = source.links[0];
+        assert!(record.linked);
+        cache
+            .mapping
+            .patch_rel32(
+                source.offset,
+                source.length,
+                source.offset + record.displacement_offset as usize,
+                source.offset + record.reset_target_offset as usize,
+            )
+            .unwrap();
+
+        assert!(cache.snapshot(0).is_err());
     }
 
     fn bounded_block(pc: u32) -> TranslatedBlock<'static> {

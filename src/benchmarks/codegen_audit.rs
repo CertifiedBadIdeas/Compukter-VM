@@ -52,6 +52,45 @@ pub fn parse_llvm_symbol(input: &str, symbol: &str) -> Result<Vec<DecodedHostIns
     unique_nonempty_region(matches, "LLVM", symbol)
 }
 
+pub fn parse_llvm_symbol_range(
+    input: &str,
+    symbol: &str,
+    start: u64,
+    length: u64,
+) -> Result<Vec<DecodedHostInstruction>, String> {
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| format!("LLVM region {symbol} range overflowed"))?;
+    let instructions = parse_llvm_symbol(input, symbol)?;
+    let mut bounded = Vec::new();
+    for instruction in instructions {
+        if instruction.address < start || instruction.address >= end {
+            continue;
+        }
+        let encoded_bytes = instruction
+            .encoded_bytes
+            .ok_or_else(|| format!("LLVM region {symbol} instruction has no encoded-byte length"))?
+            as u64;
+        let instruction_end = instruction
+            .address
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| format!("LLVM region {symbol} instruction range overflowed"))?;
+        if instruction_end > end {
+            return Err(format!(
+                "LLVM region {symbol} instruction at {:#x} crosses declared end {end:#x}",
+                instruction.address
+            ));
+        }
+        bounded.push(instruction);
+    }
+    if bounded.is_empty() {
+        return Err(format!(
+            "LLVM region {symbol} contains no instructions in {start:#x}..{end:#x}"
+        ));
+    }
+    Ok(bounded)
+}
+
 pub fn parse_wasmtime_function(
     input: &str,
     function: &str,
@@ -119,7 +158,10 @@ pub fn classify_x86_instruction(mnemonic: &str) -> InstructionGroup {
 }
 
 pub fn has_x86_memory_operand(operands: &str) -> bool {
-    operands.contains('(') && operands.contains(')')
+    (operands.contains('(') && operands.contains(')'))
+        || ["%cs:", "%ds:", "%es:", "%fs:", "%gs:", "%ss:"]
+            .iter()
+            .any(|prefix| operands.contains(prefix))
 }
 
 fn llvm_symbol_name(line: &str) -> Option<&str> {
