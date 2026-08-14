@@ -33,8 +33,9 @@ if [[ "$wasmtime_output" != "-301646504" ]]; then
 fi
 
 cargo run --manifest-path "$ROOT/Cargo.toml" --release --locked --offline \
-    --features dbt-code-audit --example rv32_c_codegen_audit -- export "$BUILD_DIR"
+    --features dbt-code-audit,dbt-execution-profile --example rv32_c_codegen_audit -- export "$BUILD_DIR"
 test -s "$BUILD_DIR/dbt-support.tsv"
+test -s "$BUILD_DIR/dbt-register-pressure.tsv"
 "$RV32_C_CLANG" -c "$BUILD_DIR/dbt-code-cache.S" -o "$BUILD_DIR/dbt-code-cache.o"
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/dbt-code-cache.o" >"$BUILD_DIR/dbt-disassembly.txt"
 
@@ -44,7 +45,7 @@ test -s "$BUILD_DIR/dbt-support.tsv"
     "$BUILD_DIR/native-analysis.o" >"$BUILD_DIR/native-analysis-disassembly.txt"
 
 cargo run --manifest-path "$ROOT/Cargo.toml" --release --locked --offline \
-    --features dbt-code-audit --example rv32_c_codegen_audit -- report "$BUILD_DIR"
+    --features dbt-code-audit,dbt-execution-profile --example rv32_c_codegen_audit -- report "$BUILD_DIR"
 test -s "$BUILD_DIR/codegen-report.tsv"
 
 AUDIT_BATCH=1024
@@ -53,7 +54,7 @@ AUDIT_BATCH=1024
     "$BUILD_DIR/product-wrapper.o" "$BUILD_DIR/kernel-rv32.o" \
     -o "$BUILD_DIR/product-audit-batch.elf"
 cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked --offline \
-    --features dbt-code-audit --example rv32_c_codegen_audit
+    --features dbt-code-audit,dbt-execution-profile --example rv32_c_codegen_audit
 
 PERF_REPORT="$BUILD_DIR/perf-report.tsv"
 printf 'system\tstatus\tcycles\tinstructions\tipc\tbranches\tbranch_misses\tcache_misses\tcommand\n' >"$PERF_REPORT"
