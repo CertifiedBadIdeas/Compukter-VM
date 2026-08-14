@@ -23,17 +23,6 @@ use crate::rv32im::{decode_fields, DecodedFields, DecodedOp};
 const PAGE_BYTES: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ValueId(u16);
-
-impl ValueId {
-    pub(crate) const ZERO: Self = Self(0);
-
-    pub(crate) const fn new(raw: u16) -> Self {
-        Self(raw)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbtIrOp {
     UpperImmediate,
     Jump,
@@ -53,8 +42,46 @@ pub(crate) enum DbtIrOp {
 pub(crate) struct DbtIrInstruction {
     word: u32,
     fields: DecodedFields,
-    inputs: [ValueId; 2],
-    output: Option<ValueId>,
+    effects: DbtRegisterEffects,
+}
+
+const NO_REGISTER: u8 = u8::MAX;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DbtRegisterEffects {
+    reads: [u8; 2],
+    write: u8,
+    may_exit_before_write: bool,
+}
+
+impl DbtRegisterEffects {
+    fn from_fields(fields: DecodedFields) -> Self {
+        let (reads, write) = register_effects(fields);
+        Self {
+            reads: reads.map(|register| register.unwrap_or(NO_REGISTER)),
+            write: write.unwrap_or(NO_REGISTER),
+            may_exit_before_write: may_exit_before_write(fields.operation),
+        }
+    }
+
+    pub(crate) fn reads(self) -> impl Iterator<Item = u8> {
+        self.reads
+            .into_iter()
+            .filter(|register| *register != NO_REGISTER)
+    }
+
+    pub(crate) const fn write(self) -> Option<u8> {
+        if self.write == NO_REGISTER {
+            None
+        } else {
+            Some(self.write)
+        }
+    }
+
+    pub(crate) const fn may_exit_before_write(self) -> bool {
+        self.may_exit_before_write
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +89,27 @@ pub(crate) enum FutureValue {
     Unused,
     Read(u8),
     Dead(u8),
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisterEventKind {
+    Read,
+    Write,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegisterEvent {
+    instruction: u8,
+    kind: RegisterEventKind,
+}
+
+impl RegisterEvent {
+    const EMPTY: Self = Self {
+        instruction: 0,
+        kind: RegisterEventKind::Read,
+    };
 }
 
 impl DbtIrInstruction {
@@ -73,12 +121,8 @@ impl DbtIrInstruction {
         self.fields
     }
 
-    pub(crate) const fn inputs(self) -> [ValueId; 2] {
-        self.inputs
-    }
-
-    pub(crate) const fn output(self) -> Option<ValueId> {
-        self.output
+    pub(crate) const fn effects(self) -> DbtRegisterEffects {
+        self.effects
     }
 
     pub(crate) const fn operation(self) -> DbtIrOp {
@@ -101,9 +145,10 @@ impl DbtIrInstruction {
 #[derive(Debug)]
 pub(crate) struct DbtIrBlock {
     instructions: Vec<DbtIrInstruction>,
-    future_values: Vec<[FutureValue; 32]>,
-    values: [ValueId; 32],
-    next_value: u16,
+    register_events: Vec<RegisterEvent>,
+    register_event_counts: [u8; 32],
+    register_ranges: [(u16, u16); 32],
+    exits: Vec<u8>,
     capacity: usize,
     invalid_word: Option<u32>,
 }
@@ -113,15 +158,12 @@ impl DbtIrBlock {
         if capacity == 0 || capacity > 64 {
             return Err(format!("RV32 DBT IR capacity {capacity} is outside 1..=64"));
         }
-        let mut values = [ValueId::ZERO; 32];
-        for (register, value) in values.iter_mut().enumerate().skip(1) {
-            *value = ValueId::new(register as u16);
-        }
         Ok(Self {
             instructions: Vec::with_capacity(capacity),
-            future_values: Vec::with_capacity(capacity),
-            values,
-            next_value: 32,
+            register_events: Vec::with_capacity(capacity * 3),
+            register_event_counts: [0; 32],
+            register_ranges: [(0, 0); 32],
+            exits: Vec::with_capacity(capacity),
             capacity,
             invalid_word: None,
         })
@@ -133,7 +175,14 @@ impl DbtIrBlock {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         self.instructions.capacity() * std::mem::size_of::<DbtIrInstruction>()
-            + self.future_values.capacity() * std::mem::size_of::<[FutureValue; 32]>()
+            + self.analysis_retained_bytes()
+    }
+
+    pub(crate) fn analysis_retained_bytes(&self) -> usize {
+        self.register_events.capacity() * std::mem::size_of::<RegisterEvent>()
+            + self.exits.capacity() * std::mem::size_of::<u8>()
+            + std::mem::size_of_val(&self.register_event_counts)
+            + std::mem::size_of_val(&self.register_ranges)
     }
 
     pub(crate) fn attempted_instruction_count(&self) -> usize {
@@ -146,12 +195,10 @@ impl DbtIrBlock {
 
     pub(crate) fn reset(&mut self) {
         self.instructions.clear();
-        self.future_values.clear();
-        self.values.fill(ValueId::ZERO);
-        for (register, value) in self.values.iter_mut().enumerate().skip(1) {
-            *value = ValueId::new(register as u16);
-        }
-        self.next_value = 32;
+        self.register_events.clear();
+        self.register_event_counts.fill(0);
+        self.register_ranges.fill((0, 0));
+        self.exits.clear();
         self.invalid_word = None;
     }
 
@@ -162,7 +209,7 @@ impl DbtIrBlock {
 
     #[cfg(test)]
     pub(crate) fn analysis_capacity(&self) -> usize {
-        self.future_values.capacity()
+        self.register_events.capacity()
     }
 
     pub(crate) fn lift_word(&mut self, word: u32) -> Result<(), String> {
@@ -173,70 +220,100 @@ impl DbtIrBlock {
             ));
         }
         let fields = decode_fields(word)?;
-        let (reads, write) = register_effects(fields);
-        let inputs = reads.map(|register| {
-            register.map_or(ValueId::ZERO, |register| self.values[usize::from(register)])
-        });
-        let output = if let Some(register) = write.filter(|register| *register != 0) {
-            let value = ValueId::new(self.next_value);
-            self.next_value = self
-                .next_value
-                .checked_add(1)
-                .ok_or_else(|| "RV32 DBT IR value ID overflow".to_string())?;
-            self.values[usize::from(register)] = value;
-            Some(value)
-        } else {
-            None
-        };
+        let effects = DbtRegisterEffects::from_fields(fields);
+        let instruction = self.instructions.len() as u8;
+        for register in effects.reads() {
+            self.register_event_counts[usize::from(register)] += 1;
+        }
+        if let Some(register) = effects.write() {
+            self.register_event_counts[usize::from(register)] += 1;
+        }
+        if effects.may_exit_before_write() {
+            self.exits.push(instruction);
+        }
         self.instructions.push(DbtIrInstruction {
             word,
             fields,
-            inputs,
-            output,
+            effects,
         });
         Ok(())
     }
 
     pub(crate) fn analyze_future_values(&mut self) {
-        self.future_values.clear();
-        self.future_values
-            .resize(self.instructions.len(), [FutureValue::Unused; 32]);
-        let mut next_read = [None; 32];
-        let mut next_write = [None; 32];
-        let mut next_exit = None;
-        for index in (0..self.instructions.len()).rev() {
-            let fields = self.instructions[index].fields;
-            let (reads, write) = register_effects(fields);
-            if may_exit_before_write(fields.operation) {
-                next_exit = Some(index);
+        self.register_events.clear();
+        let mut end = 0_u16;
+        for (guest, count) in self.register_event_counts.into_iter().enumerate() {
+            let start = end;
+            end += u16::from(count);
+            self.register_ranges[guest] = (start, end);
+        }
+        self.register_events
+            .resize(usize::from(end), RegisterEvent::EMPTY);
+        let mut cursors = self.register_ranges.map(|(start, _)| start);
+        for (index, instruction) in self.instructions.iter().copied().enumerate() {
+            let effects = instruction.effects;
+            for register in effects.reads() {
+                insert_register_event(
+                    &mut self.register_events,
+                    &mut cursors,
+                    register,
+                    RegisterEvent {
+                        instruction: index as u8,
+                        kind: RegisterEventKind::Read,
+                    },
+                );
             }
-            for register in reads.into_iter().flatten() {
-                next_read[usize::from(register)] = Some(index);
-            }
-            if let Some(register) = write {
-                next_write[usize::from(register)] = Some(index);
-            }
-            for guest in 0..32 {
-                let read = next_read[guest];
-                let write = next_write[guest];
-                self.future_values[index][guest] = match (read, write) {
-                    (Some(read), Some(write)) if read <= write => {
-                        FutureValue::Read((read - index) as u8)
-                    }
-                    (Some(read), None) => FutureValue::Read((read - index) as u8),
-                    (_, Some(write)) if next_exit.is_some_and(|exit| exit <= write) => {
-                        FutureValue::Read((write - index) as u8)
-                    }
-                    (_, Some(write)) => FutureValue::Dead((write - index) as u8),
-                    (None, None) => FutureValue::Unused,
-                };
+            if let Some(register) = effects.write() {
+                insert_register_event(
+                    &mut self.register_events,
+                    &mut cursors,
+                    register,
+                    RegisterEvent {
+                        instruction: index as u8,
+                        kind: RegisterEventKind::Write,
+                    },
+                );
             }
         }
     }
 
     pub(crate) fn future_value(&self, instruction: usize, guest: usize) -> FutureValue {
-        self.future_values[instruction][guest]
+        let (start, end) = self.register_ranges[guest];
+        let events = &self.register_events[usize::from(start)..usize::from(end)];
+        let next = events.partition_point(|event| usize::from(event.instruction) < instruction);
+        let Some(event) = events.get(next).copied() else {
+            return FutureValue::Unused;
+        };
+        let distance = event.instruction - instruction as u8;
+        match event.kind {
+            RegisterEventKind::Read => FutureValue::Read(distance),
+            RegisterEventKind::Write => {
+                let next_exit = self
+                    .exits
+                    .partition_point(|exit| usize::from(*exit) < instruction);
+                if self
+                    .exits
+                    .get(next_exit)
+                    .is_some_and(|exit| *exit <= event.instruction)
+                {
+                    FutureValue::Read(distance)
+                } else {
+                    FutureValue::Dead(distance)
+                }
+            }
+        }
     }
+}
+
+fn insert_register_event(
+    events: &mut [RegisterEvent],
+    cursors: &mut [u16; 32],
+    register: u8,
+    event: RegisterEvent,
+) {
+    let cursor = &mut cursors[usize::from(register)];
+    events[usize::from(*cursor)] = event;
+    *cursor += 1;
 }
 
 pub(crate) fn fill_ir_block(
@@ -358,7 +435,7 @@ pub(crate) fn may_exit_before_write(operation: DecodedOp) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fill_ir_block, DbtIrBlock, DbtIrInstruction, DbtIrOp, FutureValue, ValueId};
+    use super::{fill_ir_block, DbtIrBlock, DbtIrInstruction, DbtIrOp, FutureValue};
     use crate::memory::MachineMemory;
     use crate::rv32im::encoding::{add, addi, ecall, jal};
 
@@ -371,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn lifting_assigns_block_local_versions_without_materializing_decoded_instructions() {
+    fn lifting_records_compact_semantics_and_register_effects() {
         let mut block = DbtIrBlock::new(2).unwrap();
 
         block.lift_word(addi(1, 0, 7)).unwrap();
@@ -379,19 +456,28 @@ mod tests {
 
         assert_eq!(block.instructions().len(), 2);
         assert_eq!(block.instructions()[0].operation(), DbtIrOp::Immediate);
-        assert_eq!(block.instructions()[0].inputs(), [ValueId::ZERO; 2]);
-        assert_eq!(block.instructions()[0].output(), Some(ValueId::new(32)));
+        assert_eq!(
+            block.instructions()[0]
+                .effects()
+                .reads()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(block.instructions()[0].effects().write(), Some(1));
         assert_eq!(block.instructions()[1].operation(), DbtIrOp::Register);
         assert_eq!(
-            block.instructions()[1].inputs(),
-            [ValueId::new(32), ValueId::new(32)]
+            block.instructions()[1]
+                .effects()
+                .reads()
+                .collect::<Vec<_>>(),
+            vec![1, 1]
         );
-        assert_eq!(block.instructions()[1].output(), Some(ValueId::new(33)));
+        assert_eq!(block.instructions()[1].effects().write(), Some(2));
     }
 
     #[test]
     fn ir_instruction_stays_small_enough_for_a_complete_block_to_fit_in_l1() {
-        assert!(std::mem::size_of::<DbtIrInstruction>() <= 24);
+        assert!(std::mem::size_of::<DbtIrInstruction>() <= 20);
     }
 
     #[test]
@@ -409,6 +495,13 @@ mod tests {
         assert_eq!(block.future_value(2, 3), FutureValue::Read(1));
         assert_eq!(block.future_value(3, 3), FutureValue::Dead(0));
         assert_eq!(block.future_value(0, 31), FutureValue::Unused);
+    }
+
+    #[test]
+    fn sparse_analysis_storage_scales_with_register_events_not_register_file_snapshots() {
+        let block = DbtIrBlock::new(64).unwrap();
+
+        assert!(block.analysis_retained_bytes() <= 640);
     }
 
     #[test]

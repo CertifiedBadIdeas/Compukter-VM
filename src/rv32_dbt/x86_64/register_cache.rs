@@ -24,7 +24,7 @@
 
 use super::emitter::{EmitError, Gpr, Mem, X64Emitter};
 use crate::rv32_dbt::block::DbtFutureValues;
-use crate::rv32_dbt::ir::{may_exit_before_write, register_effects, DbtIrBlock, FutureValue};
+use crate::rv32_dbt::ir::{DbtIrBlock, FutureValue};
 use crate::rv32im::{
     CsrSource, DecodedInstruction, Rv32ArchitecturalState, Rv32ResolvedInstruction,
 };
@@ -156,16 +156,15 @@ impl RegisterCache {
 
     pub(crate) fn local_loop_plan_ir(ir: &DbtIrBlock) -> Option<LocalLoopRegisterPlan> {
         Self::local_loop_plan_from_accesses(ir.instructions().iter().copied().map(|instruction| {
-            let fields = instruction.fields();
-            let (reads, write) = register_effects(fields);
+            let effects = instruction.effects();
             let mut access = RegisterAccess::default();
-            for register in reads.into_iter().flatten() {
+            for register in effects.reads() {
                 access.reads |= 1_u32 << register;
             }
-            if let Some(register) = write {
+            if let Some(register) = effects.write() {
                 access.writes |= 1_u32 << register;
             }
-            access.may_exit_before_write = may_exit_before_write(fields.operation);
+            access.may_exit_before_write = effects.may_exit_before_write();
             access
         }))
     }
