@@ -14,6 +14,8 @@ use compukter_vm::benchmarks::{
     classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_llvm_symbol_range,
     parse_wasmtime_function, DecodedHostInstruction, InstructionGroup, PRODUCT_RAM_BYTES,
 };
+#[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
+use compukter_vm::rv32_machine::Rv32DbtExecutionProfile;
 #[cfg(feature = "dbt-code-audit")]
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeSnapshot, Rv32DbtSupportCodeKind, Rv32ExecutionBackendConfig, Rv32Machine,
@@ -129,7 +131,12 @@ fn execute(build_dir: &Path, batch: u64) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "dbt-code-audit")]
+#[cfg(all(feature = "dbt-code-audit", not(feature = "dbt-execution-profile")))]
+fn export(_build_dir: &Path) -> Result<(), String> {
+    Err("export requires --features dbt-code-audit,dbt-execution-profile".to_string())
+}
+
+#[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
 fn export(build_dir: &Path) -> Result<(), String> {
     let elf_path = build_dir.join("product.elf");
     let elf = fs::read(&elf_path)
@@ -167,6 +174,46 @@ fn export(build_dir: &Path) -> Result<(), String> {
         return Err("canonical DBT snapshot is empty".to_string());
     }
 
+    let mut profiled_machine = Rv32Machine::from_elf(
+        &elf,
+        Rv32MachineConfig {
+            ram_size: PRODUCT_RAM_BYTES,
+            debug_limit: 0,
+            execution: Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 512,
+                max_instructions: 16,
+                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+                cache_bytes: 128 * 1024,
+                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+            },
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    profiled_machine
+        .enable_dbt_execution_profile(4096)
+        .map_err(|error| error.to_string())?;
+    let profiled_outcome = profiled_machine
+        .run(20_100_000)
+        .map_err(|error| error.to_string())?;
+    let profiled_checksum = match profiled_outcome {
+        Rv32MachineOutcome::Halted { exit_code, .. } => exit_code as u32,
+        other => return Err(format!("profiled audit machine did not halt: {other:?}")),
+    };
+    if profiled_checksum != EXPECTED_CHECKSUM {
+        return Err(format!(
+            "profiled audit checksum mismatch: expected {EXPECTED_CHECKSUM:08x}, actual {profiled_checksum:08x}"
+        ));
+    }
+    let profile = profiled_machine
+        .dbt_execution_profile()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "profiled audit machine returned no execution profile".to_string())?;
+    fs::write(
+        build_dir.join("dbt-register-pressure.tsv"),
+        register_pressure_report(&snapshot, &profile)?,
+    )
+    .map_err(|error| format!("failed to write register-pressure report: {error}"))?;
+
     let binary_path = build_dir.join("dbt-code-cache.bin");
     fs::write(&binary_path, &snapshot.used_bytes)
         .map_err(|error| format!("failed to write {}: {error}", binary_path.display()))?;
@@ -188,7 +235,115 @@ fn export(build_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
+fn register_pressure_report(
+    snapshot: &Rv32DbtCodeSnapshot,
+    profile: &Rv32DbtExecutionProfile,
+) -> Result<String, String> {
+    if profile.counter_overflowed {
+        return Err("register-pressure execution profile overflowed".to_string());
+    }
+    let mut static_totals = [0_u128; 10];
+    let mut weighted_totals = [0_u128; 10];
+    let mut executed_guest_instructions = 0_u128;
+    let mut max_resident = 0_u8;
+    let mut block_rows = String::new();
+
+    for block in &snapshot.blocks {
+        let executions = profile
+            .blocks
+            .iter()
+            .find(|profile_block| profile_block.pc == block.guest_pc)
+            .ok_or_else(|| {
+                format!(
+                    "live DBT block 0x{:08x} is missing from execution profile",
+                    block.guest_pc
+                )
+            })?
+            .executions;
+        let pressure = block.register_pressure;
+        let values = [
+            pressure.entry_arch_loads,
+            pressure.body_arch_loads,
+            pressure.dirty_live_eviction_stores,
+            pressure.dead_evictions,
+            pressure.clean_evictions,
+            pressure.loop_reconcile_stores,
+            pressure.allocation_pressure,
+            pressure.scratch_clobber_sites[0],
+            pressure.scratch_clobber_sites[1],
+            pressure.scratch_clobber_sites[2],
+        ];
+        for (index, value) in values.into_iter().enumerate() {
+            static_totals[index] = static_totals[index]
+                .checked_add(u128::from(value))
+                .ok_or_else(|| "static register-pressure total overflowed".to_string())?;
+            weighted_totals[index] = weighted_totals[index]
+                .checked_add(u128::from(value) * u128::from(executions))
+                .ok_or_else(|| "weighted register-pressure total overflowed".to_string())?;
+        }
+        executed_guest_instructions = executed_guest_instructions
+            .checked_add(u128::from(block.guest_instruction_count) * u128::from(executions))
+            .ok_or_else(|| "executed guest-instruction total overflowed".to_string())?;
+        max_resident = max_resident.max(pressure.max_resident);
+        block_rows.push_str(&format!(
+            "0x{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            block.guest_pc,
+            executions,
+            block.guest_instruction_count,
+            pressure.entry_arch_loads,
+            pressure.body_arch_loads,
+            pressure.dirty_live_eviction_stores,
+            pressure.dead_evictions,
+            pressure.clean_evictions,
+            pressure.loop_reconcile_stores,
+            pressure.allocation_pressure,
+            pressure.max_resident,
+            pressure.scratch_clobber_sites[0],
+            pressure.scratch_clobber_sites[1],
+            pressure.scratch_clobber_sites[2],
+            block.length,
+        ));
+    }
+    if executed_guest_instructions == 0 {
+        return Err(
+            "register-pressure profile contains no executed guest instructions".to_string(),
+        );
+    }
+
+    let names = [
+        "entry_arch_loads",
+        "body_arch_loads",
+        "dirty_live_eviction_stores",
+        "dead_evictions",
+        "clean_evictions",
+        "loop_reconcile_stores",
+        "allocation_pressure",
+        "scratch_rax_sites",
+        "scratch_rcx_sites",
+        "scratch_rdx_sites",
+    ];
+    let mut output =
+        String::from("metric\tstatic_total\tweighted_total\tper_million_guest_instructions\n");
+    for (index, name) in names.into_iter().enumerate() {
+        output.push_str(&format!(
+            "{name}\t{}\t{}\t{:.6}\n",
+            static_totals[index],
+            weighted_totals[index],
+            weighted_totals[index] as f64 * 1_000_000.0 / executed_guest_instructions as f64,
+        ));
+    }
+    output.push_str(&format!("max_resident\t{max_resident}\t-\t-\n"));
+    output.push_str(&format!(
+        "executed_guest_instructions\t-\t{executed_guest_instructions}\t1000000.000000\n"
+    ));
+    output.push_str("\nblocks\nguest_pc\texecutions\tguest_instructions\tentry_arch_loads\tbody_arch_loads\tdirty_live_eviction_stores\tdead_evictions\tclean_evictions\tloop_reconcile_stores\tallocation_pressure\tmax_resident\tscratch_rax_sites\tscratch_rcx_sites\tscratch_rdx_sites\tcode_bytes\n");
+    output.push_str(&block_rows);
+    Ok(output)
+}
+
 #[cfg(feature = "dbt-code-audit")]
+#[cfg_attr(not(feature = "dbt-execution-profile"), allow(dead_code))]
 fn block_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
     let mut output = String::from(
         "guest_pc\tgeneration\toffset\tlength\tchain_entry_offset\tguest_instructions\tedge_index\ttarget_pc\tdisplacement_offset\treset_target_offset\tlinked\n",
@@ -227,6 +382,7 @@ fn block_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
 }
 
 #[cfg(feature = "dbt-code-audit")]
+#[cfg_attr(not(feature = "dbt-execution-profile"), allow(dead_code))]
 fn support_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
     let mut output = String::from("kind\toffset\tlength\n");
     for support in &snapshot.support_code {
@@ -633,12 +789,18 @@ fn option_f64(value: Option<f64>) -> String {
 
 #[cfg(all(test, feature = "dbt-code-audit"))]
 mod tests {
+    #[cfg(feature = "dbt-execution-profile")]
+    use super::register_pressure_report;
     use super::{
         assembly_wrapper, instruction_counts, metric_row, parse_block_report, parse_support_report,
     };
     use compukter_vm::benchmarks::{DecodedHostInstruction, InstructionGroup};
     use compukter_vm::rv32_machine::{
         Rv32DbtCodeBlock, Rv32DbtCodeSnapshot, Rv32DbtSupportCodeKind, Rv32DbtSupportCodeRange,
+    };
+    #[cfg(feature = "dbt-execution-profile")]
+    use compukter_vm::rv32_machine::{
+        Rv32DbtDynamicExitCounts, Rv32DbtExecutionProfile, Rv32DbtProfileBlock,
     };
 
     #[test]
@@ -728,5 +890,50 @@ mod tests {
         )
         .is_err());
         assert!(parse_support_report("kind\toffset\tlength\n").is_err());
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    #[test]
+    fn register_pressure_report_weights_translation_events_by_executions() {
+        let snapshot = Rv32DbtCodeSnapshot {
+            generation: 0,
+            used_bytes: vec![0; 8],
+            support_code: Vec::new(),
+            blocks: vec![Rv32DbtCodeBlock {
+                guest_pc: 0x1000,
+                generation: 0,
+                offset: 0,
+                length: 8,
+                chain_entry_offset: 0,
+                guest_instruction_count: 4,
+                register_pressure: compukter_vm::rv32_machine::Rv32DbtRegisterPressure {
+                    body_arch_loads: 2,
+                    dirty_live_eviction_stores: 1,
+                    scratch_clobber_sites: [3, 0, 1],
+                    max_resident: 7,
+                    ..Default::default()
+                },
+                edges: Vec::new(),
+            }],
+        };
+        let profile = Rv32DbtExecutionProfile {
+            blocks: vec![Rv32DbtProfileBlock {
+                pc: 0x1000,
+                executions: 5,
+            }],
+            static_edges: Vec::new(),
+            dynamic_exits: Rv32DbtDynamicExitCounts::default(),
+            capacity: 16,
+            used_records: 1,
+            retained_bytes: 16,
+            counter_overflowed: false,
+        };
+
+        let report = register_pressure_report(&snapshot, &profile).unwrap();
+
+        assert!(report.contains("body_arch_loads\t2\t10\t500000.000000\n"));
+        assert!(report.contains("dirty_live_eviction_stores\t1\t5\t250000.000000\n"));
+        assert!(report.contains("scratch_rax_sites\t3\t15\t750000.000000\n"));
+        assert!(report.contains("max_resident\t7\t-\t-\n"));
     }
 }
