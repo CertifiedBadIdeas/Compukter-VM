@@ -24,6 +24,8 @@ use super::block::MAX_PROFILE_RELOCATIONS;
 use super::block::{DbtBlockMode, TranslatedBlock, MAX_STATIC_LINKS};
 use super::executable::ExecutableMapping;
 use super::x86_64::cold_exit::build_completed_exit_stub;
+#[cfg(feature = "dbt-code-audit")]
+use super::x86_64::register_cache::RegisterPressureAudit;
 use super::{DbtFault, DbtFaultKind};
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::profile::ExactDbtProfile;
@@ -136,6 +138,8 @@ pub(crate) struct DirectDbtCodeCache {
     block_region_start: usize,
     code_alignment: Rv32DbtCodeAlignment,
     stats: DbtCodeCacheStats,
+    #[cfg(feature = "dbt-code-audit")]
+    register_pressure: Vec<(DbtCacheKey, RegisterPressureAudit)>,
 }
 
 impl DirectDbtCodeCache {
@@ -182,6 +186,8 @@ impl DirectDbtCodeCache {
             block_region_start,
             code_alignment,
             stats: DbtCodeCacheStats::default(),
+            #[cfg(feature = "dbt-code-audit")]
+            register_pressure: Vec::new(),
         })
     }
 
@@ -394,6 +400,13 @@ impl DirectDbtCodeCache {
             #[cfg(feature = "dbt-code-audit")]
             cold_exit_count: block.cold_exit_relocations().len() as u8,
         };
+        #[cfg(feature = "dbt-code-audit")]
+        {
+            self.register_pressure
+                .retain(|(stored_key, _)| *stored_key != key);
+            self.register_pressure
+                .push((key, block.register_pressure()));
+        }
         self.sets[set].mru_way = way as u8;
         self.write_cursor = end;
         self.link_outgoing(set, way)?;
@@ -432,6 +445,8 @@ impl DirectDbtCodeCache {
                 *entry = CacheEntry::default();
             }
         }
+        #[cfg(feature = "dbt-code-audit")]
+        self.register_pressure.clear();
     }
 
     pub(crate) const fn stats(&self) -> DbtCodeCacheStats {
@@ -572,6 +587,15 @@ impl DirectDbtCodeCache {
                 chain_entry_offset: u32::try_from(chain_entry)
                     .map_err(|_| Rv32DbtCodeSnapshotError::new("DBT chain entry exceeds u32"))?,
                 guest_instruction_count: entry.instruction_count,
+                register_pressure: self
+                    .register_pressure
+                    .iter()
+                    .find_map(|(key, pressure)| (*key == entry.key).then_some((*pressure).into()))
+                    .ok_or_else(|| {
+                        Rv32DbtCodeSnapshotError::new(
+                            "live DBT block is missing register-pressure metadata",
+                        )
+                    })?,
                 edges,
             });
             previous_end = end;
@@ -673,6 +697,9 @@ impl DirectDbtCodeCache {
             return Ok(());
         }
         let target_key = target.key;
+        #[cfg(feature = "dbt-code-audit")]
+        self.register_pressure
+            .retain(|(stored_key, _)| *stored_key != target_key);
         for set in 0..self.sets.len() {
             for way in 0..WAYS {
                 let link_count = self.sets[set].ways[way].link_count as usize;
@@ -837,6 +864,8 @@ mod tests {
     use crate::rv32_dbt::profile::{DbtProfileKey, ExactDbtProfile};
     #[cfg(feature = "dbt-code-audit")]
     use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
+    #[cfg(feature = "dbt-code-audit")]
+    use crate::rv32_dbt::x86_64::register_cache::RegisterPressureAudit;
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32_machine::{Rv32DbtCodeAlignment, DEFAULT_DBT_CODE_ALIGNMENT};
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
@@ -1036,6 +1065,34 @@ mod tests {
             let resolved = (displacement_offset + 4) as i64 + i64::from(displacement);
             assert_eq!(resolved, i64::from(target.chain_entry_offset));
         }
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn snapshot_keeps_register_pressure() {
+        let mut cache = DirectDbtCodeCache::new(4, PAGE_BYTES).unwrap();
+        let key = DbtCacheKey::new(0x1000, 0);
+        let pressure = RegisterPressureAudit {
+            body_arch_loads: 3,
+            dirty_live_eviction_stores: 2,
+            allocation_pressure: 4,
+            scratch_clobber_sites: [5, 6, 7],
+            ..RegisterPressureAudit::default()
+        };
+
+        cache
+            .publish(
+                key,
+                &block(key.pc, &[0xc3]).with_register_pressure(pressure),
+            )
+            .unwrap();
+
+        let snapshot = cache.snapshot(0).unwrap();
+        let actual = snapshot.blocks[0].register_pressure;
+        assert_eq!(actual.body_arch_loads, 3);
+        assert_eq!(actual.dirty_live_eviction_stores, 2);
+        assert_eq!(actual.allocation_pressure, 4);
+        assert_eq!(actual.scratch_clobber_sites, [5, 6, 7]);
     }
 
     #[cfg(feature = "dbt-code-audit")]

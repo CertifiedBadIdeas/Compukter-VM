@@ -27,6 +27,8 @@ use crate::rv32_dbt::ir::{
 };
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::profile::DbtProfileKey;
+#[cfg(feature = "dbt-code-audit")]
+use crate::rv32_dbt::x86_64::register_cache::RegisterPressureAudit;
 use crate::rv32im::DecodedFields;
 use crate::rv32im::Rv32ResolvedInstruction;
 
@@ -303,6 +305,8 @@ pub(crate) struct TranslatedBlock<'a> {
     lowered_load_sites: u32,
     lowered_store_sites: u32,
     local_self_backedge_sites: u32,
+    #[cfg(feature = "dbt-code-audit")]
+    register_pressure: RegisterPressureAudit,
     chain_entry_offset: u32,
     static_links: [DbtStaticLink; MAX_STATIC_LINKS],
     static_link_count: u8,
@@ -452,6 +456,8 @@ impl<'a> TranslatedBlock<'a> {
             lowered_load_sites,
             lowered_store_sites,
             local_self_backedge_sites: 0,
+            #[cfg(feature = "dbt-code-audit")]
+            register_pressure: RegisterPressureAudit::default(),
             chain_entry_offset,
             static_links: stored_links,
             static_link_count: static_links.len() as u8,
@@ -494,6 +500,17 @@ impl<'a> TranslatedBlock<'a> {
         self.local_self_backedge_sites
     }
 
+    #[cfg(feature = "dbt-code-audit")]
+    pub(crate) fn with_register_pressure(mut self, pressure: RegisterPressureAudit) -> Self {
+        self.register_pressure = pressure;
+        self
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    pub(crate) const fn register_pressure(&self) -> RegisterPressureAudit {
+        self.register_pressure
+    }
+
     pub(crate) fn chain_entry_offset(&self) -> u32 {
         self.chain_entry_offset
     }
@@ -527,6 +544,8 @@ mod tests {
     use crate::rv32_dbt::ir::DbtIrBlock;
     #[cfg(feature = "dbt-execution-profile")]
     use crate::rv32_dbt::profile::DbtProfileKey;
+    #[cfg(feature = "dbt-code-audit")]
+    use crate::rv32_dbt::x86_64::register_cache::RegisterPressureAudit;
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
 
     fn slot() -> Rv32ResolvedInstruction {
@@ -594,6 +613,26 @@ mod tests {
         assert_eq!(block.code(), &[0xc3]);
         assert_eq!(block.chain_entry_offset(), 0);
         assert!(block.static_links().is_empty());
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn translated_block_keeps_register_pressure() {
+        let slots = [slot()];
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
+        let pressure = RegisterPressureAudit {
+            body_arch_loads: 3,
+            dirty_live_eviction_stores: 2,
+            allocation_pressure: 4,
+            scratch_clobber_sites: [5, 6, 7],
+            ..RegisterPressureAudit::default()
+        };
+
+        let block = TranslatedBlock::new(&input, &[0xc3], 0, 0, 0, &[], &[])
+            .unwrap()
+            .with_register_pressure(pressure);
+
+        assert_eq!(block.register_pressure(), pressure);
     }
 
     #[test]
