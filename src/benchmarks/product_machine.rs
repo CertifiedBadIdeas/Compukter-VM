@@ -279,6 +279,20 @@ pub fn benchmark_normalize_nanos(total: u128, batch: u64) -> Result<f64, String>
     Ok(total as f64 / batch as f64)
 }
 
+pub fn self_ab_order(sample: usize) -> [usize; 2] {
+    benchmark_rotating_order::<2>(0, sample)
+}
+
+pub fn self_ab_delta(baseline: f64, candidate: f64) -> Result<f64, String> {
+    if !baseline.is_finite() || baseline <= 0.0 {
+        return Err("self-A/B baseline must be finite and positive".to_string());
+    }
+    if !candidate.is_finite() || candidate < 0.0 {
+        return Err("self-A/B candidate must be finite and non-negative".to_string());
+    }
+    Ok(candidate / baseline - 1.0)
+}
+
 pub const COMPILATION_PHASE_REPORT_HEADER: &str = "system\tphase\tsamples\tmedian_ns\tp95_ns\tinput_bytes\ttranslated_blocks\tguest_instructions\toutput_bytes\tns_per_input_byte\tns_per_guest_instruction\tcold_to_warm\tequivalent_warm_calls";
 
 pub fn compile_equivalent_calls(compile_nanos: u128, warm_call_nanos: u128) -> Result<f64, String> {

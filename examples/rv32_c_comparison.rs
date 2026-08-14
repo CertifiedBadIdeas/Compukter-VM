@@ -18,6 +18,8 @@ use compukter_vm::benchmarks::{
     benchmark_rotating_order, compile_equivalent_calls, optional_phase_rate,
     COMPILATION_PHASE_REPORT_HEADER,
 };
+#[cfg(feature = "dbt-translation-timing")]
+use compukter_vm::benchmarks::{self_ab_delta, self_ab_order};
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig,
     Rv32MachineOutcome, DEFAULT_DBT_CODE_ALIGNMENT,
@@ -144,6 +146,13 @@ impl Candidate {
             CandidateKind::CachedDbt { code_alignment, .. } => Some(code_alignment),
             _ => None,
         }
+    }
+
+    const fn is_dbt(self) -> bool {
+        matches!(
+            self.kind,
+            CandidateKind::DirectDbt | CandidateKind::CachedDbt { .. }
+        )
     }
 }
 
@@ -417,6 +426,14 @@ struct CandidateMeasurements {
     details: ProductDetails,
 }
 
+#[cfg(feature = "dbt-translation-timing")]
+#[derive(Default)]
+struct DbtPhaseMeasurements {
+    lift: Vec<u128>,
+    lower: Vec<u128>,
+    publish: Vec<u128>,
+}
+
 #[cfg(feature = "wasmtime-comparison")]
 struct CompilationPhaseMeasurement {
     system: &'static str,
@@ -439,6 +456,12 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "self-ab")
+    {
+        return run_self_ab(&arguments[1..]);
+    }
     if arguments
         .first()
         .is_some_and(|argument| argument == "profile")
@@ -736,6 +759,239 @@ fn run() -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+fn run_self_ab(arguments: &[OsString]) -> Result<(), String> {
+    if arguments.len() != 4 {
+        return Err(
+            "usage: rv32_c_comparison self-ab BUILD_DIR BASELINE CANDIDATE WARM_SAMPLES"
+                .to_string(),
+        );
+    }
+    let baseline_name = arguments[1]
+        .to_str()
+        .ok_or_else(|| "self-A/B baseline name is not UTF-8".to_string())?;
+    let candidate_name = arguments[2]
+        .to_str()
+        .ok_or_else(|| "self-A/B candidate name is not UTF-8".to_string())?;
+    if baseline_name == candidate_name {
+        return Err("self-A/B candidates must be distinct".to_string());
+    }
+    let baseline = comparison_candidate(baseline_name)
+        .ok_or_else(|| format!("unknown self-A/B baseline candidate: {baseline_name}"))?;
+    let candidate = comparison_candidate(candidate_name)
+        .ok_or_else(|| format!("unknown self-A/B candidate: {candidate_name}"))?;
+    if !baseline.is_dbt() || !candidate.is_dbt() {
+        return Err("self-A/B requires product DBT candidates".to_string());
+    }
+    let samples = arguments[3]
+        .to_str()
+        .ok_or_else(|| "self-A/B warm sample count is not UTF-8".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid self-A/B warm sample count: {error}"))?;
+    if samples < MINIMUM_SAMPLES {
+        return Err(format!(
+            "self-A/B warm sample count must be at least {MINIMUM_SAMPLES}"
+        ));
+    }
+    #[cfg(not(feature = "dbt-translation-timing"))]
+    return Err("self-A/B mode requires the dbt-translation-timing feature".to_string());
+
+    #[cfg(feature = "dbt-translation-timing")]
+    run_self_ab_measurement(Path::new(&arguments[0]), [baseline, candidate], samples)
+}
+
+#[cfg(feature = "dbt-translation-timing")]
+fn run_self_ab_measurement(
+    build_dir: &Path,
+    candidates: [Candidate; 2],
+    samples: usize,
+) -> Result<(), String> {
+    let source_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
+    let mut measurements = Vec::with_capacity(2);
+    let mut elfs = Vec::with_capacity(2);
+    for candidate in candidates {
+        let config = candidate.product_config().unwrap();
+        let batch = calibrate_product(&linker, &source_root, build_dir, config)?;
+        let elf = link_platform(&linker, &source_root, build_dir, "product", batch)?;
+        measurements.push(CandidateMeasurements {
+            candidate,
+            batch,
+            samples: Vec::with_capacity(samples),
+            details: ProductDetails::default(),
+        });
+        elfs.push(elf);
+    }
+
+    let phase_elf = link_platform(&linker, &source_root, build_dir, "product", 1)?;
+    let mut phases = [
+        DbtPhaseMeasurements::default(),
+        DbtPhaseMeasurements::default(),
+    ];
+    for sample in 0..samples {
+        for index in self_ab_order(sample) {
+            let measurement = &mut measurements[index];
+            let (elapsed, details) = run_product(
+                &elfs[index],
+                measurement.batch,
+                measurement.candidate.product_config().unwrap(),
+            )?;
+            measurement.samples.push(elapsed);
+            measurement.details = details;
+
+            let [lift, lower, publish] = run_product_translation_phases(
+                &phase_elf,
+                measurement.candidate.product_config().unwrap(),
+            )?;
+            phases[index].lift.push(lift);
+            phases[index].lower.push(lower);
+            phases[index].publish.push(publish);
+        }
+    }
+    if measurements[0].details.retired_instructions != measurements[1].details.retired_instructions
+    {
+        return Err(format!(
+            "self-A/B retired instruction mismatch: baseline {}, candidate {}",
+            measurements[0].details.retired_instructions,
+            measurements[1].details.retired_instructions
+        ));
+    }
+
+    let normalized = measurements
+        .iter_mut()
+        .map(|measurement| {
+            measurement.samples.sort_unstable();
+            benchmark_normalize_nanos(
+                product_percentile(&measurement.samples, 50),
+                measurement.batch,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    println!("self_ab\tbaseline\tcandidate\twarm_samples");
+    println!(
+        "self_ab\t{}\t{}\t{}",
+        measurements[0].candidate.name, measurements[1].candidate.name, samples
+    );
+    println!("role\tcandidate\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tdelta_vs_baseline_percent\tretired_instructions\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_local_self_backedge_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes");
+    for (index, measurement) in measurements.iter().enumerate() {
+        let details = measurement.details;
+        println!(
+            "{}\t{}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            if index == 0 { "baseline" } else { "candidate" },
+            measurement.candidate.name,
+            measurement.batch,
+            EXPECTED_CHECKSUM,
+            product_percentile(&measurement.samples, 50),
+            product_percentile(&measurement.samples, 95),
+            normalized[index],
+            self_ab_delta(normalized[0], normalized[index])? * 100.0,
+            details.retired_instructions,
+            option_u64(details.dbt_translations),
+            option_u64(details.dbt_publications),
+            option_u64(details.dbt_native_dispatches),
+            option_u64(details.dbt_chain_transitions),
+            option_u64(details.dbt_links_established),
+            option_u64(details.dbt_typed_slow_exits),
+            option_u64(details.dbt_metadata_evictions),
+            option_u64(details.dbt_overlap_invalidations),
+            option_u64(details.dbt_lowered_load_sites),
+            option_u64(details.dbt_lowered_store_sites),
+            option_u64(details.dbt_local_self_backedge_sites),
+            option_u64(details.dbt_emitted_bytes),
+            option_u64(details.dbt_reserved_bytes),
+            details.steady_allocations,
+            details.steady_allocated_bytes,
+        );
+    }
+    print_self_ab_phases(&measurements, &mut phases)?;
+    Ok(())
+}
+
+#[cfg(feature = "dbt-translation-timing")]
+fn run_product_translation_phases(
+    elf: &Path,
+    execution: Rv32ExecutionBackendConfig,
+) -> Result<[u128; 3], String> {
+    let bytes =
+        fs::read(elf).map_err(|error| format!("failed to read {}: {error}", elf.display()))?;
+    let mut machine = Rv32Machine::from_elf(
+        &bytes,
+        Rv32MachineConfig {
+            ram_size: PRODUCT_RAM_BYTES,
+            debug_limit: 0,
+            execution,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    machine.enable_dbt_translation_timing();
+    let outcome = machine.run(20_100_000).map_err(|error| error.to_string())?;
+    let checksum = match outcome {
+        Rv32MachineOutcome::Halted { exit_code, .. } => exit_code as u32,
+        other => return Err(format!("timed self-A/B DBT did not halt: {other:?}")),
+    };
+    if checksum != EXPECTED_CHECKSUM {
+        return Err(format!(
+            "timed self-A/B DBT checksum mismatch: expected {EXPECTED_CHECKSUM:08x}, actual {checksum:08x}"
+        ));
+    }
+    let stats = machine
+        .dbt_stats()
+        .ok_or_else(|| "timed self-A/B candidate exposed no DBT stats".to_string())?;
+    if stats.timed_translations != stats.translations {
+        return Err("DBT phase timer did not cover every translation".to_string());
+    }
+    Ok([
+        u128::from(stats.lift_nanos),
+        u128::from(stats.lower_nanos),
+        u128::from(stats.publish_nanos),
+    ])
+}
+
+#[cfg(feature = "dbt-translation-timing")]
+fn print_self_ab_phases(
+    measurements: &[CandidateMeasurements],
+    phases: &mut [DbtPhaseMeasurements; 2],
+) -> Result<(), String> {
+    println!("self_ab_phase\trole\tcandidate\tphase\tsamples\tmedian_ns\tp95_ns\tdelta_vs_baseline_percent");
+    for phase_name in ["lift", "lower", "publish"] {
+        let baseline_values = match phase_name {
+            "lift" => &mut phases[0].lift,
+            "lower" => &mut phases[0].lower,
+            _ => &mut phases[0].publish,
+        };
+        baseline_values.sort_unstable();
+        let baseline_median = product_percentile(baseline_values, 50) as f64;
+        for index in 0..2 {
+            let values = match phase_name {
+                "lift" => &mut phases[index].lift,
+                "lower" => &mut phases[index].lower,
+                _ => &mut phases[index].publish,
+            };
+            values.sort_unstable();
+            let median = product_percentile(values, 50);
+            println!(
+                "self_ab_phase\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
+                if index == 0 { "baseline" } else { "candidate" },
+                measurements[index].candidate.name,
+                phase_name,
+                values.len(),
+                median,
+                product_percentile(values, 95),
+                self_ab_delta(baseline_median, median as f64)? * 100.0
+            );
+        }
+    }
+    Ok(())
+}
+
+fn comparison_candidate(name: &str) -> Option<Candidate> {
+    COMMON_CANDIDATES
+        .iter()
+        .chain(&DBT_MATRIX)
+        .copied()
+        .find(|candidate| candidate.name == name)
 }
 
 #[cfg(feature = "dbt-execution-profile")]

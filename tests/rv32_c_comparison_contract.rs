@@ -374,6 +374,67 @@ fn comparison_runner_exposes_distinct_compilation_phase_rows() {
 }
 
 #[test]
+fn comparison_runner_exposes_product_only_self_ab_mode() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/rv32_c_comparison.rs"),
+    )
+    .unwrap();
+
+    for contract in [
+        "rv32_c_comparison self-ab BUILD_DIR BASELINE CANDIDATE WARM_SAMPLES",
+        "run_self_ab",
+        "self-A/B candidates must be distinct",
+        "self-A/B requires product DBT candidates",
+    ] {
+        assert!(
+            source.contains(contract),
+            "missing self-A/B contract {contract}"
+        );
+    }
+}
+
+#[test]
+fn focused_self_ab_wrapper_avoids_external_runtime_dependencies() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(root.join("scripts/tests/rv32-c-self-ab.sh")).unwrap();
+
+    assert!(script.contains("--features dbt-translation-timing"));
+    assert!(
+        script.contains("self-ab \"$BUILD_DIR\" \"$BASELINE\" \"$CANDIDATE\" \"$WARM_SAMPLES\"")
+    );
+    assert!(script.contains("RV32_C_SELF_AB_BASELINE"));
+    assert!(script.contains("RV32_C_SELF_AB_CANDIDATE"));
+    assert!(!script.contains("qemu-system"));
+    assert!(!script.contains("wasmtime"));
+}
+
+#[test]
+fn self_ab_mode_calibrates_and_reports_only_the_selected_product_pair() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/rv32_c_comparison.rs"),
+    )
+    .unwrap();
+
+    for contract in [
+        "self_ab_order",
+        "self_ab_delta",
+        "self_ab\\tbaseline\\tcandidate\\twarm_samples",
+        "role\\tcandidate\\tbatch\\tchecksum\\ttotal_median_ns\\ttotal_p95_ns\\tns_per_kernel\\tdelta_vs_baseline_percent",
+        "dbt_translations\\tdbt_publications\\tdbt_native_dispatches",
+        "dbt_emitted_bytes\\tdbt_reserved_bytes\\tsteady_allocations\\tsteady_allocated_bytes",
+        "self_ab_phase\\trole\\tcandidate\\tphase\\tsamples\\tmedian_ns\\tp95_ns\\tdelta_vs_baseline_percent",
+        "baseline",
+        "candidate",
+        "self-A/B retired instruction mismatch",
+        "DBT phase timer did not cover every translation",
+    ] {
+        assert!(source.contains(contract), "missing self-A/B report contract {contract}");
+    }
+    assert!(source.contains("calibrate_product"));
+    assert!(source.contains("run_product"));
+}
+
+#[test]
 fn codegen_audit_export_contract_is_explicit() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = fs::read_to_string(root.join("examples/rv32_c_codegen_audit.rs")).unwrap();
