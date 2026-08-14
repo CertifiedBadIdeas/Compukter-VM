@@ -243,12 +243,12 @@ fn export(build_dir: &Path) -> Result<(), String> {
 #[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
 fn raw_register_pressure_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
     let mut output = String::from(
-        "guest_pc\tguest_instructions\tentry_arch_loads\tbody_arch_loads\tdirty_live_eviction_stores\tdead_evictions\tclean_evictions\tloop_reconcile_stores\tallocation_pressure\tmax_resident\tscratch_rax_sites\tscratch_rcx_sites\tscratch_rdx_sites\tcode_bytes\n",
+        "guest_pc\tguest_instructions\tentry_arch_loads\tbody_arch_loads\tdirty_live_eviction_stores\tdead_evictions\tclean_evictions\tloop_reconcile_stores\tallocation_pressure\tmax_resident\tscratch_rax_sites\tscratch_rcx_sites\tscratch_rdx_sites\tforced_rcx_live_stores\tforced_rcx_dead_discards\tforced_rcx_clean_discards\tcode_bytes\n",
     );
     for block in &snapshot.blocks {
         let pressure = block.register_pressure;
         output.push_str(&format!(
-            "0x{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "0x{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             block.guest_pc,
             block.guest_instruction_count,
             pressure.entry_arch_loads,
@@ -262,6 +262,9 @@ fn raw_register_pressure_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
             pressure.scratch_clobber_sites[0],
             pressure.scratch_clobber_sites[1],
             pressure.scratch_clobber_sites[2],
+            pressure.forced_rcx_live_stores,
+            pressure.forced_rcx_dead_discards,
+            pressure.forced_rcx_clean_discards,
             block.length,
         ));
     }
@@ -276,8 +279,8 @@ fn weighted_register_pressure_report(
     if profile.counter_overflowed {
         return Err("register-pressure execution profile overflowed".to_string());
     }
-    let mut static_totals = [0_u128; 10];
-    let mut weighted_totals = [0_u128; 10];
+    let mut static_totals = [0_u128; 13];
+    let mut weighted_totals = [0_u128; 13];
     let mut executed_guest_instructions = 0_u128;
     let mut max_resident = 0_u8;
     let mut block_rows = String::new();
@@ -321,6 +324,9 @@ fn weighted_register_pressure_report(
             pressure.scratch_clobber_sites[0],
             pressure.scratch_clobber_sites[1],
             pressure.scratch_clobber_sites[2],
+            pressure.forced_rcx_live_stores,
+            pressure.forced_rcx_dead_discards,
+            pressure.forced_rcx_clean_discards,
         ];
         for (index, value) in values.into_iter().enumerate() {
             static_totals[index] = static_totals[index]
@@ -338,6 +344,9 @@ fn weighted_register_pressure_report(
             executions,
             executions,
             executions,
+            executions,
+            executions,
+            executions,
         ];
         for (index, (value, weight)) in values.into_iter().zip(weights).enumerate() {
             weighted_totals[index] = weighted_totals[index]
@@ -349,7 +358,7 @@ fn weighted_register_pressure_report(
             .ok_or_else(|| "executed guest-instruction total overflowed".to_string())?;
         max_resident = max_resident.max(pressure.max_resident);
         block_rows.push_str(&format!(
-            "0x{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "0x{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             block.guest_pc,
             executions,
             self_backedges,
@@ -366,6 +375,9 @@ fn weighted_register_pressure_report(
             pressure.scratch_clobber_sites[0],
             pressure.scratch_clobber_sites[1],
             pressure.scratch_clobber_sites[2],
+            pressure.forced_rcx_live_stores,
+            pressure.forced_rcx_dead_discards,
+            pressure.forced_rcx_clean_discards,
             block.length,
         ));
     }
@@ -386,6 +398,9 @@ fn weighted_register_pressure_report(
         "scratch_rax_sites",
         "scratch_rcx_sites",
         "scratch_rdx_sites",
+        "forced_rcx_live_stores",
+        "forced_rcx_dead_discards",
+        "forced_rcx_clean_discards",
     ];
     let mut output =
         String::from("metric\tstatic_total\tweighted_total\tper_million_guest_instructions\n");
@@ -401,7 +416,7 @@ fn weighted_register_pressure_report(
     output.push_str(&format!(
         "executed_guest_instructions\t-\t{executed_guest_instructions}\t1000000.000000\n"
     ));
-    output.push_str("\nblocks\nguest_pc\texecutions\tself_backedges\texternal_entries\tguest_instructions\tentry_arch_loads\tbody_arch_loads\tdirty_live_eviction_stores\tdead_evictions\tclean_evictions\tloop_reconcile_stores\tallocation_pressure\tmax_resident\tscratch_rax_sites\tscratch_rcx_sites\tscratch_rdx_sites\tcode_bytes\n");
+    output.push_str("\nblocks\nguest_pc\texecutions\tself_backedges\texternal_entries\tguest_instructions\tentry_arch_loads\tbody_arch_loads\tdirty_live_eviction_stores\tdead_evictions\tclean_evictions\tloop_reconcile_stores\tallocation_pressure\tmax_resident\tscratch_rax_sites\tscratch_rcx_sites\tscratch_rdx_sites\tforced_rcx_live_stores\tforced_rcx_dead_discards\tforced_rcx_clean_discards\tcode_bytes\n");
     output.push_str(&block_rows);
     Ok(output)
 }
@@ -977,6 +992,9 @@ mod tests {
                     loop_reconcile_stores: 2,
                     dirty_live_eviction_stores: 1,
                     scratch_clobber_sites: [3, 0, 1],
+                    forced_rcx_live_stores: 2,
+                    forced_rcx_dead_discards: 3,
+                    forced_rcx_clean_discards: 4,
                     max_resident: 7,
                     ..Default::default()
                 },
@@ -1008,6 +1026,9 @@ mod tests {
         assert!(report.contains("dirty_live_eviction_stores\t1\t5\t250000.000000\n"));
         assert!(report.contains("loop_reconcile_stores\t2\t4\t200000.000000\n"));
         assert!(report.contains("scratch_rax_sites\t3\t15\t750000.000000\n"));
+        assert!(report.contains("forced_rcx_live_stores\t2\t10\t500000.000000\n"));
+        assert!(report.contains("forced_rcx_dead_discards\t3\t15\t750000.000000\n"));
+        assert!(report.contains("forced_rcx_clean_discards\t4\t20\t1000000.000000\n"));
         assert!(report.contains("max_resident\t7\t-\t-\n"));
     }
 }
