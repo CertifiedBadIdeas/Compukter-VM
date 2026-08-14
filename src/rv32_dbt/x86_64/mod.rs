@@ -20,4 +20,6 @@
 pub(crate) mod cold_exit;
 pub(crate) mod emitter;
 pub(crate) mod lower;
+#[cfg(feature = "dbt-tier1-prototype")]
+pub(crate) mod region_alloc;
 pub(crate) mod register_cache;
