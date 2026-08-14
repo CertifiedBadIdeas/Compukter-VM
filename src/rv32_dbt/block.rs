@@ -22,7 +22,9 @@
     reason = "the direct x86_64 translator consumes block metadata in the next task"
 )]
 
-use crate::rv32_dbt::ir::{may_exit_before_write, register_effects, DbtIrBlock, FutureValue};
+use crate::rv32_dbt::ir::{
+    may_exit_before_write, register_effects, DbtIrBlock, DbtIrFutureCursor, FutureValue,
+};
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::profile::DbtProfileKey;
 use crate::rv32im::DecodedFields;
@@ -107,15 +109,19 @@ pub(crate) struct DbtLoweringInstruction {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct DbtFutureValues<'a> {
-    input: DbtBlockInput<'a>,
+pub(crate) struct DbtFutureValues<'input, 'cursor> {
+    input: DbtBlockInput<'input>,
     index: usize,
+    cursor: Option<&'cursor DbtIrFutureCursor<'input>>,
 }
 
-impl DbtFutureValues<'_> {
+impl DbtFutureValues<'_, '_> {
     pub(crate) fn value(self, guest: usize) -> FutureValue {
         match self.input.source {
-            DbtBlockSource::MicroIr(ir) => ir.future_value(self.index, guest),
+            DbtBlockSource::MicroIr(ir) => self.cursor.map_or_else(
+                || ir.future_value(self.index, guest),
+                |cursor| cursor.future_value(self.index, guest),
+            ),
             DbtBlockSource::Decoded(_) => {
                 let mut crossed_exit = false;
                 for distance in 0..self.input.instruction_count().saturating_sub(self.index) {
@@ -272,10 +278,15 @@ impl<'a> DbtBlockInput<'a> {
         }
     }
 
-    pub(crate) const fn future_values(&self, index: usize) -> DbtFutureValues<'a> {
+    pub(crate) const fn future_values<'cursor>(
+        &self,
+        index: usize,
+        cursor: Option<&'cursor DbtIrFutureCursor<'a>>,
+    ) -> DbtFutureValues<'a, 'cursor> {
         DbtFutureValues {
             input: *self,
             index,
+            cursor,
         }
     }
 

@@ -33,6 +33,7 @@ use crate::rv32_dbt::block::{
 };
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::block::{DbtProfileRelocation, MAX_PROFILE_RELOCATIONS};
+use crate::rv32_dbt::ir::DbtIrFutureCursor;
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::profile::DbtProfileKey;
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
@@ -210,6 +211,7 @@ impl DbtTranslationWorkspace {
         } else {
             RegisterCache::direct()
         };
+        let future_cursor = input.micro_ir().map(DbtIrFutureCursor::new);
         let local_loop_plan = chainable
             .then(|| local_self_branch_target(input))
             .flatten()
@@ -235,7 +237,11 @@ impl DbtTranslationWorkspace {
         };
         let local_loop_entry = if let Some(plan) = local_loop_plan {
             match input.micro_ir() {
-                Some(_) => cache.preload_local_loop(plan, input.future_values(0), &mut out),
+                Some(_) => cache.preload_local_loop(
+                    plan,
+                    input.future_values(0, future_cursor.as_ref()),
+                    &mut out,
+                ),
                 None => cache.preload_local_loop(plan, input.slots(), &mut out),
             }
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
@@ -293,7 +299,7 @@ impl DbtTranslationWorkspace {
             };
             let word = instruction.word();
             let fields = instruction.fields();
-            let future = input.future_values(index);
+            let future = input.future_values(index, future_cursor.as_ref());
             let attempted = index as u32 + 1;
             match fields.operation {
                 DecodedOp::Branch(kind) => {

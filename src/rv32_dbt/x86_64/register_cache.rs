@@ -52,7 +52,7 @@ impl FutureValueSource for &Vec<Rv32ResolvedInstruction> {
     }
 }
 
-impl FutureValueSource for DbtFutureValues<'_> {
+impl FutureValueSource for DbtFutureValues<'_, '_> {
     fn value(self, guest: usize) -> FutureValue {
         self.value(guest)
     }
