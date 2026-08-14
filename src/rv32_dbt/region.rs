@@ -21,6 +21,14 @@ pub(crate) struct ValueId(u8);
 
 impl ValueId {
     const INVALID: Self = Self(u8::MAX);
+
+    pub(crate) const fn from_index(index: usize) -> Self {
+        Self(index as u8)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +194,15 @@ impl LoopRegion<'_> {
 
     pub(crate) fn address_form(&self, value: ValueId) -> RegionAddress {
         region_address(self.workspace, value)
+    }
+
+    pub(crate) fn value_at(&self, index: usize) -> Option<(ValueId, RegionValueKind)> {
+        (index < self.workspace.value_count)
+            .then(|| (ValueId::from_index(index), self.workspace.values[index]))
+    }
+
+    pub(crate) const fn branch(&self) -> Option<RegionBranch> {
+        self.workspace.branch
     }
 
     #[cfg(test)]
