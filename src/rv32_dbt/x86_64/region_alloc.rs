@@ -182,6 +182,9 @@ fn compute_live_ends(region: &LoopRegion<'_>, ends: &mut [usize; MAX_REGION_VALU
     }
     let terminal = region.value_count();
     for guest in 1..32 {
+        if let Some(entry) = region.entry_value(guest) {
+            ends[entry.index()] = terminal;
+        }
         if let Some(output) = region.output_value(guest) {
             if region.entry_value(guest) != Some(output) {
                 ends[output.index()] = terminal;
@@ -271,5 +274,26 @@ mod tests {
         assert!(allocation.spill_slots() >= 2);
         assert_eq!(allocation.spill_frame_bytes() % 16, 0);
         assert!(allocation.max_live() > 8);
+    }
+
+    #[test]
+    fn linear_scan_preserves_distinct_loop_entry_destinations() {
+        let words = [addi(5, 5, 1), bne(5, 6, -4)];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        let mut region_workspace = LoopRegionWorkspace::new();
+        let RegionBuildOutcome::Built(region) = region_workspace.build_optimized(0x1200, &ir)
+        else {
+            panic!("expected an optimized loop")
+        };
+        let mut allocation_workspace = RegionAllocationWorkspace::new();
+        let allocation = allocate_region(&region, &mut allocation_workspace).unwrap();
+
+        assert_ne!(
+            allocation.location(region.entry_value(5).unwrap()),
+            allocation.location(region.entry_value(6).unwrap())
+        );
     }
 }

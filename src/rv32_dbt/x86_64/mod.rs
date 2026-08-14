@@ -22,4 +22,6 @@ pub(crate) mod emitter;
 pub(crate) mod lower;
 #[cfg(feature = "dbt-tier1-prototype")]
 pub(crate) mod region_alloc;
+#[cfg(feature = "dbt-tier1-prototype")]
+pub(crate) mod region_lower;
 pub(crate) mod register_cache;
