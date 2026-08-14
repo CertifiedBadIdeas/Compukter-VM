@@ -50,14 +50,14 @@ pub use product_machine::{
     benchmark_geomean, benchmark_normalize_nanos, benchmark_rotating_order,
     compile_equivalent_calls, execute_product_machine_batch, format_product_active_row,
     optional_phase_rate, populate_product_ratios, product_backend_order, product_machine_batch,
-    product_percentile, PreparedProductMachine, PreparedProductNative, ProductActiveTiming,
-    ProductExecutionCandidate, ProductMachineBackend, ProductMachineImage,
-    ProductMachineObservation, ProductMachineWorkload, ProductNativeObservation,
-    COMPILATION_PHASE_REPORT_HEADER, PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_BLOCK_CACHE_SETS,
-    PRODUCT_BLOCK_MAX_INSTRUCTIONS, PRODUCT_CACHE_SETS, PRODUCT_DBT_CACHE_SETS,
-    PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_DEBUG_LIMIT,
-    PRODUCT_MACHINE_MAX_BATCH, PRODUCT_MACHINE_TARGET_NANOS, PRODUCT_RAM_BYTES,
-    PRODUCT_RESIDENT_REPORT_HEADER,
+    product_percentile, self_ab_delta, self_ab_order, PreparedProductMachine,
+    PreparedProductNative, ProductActiveTiming, ProductExecutionCandidate, ProductMachineBackend,
+    ProductMachineImage, ProductMachineObservation, ProductMachineWorkload,
+    ProductNativeObservation, COMPILATION_PHASE_REPORT_HEADER, PRODUCT_ACTIVE_REPORT_HEADER,
+    PRODUCT_BLOCK_CACHE_SETS, PRODUCT_BLOCK_MAX_INSTRUCTIONS, PRODUCT_CACHE_SETS,
+    PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS,
+    PRODUCT_DEBUG_LIMIT, PRODUCT_MACHINE_MAX_BATCH, PRODUCT_MACHINE_TARGET_NANOS,
+    PRODUCT_RAM_BYTES, PRODUCT_RESIDENT_REPORT_HEADER,
 };
 pub use programs::{DATA_BASE, MEMORY_SIZE, MMIO_BASE, PACKET_BYTES, RING_ENTRIES, STACK_TOP};
 pub use report::{

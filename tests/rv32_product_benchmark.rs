@@ -21,11 +21,11 @@ use compukter_vm::benchmarks::{
     benchmark_geomean, benchmark_normalize_nanos, benchmark_rotating_order,
     execute_product_machine_batch, format_product_active_row, native_checksum,
     populate_product_ratios, product_backend_order, product_machine_batch, product_percentile,
-    PreparedProductMachine, PreparedProductNative, ProductActiveTiming, ProductExecutionCandidate,
-    ProductMachineBackend, ProductMachineImage, ProductMachineWorkload,
-    PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES,
-    PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_MACHINE_MAX_BATCH, PRODUCT_MACHINE_TARGET_NANOS,
-    PRODUCT_RESIDENT_REPORT_HEADER,
+    self_ab_delta, self_ab_order, PreparedProductMachine, PreparedProductNative,
+    ProductActiveTiming, ProductExecutionCandidate, ProductMachineBackend, ProductMachineImage,
+    ProductMachineWorkload, PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_DBT_CACHE_SETS,
+    PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_MACHINE_MAX_BATCH,
+    PRODUCT_MACHINE_TARGET_NANOS, PRODUCT_RESIDENT_REPORT_HEADER,
 };
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32TranslationLookupUnit,
@@ -339,6 +339,16 @@ fn product_timing_math_is_normalized_and_rotated() {
         ProductExecutionCandidate::CachedDbt.name(),
         "rv32-cached-dbt"
     );
+}
+
+#[test]
+fn self_ab_helpers_alternate_pairs_and_use_baseline_as_denominator() {
+    assert_eq!(self_ab_order(0), [0, 1]);
+    assert_eq!(self_ab_order(1), [1, 0]);
+    assert_eq!(self_ab_order(2), [0, 1]);
+    assert!((self_ab_delta(100.0, 90.0).unwrap() + 0.1).abs() < f64::EPSILON);
+    assert!((self_ab_delta(100.0, 125.0).unwrap() - 0.25).abs() < f64::EPSILON);
+    assert!(self_ab_delta(0.0, 1.0).is_err());
 }
 
 #[test]
