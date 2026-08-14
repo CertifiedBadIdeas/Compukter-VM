@@ -248,3 +248,42 @@ an ordinary workload need not fill the whole cache. Conversely it excludes
 allocator/page-table overhead and shared process code, so it is not a whole
 server RSS prediction. RCX itself adds no measurable per-VM storage; the
 resident heap was byte-identical to the historical baseline.
+
+## Four-corner register/alignment matrix
+
+A same-process matrix separated the register-pool and block-alignment changes
+instead of comparing only the historical Stable7/32 and combined RCX/64
+endpoints. Every candidate used the product geometry (256 sets, 16 guest
+instructions per block, and a 128 KiB code cache), independent calibration,
+rotated 21-sample measurement, checksum `ee053d58`, identical retired guest
+instructions, and zero steady-state allocations.
+
+The independently repeated optimized-C run produced:
+
+| Register pool | Block base | ns/kernel | Versus Stable7/32 |
+|---|---:|---:|---:|
+| Stable7 | 32 B | 382,340 | 1.000x |
+| Stable7 | 64 B | 382,131 | 0.999x |
+| RCX overflow | 32 B | 421,692 | 1.103x |
+| RCX overflow | 64 B | 367,190 | 0.960x |
+
+The first run gave the same shape: RCX/32 was 1.105x baseline and RCX/64 was
+0.962x. In the repeat, changing 32 to 64 bytes was neutral for Stable7
+(0.999x), but improved RCX by 13.0% (0.871x). Equivalently, adding RCX cost
+10.3% at 32 bytes and saved 3.9% at 64 bytes. The ratio-of-ratios interaction
+was 0.871, confirming that register capacity and generated-code placement
+cannot be evaluated as independent optimizations on this workload.
+
+The full product-workload matrix was much less polarized. Its geometric means
+relative to Stable7/32 were 1.017x for Stable7/64, 1.011x for RCX/32, and
+1.018x for RCX/64. Individual rows moved in both directions, with the largest
+RCX/32 slowdown at 5.0% on `memory-random`; all semantic and allocation gates
+still passed.
+
+Decision: retain RCX/64 as the product default. The four-corner result explains
+why the earlier RCX/32 experiment was rejected and why restoring RCX only after
+the 64-byte alignment fix succeeded. It does not justify treating 64-byte
+alignment as universally faster: Stable7 gained nothing on optimized C and the
+short-suite geometric mean slightly favored Stable7/32. Future register-cache
+experiments must therefore qualify the exact generated-code layout they ship,
+not extrapolate runtime from spill counts alone.
