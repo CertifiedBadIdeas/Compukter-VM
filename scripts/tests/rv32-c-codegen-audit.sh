@@ -34,6 +34,8 @@ fi
 
 cargo run --manifest-path "$ROOT/Cargo.toml" --release --locked --offline \
     --features dbt-code-audit,dbt-execution-profile --example rv32_c_codegen_audit -- export "$BUILD_DIR"
+test -s "$BUILD_DIR/dbt-audit-config.tsv"
+test -s "$BUILD_DIR/dbt-execution-profile.tsv"
 test -s "$BUILD_DIR/dbt-support.tsv"
 test -s "$BUILD_DIR/dbt-register-pressure.tsv"
 test -s "$BUILD_DIR/dbt-register-pressure-weighted.tsv"
@@ -48,6 +50,7 @@ test -s "$BUILD_DIR/dbt-register-pressure-weighted.tsv"
 cargo run --manifest-path "$ROOT/Cargo.toml" --release --locked --offline \
     --features dbt-code-audit,dbt-execution-profile --example rv32_c_codegen_audit -- report "$BUILD_DIR"
 test -s "$BUILD_DIR/codegen-report.tsv"
+test -s "$BUILD_DIR/dbt-hot-blocks.tsv"
 
 AUDIT_BATCH=1024
 "$RV32_C_LLD" -m elf32lriscv --no-relax --fatal-warnings --defsym=__ck_batch="$AUDIT_BATCH" \
