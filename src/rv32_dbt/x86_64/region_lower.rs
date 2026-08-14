@@ -13,7 +13,9 @@ use super::emitter::{Condition, EmitError, Gpr, Mem, X64Emitter};
 use super::lower::emit_store_reservation_invalidation;
 use super::region_alloc::{HostLocation, RegionAllocation};
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
-use crate::rv32_dbt::block::{DbtBlockInput, TranslatedBlock};
+use crate::rv32_dbt::block::{
+    DbtBlockInput, DbtColdExitRelocation, DbtLinkKind, DbtStaticLink, TranslatedBlock,
+};
 use crate::rv32_dbt::region::{
     LoopRegion, RegionBinaryOp, RegionMemoryEffectKind, RegionStep, RegionValueKind, ValueId,
 };
@@ -121,19 +123,12 @@ impl RegionTranslationWorkspace {
 
         out.add_r64_imm32(EXECUTION_COUNTER, region.instruction_count() as i32)
             .map_err(|error| emit_fault(input.start_pc(), error))?;
-        emit_exit(
-            region,
-            allocation,
-            out,
-            frame_bytes,
-            DbtExitTag::Completed,
-            input
-                .start_pc()
-                .wrapping_add(region.instruction_count() as u32 * 4),
-            true,
-            false,
-        )
-        .map_err(|error| emit_fault(input.start_pc(), error))?;
+        let fallthrough_pc = input
+            .start_pc()
+            .wrapping_add(region.instruction_count() as u32 * 4);
+        let (fallthrough_link, fallthrough_cold_exit) =
+            emit_linked_exit(region, allocation, out, frame_bytes, fallthrough_pc)
+                .map_err(|error| emit_fault(input.start_pc(), error))?;
 
         out.bind(taken)
             .map_err(|error| emit_fault(input.start_pc(), error))?;
@@ -172,11 +167,19 @@ impl RegionTranslationWorkspace {
         let code = out
             .finish()
             .map_err(|error| emit_fault(input.start_pc(), error))?;
-        TranslatedBlock::new(input, code, 0, 0, chain_entry_offset, &[], &[])
-            .map(TranslatedBlock::with_local_self_backedge)
-            .map_err(|message| {
-                DbtFault::new(DbtFaultKind::Translation, input.start_pc(), None, message)
-            })
+        TranslatedBlock::new(
+            input,
+            code,
+            0,
+            0,
+            chain_entry_offset,
+            std::slice::from_ref(&fallthrough_link),
+            std::slice::from_ref(&fallthrough_cold_exit),
+        )
+        .map(TranslatedBlock::with_local_self_backedge)
+        .map_err(|message| {
+            DbtFault::new(DbtFaultKind::Translation, input.start_pc(), None, message)
+        })
     }
 }
 
@@ -680,31 +683,7 @@ fn emit_exit(
     reconciled: bool,
 ) -> Result<(), EmitError> {
     if materialize {
-        for guest in 1..32 {
-            let Some(output) = region.output_value(guest) else {
-                continue;
-            };
-            if region.entry_value(guest) == Some(output) {
-                continue;
-            }
-            let value = if reconciled
-                && region
-                    .entry_value(guest)
-                    .is_some_and(|entry| region.is_value_live(entry))
-            {
-                region.entry_value(guest).unwrap_or(output)
-            } else {
-                output
-            };
-            load_value(allocation, value, Gpr::Rax, out)?;
-            out.mov_m32_r32(
-                Mem::base_disp(
-                    Gpr::R14,
-                    Rv32ArchitecturalState::register_offset(guest) as i32,
-                ),
-                Gpr::Rax,
-            )?;
-        }
+        emit_materialized_outputs(region, allocation, out, reconciled)?;
     }
     write_u32(out, Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0)?;
     write_u32(out, Gpr::R14, Rv32ArchitecturalState::PC_OFFSET, next_pc)?;
@@ -735,6 +714,65 @@ fn emit_exit(
         write_u32(out, Gpr::R15, DbtContext::EXIT_OFFSET + offset, 0)?;
     }
     emit_epilogue(out, frame_bytes, tag)
+}
+
+fn emit_materialized_outputs(
+    region: &LoopRegion<'_>,
+    allocation: &RegionAllocation,
+    out: &mut X64Emitter,
+    reconciled: bool,
+) -> Result<(), EmitError> {
+    for guest in 1..32 {
+        let Some(output) = region.output_value(guest) else {
+            continue;
+        };
+        if region.entry_value(guest) == Some(output) {
+            continue;
+        }
+        let value = if reconciled
+            && region
+                .entry_value(guest)
+                .is_some_and(|entry| region.is_value_live(entry))
+        {
+            region.entry_value(guest).unwrap_or(output)
+        } else {
+            output
+        };
+        load_value(allocation, value, Gpr::Rax, out)?;
+        out.mov_m32_r32(
+            Mem::base_disp(
+                Gpr::R14,
+                Rv32ArchitecturalState::register_offset(guest) as i32,
+            ),
+            Gpr::Rax,
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_linked_exit(
+    region: &LoopRegion<'_>,
+    allocation: &RegionAllocation,
+    out: &mut X64Emitter,
+    frame_bytes: usize,
+    next_pc: u32,
+) -> Result<(DbtStaticLink, DbtColdExitRelocation), EmitError> {
+    emit_materialized_outputs(region, allocation, out, false)?;
+    if frame_bytes != 0 {
+        out.add_r64_imm32(Gpr::Rsp, frame_bytes as i32)?;
+    }
+    let jump = out.patchable_jump()?;
+    let link = DbtStaticLink {
+        target_pc: next_pc,
+        displacement_offset: jump.displacement_offset(),
+        reset_target_offset: jump.reset_target_offset(),
+        kind: DbtLinkKind::BranchNotTaken,
+    };
+    out.mov_r32_imm32(Gpr::Rdx, next_pc)?;
+    let cold_exit = DbtColdExitRelocation {
+        displacement_offset: out.external_jump()?,
+    };
+    Ok((link, cold_exit))
 }
 
 fn emit_epilogue(
@@ -803,7 +841,7 @@ fn emit_fault(pc: u32, error: EmitError) -> DbtFault {
 mod tests {
     use super::RegionTranslationWorkspace;
     use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
-    use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
+    use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, DbtLinkKind};
     use crate::rv32_dbt::code_cache::{DbtCacheKey, DirectDbtCodeCache};
     use crate::rv32_dbt::ir::DbtIrBlock;
     use crate::rv32_dbt::region::{LoopRegionWorkspace, RegionBuildOutcome};
@@ -882,6 +920,10 @@ mod tests {
         let tier1 = tier1_workspace
             .lower(&input, &region, allocation, 4096)
             .unwrap();
+        assert_eq!(tier1.static_links().len(), 1);
+        assert_eq!(tier1.static_links()[0].target_pc, 0x1008);
+        assert_eq!(tier1.static_links()[0].kind, DbtLinkKind::BranchNotTaken);
+        assert_eq!(tier1.cold_exit_relocations().len(), 1);
         let mut tier1_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
         let tier1_entry = tier1_cache
             .publish(DbtCacheKey::new(0x1000, 0), &tier1)
