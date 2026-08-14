@@ -19,6 +19,8 @@
 
 use crate::memory::{MemoryBus, MemoryFault};
 use crate::rv32im::{decode_fields, DecodedFields, DecodedOp};
+use std::cell::Cell;
+use std::mem::MaybeUninit;
 
 const PAGE_BYTES: u32 = 4096;
 
@@ -45,7 +47,85 @@ pub(crate) struct DbtIrInstruction {
     effects: DbtRegisterEffects,
 }
 
-const NO_REGISTER: u8 = u8::MAX;
+const INSTRUCTIONS_PER_CACHE_CHUNK: usize = 16;
+
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+struct IrInstructionChunk {
+    slots: [MaybeUninit<DbtIrInstruction>; INSTRUCTIONS_PER_CACHE_CHUNK],
+}
+
+impl IrInstructionChunk {
+    const EMPTY: Self = Self {
+        slots: [MaybeUninit::uninit(); INSTRUCTIONS_PER_CACHE_CHUNK],
+    };
+}
+
+#[derive(Debug)]
+struct AlignedInstructions {
+    chunks: Vec<IrInstructionChunk>,
+    len: usize,
+    capacity: usize,
+}
+
+impl AlignedInstructions {
+    fn new(capacity: usize) -> Self {
+        debug_assert_eq!(
+            std::mem::size_of::<IrInstructionChunk>(),
+            INSTRUCTIONS_PER_CACHE_CHUNK * std::mem::size_of::<DbtIrInstruction>()
+        );
+        Self {
+            chunks: vec![
+                IrInstructionChunk::EMPTY;
+                capacity.div_ceil(INSTRUCTIONS_PER_CACHE_CHUNK)
+            ],
+            len: 0,
+            capacity,
+        }
+    }
+
+    fn as_slice(&self) -> &[DbtIrInstruction] {
+        // SAFETY: the first `len` slots are initialized by `push`, chunks are
+        // contiguous, and the chunk size assertion excludes inter-chunk padding.
+        unsafe {
+            std::slice::from_raw_parts(self.chunks.as_ptr().cast::<DbtIrInstruction>(), self.len)
+        }
+    }
+
+    fn push(&mut self, instruction: DbtIrInstruction) {
+        assert!(self.len < self.capacity);
+        // SAFETY: `len < capacity`, and the rounded chunk allocation contains
+        // every logical slot through `capacity - 1`.
+        unsafe {
+            self.chunks
+                .as_mut_ptr()
+                .cast::<DbtIrInstruction>()
+                .add(self.len)
+                .write(instruction);
+        }
+        self.len += 1;
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.chunks.capacity() * std::mem::size_of::<IrInstructionChunk>()
+    }
+
+    fn last(&self) -> Option<&DbtIrInstruction> {
+        self.as_slice().last()
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +134,8 @@ pub(crate) struct DbtRegisterEffects {
     write: u8,
     may_exit_before_write: bool,
 }
+
+const NO_REGISTER: u8 = u8::MAX;
 
 impl DbtRegisterEffects {
     fn from_fields(fields: DecodedFields) -> Self {
@@ -144,7 +226,7 @@ impl DbtIrInstruction {
 
 #[derive(Debug)]
 pub(crate) struct DbtIrBlock {
-    instructions: Vec<DbtIrInstruction>,
+    instructions: AlignedInstructions,
     register_events: Vec<RegisterEvent>,
     register_event_counts: [u8; 32],
     register_ranges: [(u16, u16); 32],
@@ -153,13 +235,68 @@ pub(crate) struct DbtIrBlock {
     invalid_word: Option<u32>,
 }
 
+#[derive(Debug)]
+pub(crate) struct DbtIrFutureCursor<'a> {
+    ir: &'a DbtIrBlock,
+    register_positions: [Cell<u16>; 32],
+    exit_position: Cell<u16>,
+}
+
+impl<'a> DbtIrFutureCursor<'a> {
+    pub(crate) fn new(ir: &'a DbtIrBlock) -> Self {
+        Self {
+            ir,
+            register_positions: [const { Cell::new(0) }; 32],
+            exit_position: Cell::new(0),
+        }
+    }
+
+    pub(crate) fn future_value(&self, instruction: usize, guest: usize) -> FutureValue {
+        let (start, end) = self.ir.register_ranges[guest];
+        let position = &self.register_positions[guest];
+        let mut next = position.get().max(start);
+        while next < end
+            && usize::from(self.ir.register_events[usize::from(next)].instruction) < instruction
+        {
+            next += 1;
+        }
+        position.set(next);
+        let Some(event) = (next < end).then(|| self.ir.register_events[usize::from(next)]) else {
+            return FutureValue::Unused;
+        };
+        let distance = event.instruction - instruction as u8;
+        match event.kind {
+            RegisterEventKind::Read => FutureValue::Read(distance),
+            RegisterEventKind::Write => {
+                let mut exit = self.exit_position.get();
+                while usize::from(exit) < self.ir.exits.len()
+                    && usize::from(self.ir.exits[usize::from(exit)]) < instruction
+                {
+                    exit += 1;
+                }
+                self.exit_position.set(exit);
+                if self
+                    .ir
+                    .exits
+                    .get(usize::from(exit))
+                    .is_some_and(|exit| *exit <= event.instruction)
+                {
+                    FutureValue::Read(distance)
+                } else {
+                    FutureValue::Dead(distance)
+                }
+            }
+        }
+    }
+}
+
 impl DbtIrBlock {
     pub(crate) fn new(capacity: usize) -> Result<Self, String> {
         if capacity == 0 || capacity > 64 {
             return Err(format!("RV32 DBT IR capacity {capacity} is outside 1..=64"));
         }
         Ok(Self {
-            instructions: Vec::with_capacity(capacity),
+            instructions: AlignedInstructions::new(capacity),
             register_events: Vec::with_capacity(capacity * 3),
             register_event_counts: [0; 32],
             register_ranges: [(0, 0); 32],
@@ -170,12 +307,11 @@ impl DbtIrBlock {
     }
 
     pub(crate) fn instructions(&self) -> &[DbtIrInstruction] {
-        &self.instructions
+        self.instructions.as_slice()
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.instructions.capacity() * std::mem::size_of::<DbtIrInstruction>()
-            + self.analysis_retained_bytes()
+        self.instructions.retained_bytes() + self.analysis_retained_bytes()
     }
 
     pub(crate) fn analysis_retained_bytes(&self) -> usize {
@@ -250,8 +386,8 @@ impl DbtIrBlock {
         self.register_events
             .resize(usize::from(end), RegisterEvent::EMPTY);
         let mut cursors = self.register_ranges.map(|(start, _)| start);
-        for (index, instruction) in self.instructions.iter().copied().enumerate() {
-            let effects = instruction.effects;
+        for (index, instruction) in self.instructions.as_slice().iter().copied().enumerate() {
+            let effects = instruction.effects();
             for register in effects.reads() {
                 insert_register_event(
                     &mut self.register_events,
@@ -435,7 +571,9 @@ pub(crate) fn may_exit_before_write(operation: DecodedOp) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fill_ir_block, DbtIrBlock, DbtIrInstruction, DbtIrOp, FutureValue};
+    use super::{
+        fill_ir_block, DbtIrBlock, DbtIrFutureCursor, DbtIrInstruction, DbtIrOp, FutureValue,
+    };
     use crate::memory::MachineMemory;
     use crate::rv32im::encoding::{add, addi, ecall, jal};
 
@@ -498,10 +636,38 @@ mod tests {
     }
 
     #[test]
+    fn monotonic_cursor_matches_random_access_future_queries() {
+        let mut block = DbtIrBlock::new(4).unwrap();
+        block.lift_word(addi(3, 0, 1)).unwrap();
+        block.lift_word(addi(4, 3, 1)).unwrap();
+        block.lift_word(ecall()).unwrap();
+        block.lift_word(addi(3, 0, 2)).unwrap();
+        block.analyze_future_values();
+        let cursor = DbtIrFutureCursor::new(&block);
+
+        for instruction in 0..block.instructions().len() {
+            for guest in 0..32 {
+                assert_eq!(
+                    cursor.future_value(instruction, guest),
+                    block.future_value(instruction, guest)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sparse_analysis_storage_scales_with_register_events_not_register_file_snapshots() {
         let block = DbtIrBlock::new(64).unwrap();
 
         assert!(block.analysis_retained_bytes() <= 640);
+    }
+
+    #[test]
+    fn ir_workspace_starts_on_a_cache_line() {
+        for capacity in [8, 16, 32, 64] {
+            let block = DbtIrBlock::new(capacity).unwrap();
+            assert_eq!(block.instructions().as_ptr() as usize % 64, 0);
+        }
     }
 
     #[test]
