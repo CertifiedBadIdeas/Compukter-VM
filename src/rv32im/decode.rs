@@ -169,6 +169,126 @@ pub(crate) enum DecodedInstruction {
     Mret,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodedOp {
+    Lui,
+    Auipc,
+    Jal,
+    Jalr,
+    Branch(Branch),
+    Load(Load),
+    Store(Store),
+    Immediate(ImmOp),
+    Register(Op),
+    Fence,
+    FenceI,
+    LoadReserved(MemoryOrdering),
+    StoreConditional(MemoryOrdering),
+    Atomic(AtomicOp, MemoryOrdering),
+    Csr {
+        operation: CsrOperation,
+        immediate_source: bool,
+    },
+    Ecall,
+    Ebreak,
+    Mret,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedFields {
+    pub(crate) operation: DecodedOp,
+    pub(crate) rd: u8,
+    pub(crate) rs1: u8,
+    pub(crate) rs2: u8,
+    pub(crate) immediate: i32,
+}
+
+impl DecodedFields {
+    fn into_instruction(self) -> DecodedInstruction {
+        let rd = usize::from(self.rd);
+        let rs1 = usize::from(self.rs1);
+        let rs2 = usize::from(self.rs2);
+        match self.operation {
+            DecodedOp::Lui => DecodedInstruction::Lui {
+                rd,
+                value: self.immediate as u32,
+            },
+            DecodedOp::Auipc => DecodedInstruction::Auipc {
+                rd,
+                value: self.immediate as u32,
+            },
+            DecodedOp::Jal => DecodedInstruction::Jal {
+                rd,
+                offset: self.immediate,
+            },
+            DecodedOp::Jalr => DecodedInstruction::Jalr {
+                rd,
+                rs1,
+                immediate: self.immediate,
+            },
+            DecodedOp::Branch(kind) => DecodedInstruction::Branch {
+                kind,
+                rs1,
+                rs2,
+                offset: self.immediate,
+            },
+            DecodedOp::Load(kind) => DecodedInstruction::Load {
+                kind,
+                rd,
+                rs1,
+                immediate: self.immediate,
+            },
+            DecodedOp::Store(kind) => DecodedInstruction::Store {
+                kind,
+                rs1,
+                rs2,
+                immediate: self.immediate,
+            },
+            DecodedOp::Immediate(op) => DecodedInstruction::Immediate {
+                op,
+                rd,
+                rs1,
+                immediate: self.immediate,
+            },
+            DecodedOp::Register(op) => DecodedInstruction::Register { op, rd, rs1, rs2 },
+            DecodedOp::Fence => DecodedInstruction::Fence,
+            DecodedOp::FenceI => DecodedInstruction::FenceI,
+            DecodedOp::LoadReserved(ordering) => {
+                DecodedInstruction::LoadReserved { rd, rs1, ordering }
+            }
+            DecodedOp::StoreConditional(ordering) => DecodedInstruction::StoreConditional {
+                rd,
+                rs1,
+                rs2,
+                ordering,
+            },
+            DecodedOp::Atomic(operation, ordering) => DecodedInstruction::Atomic {
+                operation,
+                rd,
+                rs1,
+                rs2,
+                ordering,
+            },
+            DecodedOp::Csr {
+                operation,
+                immediate_source,
+            } => DecodedInstruction::Csr {
+                operation,
+                rd,
+                csr: self.immediate as u16,
+                source: if immediate_source {
+                    CsrSource::Immediate(self.rs1)
+                } else {
+                    CsrSource::Register(rs1)
+                },
+            },
+            DecodedOp::Ecall => DecodedInstruction::Ecall,
+            DecodedOp::Ebreak => DecodedInstruction::Ebreak,
+            DecodedOp::Mret => DecodedInstruction::Mret,
+        }
+    }
+}
+
 pub(crate) fn decode_eager_reference(word: u32) -> Result<DecodedInstruction, String> {
     let opcode = word & 0x7f;
     let rd = ((word >> 7) & 31) as usize;
@@ -414,7 +534,207 @@ fn j_immediate(word: u32) -> i32 {
     ((raw << 11) as i32) >> 11
 }
 
+pub(crate) fn decode_fields(word: u32) -> Result<DecodedFields, String> {
+    let opcode = word & 0x7f;
+    let illegal = || Err(format!("illegal RV32IM instruction {word:#010x}"));
+    let fields = |operation, rd, rs1, rs2, immediate| {
+        Ok(DecodedFields {
+            operation,
+            rd: rd as u8,
+            rs1: rs1 as u8,
+            rs2: rs2 as u8,
+            immediate,
+        })
+    };
+    match opcode {
+        0x37 => fields(DecodedOp::Lui, rd(word), 0, 0, (word & 0xffff_f000) as i32),
+        0x17 => fields(
+            DecodedOp::Auipc,
+            rd(word),
+            0,
+            0,
+            (word & 0xffff_f000) as i32,
+        ),
+        0x6f => fields(DecodedOp::Jal, rd(word), 0, 0, j_immediate(word)),
+        0x67 => {
+            if funct3(word) != 0 {
+                return illegal();
+            }
+            fields(DecodedOp::Jalr, rd(word), rs1(word), 0, i_immediate(word))
+        }
+        0x63 => {
+            let kind = match funct3(word) {
+                0 => Branch::Eq,
+                1 => Branch::Ne,
+                4 => Branch::Lt,
+                5 => Branch::Ge,
+                6 => Branch::Ltu,
+                7 => Branch::Geu,
+                _ => return illegal(),
+            };
+            fields(
+                DecodedOp::Branch(kind),
+                0,
+                rs1(word),
+                rs2(word),
+                b_immediate(word),
+            )
+        }
+        0x03 => {
+            let kind = match funct3(word) {
+                0 => Load::Byte,
+                1 => Load::Half,
+                2 => Load::Word,
+                4 => Load::ByteU,
+                5 => Load::HalfU,
+                _ => return illegal(),
+            };
+            fields(
+                DecodedOp::Load(kind),
+                rd(word),
+                rs1(word),
+                0,
+                i_immediate(word),
+            )
+        }
+        0x23 => {
+            let kind = match funct3(word) {
+                0 => Store::Byte,
+                1 => Store::Half,
+                2 => Store::Word,
+                _ => return illegal(),
+            };
+            fields(
+                DecodedOp::Store(kind),
+                0,
+                rs1(word),
+                rs2(word),
+                s_immediate(word),
+            )
+        }
+        0x13 => {
+            let instruction_funct3 = funct3(word);
+            let (op, immediate) = match instruction_funct3 {
+                0 => (ImmOp::Add, i_immediate(word)),
+                2 => (ImmOp::Slt, i_immediate(word)),
+                3 => (ImmOp::Sltu, i_immediate(word)),
+                4 => (ImmOp::Xor, i_immediate(word)),
+                6 => (ImmOp::Or, i_immediate(word)),
+                7 => (ImmOp::And, i_immediate(word)),
+                1 if funct7(word) == 0 => (ImmOp::Sll, rs2(word) as i32),
+                5 if funct7(word) == 0 => (ImmOp::Srl, rs2(word) as i32),
+                5 if funct7(word) == 0x20 => (ImmOp::Sra, rs2(word) as i32),
+                _ => return illegal(),
+            };
+            fields(DecodedOp::Immediate(op), rd(word), rs1(word), 0, immediate)
+        }
+        0x33 => {
+            let op = match (funct7(word), funct3(word)) {
+                (0, 0) => Op::Add,
+                (0x20, 0) => Op::Sub,
+                (0, 1) => Op::Sll,
+                (0, 2) => Op::Slt,
+                (0, 3) => Op::Sltu,
+                (0, 4) => Op::Xor,
+                (0, 5) => Op::Srl,
+                (0x20, 5) => Op::Sra,
+                (0, 6) => Op::Or,
+                (0, 7) => Op::And,
+                (1, 0) => Op::Mul,
+                (1, 1) => Op::Mulh,
+                (1, 2) => Op::Mulhsu,
+                (1, 3) => Op::Mulhu,
+                (1, 4) => Op::Div,
+                (1, 5) => Op::Divu,
+                (1, 6) => Op::Rem,
+                (1, 7) => Op::Remu,
+                _ => return illegal(),
+            };
+            fields(DecodedOp::Register(op), rd(word), rs1(word), rs2(word), 0)
+        }
+        0x0f => match funct3(word) {
+            0 => fields(DecodedOp::Fence, 0, 0, 0, 0),
+            1 => fields(DecodedOp::FenceI, 0, 0, 0, 0),
+            _ => illegal(),
+        },
+        0x2f => {
+            if funct3(word) != 0b010 {
+                return illegal();
+            }
+            let ordering = MemoryOrdering {
+                acquire: word & (1 << 26) != 0,
+                release: word & (1 << 25) != 0,
+            };
+            let instruction_rs2 = rs2(word);
+            match word >> 27 {
+                0b00010 if instruction_rs2 == 0 => {
+                    fields(DecodedOp::LoadReserved(ordering), rd(word), rs1(word), 0, 0)
+                }
+                0b00011 => fields(
+                    DecodedOp::StoreConditional(ordering),
+                    rd(word),
+                    rs1(word),
+                    instruction_rs2,
+                    0,
+                ),
+                funct5 => {
+                    let operation = match funct5 {
+                        0b00001 => AtomicOp::Swap,
+                        0b00000 => AtomicOp::Add,
+                        0b00100 => AtomicOp::Xor,
+                        0b01100 => AtomicOp::And,
+                        0b01000 => AtomicOp::Or,
+                        0b10000 => AtomicOp::Min,
+                        0b10100 => AtomicOp::Max,
+                        0b11000 => AtomicOp::MinU,
+                        0b11100 => AtomicOp::MaxU,
+                        _ => return illegal(),
+                    };
+                    fields(
+                        DecodedOp::Atomic(operation, ordering),
+                        rd(word),
+                        rs1(word),
+                        instruction_rs2,
+                        0,
+                    )
+                }
+            }
+        }
+        0x73 if word == 0x0000_0073 => fields(DecodedOp::Ecall, 0, 0, 0, 0),
+        0x73 if word == 0x0010_0073 => fields(DecodedOp::Ebreak, 0, 0, 0, 0),
+        0x73 if word == 0x3020_0073 => fields(DecodedOp::Mret, 0, 0, 0, 0),
+        0x73 => {
+            let instruction_funct3 = funct3(word);
+            let operation = match instruction_funct3 {
+                1 | 5 => CsrOperation::Write,
+                2 | 6 => CsrOperation::Set,
+                3 | 7 => CsrOperation::Clear,
+                _ => return illegal(),
+            };
+            fields(
+                DecodedOp::Csr {
+                    operation,
+                    immediate_source: instruction_funct3 >= 5,
+                },
+                rd(word),
+                rs1(word),
+                0,
+                (word >> 20) as i32,
+            )
+        }
+        _ => illegal(),
+    }
+}
+
 pub(crate) fn decode(word: u32) -> Result<DecodedInstruction, String> {
+    decode_fields(word).map(DecodedFields::into_instruction)
+}
+
+#[allow(
+    dead_code,
+    reason = "kept temporarily for opcode-first benchmark comparison"
+)]
+pub(crate) fn decode_opcode_first_reference(word: u32) -> Result<DecodedInstruction, String> {
     let opcode = word & 0x7f;
     let illegal = || Err(format!("illegal RV32IM instruction {word:#010x}"));
     match opcode {
