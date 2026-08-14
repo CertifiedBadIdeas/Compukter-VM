@@ -25,6 +25,7 @@
 use super::emitter::{EmitError, Gpr, Mem, X64Emitter};
 use crate::rv32_dbt::block::DbtFutureValues;
 use crate::rv32_dbt::ir::{DbtIrBlock, FutureValue};
+use crate::rv32_machine::Rv32DbtRegisterProfile;
 use crate::rv32im::{
     CsrSource, DecodedInstruction, Rv32ArchitecturalState, Rv32ResolvedInstruction,
 };
@@ -200,9 +201,12 @@ impl RegisterCache {
         }
     }
 
-    pub(crate) const fn chainable() -> Self {
+    pub(crate) const fn chainable(register_profile: Rv32DbtRegisterProfile) -> Self {
         Self {
-            host_pool: &CHAINABLE_HOST_POOL,
+            host_pool: match register_profile {
+                Rv32DbtRegisterProfile::Stable7 => &CHAINABLE_STABLE_HOSTS,
+                Rv32DbtRegisterProfile::RcxOverflow8 => &CHAINABLE_HOST_POOL,
+            },
             entries: [None; DIRECT_HOST_POOL.len()],
             protected_guests: 0,
             rcx_reserved: false,
@@ -318,7 +322,7 @@ impl RegisterCache {
     }
 
     pub(crate) const fn is_chainable(&self) -> bool {
-        self.host_pool.len() == CHAINABLE_HOST_POOL.len()
+        self.host_pool.len() != DIRECT_HOST_POOL.len()
     }
 
     pub(crate) fn local_loop_plan(
@@ -722,6 +726,7 @@ mod tests {
     #[cfg(feature = "dbt-code-audit")]
     use super::{LocalLoopRegisterPlan, RegisterAuditPhase};
     use crate::rv32_dbt::x86_64::emitter::{Gpr, X64Emitter};
+    use crate::rv32_machine::Rv32DbtRegisterProfile;
     use crate::rv32im::{
         decode_product_word,
         encoding::{add, addi, bne, ecall, jal, jalr, lw, slli, sw},
@@ -752,7 +757,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            RegisterCache::chainable().host_pool(),
+            RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8).host_pool(),
             &[
                 Gpr::Rbx,
                 Gpr::Rbp,
@@ -763,6 +768,33 @@ mod tests {
                 Gpr::R11,
                 Gpr::Rcx,
             ]
+        );
+    }
+
+    #[test]
+    fn chainable_profile_selects_the_exact_host_pool() {
+        let mut stable = RegisterCache::chainable(Rv32DbtRegisterProfile::Stable7);
+        let mut overflow = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
+        let mut out = X64Emitter::new(512, 16).unwrap();
+
+        assert_eq!(stable.host_pool(), &super::CHAINABLE_STABLE_HOSTS);
+        assert_eq!(overflow.host_pool(), &super::CHAINABLE_HOST_POOL);
+        assert!(stable.is_chainable());
+        assert!(overflow.is_chainable());
+        for guest in 1..=7 {
+            assert_ne!(
+                stable.write(guest, &[], &[], &mut out).unwrap(),
+                Some(Gpr::Rcx)
+            );
+            assert_ne!(
+                overflow.write(guest, &[], &[], &mut out).unwrap(),
+                Some(Gpr::Rcx)
+            );
+        }
+        assert_ne!(stable.write(8, &[], &[], &mut out).unwrap(), Some(Gpr::Rcx));
+        assert_eq!(
+            overflow.write(8, &[], &[], &mut out).unwrap(),
+            Some(Gpr::Rcx)
         );
     }
 
@@ -841,7 +873,7 @@ mod tests {
             slot(bne(5, 15, -20)),
         ];
         let plan = RegisterCache::local_loop_plan(&slots).unwrap();
-        let mut cache = RegisterCache::chainable();
+        let mut cache = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
         let mut out = X64Emitter::new(512, slots.len()).unwrap();
         cache.preload_local_loop(plan, &slots, &mut out).unwrap();
 
@@ -876,7 +908,7 @@ mod tests {
         ];
         let plan = RegisterCache::local_loop_plan(&slots).unwrap();
         assert!(!plan.guests().contains(&20));
-        let mut cache = RegisterCache::chainable();
+        let mut cache = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
         let mut out = X64Emitter::new(512, slots.len()).unwrap();
         cache.preload_local_loop(plan, &slots, &mut out).unwrap();
         cache.write(20, &[], &[], &mut out).unwrap();
@@ -932,7 +964,7 @@ mod tests {
 
     #[test]
     fn rcx_is_used_only_after_every_stable_host_is_resident() {
-        let mut chainable = RegisterCache::chainable();
+        let mut chainable = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
         let mut direct = RegisterCache::direct();
         let mut out = X64Emitter::new(512, 16).unwrap();
 
@@ -958,7 +990,7 @@ mod tests {
 
     #[test]
     fn reserving_rcx_preserves_a_live_dirty_resident_and_blocks_reallocation() {
-        let mut cache = RegisterCache::chainable();
+        let mut cache = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
         let mut out = X64Emitter::new(512, 16).unwrap();
         for guest in 1..=8 {
             cache.write(guest, &[], &[], &mut out).unwrap();
@@ -981,7 +1013,7 @@ mod tests {
     #[test]
     fn reserving_rcx_discards_dead_and_clean_residents_without_a_store() {
         for dirty in [false, true] {
-            let mut cache = RegisterCache::chainable();
+            let mut cache = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
             let mut out = X64Emitter::new(512, 16).unwrap();
             for guest in 1..=8 {
                 if dirty {
@@ -1192,7 +1224,7 @@ mod tests {
     #[cfg(feature = "dbt-code-audit")]
     #[test]
     fn audit_distinguishes_entry_body_and_eviction_traffic() {
-        let mut cache = RegisterCache::chainable();
+        let mut cache = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
         let mut out = X64Emitter::new(512, 16).unwrap();
         cache.set_audit_phase(RegisterAuditPhase::Entry);
         cache.read(1, &[], &[], &mut out).unwrap();
@@ -1218,7 +1250,7 @@ mod tests {
             len: 1,
             written: 0,
         };
-        let mut cache = RegisterCache::chainable();
+        let mut cache = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
         let mut out = X64Emitter::new(512, 16).unwrap();
         cache.set_audit_phase(RegisterAuditPhase::Entry);
         cache.preload_local_loop(plan, &[], &mut out).unwrap();
@@ -1236,7 +1268,7 @@ mod tests {
     #[cfg(feature = "dbt-code-audit")]
     #[test]
     fn audit_classifies_actual_rcx_forced_releases() {
-        let mut cache = RegisterCache::chainable();
+        let mut cache = RegisterCache::chainable(Rv32DbtRegisterProfile::RcxOverflow8);
         let mut out = X64Emitter::new(512, 16).unwrap();
         for guest in 1..=8 {
             cache.write(guest, &[], &[], &mut out).unwrap();

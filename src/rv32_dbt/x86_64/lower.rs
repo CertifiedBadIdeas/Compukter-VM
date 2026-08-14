@@ -41,6 +41,7 @@ use crate::rv32_dbt::profile::DbtProfileKey;
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_machine::Rv32DbtProfileEdgeKind;
+use crate::rv32_machine::{Rv32DbtRegisterProfile, DEFAULT_DBT_REGISTER_PROFILE};
 use crate::rv32im::{
     Branch, DecodedFields, DecodedOp, ImmOp, Load, Op, Rv32ArchitecturalState, Store,
 };
@@ -49,6 +50,7 @@ const EXECUTION_COUNTER: Gpr = Gpr::Rdi;
 
 pub(crate) struct DbtTranslationWorkspace {
     emitter: X64Emitter,
+    register_profile: Rv32DbtRegisterProfile,
 }
 
 struct StaticLinkCollector {
@@ -150,6 +152,18 @@ impl DbtTranslationWorkspace {
         code_capacity: usize,
         max_block_instructions: usize,
     ) -> Result<Self, DbtFault> {
+        Self::new_with_register_profile(
+            code_capacity,
+            max_block_instructions,
+            DEFAULT_DBT_REGISTER_PROFILE,
+        )
+    }
+
+    pub(crate) fn new_with_register_profile(
+        code_capacity: usize,
+        max_block_instructions: usize,
+        register_profile: Rv32DbtRegisterProfile,
+    ) -> Result<Self, DbtFault> {
         let control_capacity = max_block_instructions.checked_mul(16).ok_or_else(|| {
             fault(
                 DbtFaultKind::Capacity,
@@ -160,7 +174,10 @@ impl DbtTranslationWorkspace {
         })?;
         let emitter = X64Emitter::new(code_capacity, control_capacity)
             .map_err(|error| fault(DbtFaultKind::Capacity, 0, None, error.to_string()))?;
-        Ok(Self { emitter })
+        Ok(Self {
+            emitter,
+            register_profile,
+        })
     }
 
     pub(crate) fn lower<'a>(
@@ -209,7 +226,7 @@ impl DbtTranslationWorkspace {
         #[cfg(feature = "dbt-execution-profile")]
         let mut profile_relocations = ProfileRelocationCollector::new();
         let mut cache = if chainable {
-            RegisterCache::chainable()
+            RegisterCache::chainable(self.register_profile)
         } else {
             RegisterCache::direct()
         };

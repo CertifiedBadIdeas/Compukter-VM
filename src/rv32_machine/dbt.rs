@@ -22,8 +22,9 @@
     reason = "the machine dispatcher consumes the per-VM DBT owner in the next issue #17 task"
 )]
 
-use super::Rv32DbtCodeAlignment;
-use super::Rv32DbtStats;
+use super::{
+    Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32DbtStats, DEFAULT_DBT_REGISTER_PROFILE,
+};
 #[cfg(feature = "dbt-code-audit")]
 use super::{Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError};
 #[cfg(feature = "dbt-execution-profile")]
@@ -49,6 +50,7 @@ pub(crate) enum Rv32DbtPolicy {
         sets: usize,
         cache_bytes: usize,
         code_alignment: Rv32DbtCodeAlignment,
+        register_profile: Rv32DbtRegisterProfile,
     },
 }
 
@@ -166,6 +168,12 @@ impl Rv32DbtExecution {
             }
         }
 
+        let register_profile = match policy {
+            Rv32DbtPolicy::Direct => DEFAULT_DBT_REGISTER_PROFILE,
+            Rv32DbtPolicy::Cached {
+                register_profile, ..
+            } => register_profile,
+        };
         let storage = match policy {
             Rv32DbtPolicy::Direct => Rv32DbtStorage::Direct {
                 scratch: ExecutableScratch::new(scratch_bytes)?,
@@ -175,6 +183,7 @@ impl Rv32DbtExecution {
                 sets,
                 cache_bytes,
                 code_alignment,
+                register_profile: _,
             } => Rv32DbtStorage::Cached {
                 cache: DirectDbtCodeCache::new_with_alignment(sets, cache_bytes, code_alignment)?,
                 bounded_scratch: ExecutableScratch::new(scratch_bytes)?,
@@ -189,7 +198,11 @@ impl Rv32DbtExecution {
             decoded: Vec::with_capacity(max_instructions),
             ir: DbtIrBlock::new(max_instructions)
                 .map_err(|message| Self::fault(DbtFaultKind::Capacity, message))?,
-            workspace: DbtTranslationWorkspace::new(scratch_bytes, max_instructions)?,
+            workspace: DbtTranslationWorkspace::new_with_register_profile(
+                scratch_bytes,
+                max_instructions,
+                register_profile,
+            )?,
             storage,
             translations: 0,
             publications: 0,
@@ -705,6 +718,7 @@ mod tests {
     use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
     use crate::rv32_dbt::block::DbtBlockMode;
     use crate::rv32_dbt::DbtFaultKind;
+    use crate::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE;
     use crate::rv32im::{
         decode_product_word,
         encoding::{addi, lw, sw},
@@ -766,6 +780,7 @@ mod tests {
                 sets: 2,
                 cache_bytes: 4096,
                 code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
             },
             8,
             4096,
@@ -799,6 +814,7 @@ mod tests {
                 sets: 2,
                 cache_bytes: 16 * 1024,
                 code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
             },
             8,
             8 * 1024,
@@ -815,6 +831,7 @@ mod tests {
                 sets: 2,
                 cache_bytes: 4096,
                 code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
             },
             8,
             4096,
@@ -843,6 +860,7 @@ mod tests {
                 sets: 2,
                 cache_bytes: 4096,
                 code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
             },
             8,
             4096,
@@ -958,6 +976,7 @@ mod tests {
                 sets: 8,
                 cache_bytes: 4096,
                 code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
             },
             8,
             4096,
@@ -1026,6 +1045,7 @@ mod tests {
                 sets: 8,
                 cache_bytes: 4096,
                 code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
             },
             8,
             4096,
@@ -1086,6 +1106,7 @@ mod tests {
                 sets: 8,
                 cache_bytes: 4096,
                 code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
             },
             8,
             4096,
@@ -1147,6 +1168,7 @@ mod tests {
                 sets: 8,
                 cache_bytes: 4096,
                 code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
             },
             16,
             4096,
@@ -1206,6 +1228,7 @@ mod tests {
                     sets: 0,
                     cache_bytes: 4096,
                     code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                    register_profile: DEFAULT_DBT_REGISTER_PROFILE,
                 },
                 8,
                 4096,
@@ -1216,6 +1239,7 @@ mod tests {
                     sets: 3,
                     cache_bytes: 4096,
                     code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                    register_profile: DEFAULT_DBT_REGISTER_PROFILE,
                 },
                 8,
                 4096,
