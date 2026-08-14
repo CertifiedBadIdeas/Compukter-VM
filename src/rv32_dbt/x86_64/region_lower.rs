@@ -10,12 +10,15 @@
  */
 
 use super::emitter::{Condition, EmitError, Gpr, Mem, X64Emitter};
+use super::lower::emit_store_reservation_invalidation;
 use super::region_alloc::{HostLocation, RegionAllocation};
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, TranslatedBlock};
-use crate::rv32_dbt::region::{LoopRegion, RegionBinaryOp, RegionValueKind, ValueId};
+use crate::rv32_dbt::region::{
+    LoopRegion, RegionBinaryOp, RegionMemoryEffectKind, RegionStep, RegionValueKind, ValueId,
+};
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
-use crate::rv32im::{Branch, Rv32ArchitecturalState};
+use crate::rv32im::{Branch, Load, Rv32ArchitecturalState, Store};
 
 const EXECUTION_COUNTER: Gpr = Gpr::Rdi;
 
@@ -52,15 +55,6 @@ impl RegionTranslationWorkspace {
                 "Tier 1 region and DBT input instruction counts differ",
             ));
         }
-        if region.memory_effect_count() != 0 {
-            return Err(DbtFault::new(
-                DbtFaultKind::Translation,
-                input.start_pc(),
-                None,
-                "Tier 1 arithmetic lowering does not yet accept RAM effects",
-            ));
-        }
-
         self.emitter.reset();
         let out = &mut self.emitter;
         emit_prologue(out).map_err(|error| emit_fault(input.start_pc(), error))?;
@@ -102,7 +96,7 @@ impl RegionTranslationWorkspace {
             .map_err(|error| emit_fault(input.start_pc(), error))?;
         out.bind(loop_entry)
             .map_err(|error| emit_fault(input.start_pc(), error))?;
-        emit_values(region, allocation, out)
+        emit_steps(region, allocation, out, ram_len, frame_bytes)
             .map_err(|error| emit_fault(input.start_pc(), error))?;
 
         let branch = region.branch().ok_or_else(|| {
@@ -243,26 +237,291 @@ fn emit_entry_parameters(
     Ok(())
 }
 
-fn emit_values(
+fn emit_steps(
     region: &LoopRegion<'_>,
     allocation: &RegionAllocation,
     out: &mut X64Emitter,
+    ram_len: u32,
+    frame_bytes: usize,
 ) -> Result<(), EmitError> {
-    for index in 0..region.value_count() {
-        let Some((value, kind)) = region.value_at(index) else {
-            continue;
-        };
-        if !region.is_value_live(value) {
-            continue;
+    for index in 0..region.step_count() {
+        match region.step(index) {
+            RegionStep::Empty => {}
+            RegionStep::Value(value) => emit_value(region, allocation, value, out)?,
+            RegionStep::Load(effect) => emit_load(
+                region,
+                allocation,
+                usize::from(effect),
+                out,
+                ram_len,
+                frame_bytes,
+            )?,
+            RegionStep::Store(effect) => emit_store(
+                region,
+                allocation,
+                usize::from(effect),
+                out,
+                ram_len,
+                frame_bytes,
+            )?,
         }
-        let RegionValueKind::Binary { op, lhs, rhs } = kind else {
-            continue;
-        };
-        load_value(allocation, lhs, Gpr::Rax, out)?;
-        emit_binary(op, allocation, rhs, out)?;
-        store_value(allocation, value, Gpr::Rax, out)?;
     }
     Ok(())
+}
+
+fn emit_value(
+    region: &LoopRegion<'_>,
+    allocation: &RegionAllocation,
+    value: ValueId,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    if !region.is_value_live(value) {
+        return Ok(());
+    }
+    let RegionValueKind::Binary { op, lhs, rhs } = region.value_kind(value) else {
+        return Ok(());
+    };
+    load_value(allocation, lhs, Gpr::Rax, out)?;
+    emit_binary(op, allocation, rhs, out)?;
+    store_value(allocation, value, Gpr::Rax, out)
+}
+
+fn emit_load(
+    region: &LoopRegion<'_>,
+    allocation: &RegionAllocation,
+    effect_index: usize,
+    out: &mut X64Emitter,
+    ram_len: u32,
+    frame_bytes: usize,
+) -> Result<(), EmitError> {
+    let effect = region.memory_effect(effect_index);
+    let RegionMemoryEffectKind::Load {
+        kind,
+        address,
+        output,
+    } = effect.kind()
+    else {
+        return Err(EmitError::InvalidOperand(
+            "Tier 1 load step is not a load effect",
+        ));
+    };
+    load_value(allocation, address, Gpr::Rdx, out)?;
+    let width = load_width(kind);
+    let slow = emit_ram_checks(Gpr::Rdx, width, 0b001, ram_len, out)?;
+    let memory = Mem::base_index_disp(Gpr::R13, Gpr::Rdx, super::emitter::Scale::One, 0);
+    match kind {
+        Load::Byte => out.movsx_r32_m8(Gpr::Rax, memory)?,
+        Load::Half => out.movsx_r32_m16(Gpr::Rax, memory)?,
+        Load::Word => out.mov_r32_m32(Gpr::Rax, memory)?,
+        Load::ByteU => out.movzx_r32_m8(Gpr::Rax, memory)?,
+        Load::HalfU => out.movzx_r32_m16(Gpr::Rax, memory)?,
+    }
+    store_value(allocation, output, Gpr::Rax, out)?;
+    emit_ram_slow_path(
+        region,
+        allocation,
+        effect_index,
+        slow,
+        Gpr::Rdx,
+        width,
+        frame_bytes,
+        out,
+    )
+}
+
+fn emit_store(
+    region: &LoopRegion<'_>,
+    allocation: &RegionAllocation,
+    effect_index: usize,
+    out: &mut X64Emitter,
+    ram_len: u32,
+    frame_bytes: usize,
+) -> Result<(), EmitError> {
+    let effect = region.memory_effect(effect_index);
+    let RegionMemoryEffectKind::Store {
+        kind,
+        address,
+        value,
+    } = effect.kind()
+    else {
+        return Err(EmitError::InvalidOperand(
+            "Tier 1 store step is not a store effect",
+        ));
+    };
+    load_value(allocation, address, Gpr::Rdx, out)?;
+    let width = store_width(kind);
+    let slow = emit_ram_checks(Gpr::Rdx, width, 0b010, ram_len, out)?;
+    load_value(allocation, value, Gpr::Rax, out)?;
+    let memory = Mem::base_index_disp(Gpr::R13, Gpr::Rdx, super::emitter::Scale::One, 0);
+    match kind {
+        Store::Byte => out.mov_m8_r8(memory, Gpr::Rax)?,
+        Store::Half => out.mov_m16_r16(memory, Gpr::Rax)?,
+        Store::Word => out.mov_m32_r32(memory, Gpr::Rax)?,
+    }
+    // Tier 1 may allocate a live region value to RCX, while the shared
+    // reservation helper uses RCX as scratch. Preserve it across the helper;
+    // RAX is dead after the store and can remain scratch.
+    out.push(Gpr::Rcx)?;
+    emit_store_reservation_invalidation(Gpr::Rdx, width, out)?;
+    out.pop(Gpr::Rcx)?;
+    emit_ram_slow_path(
+        region,
+        allocation,
+        effect_index,
+        slow,
+        Gpr::Rdx,
+        width,
+        frame_bytes,
+        out,
+    )
+}
+
+fn emit_ram_checks(
+    address: Gpr,
+    width: u32,
+    permission: u8,
+    ram_len: u32,
+    out: &mut X64Emitter,
+) -> Result<super::emitter::Label, EmitError> {
+    let slow = out.new_label()?;
+    if width > 1 {
+        out.mov_r32_r32(Gpr::Rax, address)?;
+        out.and_r32_imm32(Gpr::Rax, width as i32 - 1)?;
+        out.test_r32_r32(Gpr::Rax, Gpr::Rax)?;
+        out.jcc(Condition::NotEqual, slow)?;
+    }
+    if ram_len < width {
+        out.jmp(slow)?;
+        return Ok(slow);
+    }
+    out.cmp_r32_imm32(address, ram_len.wrapping_sub(width) as i32)?;
+    out.jcc(Condition::Above, slow)?;
+    out.mov_r32_r32(Gpr::Rax, address)?;
+    out.shr_r32_imm8(Gpr::Rax, 12)?;
+    out.test_m8_imm8(
+        Mem::base_index_disp(Gpr::R12, Gpr::Rax, super::emitter::Scale::One, 0),
+        permission,
+    )?;
+    out.jcc(Condition::Equal, slow)?;
+    Ok(slow)
+}
+
+fn emit_ram_slow_path(
+    region: &LoopRegion<'_>,
+    allocation: &RegionAllocation,
+    effect_index: usize,
+    slow: super::emitter::Label,
+    address: Gpr,
+    width: u32,
+    frame_bytes: usize,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let done = out.new_label()?;
+    out.jmp(done)?;
+    out.bind(slow)?;
+    emit_memory_exit(
+        region,
+        allocation,
+        effect_index,
+        address,
+        width,
+        frame_bytes,
+        out,
+    )?;
+    out.bind(done)
+}
+
+fn emit_memory_exit(
+    region: &LoopRegion<'_>,
+    allocation: &RegionAllocation,
+    effect_index: usize,
+    address: Gpr,
+    width: u32,
+    frame_bytes: usize,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    let effect = region.memory_effect(effect_index);
+    for guest in 1..32 {
+        let Some(value) = region.memory_snapshot(effect_index, guest) else {
+            continue;
+        };
+        load_value(allocation, value, Gpr::Rax, out)?;
+        out.mov_m32_r32(
+            Mem::base_disp(
+                Gpr::R14,
+                Rv32ArchitecturalState::register_offset(guest) as i32,
+            ),
+            Gpr::Rax,
+        )?;
+    }
+    write_u32(out, Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0)?;
+    write_u32(
+        out,
+        Gpr::R14,
+        Rv32ArchitecturalState::PC_OFFSET,
+        effect.pc(),
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::NEXT_PC_OFFSET,
+        effect.pc(),
+    )?;
+    out.mov_r32_m32(
+        Gpr::Rax,
+        Mem::base_disp(Gpr::R15, DbtContext::REMAINING_BUDGET_OFFSET as i32),
+    )?;
+    out.add_r64_r64(Gpr::Rax, EXECUTION_COUNTER)?;
+    out.add_r32_imm32(Gpr::Rax, i32::from(effect.attempted_index()) + 1)?;
+    out.mov_m32_r32(
+        Mem::base_disp(
+            Gpr::R15,
+            (DbtContext::EXIT_OFFSET + DbtExitRecord::ATTEMPTED_OFFSET) as i32,
+        ),
+        Gpr::Rax,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::INSTRUCTION_PC_OFFSET,
+        effect.pc(),
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::INSTRUCTION_WORD_OFFSET,
+        effect.word(),
+    )?;
+    out.mov_m32_r32(
+        Mem::base_disp(
+            Gpr::R15,
+            (DbtContext::EXIT_OFFSET + DbtExitRecord::ADDRESS_OFFSET) as i32,
+        ),
+        address,
+    )?;
+    write_u32(
+        out,
+        Gpr::R15,
+        DbtContext::EXIT_OFFSET + DbtExitRecord::ACCESS_SIZE_OFFSET,
+        width,
+    )?;
+    emit_epilogue(out, frame_bytes, DbtExitTag::MemoryAccess)
+}
+
+const fn load_width(kind: Load) -> u32 {
+    match kind {
+        Load::Byte | Load::ByteU => 1,
+        Load::Half | Load::HalfU => 2,
+        Load::Word => 4,
+    }
+}
+
+const fn store_width(kind: Store) -> u32 {
+    match kind {
+        Store::Byte => 1,
+        Store::Half => 2,
+        Store::Word => 4,
+    }
 }
 
 fn emit_binary(
@@ -547,7 +806,7 @@ mod tests {
     use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
     use crate::rv32_dbt::x86_64::region_alloc::{allocate_region, RegionAllocationWorkspace};
     use crate::rv32im::{
-        encoding::{addi, bne},
+        encoding::{addi, bne, lw, sw},
         Rv32imCpu,
     };
 
@@ -632,5 +891,202 @@ mod tests {
                 "budget={budget}"
             );
         }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct MemoryObservation {
+        x5: u32,
+        x10: u32,
+        pc: u32,
+        tag: DbtExitTag,
+        exit: DbtExitRecord,
+        reservation_valid: u32,
+        ram: Vec<u8>,
+    }
+
+    fn execute_memory(
+        entry: *const u8,
+        mut ram: Vec<u8>,
+        start: u32,
+        end: u32,
+        reservation: Option<u32>,
+    ) -> MemoryObservation {
+        let permissions = [0b011_u8];
+        let mut cpu = Rv32imCpu::new(0x2000);
+        cpu.set_register(10, start).unwrap();
+        cpu.set_register(11, end).unwrap();
+        let mut context = DbtContext {
+            state: cpu.architectural_state_mut(),
+            ram_base: ram.as_mut_ptr(),
+            ram_len: ram.len() as u32,
+            page_permissions: permissions.as_ptr(),
+            page_count: 1,
+            remaining_budget: 10,
+            reservation_valid: u32::from(reservation.is_some()),
+            reservation_address: reservation.unwrap_or(0),
+            chain_transitions: 0,
+            #[cfg(feature = "dbt-execution-profile")]
+            profile_exit_kind: Default::default(),
+            exit: DbtExitRecord::default(),
+        };
+        let entry: DbtEntry = unsafe { std::mem::transmute(entry) };
+        let tag = DbtExitTag::try_from(unsafe { entry(&mut context) }).unwrap();
+        let exit = context.exit;
+        let reservation_valid = context.reservation_valid;
+        drop(context);
+        MemoryObservation {
+            x5: cpu.register(5),
+            x10: cpu.register(10),
+            pc: cpu.pc(),
+            tag,
+            exit,
+            reservation_valid,
+            ram,
+        }
+    }
+
+    #[test]
+    fn ram_region_matches_tier0_for_ordered_two_iteration_loop() {
+        let words = [
+            lw(5, 10, 0),
+            addi(5, 5, 1),
+            sw(10, 5, 0),
+            addi(10, 10, 4),
+            bne(10, 11, -16),
+        ];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        ir.analyze_future_values();
+        let input = DbtBlockInput::new_ir(0x2000, &ir, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut region_workspace = LoopRegionWorkspace::new();
+        let RegionBuildOutcome::Built(region) = region_workspace.build_optimized(0x2000, &ir)
+        else {
+            panic!("expected an optimized RAM region")
+        };
+        let mut allocation_workspace = RegionAllocationWorkspace::new();
+        let allocation = allocate_region(&region, &mut allocation_workspace).unwrap();
+
+        let mut tier0_workspace = DbtTranslationWorkspace::new(4096, 16).unwrap();
+        let tier0 = tier0_workspace.lower(&input, 4096).unwrap();
+        let mut tier0_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
+        let tier0_entry = tier0_cache
+            .publish(DbtCacheKey::new(0x2000, 0), &tier0)
+            .unwrap()
+            .entry();
+        let mut tier1_workspace = RegionTranslationWorkspace::new(4096).unwrap();
+        let tier1 = tier1_workspace
+            .lower(&input, &region, allocation, 4096)
+            .unwrap();
+        let mut tier1_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
+        let tier1_entry = tier1_cache
+            .publish(DbtCacheKey::new(0x2000, 0), &tier1)
+            .unwrap()
+            .entry();
+
+        let mut ram = vec![0; 4096];
+        ram[64..68].copy_from_slice(&7_u32.to_le_bytes());
+        ram[68..72].copy_from_slice(&11_u32.to_le_bytes());
+        assert_eq!(
+            execute_memory(tier1_entry, ram.clone(), 64, 72, None),
+            execute_memory(tier0_entry, ram, 64, 72, None)
+        );
+    }
+
+    #[test]
+    fn ram_region_preserves_second_iteration_pre_fault_state() {
+        let words = [
+            lw(5, 10, 0),
+            addi(5, 5, 1),
+            sw(10, 5, 0),
+            addi(10, 10, 4),
+            bne(10, 11, -16),
+        ];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        ir.analyze_future_values();
+        let input = DbtBlockInput::new_ir(0x2000, &ir, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut region_workspace = LoopRegionWorkspace::new();
+        let RegionBuildOutcome::Built(region) = region_workspace.build_optimized(0x2000, &ir)
+        else {
+            panic!("expected an optimized RAM region")
+        };
+        let mut allocation_workspace = RegionAllocationWorkspace::new();
+        let allocation = allocate_region(&region, &mut allocation_workspace).unwrap();
+
+        let mut tier0_workspace = DbtTranslationWorkspace::new(4096, 16).unwrap();
+        let tier0 = tier0_workspace.lower(&input, 4096).unwrap();
+        let mut tier0_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
+        let tier0_entry = tier0_cache
+            .publish(DbtCacheKey::new(0x2000, 0), &tier0)
+            .unwrap()
+            .entry();
+        let mut tier1_workspace = RegionTranslationWorkspace::new(4096).unwrap();
+        let tier1 = tier1_workspace
+            .lower(&input, &region, allocation, 4096)
+            .unwrap();
+        let mut tier1_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
+        let tier1_entry = tier1_cache
+            .publish(DbtCacheKey::new(0x2000, 0), &tier1)
+            .unwrap()
+            .entry();
+
+        let mut ram = vec![0; 4096];
+        ram[4092..4096].copy_from_slice(&7_u32.to_le_bytes());
+        assert_eq!(
+            execute_memory(tier1_entry, ram.clone(), 4092, 4100, None),
+            execute_memory(tier0_entry, ram, 4092, 4100, None)
+        );
+    }
+
+    #[test]
+    fn ram_region_store_invalidates_an_overlapping_reservation() {
+        let words = [
+            lw(5, 10, 0),
+            addi(5, 5, 1),
+            sw(10, 5, 0),
+            addi(10, 10, 4),
+            bne(10, 11, -16),
+        ];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        ir.analyze_future_values();
+        let input = DbtBlockInput::new_ir(0x2000, &ir, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut region_workspace = LoopRegionWorkspace::new();
+        let RegionBuildOutcome::Built(region) = region_workspace.build_optimized(0x2000, &ir)
+        else {
+            panic!("expected an optimized RAM region")
+        };
+        let mut allocation_workspace = RegionAllocationWorkspace::new();
+        let allocation = allocate_region(&region, &mut allocation_workspace).unwrap();
+
+        let mut tier0_workspace = DbtTranslationWorkspace::new(4096, 16).unwrap();
+        let tier0 = tier0_workspace.lower(&input, 4096).unwrap();
+        let mut tier0_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
+        let tier0_entry = tier0_cache
+            .publish(DbtCacheKey::new(0x2000, 0), &tier0)
+            .unwrap()
+            .entry();
+        let mut tier1_workspace = RegionTranslationWorkspace::new(4096).unwrap();
+        let tier1 = tier1_workspace
+            .lower(&input, &region, allocation, 4096)
+            .unwrap();
+        let mut tier1_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
+        let tier1_entry = tier1_cache
+            .publish(DbtCacheKey::new(0x2000, 0), &tier1)
+            .unwrap()
+            .entry();
+
+        let mut ram = vec![0; 4096];
+        ram[64..68].copy_from_slice(&7_u32.to_le_bytes());
+        assert_eq!(
+            execute_memory(tier1_entry, ram.clone(), 64, 68, Some(64)),
+            execute_memory(tier0_entry, ram, 64, 68, Some(64))
+        );
     }
 }
