@@ -85,6 +85,15 @@ pub enum Rv32ExecutionBackendConfig {
         code_alignment: Rv32DbtCodeAlignment,
         register_profile: Rv32DbtRegisterProfile,
     },
+    #[cfg(feature = "dbt-tier1-prototype")]
+    CachedDbtTier1Prototype {
+        sets: usize,
+        max_instructions: usize,
+        scratch_bytes: usize,
+        cache_bytes: usize,
+        code_alignment: Rv32DbtCodeAlignment,
+        register_profile: Rv32DbtRegisterProfile,
+    },
 }
 
 pub const DEFAULT_DBT_CACHE_SETS: usize = 256;
@@ -208,6 +217,13 @@ enum Rv32DbtBackendBuild {
         code_alignment: Rv32DbtCodeAlignment,
         register_profile: Rv32DbtRegisterProfile,
     },
+    #[cfg(feature = "dbt-tier1-prototype")]
+    CachedTier1Prototype {
+        sets: usize,
+        cache_bytes: usize,
+        code_alignment: Rv32DbtCodeAlignment,
+        register_profile: Rv32DbtRegisterProfile,
+    },
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -225,6 +241,18 @@ fn build_dbt_backend(
             code_alignment,
             register_profile,
         } => Rv32DbtPolicy::Cached {
+            sets,
+            cache_bytes,
+            code_alignment,
+            register_profile,
+        },
+        #[cfg(feature = "dbt-tier1-prototype")]
+        Rv32DbtBackendBuild::CachedTier1Prototype {
+            sets,
+            cache_bytes,
+            code_alignment,
+            register_profile,
+        } => Rv32DbtPolicy::CachedTier1Prototype {
             sets,
             cache_bytes,
             code_alignment,
@@ -297,6 +325,25 @@ impl Rv32Machine {
                 register_profile,
             } => build_dbt_backend(
                 Rv32DbtBackendBuild::Cached {
+                    sets,
+                    cache_bytes,
+                    code_alignment,
+                    register_profile,
+                },
+                max_instructions,
+                scratch_bytes,
+                ram_len,
+            )?,
+            #[cfg(feature = "dbt-tier1-prototype")]
+            Rv32ExecutionBackendConfig::CachedDbtTier1Prototype {
+                sets,
+                max_instructions,
+                scratch_bytes,
+                cache_bytes,
+                code_alignment,
+                register_profile,
+            } => build_dbt_backend(
+                Rv32DbtBackendBuild::CachedTier1Prototype {
                     sets,
                     cache_bytes,
                     code_alignment,

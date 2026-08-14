@@ -645,7 +645,7 @@ fn emit_loop_reconciliation(
         else {
             continue;
         };
-        if entry == output {
+        if entry == output || !region.is_value_live(entry) {
             continue;
         }
         load_value(allocation, output, Gpr::Rax, out)?;
@@ -658,7 +658,7 @@ fn emit_loop_reconciliation(
         else {
             continue;
         };
-        if entry == output {
+        if entry == output || !region.is_value_live(entry) {
             continue;
         }
         out.mov_r32_m32(Gpr::Rax, stack_slot(phi_base + phi))?;
@@ -687,7 +687,11 @@ fn emit_exit(
             if region.entry_value(guest) == Some(output) {
                 continue;
             }
-            let value = if reconciled {
+            let value = if reconciled
+                && region
+                    .entry_value(guest)
+                    .is_some_and(|entry| region.is_value_live(entry))
+            {
                 region.entry_value(guest).unwrap_or(output)
             } else {
                 output
@@ -766,7 +770,7 @@ fn carried_guest_count(region: &LoopRegion<'_>) -> usize {
         .filter(|guest| {
             matches!(
                 (region.entry_value(*guest), region.output_value(*guest)),
-                (Some(entry), Some(output)) if entry != output
+                (Some(entry), Some(output)) if entry != output && region.is_value_live(entry)
             )
         })
         .count()
@@ -891,6 +895,43 @@ mod tests {
                 "budget={budget}"
             );
         }
+    }
+
+    #[test]
+    fn loop_with_a_dead_entry_value_matches_tier0() {
+        let words = [addi(5, 0, 1), bne(6, 7, -4)];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        ir.analyze_future_values();
+        let input = DbtBlockInput::new_ir(0x1000, &ir, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut region_workspace = LoopRegionWorkspace::new();
+        let RegionBuildOutcome::Built(region) = region_workspace.build_optimized(0x1000, &ir)
+        else {
+            panic!("expected an optimized region")
+        };
+        assert!(!region.is_value_live(region.entry_value(5).unwrap()));
+        let mut allocation_workspace = RegionAllocationWorkspace::new();
+        let allocation = allocate_region(&region, &mut allocation_workspace).unwrap();
+        let mut tier0_workspace = DbtTranslationWorkspace::new(4096, 16).unwrap();
+        let tier0 = tier0_workspace.lower(&input, 4096).unwrap();
+        let mut tier0_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
+        let tier0_entry = tier0_cache
+            .publish(DbtCacheKey::new(0x1000, 0), &tier0)
+            .unwrap()
+            .entry();
+        let mut tier1_workspace = RegionTranslationWorkspace::new(4096).unwrap();
+        let tier1 = tier1_workspace
+            .lower(&input, &region, allocation, 4096)
+            .unwrap();
+        let mut tier1_cache = DirectDbtCodeCache::new(16, 64 * 1024).unwrap();
+        let tier1_entry = tier1_cache
+            .publish(DbtCacheKey::new(0x1000, 0), &tier1)
+            .unwrap()
+            .entry();
+
+        assert_eq!(execute(tier1_entry, 5), execute(tier0_entry, 5));
     }
 
     #[derive(Debug, PartialEq, Eq)]
