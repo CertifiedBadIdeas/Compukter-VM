@@ -38,7 +38,13 @@ use crate::rv32_dbt::executable::ExecutableScratch;
 use crate::rv32_dbt::ir::DbtIrBlock;
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::profile::{DbtProfileDynamicExit, ExactDbtProfile};
+#[cfg(feature = "dbt-tier1-prototype")]
+use crate::rv32_dbt::region::{LoopRegionWorkspace, RegionBuildOutcome};
 use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
+#[cfg(feature = "dbt-tier1-prototype")]
+use crate::rv32_dbt::x86_64::region_alloc::{allocate_region, RegionAllocationWorkspace};
+#[cfg(feature = "dbt-tier1-prototype")]
+use crate::rv32_dbt::x86_64::region_lower::RegionTranslationWorkspace;
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 #[cfg(test)]
 use crate::rv32im::Rv32ResolvedInstruction;
@@ -52,6 +58,39 @@ pub(crate) enum Rv32DbtPolicy {
         code_alignment: Rv32DbtCodeAlignment,
         register_profile: Rv32DbtRegisterProfile,
     },
+    #[cfg(feature = "dbt-tier1-prototype")]
+    CachedTier1Prototype {
+        sets: usize,
+        cache_bytes: usize,
+        code_alignment: Rv32DbtCodeAlignment,
+        register_profile: Rv32DbtRegisterProfile,
+    },
+}
+
+impl Rv32DbtPolicy {
+    fn cached_config(self) -> Option<(usize, usize, Rv32DbtCodeAlignment, Rv32DbtRegisterProfile)> {
+        match self {
+            Self::Direct => None,
+            Self::Cached {
+                sets,
+                cache_bytes,
+                code_alignment,
+                register_profile,
+            } => Some((sets, cache_bytes, code_alignment, register_profile)),
+            #[cfg(feature = "dbt-tier1-prototype")]
+            Self::CachedTier1Prototype {
+                sets,
+                cache_bytes,
+                code_alignment,
+                register_profile,
+            } => Some((sets, cache_bytes, code_alignment, register_profile)),
+        }
+    }
+
+    #[cfg(feature = "dbt-tier1-prototype")]
+    const fn tier1_enabled(self) -> bool {
+        matches!(self, Self::CachedTier1Prototype { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +135,14 @@ pub(crate) struct Rv32DbtExecution {
     decoded: Vec<Rv32ResolvedInstruction>,
     ir: DbtIrBlock,
     workspace: DbtTranslationWorkspace,
+    #[cfg(feature = "dbt-tier1-prototype")]
+    region_workspace: LoopRegionWorkspace,
+    #[cfg(feature = "dbt-tier1-prototype")]
+    region_allocation_workspace: RegionAllocationWorkspace,
+    #[cfg(feature = "dbt-tier1-prototype")]
+    region_translation_workspace: RegionTranslationWorkspace,
+    #[cfg(feature = "dbt-tier1-prototype")]
+    tier1_enabled: bool,
     storage: Rv32DbtStorage,
     translations: u64,
     publications: u64,
@@ -111,6 +158,10 @@ pub(crate) struct Rv32DbtExecution {
     lowered_store_sites: u64,
     local_self_backedge_sites: u64,
     emitted_bytes: u64,
+    #[cfg(feature = "dbt-tier1-prototype")]
+    tier1_regions: u64,
+    #[cfg(feature = "dbt-tier1-prototype")]
+    tier1_fallbacks: u64,
     decoded_slots_built: u64,
     generation: u64,
     #[cfg(feature = "dbt-translation-timing")]
@@ -150,10 +201,7 @@ impl Rv32DbtExecution {
                 "DBT scratch bytes must be a positive multiple of 4096",
             ));
         }
-        if let Rv32DbtPolicy::Cached {
-            sets, cache_bytes, ..
-        } = policy
-        {
+        if let Some((sets, cache_bytes, _, _)) = policy.cached_config() {
             if sets == 0 || sets > u32::MAX as usize || !sets.is_power_of_two() {
                 return Err(Self::fault(
                     DbtFaultKind::Capacity,
@@ -168,23 +216,16 @@ impl Rv32DbtExecution {
             }
         }
 
-        let register_profile = match policy {
-            Rv32DbtPolicy::Direct => DEFAULT_DBT_REGISTER_PROFILE,
-            Rv32DbtPolicy::Cached {
-                register_profile, ..
-            } => register_profile,
-        };
-        let storage = match policy {
-            Rv32DbtPolicy::Direct => Rv32DbtStorage::Direct {
+        let register_profile = policy
+            .cached_config()
+            .map(|(_, _, _, profile)| profile)
+            .unwrap_or(DEFAULT_DBT_REGISTER_PROFILE);
+        let storage = match policy.cached_config() {
+            None => Rv32DbtStorage::Direct {
                 scratch: ExecutableScratch::new(scratch_bytes)?,
                 serial: 0,
             },
-            Rv32DbtPolicy::Cached {
-                sets,
-                cache_bytes,
-                code_alignment,
-                register_profile: _,
-            } => Rv32DbtStorage::Cached {
+            Some((sets, cache_bytes, code_alignment, _)) => Rv32DbtStorage::Cached {
                 cache: DirectDbtCodeCache::new_with_alignment(sets, cache_bytes, code_alignment)?,
                 bounded_scratch: ExecutableScratch::new(scratch_bytes)?,
                 scratch_serial: 0,
@@ -203,6 +244,14 @@ impl Rv32DbtExecution {
                 max_instructions,
                 register_profile,
             )?,
+            #[cfg(feature = "dbt-tier1-prototype")]
+            region_workspace: LoopRegionWorkspace::new(),
+            #[cfg(feature = "dbt-tier1-prototype")]
+            region_allocation_workspace: RegionAllocationWorkspace::new(),
+            #[cfg(feature = "dbt-tier1-prototype")]
+            region_translation_workspace: RegionTranslationWorkspace::new(scratch_bytes)?,
+            #[cfg(feature = "dbt-tier1-prototype")]
+            tier1_enabled: policy.tier1_enabled(),
             storage,
             translations: 0,
             publications: 0,
@@ -218,6 +267,10 @@ impl Rv32DbtExecution {
             lowered_store_sites: 0,
             local_self_backedge_sites: 0,
             emitted_bytes: 0,
+            #[cfg(feature = "dbt-tier1-prototype")]
+            tier1_regions: 0,
+            #[cfg(feature = "dbt-tier1-prototype")]
+            tier1_fallbacks: 0,
             decoded_slots_built: 0,
             generation: 0,
             #[cfg(feature = "dbt-translation-timing")]
@@ -404,13 +457,77 @@ impl Rv32DbtExecution {
                 ..
             }
         ) && mode == DbtBlockMode::ChainableThroughput;
-        #[cfg(feature = "dbt-execution-profile")]
+        #[cfg(feature = "dbt-tier1-prototype")]
+        let tier1_candidate = self.tier1_enabled && mode == DbtBlockMode::ChainableThroughput && {
+            #[cfg(feature = "dbt-execution-profile")]
+            {
+                !profile_enabled
+            }
+            #[cfg(not(feature = "dbt-execution-profile"))]
+            {
+                true
+            }
+        };
+        #[cfg(feature = "dbt-tier1-prototype")]
+        let block = if tier1_candidate {
+            match self.region_workspace.build_optimized(pc, &self.ir) {
+                RegionBuildOutcome::Built(region) => {
+                    match allocate_region(&region, &mut self.region_allocation_workspace) {
+                        Ok(allocation) => match self.region_translation_workspace.lower(
+                            &input,
+                            &region,
+                            allocation,
+                            self.ram_len,
+                        ) {
+                            Ok(block) => {
+                                self.tier1_regions = self.tier1_regions.saturating_add(1);
+                                block
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    DbtFaultKind::Capacity | DbtFaultKind::Translation
+                                ) =>
+                            {
+                                self.tier1_fallbacks = self.tier1_fallbacks.saturating_add(1);
+                                self.workspace.lower(&input, self.ram_len)?
+                            }
+                            Err(error) => return Err(error),
+                        },
+                        Err(_) => {
+                            self.tier1_fallbacks = self.tier1_fallbacks.saturating_add(1);
+                            self.workspace.lower(&input, self.ram_len)?
+                        }
+                    }
+                }
+                RegionBuildOutcome::Fallback(_) => {
+                    self.tier1_fallbacks = self.tier1_fallbacks.saturating_add(1);
+                    self.workspace.lower(&input, self.ram_len)?
+                }
+            }
+        } else {
+            #[cfg(feature = "dbt-execution-profile")]
+            if profile_enabled {
+                self.workspace.lower_profiled(&input, self.ram_len)?
+            } else {
+                self.workspace.lower(&input, self.ram_len)?
+            }
+            #[cfg(not(feature = "dbt-execution-profile"))]
+            self.workspace.lower(&input, self.ram_len)?
+        };
+        #[cfg(all(
+            not(feature = "dbt-tier1-prototype"),
+            feature = "dbt-execution-profile"
+        ))]
         let block = if profile_enabled {
             self.workspace.lower_profiled(&input, self.ram_len)?
         } else {
             self.workspace.lower(&input, self.ram_len)?
         };
-        #[cfg(not(feature = "dbt-execution-profile"))]
+        #[cfg(all(
+            not(feature = "dbt-tier1-prototype"),
+            not(feature = "dbt-execution-profile")
+        ))]
         let block = self.workspace.lower(&input, self.ram_len)?;
         #[cfg(feature = "dbt-translation-timing")]
         let lower_nanos = lower_started.map(|started| started.elapsed().as_nanos());
@@ -684,6 +801,10 @@ impl Rv32DbtExecution {
             local_self_backedge_sites: self.local_self_backedge_sites,
             decoded_slots_built: self.decoded_slots_built,
             emitted_bytes: self.emitted_bytes,
+            #[cfg(feature = "dbt-tier1-prototype")]
+            tier1_regions: self.tier1_regions,
+            #[cfg(feature = "dbt-tier1-prototype")]
+            tier1_fallbacks: self.tier1_fallbacks,
             alignment_padding_bytes: cache_stats.alignment_padding_bytes,
             live_code_bytes,
             code_prefix_bytes,
@@ -719,6 +840,8 @@ mod tests {
     use crate::rv32_dbt::block::DbtBlockMode;
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE;
+    #[cfg(feature = "dbt-tier1-prototype")]
+    use crate::rv32im::encoding::bne;
     use crate::rv32im::{
         decode_product_word,
         encoding::{addi, lw, sw},
@@ -802,6 +925,64 @@ mod tests {
         assert_eq!(cached.stats().publications, 1);
         assert_eq!(cached.stats().hits, 1);
         assert_eq!(cached.stats().misses, 1);
+    }
+
+    #[cfg(feature = "dbt-tier1-prototype")]
+    #[test]
+    fn tier1_policy_publishes_an_eligible_loop_and_reports_it() {
+        let mut execution = Rv32DbtExecution::new(
+            Rv32DbtPolicy::CachedTier1Prototype {
+                sets: 2,
+                cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+            },
+            8,
+            4096,
+            4096,
+        )
+        .unwrap();
+        let ir = execution.ir_block_mut();
+        ir.reset();
+        for word in [addi(5, 5, 1), bne(5, 6, -4)] {
+            ir.lift_word(word).unwrap();
+        }
+
+        execution
+            .translate(0x1000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+
+        let stats = execution.stats();
+        assert_eq!(stats.tier1_regions, 1);
+        assert_eq!(stats.tier1_fallbacks, 0);
+        assert_eq!(stats.local_self_backedge_sites, 1);
+    }
+
+    #[cfg(feature = "dbt-tier1-prototype")]
+    #[test]
+    fn tier1_policy_falls_back_to_tier0_for_an_ineligible_block() {
+        let mut execution = Rv32DbtExecution::new(
+            Rv32DbtPolicy::CachedTier1Prototype {
+                sets: 2,
+                cache_bytes: 4096,
+                code_alignment: super::Rv32DbtCodeAlignment::BlockBase(64),
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+            },
+            8,
+            4096,
+            4096,
+        )
+        .unwrap();
+        execution.ir_block_mut().lift_word(addi(5, 5, 1)).unwrap();
+
+        execution
+            .translate(0x1000, DbtBlockMode::ChainableThroughput)
+            .unwrap();
+
+        let stats = execution.stats();
+        assert_eq!(stats.tier1_regions, 0);
+        assert_eq!(stats.tier1_fallbacks, 1);
+        assert_eq!(stats.translations, 1);
     }
 
     #[test]

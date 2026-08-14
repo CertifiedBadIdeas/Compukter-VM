@@ -223,6 +223,10 @@ pub struct Rv32DbtStats {
     pub local_self_backedge_sites: u64,
     pub decoded_slots_built: u64,
     pub emitted_bytes: u64,
+    #[cfg(feature = "dbt-tier1-prototype")]
+    pub tier1_regions: u64,
+    #[cfg(feature = "dbt-tier1-prototype")]
+    pub tier1_fallbacks: u64,
     pub alignment_padding_bytes: u64,
     pub live_code_bytes: usize,
     pub code_prefix_bytes: usize,

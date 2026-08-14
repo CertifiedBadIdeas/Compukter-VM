@@ -317,11 +317,22 @@ impl LoopRegionWorkspace {
             return RegionBuildOutcome::Fallback(RegionFallbackReason::NotSelfLoop);
         }
         self.reset(instructions.len());
-        for instruction in &instructions[..last_index] {
-            if let Some(guest) = instruction.effects().write().filter(|guest| *guest != 0) {
-                if self.read_guest(guest).is_err() {
-                    return RegionBuildOutcome::Fallback(RegionFallbackReason::Capacity);
-                }
+        // Every guest parameter is defined at region entry, regardless of the
+        // instruction that first reads it. Materialize all referenced
+        // parameters before expression values so linear-scan lifetimes share
+        // the same semantic timeline as the generated loop.
+        let mut referenced_guests = [false; 32];
+        for instruction in instructions {
+            for guest in instruction.effects().reads() {
+                referenced_guests[usize::from(guest)] = guest != 0;
+            }
+            if let Some(guest) = instruction.effects().write() {
+                referenced_guests[usize::from(guest)] = guest != 0;
+            }
+        }
+        for (guest, referenced) in referenced_guests.into_iter().enumerate().skip(1) {
+            if referenced && self.read_guest(guest as u8).is_err() {
+                return RegionBuildOutcome::Fallback(RegionFallbackReason::Capacity);
             }
         }
         for (index, instruction) in instructions[..last_index].iter().copied().enumerate() {

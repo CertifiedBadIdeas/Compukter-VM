@@ -725,6 +725,21 @@ fn cached_dbt_reconciles_temporary_state_before_a_later_loop_fault() {
     ));
     assert_eq!(stats.unwrap().local_self_backedge_sites, 1);
     assert_eq!(actual, expected);
+
+    #[cfg(feature = "dbt-tier1-prototype")]
+    {
+        let (tier1, stats) = run(Rv32ExecutionBackendConfig::CachedDbtTier1Prototype {
+            sets: 32,
+            max_instructions: 16,
+            scratch_bytes: 4096,
+            cache_bytes: 4096,
+            code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+            register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+        });
+        let stats = stats.unwrap();
+        assert!(stats.tier1_regions >= 1);
+        assert_eq!(tier1, expected);
+    }
 }
 
 #[test]

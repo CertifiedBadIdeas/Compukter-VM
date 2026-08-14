@@ -216,7 +216,9 @@ fn compute_live_ends(region: &LoopRegion<'_>, ends: &mut [usize; MAX_REGION_VALU
 mod tests {
     use super::{allocate_region, HostLocation, RegionAllocationWorkspace};
     use crate::rv32_dbt::ir::DbtIrBlock;
-    use crate::rv32_dbt::region::{LoopRegionWorkspace, RegionBuildOutcome};
+    use crate::rv32_dbt::region::{
+        LoopRegionWorkspace, RegionBinaryOp, RegionBuildOutcome, RegionValueKind,
+    };
     use crate::rv32_dbt::x86_64::emitter::Gpr;
     use crate::rv32im::encoding::{add, addi, bne};
 
@@ -295,5 +297,46 @@ mod tests {
             allocation.location(region.entry_value(5).unwrap()),
             allocation.location(region.entry_value(6).unwrap())
         );
+    }
+
+    #[test]
+    fn loop_entry_parameter_never_aliases_an_earlier_temporary() {
+        let words = [
+            0x00a7_1833,
+            0x40a0_08b3,
+            0x0117_58b3,
+            0x0118_6833,
+            0x00a5_88b3,
+            0x0015_0513,
+            0x0188_5813,
+            0x0108_8023,
+            0x0117_0713,
+            0xfcf5_1ee3,
+        ];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        let mut region_workspace = LoopRegionWorkspace::new();
+        let RegionBuildOutcome::Built(region) = region_workspace.build_optimized(0x170, &ir) else {
+            panic!("expected the C rotation loop to be eligible")
+        };
+        let shift = (0..region.value_count())
+            .find_map(|index| match region.value_at(index) {
+                Some((
+                    value,
+                    RegionValueKind::Binary {
+                        op: RegionBinaryOp::ShiftLeft,
+                        ..
+                    },
+                )) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        let invariant = region.entry_value(11).unwrap();
+        let mut allocation_workspace = RegionAllocationWorkspace::new();
+        let allocation = allocate_region(&region, &mut allocation_workspace).unwrap();
+
+        assert_ne!(allocation.location(shift), allocation.location(invariant));
     }
 }

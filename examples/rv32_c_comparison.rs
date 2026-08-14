@@ -102,6 +102,14 @@ enum CandidateKind {
         code_alignment: Rv32DbtCodeAlignment,
         register_profile: Rv32DbtRegisterProfile,
     },
+    #[cfg(feature = "dbt-tier1-prototype")]
+    CachedDbtTier1Prototype {
+        sets: usize,
+        cache_bytes: usize,
+        max_instructions: usize,
+        code_alignment: Rv32DbtCodeAlignment,
+        register_profile: Rv32DbtRegisterProfile,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -142,21 +150,40 @@ impl Candidate {
                 code_alignment,
                 register_profile,
             }),
+            #[cfg(feature = "dbt-tier1-prototype")]
+            CandidateKind::CachedDbtTier1Prototype {
+                sets,
+                cache_bytes,
+                max_instructions,
+                code_alignment,
+                register_profile,
+            } => Some(Rv32ExecutionBackendConfig::CachedDbtTier1Prototype {
+                sets,
+                max_instructions,
+                scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
+                cache_bytes,
+                code_alignment,
+                register_profile,
+            }),
         }
     }
 
     const fn dbt_alignment(self) -> Option<Rv32DbtCodeAlignment> {
         match self.kind {
             CandidateKind::CachedDbt { code_alignment, .. } => Some(code_alignment),
+            #[cfg(feature = "dbt-tier1-prototype")]
+            CandidateKind::CachedDbtTier1Prototype { code_alignment, .. } => Some(code_alignment),
             _ => None,
         }
     }
 
     const fn is_dbt(self) -> bool {
-        matches!(
-            self.kind,
-            CandidateKind::DirectDbt | CandidateKind::CachedDbt { .. }
-        )
+        match self.kind {
+            CandidateKind::DirectDbt | CandidateKind::CachedDbt { .. } => true,
+            #[cfg(feature = "dbt-tier1-prototype")]
+            CandidateKind::CachedDbtTier1Prototype { .. } => true,
+            _ => false,
+        }
     }
 }
 
@@ -276,6 +303,23 @@ const COMMON_CANDIDATES: [Candidate; 7] = [
         kind: CandidateKind::DirectDbt,
     },
 ];
+
+#[cfg(feature = "dbt-tier1-prototype")]
+const TIER1_CANDIDATES: [Candidate; 1] = [Candidate {
+    name: "rv32-cached-dbt-tier1",
+    mode: "product-machine-cached-dbt-tier1-prototype",
+    artifact_stem: None,
+    kind: CandidateKind::CachedDbtTier1Prototype {
+        sets: 512,
+        cache_bytes: 128 * 1024,
+        max_instructions: 16,
+        code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+    },
+}];
+
+#[cfg(not(feature = "dbt-tier1-prototype"))]
+const TIER1_CANDIDATES: [Candidate; 0] = [];
 
 const DBT_MATRIX: [Candidate; 19] = [
     cached_dbt_candidate(
@@ -447,6 +491,8 @@ struct ProductDetails {
     dbt_lowered_load_sites: Option<u64>,
     dbt_lowered_store_sites: Option<u64>,
     dbt_local_self_backedge_sites: Option<u64>,
+    dbt_tier1_regions: Option<u64>,
+    dbt_tier1_fallbacks: Option<u64>,
     dbt_emitted_bytes: Option<u64>,
     dbt_alignment_padding_bytes: Option<u64>,
     dbt_live_code_bytes: Option<u64>,
@@ -533,6 +579,7 @@ fn run() -> Result<(), String> {
     let candidates = COMMON_CANDIDATES
         .iter()
         .chain(&DBT_MATRIX)
+        .chain(&TIER1_CANDIDATES)
         .copied()
         .collect::<Vec<_>>();
 
@@ -682,7 +729,7 @@ fn run() -> Result<(), String> {
         }
     }
     println!(
-        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\tvs_wasmtime\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_local_self_backedge_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes\tdbt_budget_overshoot\tdbt_max_budget_overshoot\tdbt_code_alignment\tdbt_alignment_anchor\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes"
+        "candidate\tmode\titerations\tseed\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tkernels_per_second\tvs_native\tvs_qemu\tvs_wasmtime\ttext_bytes\tqemu_startup_median_ns\tretired_instructions\tlookup_unit\tcache_hits\tcache_misses\tcache_evictions\tblocks_built\tdecoded_slots_built\ttranslation_bytes\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_links_reset\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_local_self_backedge_sites\tdbt_tier1_regions\tdbt_tier1_fallbacks\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes\tdbt_budget_overshoot\tdbt_max_budget_overshoot\tdbt_code_alignment\tdbt_alignment_anchor\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes"
     );
 
     let normalized = measurements
@@ -715,7 +762,7 @@ fn run() -> Result<(), String> {
         let mode = measurement.candidate.mode;
         let product_candidate = measurement.candidate.product_config().is_some();
         println!(
-            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t0x{:08x}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             measurement.candidate.name,
             mode,
             ITERATIONS,
@@ -759,6 +806,8 @@ fn run() -> Result<(), String> {
             option_u64(measurement.details.dbt_lowered_load_sites),
             option_u64(measurement.details.dbt_lowered_store_sites),
             option_u64(measurement.details.dbt_local_self_backedge_sites),
+            option_u64(measurement.details.dbt_tier1_regions),
+            option_u64(measurement.details.dbt_tier1_fallbacks),
             option_u64(measurement.details.dbt_emitted_bytes),
             option_u64(measurement.details.dbt_reserved_bytes),
             option_u64(product_candidate.then_some(measurement.details.steady_allocations)),
@@ -1044,12 +1093,19 @@ fn run_self_ab_measurement(
             phases[index].publish.push(publish);
         }
     }
-    if measurements[0].details.retired_instructions != measurements[1].details.retired_instructions
-    {
+    let retired_shape = |measurement: &CandidateMeasurements| {
+        (
+            measurement.details.retired_instructions / measurement.batch,
+            measurement.details.retired_instructions % measurement.batch,
+        )
+    };
+    if retired_shape(&measurements[0]) != retired_shape(&measurements[1]) {
         return Err(format!(
-            "self-A/B retired instruction mismatch: baseline {}, candidate {}",
+            "self-A/B normalized retired instruction mismatch: baseline {} at batch {}, candidate {} at batch {}",
             measurements[0].details.retired_instructions,
-            measurements[1].details.retired_instructions
+            measurements[0].batch,
+            measurements[1].details.retired_instructions,
+            measurements[1].batch,
         ));
     }
 
@@ -1068,11 +1124,11 @@ fn run_self_ab_measurement(
         "self_ab\t{}\t{}\t{}",
         measurements[0].candidate.name, measurements[1].candidate.name, samples
     );
-    println!("role\tcandidate\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tdelta_vs_baseline_percent\tretired_instructions\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_local_self_backedge_sites\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes");
+    println!("role\tcandidate\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tdelta_vs_baseline_percent\tretired_instructions\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_typed_slow_exits\tdbt_metadata_evictions\tdbt_overlap_invalidations\tdbt_lowered_load_sites\tdbt_lowered_store_sites\tdbt_local_self_backedge_sites\tdbt_tier1_regions\tdbt_tier1_fallbacks\tdbt_emitted_bytes\tdbt_reserved_bytes\tsteady_allocations\tsteady_allocated_bytes");
     for (index, measurement) in measurements.iter().enumerate() {
         let details = measurement.details;
         println!(
-            "{}\t{}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             if index == 0 { "baseline" } else { "candidate" },
             measurement.candidate.name,
             measurement.batch,
@@ -1093,6 +1149,8 @@ fn run_self_ab_measurement(
             option_u64(details.dbt_lowered_load_sites),
             option_u64(details.dbt_lowered_store_sites),
             option_u64(details.dbt_local_self_backedge_sites),
+            option_u64(details.dbt_tier1_regions),
+            option_u64(details.dbt_tier1_fallbacks),
             option_u64(details.dbt_emitted_bytes),
             option_u64(details.dbt_reserved_bytes),
             details.steady_allocations,
@@ -1184,6 +1242,7 @@ fn comparison_candidate(name: &str) -> Option<Candidate> {
     COMMON_CANDIDATES
         .iter()
         .chain(&DBT_MATRIX)
+        .chain(&TIER1_CANDIDATES)
         .copied()
         .find(|candidate| candidate.name == name)
 }
@@ -2030,6 +2089,13 @@ fn run_product(
     }
     let stats = machine.translation_stats();
     let dbt = machine.dbt_stats();
+    #[cfg(feature = "dbt-tier1-prototype")]
+    let (dbt_tier1_regions, dbt_tier1_fallbacks) = (
+        dbt.map(|value| value.tier1_regions),
+        dbt.map(|value| value.tier1_fallbacks),
+    );
+    #[cfg(not(feature = "dbt-tier1-prototype"))]
+    let (dbt_tier1_regions, dbt_tier1_fallbacks) = (None, None);
     Ok((
         elapsed,
         ProductDetails {
@@ -2054,6 +2120,8 @@ fn run_product(
             dbt_lowered_load_sites: dbt.map(|value| value.lowered_load_sites),
             dbt_lowered_store_sites: dbt.map(|value| value.lowered_store_sites),
             dbt_local_self_backedge_sites: dbt.map(|value| value.local_self_backedge_sites),
+            dbt_tier1_regions,
+            dbt_tier1_fallbacks,
             dbt_emitted_bytes: dbt.map(|value| value.emitted_bytes),
             dbt_alignment_padding_bytes: dbt.map(|value| value.alignment_padding_bytes),
             dbt_live_code_bytes: dbt.map(|value| value.live_code_bytes as u64),
