@@ -210,9 +210,14 @@ fn export(build_dir: &Path) -> Result<(), String> {
         .ok_or_else(|| "profiled audit machine returned no execution profile".to_string())?;
     fs::write(
         build_dir.join("dbt-register-pressure.tsv"),
-        register_pressure_report(&snapshot, &profile)?,
+        raw_register_pressure_report(&snapshot),
     )
     .map_err(|error| format!("failed to write register-pressure report: {error}"))?;
+    fs::write(
+        build_dir.join("dbt-register-pressure-weighted.tsv"),
+        weighted_register_pressure_report(&snapshot, &profile)?,
+    )
+    .map_err(|error| format!("failed to write weighted register-pressure report: {error}"))?;
 
     let binary_path = build_dir.join("dbt-code-cache.bin");
     fs::write(&binary_path, &snapshot.used_bytes)
@@ -236,7 +241,35 @@ fn export(build_dir: &Path) -> Result<(), String> {
 }
 
 #[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
-fn register_pressure_report(
+fn raw_register_pressure_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
+    let mut output = String::from(
+        "guest_pc\tguest_instructions\tentry_arch_loads\tbody_arch_loads\tdirty_live_eviction_stores\tdead_evictions\tclean_evictions\tloop_reconcile_stores\tallocation_pressure\tmax_resident\tscratch_rax_sites\tscratch_rcx_sites\tscratch_rdx_sites\tcode_bytes\n",
+    );
+    for block in &snapshot.blocks {
+        let pressure = block.register_pressure;
+        output.push_str(&format!(
+            "0x{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            block.guest_pc,
+            block.guest_instruction_count,
+            pressure.entry_arch_loads,
+            pressure.body_arch_loads,
+            pressure.dirty_live_eviction_stores,
+            pressure.dead_evictions,
+            pressure.clean_evictions,
+            pressure.loop_reconcile_stores,
+            pressure.allocation_pressure,
+            pressure.max_resident,
+            pressure.scratch_clobber_sites[0],
+            pressure.scratch_clobber_sites[1],
+            pressure.scratch_clobber_sites[2],
+            block.length,
+        ));
+    }
+    output
+}
+
+#[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
+fn weighted_register_pressure_report(
     snapshot: &Rv32DbtCodeSnapshot,
     profile: &Rv32DbtExecutionProfile,
 ) -> Result<String, String> {
@@ -261,6 +294,21 @@ fn register_pressure_report(
                 )
             })?
             .executions;
+        let self_backedges = profile
+            .static_edges
+            .iter()
+            .filter(|edge| edge.source_pc == block.guest_pc && edge.target_pc == block.guest_pc)
+            .try_fold(0_u64, |total, edge| {
+                total
+                    .checked_add(edge.executions)
+                    .ok_or_else(|| "self-backedge execution total overflowed".to_string())
+            })?;
+        let external_entries = executions.checked_sub(self_backedges).ok_or_else(|| {
+            format!(
+                "self-backedges exceed block executions at 0x{:08x}",
+                block.guest_pc
+            )
+        })?;
         let pressure = block.register_pressure;
         let values = [
             pressure.entry_arch_loads,
@@ -278,8 +326,22 @@ fn register_pressure_report(
             static_totals[index] = static_totals[index]
                 .checked_add(u128::from(value))
                 .ok_or_else(|| "static register-pressure total overflowed".to_string())?;
+        }
+        let weights = [
+            external_entries,
+            executions,
+            executions,
+            executions,
+            executions,
+            self_backedges,
+            executions,
+            executions,
+            executions,
+            executions,
+        ];
+        for (index, (value, weight)) in values.into_iter().zip(weights).enumerate() {
             weighted_totals[index] = weighted_totals[index]
-                .checked_add(u128::from(value) * u128::from(executions))
+                .checked_add(u128::from(value) * u128::from(weight))
                 .ok_or_else(|| "weighted register-pressure total overflowed".to_string())?;
         }
         executed_guest_instructions = executed_guest_instructions
@@ -287,9 +349,11 @@ fn register_pressure_report(
             .ok_or_else(|| "executed guest-instruction total overflowed".to_string())?;
         max_resident = max_resident.max(pressure.max_resident);
         block_rows.push_str(&format!(
-            "0x{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "0x{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             block.guest_pc,
             executions,
+            self_backedges,
+            external_entries,
             block.guest_instruction_count,
             pressure.entry_arch_loads,
             pressure.body_arch_loads,
@@ -337,7 +401,7 @@ fn register_pressure_report(
     output.push_str(&format!(
         "executed_guest_instructions\t-\t{executed_guest_instructions}\t1000000.000000\n"
     ));
-    output.push_str("\nblocks\nguest_pc\texecutions\tguest_instructions\tentry_arch_loads\tbody_arch_loads\tdirty_live_eviction_stores\tdead_evictions\tclean_evictions\tloop_reconcile_stores\tallocation_pressure\tmax_resident\tscratch_rax_sites\tscratch_rcx_sites\tscratch_rdx_sites\tcode_bytes\n");
+    output.push_str("\nblocks\nguest_pc\texecutions\tself_backedges\texternal_entries\tguest_instructions\tentry_arch_loads\tbody_arch_loads\tdirty_live_eviction_stores\tdead_evictions\tclean_evictions\tloop_reconcile_stores\tallocation_pressure\tmax_resident\tscratch_rax_sites\tscratch_rcx_sites\tscratch_rdx_sites\tcode_bytes\n");
     output.push_str(&block_rows);
     Ok(output)
 }
@@ -790,7 +854,7 @@ fn option_f64(value: Option<f64>) -> String {
 #[cfg(all(test, feature = "dbt-code-audit"))]
 mod tests {
     #[cfg(feature = "dbt-execution-profile")]
-    use super::register_pressure_report;
+    use super::weighted_register_pressure_report;
     use super::{
         assembly_wrapper, instruction_counts, metric_row, parse_block_report, parse_support_report,
     };
@@ -800,7 +864,8 @@ mod tests {
     };
     #[cfg(feature = "dbt-execution-profile")]
     use compukter_vm::rv32_machine::{
-        Rv32DbtDynamicExitCounts, Rv32DbtExecutionProfile, Rv32DbtProfileBlock,
+        Rv32DbtDynamicExitCounts, Rv32DbtExecutionProfile, Rv32DbtProfileBlock, Rv32DbtProfileEdge,
+        Rv32DbtProfileEdgeKind,
     };
 
     #[test]
@@ -907,7 +972,9 @@ mod tests {
                 chain_entry_offset: 0,
                 guest_instruction_count: 4,
                 register_pressure: compukter_vm::rv32_machine::Rv32DbtRegisterPressure {
+                    entry_arch_loads: 1,
                     body_arch_loads: 2,
+                    loop_reconcile_stores: 2,
                     dirty_live_eviction_stores: 1,
                     scratch_clobber_sites: [3, 0, 1],
                     max_resident: 7,
@@ -921,7 +988,12 @@ mod tests {
                 pc: 0x1000,
                 executions: 5,
             }],
-            static_edges: Vec::new(),
+            static_edges: vec![Rv32DbtProfileEdge {
+                source_pc: 0x1000,
+                target_pc: 0x1000,
+                kind: Rv32DbtProfileEdgeKind::Taken,
+                executions: 2,
+            }],
             dynamic_exits: Rv32DbtDynamicExitCounts::default(),
             capacity: 16,
             used_records: 1,
@@ -929,10 +1001,12 @@ mod tests {
             counter_overflowed: false,
         };
 
-        let report = register_pressure_report(&snapshot, &profile).unwrap();
+        let report = weighted_register_pressure_report(&snapshot, &profile).unwrap();
 
+        assert!(report.contains("entry_arch_loads\t1\t3\t150000.000000\n"));
         assert!(report.contains("body_arch_loads\t2\t10\t500000.000000\n"));
         assert!(report.contains("dirty_live_eviction_stores\t1\t5\t250000.000000\n"));
+        assert!(report.contains("loop_reconcile_stores\t2\t4\t200000.000000\n"));
         assert!(report.contains("scratch_rax_sites\t3\t15\t750000.000000\n"));
         assert!(report.contains("max_resident\t7\t-\t-\n"));
     }
