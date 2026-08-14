@@ -105,6 +105,7 @@ impl Mem {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Condition {
+    Sign,
     Equal,
     NotEqual,
     Less,
@@ -120,6 +121,7 @@ pub(crate) enum Condition {
 impl Condition {
     const fn code(self) -> u8 {
         match self {
+            Self::Sign => 0x8,
             Self::Equal => 0x4,
             Self::NotEqual => 0x5,
             Self::Below => 0x2,

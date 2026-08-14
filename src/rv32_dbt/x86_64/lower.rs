@@ -475,8 +475,9 @@ impl DbtTranslationWorkspace {
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
             }
         }
-        if let Some(cold_exit) = deferred_budget_exit {
-            out.bind(cold_exit)
+        if let Some(mut exit_cache) = deferred_local_budget_exit {
+            exit_cache
+                .flush(&mut out)
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
             #[cfg(feature = "dbt-execution-profile")]
             if profile_enabled {
@@ -486,9 +487,8 @@ impl DbtTranslationWorkspace {
             emit_completed_trampoline(&mut out, input.start_pc(), &mut cold_exits)
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
         }
-        if let Some((cold_exit, mut exit_cache)) = deferred_local_budget_exit {
+        if let Some(cold_exit) = deferred_budget_exit {
             out.bind(cold_exit)
-                .and_then(|()| exit_cache.flush(&mut out))
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
             #[cfg(feature = "dbt-execution-profile")]
             if profile_enabled {
@@ -581,7 +581,7 @@ fn emit_branch<S: FutureValueSource>(
     static_links: &mut StaticLinkCollector,
     cold_exits: &mut ColdExitCollector,
     local_loop_entry: Option<Label>,
-    deferred_local_budget_exit: &mut Option<(Label, RegisterCache)>,
+    deferred_local_budget_exit: &mut Option<RegisterCache>,
     source_pc: u32,
     #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
     #[cfg(feature = "dbt-execution-profile")] profile_relocations: &mut ProfileRelocationCollector,
@@ -634,11 +634,8 @@ fn emit_branch<S: FutureValueSource>(
             )?;
         }
         out.add_r64_imm32(EXECUTION_COUNTER, attempted as i32)?;
-        out.test_r64_r64(EXECUTION_COUNTER, EXECUTION_COUNTER)?;
-        let cold_exit = out.new_label()?;
-        out.jcc(Condition::GreaterEqual, cold_exit)?;
-        out.jmp(local_loop_entry)?;
-        *deferred_local_budget_exit = Some((cold_exit, taken_cache));
+        out.jcc(Condition::Sign, local_loop_entry)?;
+        *deferred_local_budget_exit = Some(taken_cache);
         return Ok(());
     }
     if target & 3 == 0 {
@@ -2088,6 +2085,31 @@ mod tests {
             .iter()
             .all(|link| link.target_pc != 0x1000));
         assert_eq!(block.local_self_backedge_sites(), 1);
+    }
+
+    #[test]
+    fn eligible_self_branch_reuses_budget_add_sign_flag() {
+        let words = slots(&[addi(1, 1, 1), bne(1, 2, -4)]);
+        let input = DbtBlockInput::new(0x1000, &words, DbtBlockMode::ChainableThroughput).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, 8).unwrap();
+        let block = workspace.lower(&input, 4096).unwrap();
+        let code = block.code();
+        let budget_add = [0x48, 0x81, 0xc7, 2, 0, 0, 0];
+        let add_offset = code
+            .windows(budget_add.len())
+            .rposition(|bytes| bytes == budget_add)
+            .expect("local self-backedge must add its attempted instructions");
+        let branch_offset = add_offset + budget_add.len();
+
+        assert_eq!(&code[branch_offset..branch_offset + 2], &[0x0f, 0x88]);
+        let displacement = i32::from_le_bytes(
+            code[branch_offset + 2..branch_offset + 6]
+                .try_into()
+                .unwrap(),
+        );
+        let target = (branch_offset + 6) as isize + displacement as isize;
+        assert!(target >= 0 && target < add_offset as isize);
+        assert_ne!(&code[branch_offset..branch_offset + 3], &[0x48, 0x85, 0xff]);
     }
 
     #[test]
