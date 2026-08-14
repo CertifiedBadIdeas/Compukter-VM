@@ -465,9 +465,7 @@ pub(crate) fn fill_ir_block(
             block.capacity
         )));
     }
-    let page_end = (start_pc & !(PAGE_BYTES - 1))
-        .checked_add(PAGE_BYTES)
-        .unwrap_or(u32::MAX);
+    let page_end = (start_pc & !(PAGE_BYTES - 1)).saturating_add(PAGE_BYTES);
     let block_end = executable_end.min(page_end);
     require_complete_word(start_pc, block_end)?;
     block.reset();

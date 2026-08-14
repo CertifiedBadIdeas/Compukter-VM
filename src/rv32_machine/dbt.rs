@@ -304,7 +304,7 @@ impl Rv32DbtExecution {
         } else {
             #[cfg(test)]
             {
-                return self.decoded.len();
+                self.decoded.len()
             }
             #[cfg(not(test))]
             {
