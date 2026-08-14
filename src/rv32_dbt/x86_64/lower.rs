@@ -23,6 +23,8 @@
 )]
 
 use super::emitter::{Condition, EmitError, Gpr, Label, Mem, X64Emitter};
+#[cfg(feature = "dbt-code-audit")]
+use super::register_cache::RegisterAuditPhase;
 use super::register_cache::{FutureValueSource, RegisterCache};
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::abi::DbtProfileExitKind;
@@ -236,6 +238,8 @@ impl DbtTranslationWorkspace {
             (offset, None)
         };
         let local_loop_entry = if let Some(plan) = local_loop_plan {
+            #[cfg(feature = "dbt-code-audit")]
+            cache.set_audit_phase(RegisterAuditPhase::Entry);
             match input.micro_ir() {
                 Some(_) => cache.preload_local_loop(
                     plan,
@@ -254,6 +258,8 @@ impl DbtTranslationWorkspace {
         } else {
             None
         };
+        #[cfg(feature = "dbt-code-audit")]
+        cache.set_audit_phase(RegisterAuditPhase::Body);
         #[cfg(feature = "dbt-execution-profile")]
         if profile_enabled {
             emit_profile_increment(
@@ -299,6 +305,7 @@ impl DbtTranslationWorkspace {
             };
             let word = instruction.word();
             let fields = instruction.fields();
+            cache.begin_instruction_audit();
             let future = input.future_values(index, future_cursor.as_ref());
             let attempted = index as u32 + 1;
             match fields.operation {
@@ -491,11 +498,14 @@ impl DbtTranslationWorkspace {
                 profile_relocations.as_slice(),
             )
             .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))?;
-            return Ok(if local_self_backedge {
+            let block = if local_self_backedge {
                 block.with_local_self_backedge()
             } else {
                 block
-            });
+            };
+            #[cfg(feature = "dbt-code-audit")]
+            let block = block.with_register_pressure(cache.audit());
+            return Ok(block);
         }
         let block = TranslatedBlock::new(
             input,
@@ -507,11 +517,14 @@ impl DbtTranslationWorkspace {
             cold_exits.as_slice(),
         )
         .map_err(|message| fault(DbtFaultKind::Translation, input.start_pc(), None, message))?;
-        Ok(if local_self_backedge {
+        let block = if local_self_backedge {
             block.with_local_self_backedge()
         } else {
             block
-        })
+        };
+        #[cfg(feature = "dbt-code-audit")]
+        let block = block.with_register_pressure(cache.audit());
+        Ok(block)
     }
 
     #[cfg(test)]
@@ -704,6 +717,9 @@ fn emit_jalr<S: FutureValueSource>(
     #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
 ) -> Result<(), EmitError> {
     let base = cache.read(rs1, remaining, &[], out)?;
+    cache.record_scratch_clobber(Gpr::Rax);
+    cache.record_scratch_clobber(Gpr::Rcx);
+    cache.record_scratch_clobber(Gpr::Rdx);
     out.mov_r32_r32(Gpr::Rax, base)?;
     out.add_r32_imm32(Gpr::Rax, immediate)?;
     out.and_r32_imm32(Gpr::Rax, -2)?;
@@ -853,6 +869,8 @@ fn lower_load<S: FutureValueSource>(
         Load::Word => 4,
     };
     let base = cache.read(rs1, remaining, &[], out)?;
+    cache.record_scratch_clobber(Gpr::Rdx);
+    cache.record_scratch_clobber(Gpr::Rax);
     out.mov_r32_r32(Gpr::Rdx, base)?;
     if immediate != 0 {
         out.add_r32_imm32(Gpr::Rdx, immediate)?;
@@ -898,6 +916,9 @@ fn lower_store<S: FutureValueSource>(
         Store::Word => 4,
     };
     let base = cache.read(rs1, remaining, &[], out)?;
+    cache.record_scratch_clobber(Gpr::Rdx);
+    cache.record_scratch_clobber(Gpr::Rax);
+    cache.record_scratch_clobber(Gpr::Rcx);
     out.mov_r32_r32(Gpr::Rdx, base)?;
     if immediate != 0 {
         out.add_r32_imm32(Gpr::Rdx, immediate)?;
@@ -998,6 +1019,7 @@ fn lower_immediate<S: FutureValueSource>(
     let dst = cache.write(rd, remaining, &[src], out)?.unwrap();
     match op {
         ImmOp::Slt | ImmOp::Sltu => {
+            cache.record_scratch_clobber(Gpr::Rax);
             out.cmp_r32_imm32(src, immediate)?;
             out.setcc_r8(
                 if op == ImmOp::Slt {
@@ -1044,6 +1066,7 @@ fn lower_register<S: FutureValueSource>(
     let rhs = cache.read(rs2, remaining, &[lhs], out)?;
     let dst = cache.write(rd, remaining, &[lhs, rhs], out)?.unwrap();
     if matches!(op, Op::Slt | Op::Sltu) {
+        cache.record_scratch_clobber(Gpr::Rax);
         out.cmp_r32_r32(lhs, rhs)?;
         out.setcc_r8(
             if op == Op::Slt {
@@ -1057,8 +1080,10 @@ fn lower_register<S: FutureValueSource>(
         return Ok(());
     }
     if matches!(op, Op::Sll | Op::Srl | Op::Sra) {
+        cache.record_scratch_clobber(Gpr::Rcx);
         out.mov_r32_r32(Gpr::Rcx, rhs)?;
         if dst == rhs && dst != lhs {
+            cache.record_scratch_clobber(Gpr::Rax);
             out.mov_r32_r32(Gpr::Rax, lhs)?;
             emit_cl_shift(op, Gpr::Rax, out)?;
             out.mov_r32_r32(dst, Gpr::Rax)?;
@@ -1073,6 +1098,7 @@ fn lower_register<S: FutureValueSource>(
     if dst == rhs && matches!(op, Op::Add | Op::Xor | Op::Or | Op::And) {
         emit_binary(op, dst, lhs, out)?;
     } else if dst == rhs && dst != lhs {
+        cache.record_scratch_clobber(Gpr::Rax);
         out.mov_r32_r32(Gpr::Rax, lhs)?;
         emit_binary(op, Gpr::Rax, rhs, out)?;
         out.mov_r32_r32(dst, Gpr::Rax)?;
@@ -1143,20 +1169,28 @@ fn lower_rv32m<S: FutureValueSource>(
     let dst = cache.write(rd, remaining, &[lhs, rhs], out)?.unwrap();
     match op {
         Op::Mul => {
+            cache.record_scratch_clobber(Gpr::Rax);
             out.mov_r32_r32(Gpr::Rax, lhs)?;
             out.imul_r32_r32(Gpr::Rax, rhs)?;
         }
         Op::Mulh => {
+            cache.record_scratch_clobber(Gpr::Rax);
+            cache.record_scratch_clobber(Gpr::Rdx);
             out.mov_r32_r32(Gpr::Rax, lhs)?;
             out.imul_r32(rhs)?;
             out.mov_r32_r32(Gpr::Rax, Gpr::Rdx)?;
         }
         Op::Mulhu => {
+            cache.record_scratch_clobber(Gpr::Rax);
+            cache.record_scratch_clobber(Gpr::Rdx);
             out.mov_r32_r32(Gpr::Rax, lhs)?;
             out.mul_r32(rhs)?;
             out.mov_r32_r32(Gpr::Rax, Gpr::Rdx)?;
         }
         Op::Mulhsu => {
+            cache.record_scratch_clobber(Gpr::Rax);
+            cache.record_scratch_clobber(Gpr::Rcx);
+            cache.record_scratch_clobber(Gpr::Rdx);
             out.mov_r32_r32(Gpr::Rcx, lhs)?;
             out.mov_r32_r32(Gpr::Rax, lhs)?;
             out.mul_r32(rhs)?;
@@ -1167,8 +1201,16 @@ fn lower_rv32m<S: FutureValueSource>(
             out.bind(nonnegative)?;
             out.mov_r32_r32(Gpr::Rax, Gpr::Rdx)?;
         }
-        Op::Div | Op::Rem => emit_signed_division(op, lhs, rhs, out)?,
-        Op::Divu | Op::Remu => emit_unsigned_division(op, lhs, rhs, out)?,
+        Op::Div | Op::Rem => {
+            cache.record_scratch_clobber(Gpr::Rax);
+            cache.record_scratch_clobber(Gpr::Rdx);
+            emit_signed_division(op, lhs, rhs, out)?;
+        }
+        Op::Divu | Op::Remu => {
+            cache.record_scratch_clobber(Gpr::Rax);
+            cache.record_scratch_clobber(Gpr::Rdx);
+            emit_unsigned_division(op, lhs, rhs, out)?;
+        }
         _ => return Err(EmitError::InvalidOperand("non-RV32M operation")),
     }
     if dst != Gpr::Rax {
@@ -1886,6 +1928,31 @@ mod tests {
 
         assert_eq!(block.lowered_load_sites(), 1);
         assert_eq!(block.lowered_store_sites(), 1);
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn register_pressure_reports_actual_fixed_scratch_sites() {
+        fn scratch(word: u32) -> [u32; 3] {
+            let slots = slots(&[word]);
+            let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
+            let mut workspace = DbtTranslationWorkspace::new(4096, 1).unwrap();
+
+            workspace
+                .lower(&input, 4096)
+                .unwrap()
+                .register_pressure()
+                .scratch_clobber_sites
+        }
+
+        assert_eq!(scratch(lw(3, 1, 0)), [1, 0, 1]);
+        assert_eq!(scratch(sw(1, 2, 0)), [1, 1, 1]);
+        assert_eq!(scratch(sll(3, 1, 2)), [0, 1, 0]);
+        assert_eq!(scratch(mul(3, 1, 2)), [1, 0, 0]);
+        assert_eq!(scratch(div(3, 1, 2)), [1, 0, 1]);
+        assert_eq!(scratch(add(3, 1, 2)), [0, 0, 0]);
+        assert_eq!(scratch(addi(3, 0, 1)), [1, 0, 0]);
+        assert_eq!(scratch(jalr(3, 1, 0)), [1, 1, 1]);
     }
 
     #[test]

@@ -147,6 +147,8 @@ pub(crate) struct RegisterCache {
     audit: RegisterPressureAudit,
     #[cfg(feature = "dbt-code-audit")]
     audit_phase: RegisterAuditPhase,
+    #[cfg(feature = "dbt-code-audit")]
+    instruction_scratch_clobbers: u8,
 }
 
 impl RegisterCache {
@@ -173,6 +175,8 @@ impl RegisterCache {
             },
             #[cfg(feature = "dbt-code-audit")]
             audit_phase: RegisterAuditPhase::Body,
+            #[cfg(feature = "dbt-code-audit")]
+            instruction_scratch_clobbers: 0,
         }
     }
 
@@ -195,6 +199,8 @@ impl RegisterCache {
             },
             #[cfg(feature = "dbt-code-audit")]
             audit_phase: RegisterAuditPhase::Body,
+            #[cfg(feature = "dbt-code-audit")]
+            instruction_scratch_clobbers: 0,
         }
     }
 
@@ -206,6 +212,32 @@ impl RegisterCache {
     #[cfg(feature = "dbt-code-audit")]
     pub(crate) const fn audit(&self) -> RegisterPressureAudit {
         self.audit
+    }
+
+    pub(crate) fn begin_instruction_audit(&mut self) {
+        #[cfg(feature = "dbt-code-audit")]
+        {
+            self.instruction_scratch_clobbers = 0;
+        }
+    }
+
+    pub(crate) fn record_scratch_clobber(&mut self, register: Gpr) {
+        #[cfg(feature = "dbt-code-audit")]
+        {
+            let (index, bit) = match register {
+                Gpr::Rax => (0, 1),
+                Gpr::Rcx => (1, 2),
+                Gpr::Rdx => (2, 4),
+                _ => return,
+            };
+            if self.instruction_scratch_clobbers & bit == 0 {
+                self.instruction_scratch_clobbers |= bit;
+                self.audit.scratch_clobber_sites[index] =
+                    self.audit.scratch_clobber_sites[index].saturating_add(1);
+            }
+        }
+        #[cfg(not(feature = "dbt-code-audit"))]
+        let _ = register;
     }
 
     #[cfg(feature = "dbt-code-audit")]
@@ -318,6 +350,7 @@ impl RegisterCache {
         out: &mut X64Emitter,
     ) -> Result<Gpr, EmitError> {
         if guest == 0 {
+            self.record_scratch_clobber(Gpr::Rax);
             out.xor_r32_r32(Gpr::Rax, Gpr::Rax)?;
             return Ok(Gpr::Rax);
         }
