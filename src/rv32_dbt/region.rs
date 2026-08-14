@@ -15,6 +15,7 @@ use crate::rv32im::{Branch, DecodedFields, DecodedOp, ImmOp, Load, Op, Store};
 pub(crate) const MAX_REGION_INSTRUCTIONS: usize = 16;
 pub(crate) const MAX_REGION_VALUES: usize = 64;
 pub(crate) const MAX_REGION_MEMORY_EFFECTS: usize = MAX_REGION_INSTRUCTIONS;
+pub(crate) const MAX_REGION_STEPS: usize = MAX_REGION_VALUES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ValueId(u8);
@@ -76,6 +77,14 @@ pub(crate) enum RegionMemoryEffectKind {
         address: ValueId,
         value: ValueId,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegionStep {
+    Empty,
+    Value(ValueId),
+    Load(u8),
+    Store(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +189,18 @@ impl LoopRegion<'_> {
         self.workspace.memory_effects[index]
     }
 
+    pub(crate) const fn step_count(&self) -> usize {
+        self.workspace.step_count
+    }
+
+    pub(crate) fn step(&self, index: usize) -> RegionStep {
+        self.workspace.steps[index]
+    }
+
+    pub(crate) fn memory_snapshot(&self, effect: usize, guest: usize) -> Option<ValueId> {
+        valid_value(self.workspace.memory_snapshots[effect][guest])
+    }
+
     pub(crate) const fn optimization_stats(&self) -> RegionOptimizationStats {
         self.workspace.optimization_stats
     }
@@ -230,7 +251,10 @@ pub(crate) struct LoopRegionWorkspace {
     guest_values: [ValueId; 32],
     live_values: [bool; MAX_REGION_VALUES],
     memory_effects: [RegionMemoryEffect; MAX_REGION_MEMORY_EFFECTS],
+    memory_snapshots: [[ValueId; 32]; MAX_REGION_MEMORY_EFFECTS],
     memory_effect_count: usize,
+    steps: [RegionStep; MAX_REGION_STEPS],
+    step_count: usize,
     instruction_count: usize,
     branch: Option<RegionBranch>,
     optimization_stats: RegionOptimizationStats,
@@ -245,7 +269,10 @@ impl LoopRegionWorkspace {
             guest_values: [ValueId::INVALID; 32],
             live_values: [false; MAX_REGION_VALUES],
             memory_effects: [RegionMemoryEffect::EMPTY; MAX_REGION_MEMORY_EFFECTS],
+            memory_snapshots: [[ValueId::INVALID; 32]; MAX_REGION_MEMORY_EFFECTS],
             memory_effect_count: 0,
+            steps: [RegionStep::Empty; MAX_REGION_STEPS],
+            step_count: 0,
             instruction_count: 0,
             branch: None,
             optimization_stats: RegionOptimizationStats {
@@ -290,6 +317,13 @@ impl LoopRegionWorkspace {
             return RegionBuildOutcome::Fallback(RegionFallbackReason::NotSelfLoop);
         }
         self.reset(instructions.len());
+        for instruction in &instructions[..last_index] {
+            if let Some(guest) = instruction.effects().write().filter(|guest| *guest != 0) {
+                if self.read_guest(guest).is_err() {
+                    return RegionBuildOutcome::Fallback(RegionFallbackReason::Capacity);
+                }
+            }
+        }
         for (index, instruction) in instructions[..last_index].iter().copied().enumerate() {
             if self
                 .push_instruction(start_pc, index, instruction.word(), instruction.fields())
@@ -335,7 +369,10 @@ impl LoopRegionWorkspace {
         self.guest_values.fill(ValueId::INVALID);
         self.live_values.fill(false);
         self.memory_effects.fill(RegionMemoryEffect::EMPTY);
+        self.memory_snapshots.fill([ValueId::INVALID; 32]);
         self.memory_effect_count = 0;
+        self.steps.fill(RegionStep::Empty);
+        self.step_count = 0;
         self.instruction_count = instruction_count;
         self.branch = None;
         self.optimization_stats = RegionOptimizationStats::default();
@@ -365,6 +402,7 @@ impl LoopRegionWorkspace {
             self.read_guest(fields.rs2)?
         };
         let value = self.push_value(RegionValueKind::Binary { op, lhs, rhs })?;
+        self.push_step(RegionStep::Value(value))?;
         if fields.rd != 0 {
             self.guest_values[usize::from(fields.rd)] = value;
         }
@@ -379,8 +417,12 @@ impl LoopRegionWorkspace {
         fields: DecodedFields,
         kind: Load,
     ) -> Result<(), ()> {
-        let address = self.push_address(fields.rs1, fields.immediate)?;
+        let (address, address_created) = self.push_address(fields.rs1, fields.immediate)?;
+        if address_created {
+            self.push_step(RegionStep::Value(address))?;
+        }
         let effect = u8::try_from(self.memory_effect_count).map_err(|_| ())?;
+        self.memory_snapshots[usize::from(effect)] = self.guest_values;
         let output = self.push_value(RegionValueKind::Load { effect })?;
         self.push_memory_effect(RegionMemoryEffect {
             kind: RegionMemoryEffectKind::Load {
@@ -392,6 +434,7 @@ impl LoopRegionWorkspace {
             word,
             attempted_index: index as u8,
         })?;
+        self.push_step(RegionStep::Load(effect))?;
         if fields.rd != 0 {
             self.guest_values[usize::from(fields.rd)] = output;
         }
@@ -406,8 +449,13 @@ impl LoopRegionWorkspace {
         fields: DecodedFields,
         kind: Store,
     ) -> Result<(), ()> {
-        let address = self.push_address(fields.rs1, fields.immediate)?;
+        let (address, address_created) = self.push_address(fields.rs1, fields.immediate)?;
+        if address_created {
+            self.push_step(RegionStep::Value(address))?;
+        }
         let value = self.read_guest(fields.rs2)?;
+        let effect = u8::try_from(self.memory_effect_count).map_err(|_| ())?;
+        self.memory_snapshots[usize::from(effect)] = self.guest_values;
         self.push_memory_effect(RegionMemoryEffect {
             kind: RegionMemoryEffectKind::Store {
                 kind,
@@ -417,20 +465,22 @@ impl LoopRegionWorkspace {
             pc: start_pc.wrapping_add((index as u32).wrapping_mul(4)),
             word,
             attempted_index: index as u8,
-        })
+        })?;
+        self.push_step(RegionStep::Store(effect))
     }
 
-    fn push_address(&mut self, base_guest: u8, immediate: i32) -> Result<ValueId, ()> {
+    fn push_address(&mut self, base_guest: u8, immediate: i32) -> Result<(ValueId, bool), ()> {
         let base = self.read_guest(base_guest)?;
         if immediate == 0 {
-            return Ok(base);
+            return Ok((base, false));
         }
         let displacement = self.push_value(RegionValueKind::Constant(immediate as u32))?;
-        self.push_value(RegionValueKind::Binary {
+        let address = self.push_value(RegionValueKind::Binary {
             op: RegionBinaryOp::Add,
             lhs: base,
             rhs: displacement,
-        })
+        })?;
+        Ok((address, true))
     }
 
     fn push_memory_effect(&mut self, effect: RegionMemoryEffect) -> Result<(), ()> {
@@ -440,6 +490,13 @@ impl LoopRegionWorkspace {
             .ok_or(())?;
         *slot = effect;
         self.memory_effect_count += 1;
+        Ok(())
+    }
+
+    fn push_step(&mut self, step: RegionStep) -> Result<(), ()> {
+        let slot = self.steps.get_mut(self.step_count).ok_or(())?;
+        *slot = step;
+        self.step_count += 1;
         Ok(())
     }
 
@@ -541,6 +598,18 @@ impl LoopRegionWorkspace {
                 RegionMemoryEffectKind::Empty => RegionMemoryEffectKind::Empty,
             };
         }
+        for snapshot in &mut self.memory_snapshots[..self.memory_effect_count] {
+            for value in snapshot {
+                if valid_value(*value).is_some() {
+                    *value = canonical_value(*value, &aliases);
+                }
+            }
+        }
+        for step in &mut self.steps[..self.step_count] {
+            if let RegionStep::Value(value) = step {
+                *value = canonical_value(*value, &aliases);
+            }
+        }
         if let Some(branch) = &mut self.branch {
             branch.lhs = canonical_value(branch.lhs, &aliases);
             branch.rhs = canonical_value(branch.rhs, &aliases);
@@ -584,6 +653,11 @@ impl LoopRegionWorkspace {
                     push_liveness(value, &mut stack, &mut stack_len, &mut queued);
                 }
                 RegionMemoryEffectKind::Empty => {}
+            }
+        }
+        for snapshot in &self.memory_snapshots[..self.memory_effect_count] {
+            for value in snapshot {
+                push_liveness(*value, &mut stack, &mut stack_len, &mut queued);
             }
         }
         if let Some(branch) = self.branch {

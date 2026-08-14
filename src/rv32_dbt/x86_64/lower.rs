@@ -957,7 +957,7 @@ fn lower_store<S: FutureValueSource>(
     out.bind(done)
 }
 
-fn emit_store_reservation_invalidation(
+pub(super) fn emit_store_reservation_invalidation(
     address: Gpr,
     width: u32,
     out: &mut X64Emitter,
