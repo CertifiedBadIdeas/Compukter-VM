@@ -12,14 +12,16 @@
 #[cfg(feature = "dbt-code-audit")]
 use compukter_vm::benchmarks::{
     classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_llvm_symbol_range,
-    parse_wasmtime_function, DecodedHostInstruction, InstructionGroup, PRODUCT_RAM_BYTES,
+    parse_wasmtime_function, DecodedHostInstruction, InstructionGroup, PRODUCT_DBT_CACHE_SETS,
+    PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_RAM_BYTES,
 };
 #[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
 use compukter_vm::rv32_machine::Rv32DbtExecutionProfile;
 #[cfg(feature = "dbt-code-audit")]
 use compukter_vm::rv32_machine::{
-    Rv32DbtCodeSnapshot, Rv32DbtSupportCodeKind, Rv32ExecutionBackendConfig, Rv32Machine,
-    Rv32MachineConfig, Rv32MachineOutcome, DEFAULT_DBT_SCRATCH_BYTES,
+    Rv32DbtCodeAlignment, Rv32DbtCodeSnapshot, Rv32DbtRegisterProfile, Rv32DbtSupportCodeKind,
+    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
+    DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES,
 };
 #[cfg(feature = "dbt-code-audit")]
 use std::env;
@@ -48,6 +50,44 @@ struct InstructionCounts {
 
 #[cfg(feature = "dbt-code-audit")]
 const EXPECTED_CHECKSUM: u32 = 0xee05_3d58;
+
+#[cfg(feature = "dbt-code-audit")]
+const fn audit_execution() -> Rv32ExecutionBackendConfig {
+    Rv32ExecutionBackendConfig::CachedDbt {
+        sets: PRODUCT_DBT_CACHE_SETS,
+        max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+        scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+        cache_bytes: PRODUCT_DBT_CODE_BYTES,
+        code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+    }
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn audit_config_report() -> Result<String, String> {
+    let Rv32ExecutionBackendConfig::CachedDbt {
+        sets,
+        max_instructions,
+        scratch_bytes,
+        cache_bytes,
+        code_alignment,
+        register_profile,
+    } = audit_execution()
+    else {
+        return Err("codegen audit requires Cached DBT".to_string());
+    };
+    let (alignment, alignment_bytes) = match code_alignment {
+        Rv32DbtCodeAlignment::BlockBase(bytes) => ("block-base", bytes),
+        Rv32DbtCodeAlignment::ChainEntry(bytes) => ("chain-entry", bytes),
+    };
+    let register_profile = match register_profile {
+        Rv32DbtRegisterProfile::Stable7 => "stable7",
+        Rv32DbtRegisterProfile::RcxOverflow8 => "rcx-overflow8",
+    };
+    Ok(format!(
+        "key\tvalue\ncache_sets\t{sets}\nmax_instructions\t{max_instructions}\nscratch_bytes\t{scratch_bytes}\ncode_cache_bytes\t{cache_bytes}\ncode_alignment\t{alignment}\nalignment_bytes\t{alignment_bytes}\nregister_profile\t{register_profile}\n"
+    ))
+}
 
 #[cfg(not(feature = "dbt-code-audit"))]
 fn main() {
@@ -104,14 +144,7 @@ fn execute(build_dir: &Path, batch: u64) -> Result<(), String> {
         Rv32MachineConfig {
             ram_size: PRODUCT_RAM_BYTES,
             debug_limit: 0,
-            execution: Rv32ExecutionBackendConfig::CachedDbt {
-                sets: 512,
-                max_instructions: 16,
-                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
-                cache_bytes: 128 * 1024,
-                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
-                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
-            },
+            execution: audit_execution(),
         },
     )
     .map_err(|error| error.to_string())?;
@@ -147,14 +180,7 @@ fn export(build_dir: &Path) -> Result<(), String> {
         Rv32MachineConfig {
             ram_size: PRODUCT_RAM_BYTES,
             debug_limit: 0,
-            execution: Rv32ExecutionBackendConfig::CachedDbt {
-                sets: 512,
-                max_instructions: 16,
-                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
-                cache_bytes: 128 * 1024,
-                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
-                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
-            },
+            execution: audit_execution(),
         },
     )
     .map_err(|error| error.to_string())?;
@@ -181,14 +207,7 @@ fn export(build_dir: &Path) -> Result<(), String> {
         Rv32MachineConfig {
             ram_size: PRODUCT_RAM_BYTES,
             debug_limit: 0,
-            execution: Rv32ExecutionBackendConfig::CachedDbt {
-                sets: 512,
-                max_instructions: 16,
-                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
-                cache_bytes: 128 * 1024,
-                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
-                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
-            },
+            execution: audit_execution(),
         },
     )
     .map_err(|error| error.to_string())?;
@@ -211,6 +230,11 @@ fn export(build_dir: &Path) -> Result<(), String> {
         .dbt_execution_profile()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "profiled audit machine returned no execution profile".to_string())?;
+    fs::write(
+        build_dir.join("dbt-audit-config.tsv"),
+        audit_config_report()?,
+    )
+    .map_err(|error| format!("failed to write audit configuration report: {error}"))?;
     fs::write(
         build_dir.join("dbt-register-pressure.tsv"),
         raw_register_pressure_report(&snapshot),
@@ -874,17 +898,42 @@ mod tests {
     #[cfg(feature = "dbt-execution-profile")]
     use super::weighted_register_pressure_report;
     use super::{
-        assembly_wrapper, instruction_counts, metric_row, parse_block_report, parse_support_report,
+        assembly_wrapper, audit_config_report, audit_execution, instruction_counts, metric_row,
+        parse_block_report, parse_support_report,
     };
-    use compukter_vm::benchmarks::{DecodedHostInstruction, InstructionGroup};
+    use compukter_vm::benchmarks::{
+        DecodedHostInstruction, InstructionGroup, PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES,
+        PRODUCT_DBT_MAX_INSTRUCTIONS,
+    };
     use compukter_vm::rv32_machine::{
         Rv32DbtCodeBlock, Rv32DbtCodeSnapshot, Rv32DbtSupportCodeKind, Rv32DbtSupportCodeRange,
+        Rv32ExecutionBackendConfig, DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_REGISTER_PROFILE,
+        DEFAULT_DBT_SCRATCH_BYTES,
     };
     #[cfg(feature = "dbt-execution-profile")]
     use compukter_vm::rv32_machine::{
         Rv32DbtDynamicExitCounts, Rv32DbtExecutionProfile, Rv32DbtProfileBlock, Rv32DbtProfileEdge,
         Rv32DbtProfileEdgeKind,
     };
+
+    #[test]
+    fn audit_execution_matches_the_cached_dbt_product_geometry() {
+        assert_eq!(
+            audit_execution(),
+            Rv32ExecutionBackendConfig::CachedDbt {
+                sets: PRODUCT_DBT_CACHE_SETS,
+                max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
+                scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+                cache_bytes: PRODUCT_DBT_CODE_BYTES,
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+            }
+        );
+        assert_eq!(
+            audit_config_report().unwrap(),
+            "key\tvalue\ncache_sets\t256\nmax_instructions\t16\nscratch_bytes\t8192\ncode_cache_bytes\t131072\ncode_alignment\tblock-base\nalignment_bytes\t64\nregister_profile\trcx-overflow8\n"
+        );
+    }
 
     #[test]
     fn assembly_preserves_gaps_and_live_block_ranges() {
