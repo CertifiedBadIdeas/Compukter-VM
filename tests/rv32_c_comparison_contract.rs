@@ -443,6 +443,8 @@ fn codegen_audit_export_contract_is_explicit() {
     assert!(source.contains("dbt-code-cache.bin"));
     assert!(source.contains("dbt-blocks.tsv"));
     assert!(source.contains("dbt-support.tsv"));
+    assert!(source.contains("dbt-register-pressure.tsv"));
+    assert!(source.contains("dbt-register-pressure-weighted.tsv"));
     assert!(source.contains("dbt-code-cache.S"));
     assert!(source.contains("ee05_3d58"));
     assert!(source.contains("dbt_code_snapshot"));
@@ -471,7 +473,8 @@ fn focused_codegen_audit_keeps_perf_optional() {
     .unwrap();
 
     assert!(script.contains("compile-rv32-c-comparison.sh"));
-    assert!(script.contains("--features dbt-code-audit"));
+    assert!(script.contains("--features dbt-code-audit,dbt-execution-profile"));
+    assert!(script.contains("dbt-register-pressure-weighted.tsv"));
     assert!(script.contains("native-analysis.o"));
     assert!(script.contains("--disassemble-symbols=benchmark_kernel"));
     assert!(script.contains("dbt-code-cache.S"));

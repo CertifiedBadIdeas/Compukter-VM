@@ -36,6 +36,7 @@ cargo run --manifest-path "$ROOT/Cargo.toml" --release --locked --offline \
     --features dbt-code-audit,dbt-execution-profile --example rv32_c_codegen_audit -- export "$BUILD_DIR"
 test -s "$BUILD_DIR/dbt-support.tsv"
 test -s "$BUILD_DIR/dbt-register-pressure.tsv"
+test -s "$BUILD_DIR/dbt-register-pressure-weighted.tsv"
 "$RV32_C_CLANG" -c "$BUILD_DIR/dbt-code-cache.S" -o "$BUILD_DIR/dbt-code-cache.o"
 "$RV32_C_OBJDUMP" -d "$BUILD_DIR/dbt-code-cache.o" >"$BUILD_DIR/dbt-disassembly.txt"
 
