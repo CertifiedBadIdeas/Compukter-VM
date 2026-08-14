@@ -105,3 +105,61 @@ at least a 1.0% Cached DBT median improvement, Direct DBT regresses by no more
 than 1.0%, dynamically weighted spill/reload traffic falls, checksum and full
 correctness remain exact, and steady-state execution allocations remain zero.
 Otherwise remove the candidate and retain this audit infrastructure.
+
+## Phase 2 result: RCX overflow rejected
+
+The candidate was implemented in `00b4173` and its forced-release telemetry in
+`0785806`. Stable hosts remained preferred; `RCX` was the ninth Direct and
+eighth Chainable host. Fixed-`RCX` lowerers reserved it before operand
+allocation and preserved a live dirty resident when required.
+
+The focused audit showed that the extra resident did what the allocator model
+predicted:
+
+| Weighted event | Seven-host baseline | RCX candidate | Delta |
+|---|---:|---:|---:|
+| Body architectural loads | 570,162 | 254,171 | -55.4% |
+| Dirty live eviction stores | 407,531 | 145,527 | -64.3% |
+| Allocation-pressure events | 591,624 | 187,050 | -68.4% |
+| Forced live `RCX` stores | - | 3,066 | - |
+| Forced dead `RCX` discards | - | 0 | - |
+| Forced clean `RCX` discards | - | 72,003 | - |
+
+The candidate reached eight resident guest registers. At the dominant block
+`0x00000608`, body loads fell from six to one per execution, dirty stores from
+six to two, and allocation-pressure events from eight to two. The audit still
+completed with checksum `ee053d58`.
+
+Runtime qualification nevertheless failed the mandatory gate:
+
+| Execution mode | RCX off, ns/kernel | RCX on, ns/kernel | RCX-on delta |
+|---|---:|---:|---:|
+| Cached DBT, 21 alternating warm samples | 378,112.628 | 422,637.943 | +11.776% |
+| Direct DBT, 21 alternating warm samples | 448,464,048.000 | 451,960,539.000 | +0.780% |
+
+Both sides produced checksum `ee053d58`, identical retired-instruction counts,
+and zero steady-state allocations. Reversing the Cached baseline/candidate
+labels confirmed the result: RCX-off was 10.806% faster than RCX-on, equivalent
+to RCX-on being about 12.1% slower in that run. The regression is therefore not
+an A/B ordering artifact.
+
+Translation itself did not explain the Cached regression: in the first Cached
+run, RCX-on lift, lower, and publish medians changed by -0.374%, -4.511%, and
+-1.620% respectively. The failure is in generated-code steady-state behavior.
+The experiment demonstrates that fewer architectural spill/reload operations
+are not sufficient evidence of better host execution; no narrower
+microarchitectural root cause is claimed by this audit.
+
+Decision: **REJECT**. The candidate and candidate-specific counters were
+removed by `f5b5af2` and `ab3fbcb`; the seven-host Chainable allocator remains
+the product implementation. The general register-pressure audit remains
+available for later allocator experiments.
+
+The ignored raw self-A/B reports produced during qualification had these
+SHA-256 hashes:
+
+```text
+cached forward  1a94c3452de498c21658715ec63b92dfaa06041a54f782f1f4e4a4e683e8587b
+cached reversed 8758926e02ab364232b5ecf45918b7c6b2bb6532c1fe5688ead51be365953e31
+direct          54fc17b93960d46d9a719a831101d925aa5c9e72b76ec94e82439c000afb686d
+```
