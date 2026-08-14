@@ -305,7 +305,7 @@ impl DbtTranslationWorkspace {
             };
             let word = instruction.word();
             let fields = instruction.fields();
-            cache.begin_instruction();
+            cache.begin_instruction_audit();
             let future = input.future_values(index, future_cursor.as_ref());
             let attempted = index as u32 + 1;
             match fields.operation {
@@ -718,6 +718,7 @@ fn emit_jalr<S: FutureValueSource>(
 ) -> Result<(), EmitError> {
     let base = cache.read(rs1, remaining, &[], out)?;
     cache.record_scratch_clobber(Gpr::Rax);
+    cache.record_scratch_clobber(Gpr::Rcx);
     cache.record_scratch_clobber(Gpr::Rdx);
     out.mov_r32_r32(Gpr::Rax, base)?;
     out.add_r32_imm32(Gpr::Rax, immediate)?;
@@ -867,7 +868,6 @@ fn lower_load<S: FutureValueSource>(
         Load::Half | Load::HalfU => 2,
         Load::Word => 4,
     };
-    cache.reserve_fixed_host(Gpr::Rcx, remaining, out)?;
     let base = cache.read(rs1, remaining, &[], out)?;
     cache.record_scratch_clobber(Gpr::Rdx);
     cache.record_scratch_clobber(Gpr::Rax);
@@ -915,10 +915,10 @@ fn lower_store<S: FutureValueSource>(
         Store::Half => 2,
         Store::Word => 4,
     };
-    cache.reserve_fixed_host(Gpr::Rcx, remaining, out)?;
     let base = cache.read(rs1, remaining, &[], out)?;
     cache.record_scratch_clobber(Gpr::Rdx);
     cache.record_scratch_clobber(Gpr::Rax);
+    cache.record_scratch_clobber(Gpr::Rcx);
     out.mov_r32_r32(Gpr::Rdx, base)?;
     if immediate != 0 {
         out.add_r32_imm32(Gpr::Rdx, immediate)?;
@@ -1062,9 +1062,6 @@ fn lower_register<S: FutureValueSource>(
     if rd == 0 {
         return Ok(());
     }
-    if matches!(op, Op::Sll | Op::Srl | Op::Sra) {
-        cache.reserve_fixed_host(Gpr::Rcx, remaining, out)?;
-    }
     let lhs = cache.read(rs1, remaining, &[], out)?;
     let rhs = cache.read(rs2, remaining, &[lhs], out)?;
     let dst = cache.write(rd, remaining, &[lhs, rhs], out)?.unwrap();
@@ -1083,6 +1080,7 @@ fn lower_register<S: FutureValueSource>(
         return Ok(());
     }
     if matches!(op, Op::Sll | Op::Srl | Op::Sra) {
+        cache.record_scratch_clobber(Gpr::Rcx);
         out.mov_r32_r32(Gpr::Rcx, rhs)?;
         if dst == rhs && dst != lhs {
             cache.record_scratch_clobber(Gpr::Rax);
@@ -1165,9 +1163,6 @@ fn lower_rv32m<S: FutureValueSource>(
     if matches!(op, Op::Div | Op::Divu | Op::Rem | Op::Remu) && rs1 == 0 {
         return write_rv32m_constant(rd, 0, remaining, cache, out);
     }
-    if op == Op::Mulhsu {
-        cache.reserve_fixed_host(Gpr::Rcx, remaining, out)?;
-    }
 
     let lhs = cache.read(rs1, remaining, &[], out)?;
     let rhs = cache.read(rs2, remaining, &[lhs], out)?;
@@ -1194,6 +1189,7 @@ fn lower_rv32m<S: FutureValueSource>(
         }
         Op::Mulhsu => {
             cache.record_scratch_clobber(Gpr::Rax);
+            cache.record_scratch_clobber(Gpr::Rcx);
             cache.record_scratch_clobber(Gpr::Rdx);
             out.mov_r32_r32(Gpr::Rcx, lhs)?;
             out.mov_r32_r32(Gpr::Rax, lhs)?;
