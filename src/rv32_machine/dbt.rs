@@ -39,6 +39,7 @@ use crate::rv32_dbt::ir::DbtIrBlock;
 use crate::rv32_dbt::profile::{DbtProfileDynamicExit, ExactDbtProfile};
 use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
+#[cfg(test)]
 use crate::rv32im::Rv32ResolvedInstruction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,7 @@ enum Rv32DbtStorage {
 
 pub(crate) struct Rv32DbtExecution {
     max_instructions: usize,
+    #[cfg(test)]
     decoded: Vec<Rv32ResolvedInstruction>,
     ir: DbtIrBlock,
     workspace: DbtTranslationWorkspace,
@@ -183,6 +185,7 @@ impl Rv32DbtExecution {
         };
         Ok(Self {
             max_instructions,
+            #[cfg(test)]
             decoded: Vec::with_capacity(max_instructions),
             ir: DbtIrBlock::new(max_instructions)
                 .map_err(|message| Self::fault(DbtFaultKind::Capacity, message))?,
@@ -277,17 +280,20 @@ impl Rv32DbtExecution {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn decoded_slots_mut(&mut self) -> &mut Vec<Rv32ResolvedInstruction> {
         self.ir.reset();
         self.decoded.clear();
         &mut self.decoded
     }
 
+    #[cfg(test)]
     pub(crate) fn decoded_slots(&self) -> &[Rv32ResolvedInstruction] {
         &self.decoded
     }
 
     pub(crate) fn ir_block_mut(&mut self) -> &mut DbtIrBlock {
+        #[cfg(test)]
         self.decoded.clear();
         &mut self.ir
     }
@@ -296,7 +302,14 @@ impl Rv32DbtExecution {
         if self.ir.attempted_instruction_count() != 0 {
             self.ir.attempted_instruction_count()
         } else {
-            self.decoded.len()
+            #[cfg(test)]
+            {
+                return self.decoded.len();
+            }
+            #[cfg(not(test))]
+            {
+                0
+            }
         }
     }
 
@@ -356,7 +369,14 @@ impl Rv32DbtExecution {
         let input = if self.ir.attempted_instruction_count() != 0 {
             DbtBlockInput::new_ir(pc, &self.ir, mode)
         } else {
-            DbtBlockInput::new(pc, &self.decoded, mode)
+            #[cfg(test)]
+            {
+                DbtBlockInput::new(pc, &self.decoded, mode)
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("product DBT translation requires a lifted micro-IR block")
+            }
         }
         .map_err(|message| Self::fault(DbtFaultKind::Translation, message))?;
         #[cfg(feature = "dbt-translation-timing")]
@@ -579,13 +599,14 @@ impl Rv32DbtExecution {
         let retained = stats
             .reserved_bytes
             .saturating_add(stats.metadata_bytes)
-            .saturating_add(
-                self.decoded
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<Rv32ResolvedInstruction>()),
-            )
             .saturating_add(self.ir.retained_bytes())
             .saturating_add(self.workspace.retained_bytes());
+        #[cfg(test)]
+        let retained = retained.saturating_add(
+            self.decoded
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Rv32ResolvedInstruction>()),
+        );
         #[cfg(feature = "dbt-execution-profile")]
         let retained = retained.saturating_add(match &self.storage {
             Rv32DbtStorage::Cached {
