@@ -103,6 +103,28 @@ struct Resident {
     dirty: bool,
 }
 
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RegisterPressureAudit {
+    pub(crate) entry_arch_loads: u32,
+    pub(crate) body_arch_loads: u32,
+    pub(crate) dirty_live_eviction_stores: u32,
+    pub(crate) dead_evictions: u32,
+    pub(crate) clean_evictions: u32,
+    pub(crate) loop_reconcile_stores: u32,
+    pub(crate) allocation_pressure: u32,
+    pub(crate) max_resident: u8,
+    pub(crate) scratch_clobber_sites: [u32; 3],
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RegisterAuditPhase {
+    Entry,
+    #[default]
+    Body,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalLoopRegisterPlan {
     guests: [usize; CHAINABLE_HOST_POOL.len()],
@@ -121,6 +143,10 @@ pub(crate) struct RegisterCache {
     host_pool: &'static [Gpr],
     entries: [Option<Resident>; DIRECT_HOST_POOL.len()],
     protected_guests: u32,
+    #[cfg(feature = "dbt-code-audit")]
+    audit: RegisterPressureAudit,
+    #[cfg(feature = "dbt-code-audit")]
+    audit_phase: RegisterAuditPhase,
 }
 
 impl RegisterCache {
@@ -133,6 +159,20 @@ impl RegisterCache {
             host_pool: &DIRECT_HOST_POOL,
             entries: [None; DIRECT_HOST_POOL.len()],
             protected_guests: 0,
+            #[cfg(feature = "dbt-code-audit")]
+            audit: RegisterPressureAudit {
+                entry_arch_loads: 0,
+                body_arch_loads: 0,
+                dirty_live_eviction_stores: 0,
+                dead_evictions: 0,
+                clean_evictions: 0,
+                loop_reconcile_stores: 0,
+                allocation_pressure: 0,
+                max_resident: 0,
+                scratch_clobber_sites: [0; 3],
+            },
+            #[cfg(feature = "dbt-code-audit")]
+            audit_phase: RegisterAuditPhase::Body,
         }
     }
 
@@ -141,7 +181,40 @@ impl RegisterCache {
             host_pool: &CHAINABLE_HOST_POOL,
             entries: [None; DIRECT_HOST_POOL.len()],
             protected_guests: 0,
+            #[cfg(feature = "dbt-code-audit")]
+            audit: RegisterPressureAudit {
+                entry_arch_loads: 0,
+                body_arch_loads: 0,
+                dirty_live_eviction_stores: 0,
+                dead_evictions: 0,
+                clean_evictions: 0,
+                loop_reconcile_stores: 0,
+                allocation_pressure: 0,
+                max_resident: 0,
+                scratch_clobber_sites: [0; 3],
+            },
+            #[cfg(feature = "dbt-code-audit")]
+            audit_phase: RegisterAuditPhase::Body,
         }
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    pub(crate) fn set_audit_phase(&mut self, phase: RegisterAuditPhase) {
+        self.audit_phase = phase;
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    pub(crate) const fn audit(&self) -> RegisterPressureAudit {
+        self.audit
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    fn record_resident_count(&mut self) {
+        let resident = self.entries[..self.host_pool.len()]
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count() as u8;
+        self.audit.max_resident = self.audit.max_resident.max(resident);
     }
 
     pub(crate) const fn is_chainable(&self) -> bool {
@@ -265,6 +338,18 @@ impl RegisterCache {
             host,
             dirty: false,
         });
+        #[cfg(feature = "dbt-code-audit")]
+        {
+            match self.audit_phase {
+                RegisterAuditPhase::Entry => {
+                    self.audit.entry_arch_loads = self.audit.entry_arch_loads.saturating_add(1)
+                }
+                RegisterAuditPhase::Body => {
+                    self.audit.body_arch_loads = self.audit.body_arch_loads.saturating_add(1)
+                }
+            }
+            self.record_resident_count();
+        }
         Ok(host)
     }
 
@@ -290,6 +375,8 @@ impl RegisterCache {
             host,
             dirty: true,
         });
+        #[cfg(feature = "dbt-code-audit")]
+        self.record_resident_count();
         Ok(Some(host))
     }
 
@@ -325,6 +412,11 @@ impl RegisterCache {
                     ),
                     resident.host,
                 )?;
+                #[cfg(feature = "dbt-code-audit")]
+                {
+                    self.audit.loop_reconcile_stores =
+                        self.audit.loop_reconcile_stores.saturating_add(1);
+                }
             }
             *entry = None;
         }
@@ -342,6 +434,10 @@ impl RegisterCache {
             .position(Option::is_none)
         {
             return Ok(index);
+        }
+        #[cfg(feature = "dbt-code-audit")]
+        {
+            self.audit.allocation_pressure = self.audit.allocation_pressure.saturating_add(1);
         }
         let index = self.entries[..self.host_pool.len()]
             .iter()
@@ -369,6 +465,17 @@ impl RegisterCache {
             ))?;
         if let Some(resident) = self.entries[index] {
             let dead = matches!(future_values.value(resident.guest), FutureValue::Dead(_));
+            #[cfg(feature = "dbt-code-audit")]
+            if resident.dirty {
+                if dead {
+                    self.audit.dead_evictions = self.audit.dead_evictions.saturating_add(1);
+                } else {
+                    self.audit.dirty_live_eviction_stores =
+                        self.audit.dirty_live_eviction_stores.saturating_add(1);
+                }
+            } else {
+                self.audit.clean_evictions = self.audit.clean_evictions.saturating_add(1);
+            }
             if resident.dirty && !dead {
                 out.mov_m32_r32(
                     Mem::base_disp(
@@ -503,6 +610,8 @@ fn instruction_access(slot: Rv32ResolvedInstruction) -> RegisterAccess {
 #[cfg(test)]
 mod tests {
     use super::{future_value, FutureValue, RegisterCache};
+    #[cfg(feature = "dbt-code-audit")]
+    use super::{LocalLoopRegisterPlan, RegisterAuditPhase};
     use crate::rv32_dbt::x86_64::emitter::{Gpr, X64Emitter};
     use crate::rv32im::{
         decode_product_word,
@@ -889,5 +998,49 @@ mod tests {
         cache.read(10, &current_and_future, &[], &mut out).unwrap();
 
         assert!(cache.resident_guests().contains(&8));
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn audit_distinguishes_entry_body_and_eviction_traffic() {
+        let mut cache = RegisterCache::chainable();
+        let mut out = X64Emitter::new(512, 16).unwrap();
+        cache.set_audit_phase(RegisterAuditPhase::Entry);
+        cache.read(1, &[], &[], &mut out).unwrap();
+        cache.write(1, &[], &[], &mut out).unwrap();
+        cache.set_audit_phase(RegisterAuditPhase::Body);
+        for guest in 2..=8 {
+            cache.write(guest, &[], &[], &mut out).unwrap();
+        }
+
+        let audit = cache.audit();
+        assert_eq!(audit.entry_arch_loads, 1);
+        assert_eq!(audit.body_arch_loads, 0);
+        assert_eq!(audit.allocation_pressure, 1);
+        assert_eq!(audit.dirty_live_eviction_stores, 1);
+        assert_eq!(audit.max_resident, 7);
+    }
+
+    #[cfg(feature = "dbt-code-audit")]
+    #[test]
+    fn audit_separates_loop_reconciliation_from_exit_flushes() {
+        let plan = LocalLoopRegisterPlan {
+            guests: [1, 0, 0, 0, 0, 0, 0],
+            len: 1,
+            written: 0,
+        };
+        let mut cache = RegisterCache::chainable();
+        let mut out = X64Emitter::new(512, 16).unwrap();
+        cache.set_audit_phase(RegisterAuditPhase::Entry);
+        cache.preload_local_loop(plan, &[], &mut out).unwrap();
+        cache.set_audit_phase(RegisterAuditPhase::Body);
+        cache.write(20, &[], &[], &mut out).unwrap();
+
+        cache.reconcile_local_loop(&mut out).unwrap();
+        cache.flush(&mut out).unwrap();
+
+        let audit = cache.audit();
+        assert_eq!(audit.loop_reconcile_stores, 1);
+        assert_eq!(audit.dirty_live_eviction_stores, 0);
     }
 }
