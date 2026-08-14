@@ -17,6 +17,8 @@ use compukter_vm::benchmarks::{
 };
 #[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
 use compukter_vm::rv32_machine::Rv32DbtExecutionProfile;
+#[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
+use compukter_vm::rv32_machine::Rv32DbtProfileEdgeKind;
 #[cfg(feature = "dbt-code-audit")]
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32DbtCodeSnapshot, Rv32DbtRegisterProfile, Rv32DbtSupportCodeKind,
@@ -245,6 +247,11 @@ fn export(build_dir: &Path) -> Result<(), String> {
         weighted_register_pressure_report(&snapshot, &profile)?,
     )
     .map_err(|error| format!("failed to write weighted register-pressure report: {error}"))?;
+    fs::write(
+        build_dir.join("dbt-execution-profile.tsv"),
+        execution_profile_report(&profile)?,
+    )
+    .map_err(|error| format!("failed to write execution-profile report: {error}"))?;
 
     let binary_path = build_dir.join("dbt-code-cache.bin");
     fs::write(&binary_path, &snapshot.used_bytes)
@@ -448,6 +455,144 @@ fn weighted_register_pressure_report(
     Ok(output)
 }
 
+#[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
+fn execution_profile_report(profile: &Rv32DbtExecutionProfile) -> Result<String, String> {
+    if profile.counter_overflowed {
+        return Err("execution profile counter overflowed".to_string());
+    }
+    let mut output = format!(
+        "key\tvalue\ncapacity\t{}\nused_records\t{}\nretained_bytes\t{}\ncounter_overflowed\tfalse\n\nsection\tpc\tsource_pc\ttarget_pc\tkind\texecutions\n",
+        profile.capacity, profile.used_records, profile.retained_bytes,
+    );
+    for block in &profile.blocks {
+        output.push_str(&format!(
+            "block\t{:08x}\t-\t-\t-\t{}\n",
+            block.pc, block.executions
+        ));
+    }
+    for edge in &profile.static_edges {
+        let kind = match edge.kind {
+            Rv32DbtProfileEdgeKind::Taken => "taken",
+            Rv32DbtProfileEdgeKind::Fallthrough => "fallthrough",
+            Rv32DbtProfileEdgeKind::Jump => "jump",
+        };
+        output.push_str(&format!(
+            "edge\t-\t{:08x}\t{:08x}\t{kind}\t{}\n",
+            edge.source_pc, edge.target_pc, edge.executions
+        ));
+    }
+    for (kind, executions) in [
+        ("jalr", profile.dynamic_exits.jalr),
+        ("budget", profile.dynamic_exits.budget),
+        ("slow_instruction", profile.dynamic_exits.slow_instruction),
+        ("memory_access", profile.dynamic_exits.memory_access),
+        ("trap_or_terminal", profile.dynamic_exits.trap_or_terminal),
+    ] {
+        output.push_str(&format!("exit\t-\t-\t-\t{kind}\t{executions}\n"));
+    }
+    Ok(output)
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn parse_profile_blocks(input: &str) -> Result<Vec<(u32, u64)>, String> {
+    let mut blocks = Vec::new();
+    let mut in_records = false;
+    for line in input.lines() {
+        if line == "section\tpc\tsource_pc\ttarget_pc\tkind\texecutions" {
+            in_records = true;
+            continue;
+        }
+        if !in_records || line.is_empty() {
+            continue;
+        }
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() != 6 {
+            return Err(format!("invalid execution-profile row: {line}"));
+        }
+        if columns[0] != "block" {
+            continue;
+        }
+        let pc = u32::from_str_radix(columns[1], 16)
+            .map_err(|error| format!("invalid profile block PC: {error}"))?;
+        let executions = columns[5]
+            .parse::<u64>()
+            .map_err(|error| format!("invalid profile block executions: {error}"))?;
+        if blocks.iter().any(|(existing, _)| *existing == pc) {
+            return Err(format!("duplicate execution-profile block 0x{pc:08x}"));
+        }
+        blocks.push((pc, executions));
+    }
+    if !in_records || blocks.is_empty() {
+        return Err("execution profile contains no block records".to_string());
+    }
+    Ok(blocks)
+}
+
+#[cfg(feature = "dbt-code-audit")]
+fn hot_block_report(
+    disassembled: &[(AuditBlock, Vec<DecodedHostInstruction>)],
+    profile_blocks: &[(u32, u64)],
+) -> Result<String, String> {
+    let mut rows = Vec::with_capacity(disassembled.len());
+    let mut total_executions = 0_u128;
+    for (block, instructions) in disassembled {
+        let executions = profile_blocks
+            .iter()
+            .find(|(pc, _)| *pc == block.guest_pc)
+            .map(|(_, executions)| *executions)
+            .ok_or_else(|| {
+                format!(
+                    "live DBT block 0x{:08x} is missing from execution profile",
+                    block.guest_pc
+                )
+            })?;
+        total_executions = total_executions
+            .checked_add(u128::from(executions))
+            .ok_or_else(|| "hot-block execution total overflowed".to_string())?;
+        rows.push((block, instructions, executions));
+    }
+    if total_executions == 0 {
+        return Err("hot-block profile has zero executions".to_string());
+    }
+    rows.sort_by(|(lhs, _, lhs_executions), (rhs, _, rhs_executions)| {
+        rhs_executions
+            .cmp(lhs_executions)
+            .then_with(|| lhs.guest_pc.cmp(&rhs.guest_pc))
+    });
+
+    let mut output = String::from(
+        "rank\tguest_pc\texecutions\texecution_share\tcumulative_share\tguest_instructions\tcode_bytes\thost_instructions\thost_per_guest\tmemory_operands\tmove\tconditional_branch\tunconditional_branch\tarithmetic_logical\tshift_rotate\tmultiply_divide\tcall_return\tvector\tother\n",
+    );
+    let mut cumulative = 0_u128;
+    for (rank, (block, instructions, executions)) in rows.into_iter().enumerate() {
+        cumulative += u128::from(executions);
+        let counts = instruction_counts(instructions);
+        output.push_str(&format!(
+            "{}\t{:08x}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            rank + 1,
+            block.guest_pc,
+            executions,
+            executions as f64 / total_executions as f64,
+            cumulative as f64 / total_executions as f64,
+            block.guest_instructions,
+            block.length,
+            instructions.len(),
+            instructions.len() as f64 / f64::from(block.guest_instructions),
+            counts.memory_operands,
+            counts.groups[0],
+            counts.groups[1],
+            counts.groups[2],
+            counts.groups[3],
+            counts.groups[4],
+            counts.groups[5],
+            counts.groups[6],
+            counts.groups[7],
+            counts.groups[8],
+        ));
+    }
+    Ok(output)
+}
+
 #[cfg(feature = "dbt-code-audit")]
 #[cfg_attr(not(feature = "dbt-execution-profile"), allow(dead_code))]
 fn block_report(snapshot: &Rv32DbtCodeSnapshot) -> String {
@@ -586,6 +731,9 @@ fn report(build_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to read native analysis disassembly: {error}"))?;
     let wasmtime_disassembly = fs::read_to_string(build_dir.join("wasmtime-aot-objdump.txt"))
         .map_err(|error| format!("failed to read Wasmtime disassembly: {error}"))?;
+    let profile_report = fs::read_to_string(build_dir.join("dbt-execution-profile.tsv"))
+        .map_err(|error| format!("failed to read execution-profile report: {error}"))?;
+    let profile_blocks = parse_profile_blocks(&profile_report)?;
 
     let mut dbt_instructions = Vec::new();
     let support_instructions = parse_llvm_symbol_range(
@@ -597,6 +745,7 @@ fn report(build_dir: &Path) -> Result<(), String> {
     let support_code_bytes = u64::from(support_length);
     dbt_instructions.extend(support_instructions.iter().cloned());
     let mut hot_blocks = Vec::with_capacity(blocks.len());
+    let mut disassembled_blocks = Vec::with_capacity(blocks.len());
     for block in &blocks {
         let symbol = format!("dbt_pc_{:08x}_off_{:08x}", block.guest_pc, block.offset);
         let instructions = parse_llvm_symbol_range(
@@ -606,6 +755,7 @@ fn report(build_dir: &Path) -> Result<(), String> {
             u64::from(block.length),
         )?;
         hot_blocks.push((block.clone(), instructions.len() as u64));
+        disassembled_blocks.push((block.clone(), instructions.clone()));
         dbt_instructions.extend(instructions);
     }
     let native_instructions = parse_llvm_symbol(&native_disassembly, "benchmark_kernel")?;
@@ -715,6 +865,11 @@ fn report(build_dir: &Path) -> Result<(), String> {
     ));
     fs::write(build_dir.join("codegen-report.tsv"), &output)
         .map_err(|error| format!("failed to write codegen report: {error}"))?;
+    fs::write(
+        build_dir.join("dbt-hot-blocks.tsv"),
+        hot_block_report(&disassembled_blocks, &profile_blocks)?,
+    )
+    .map_err(|error| format!("failed to write hot-block report: {error}"))?;
     print!("{output}");
     Ok(())
 }
@@ -898,8 +1053,9 @@ mod tests {
     #[cfg(feature = "dbt-execution-profile")]
     use super::weighted_register_pressure_report;
     use super::{
-        assembly_wrapper, audit_config_report, audit_execution, instruction_counts, metric_row,
-        parse_block_report, parse_support_report,
+        assembly_wrapper, audit_config_report, audit_execution, execution_profile_report,
+        hot_block_report, instruction_counts, metric_row, parse_block_report, parse_profile_blocks,
+        parse_support_report, AuditBlock,
     };
     use compukter_vm::benchmarks::{
         DecodedHostInstruction, InstructionGroup, PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES,
@@ -1082,5 +1238,88 @@ mod tests {
         assert!(report.contains("forced_rcx_dead_discards\t3\t15\t750000.000000\n"));
         assert!(report.contains("forced_rcx_clean_discards\t4\t20\t1000000.000000\n"));
         assert!(report.contains("max_resident\t7\t-\t-\n"));
+    }
+
+    #[cfg(feature = "dbt-execution-profile")]
+    #[test]
+    fn hot_block_report_ranks_exact_executions_and_static_shape() {
+        let profile = Rv32DbtExecutionProfile {
+            blocks: vec![
+                Rv32DbtProfileBlock {
+                    pc: 0x1000,
+                    executions: 5,
+                },
+                Rv32DbtProfileBlock {
+                    pc: 0x2000,
+                    executions: 20,
+                },
+            ],
+            static_edges: vec![Rv32DbtProfileEdge {
+                source_pc: 0x2000,
+                target_pc: 0x2000,
+                kind: Rv32DbtProfileEdgeKind::Taken,
+                executions: 19,
+            }],
+            dynamic_exits: Rv32DbtDynamicExitCounts {
+                jalr: 1,
+                ..Default::default()
+            },
+            capacity: 16,
+            used_records: 3,
+            retained_bytes: 96,
+            counter_overflowed: false,
+        };
+        let profile_text = execution_profile_report(&profile).unwrap();
+        let profile_blocks = parse_profile_blocks(&profile_text).unwrap();
+        let disassembled = vec![
+            (
+                AuditBlock {
+                    guest_pc: 0x1000,
+                    offset: 0,
+                    length: 8,
+                    guest_instructions: 2,
+                    linked_edges: 0,
+                    unlinked_edges: 0,
+                },
+                vec![DecodedHostInstruction {
+                    address: 0,
+                    encoded_bytes: Some(2),
+                    mnemonic: "movl".to_string(),
+                    operands: "%eax, (%rdi)".to_string(),
+                }],
+            ),
+            (
+                AuditBlock {
+                    guest_pc: 0x2000,
+                    offset: 64,
+                    length: 16,
+                    guest_instructions: 2,
+                    linked_edges: 1,
+                    unlinked_edges: 0,
+                },
+                vec![
+                    DecodedHostInstruction {
+                        address: 64,
+                        encoded_bytes: Some(2),
+                        mnemonic: "movl".to_string(),
+                        operands: "(%rdi), %eax".to_string(),
+                    },
+                    DecodedHostInstruction {
+                        address: 66,
+                        encoded_bytes: Some(2),
+                        mnemonic: "jne".to_string(),
+                        operands: "0x40".to_string(),
+                    },
+                ],
+            ),
+        ];
+
+        let report = hot_block_report(&disassembled, &profile_blocks).unwrap();
+        let first = report.lines().nth(1).unwrap();
+        assert!(
+            first.starts_with("1\t00002000\t20\t0.800000\t0.800000\t2\t16\t2\t1.000000\t1\t1\t1\t")
+        );
+        assert!(profile_text.contains("edge\t-\t00002000\t00002000\ttaken\t19\n"));
+        assert!(profile_text.contains("exit\t-\t-\t-\tjalr\t1\n"));
     }
 }
