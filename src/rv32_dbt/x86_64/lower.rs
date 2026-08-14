@@ -1154,15 +1154,8 @@ fn lower_rv32m(
     let dst = cache.write(rd, remaining, &[lhs, rhs], out)?.unwrap();
     match op {
         Op::Mul => {
-            if dst == lhs {
-                out.imul_r32_r32(dst, rhs)?;
-            } else if dst == rhs {
-                out.imul_r32_r32(dst, lhs)?;
-            } else {
-                out.mov_r32_r32(dst, lhs)?;
-                out.imul_r32_r32(dst, rhs)?;
-            }
-            return Ok(());
+            out.mov_r32_r32(Gpr::Rax, lhs)?;
+            out.imul_r32_r32(Gpr::Rax, rhs)?;
         }
         Op::Mulh => {
             out.mov_r32_r32(Gpr::Rax, lhs)?;
@@ -1565,7 +1558,7 @@ fn fault(kind: DbtFaultKind, pc: u32, word: Option<u32>, message: impl Into<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{emit_fault, lower_rv32m, write_u32, DbtTranslationWorkspace};
+    use super::{emit_fault, write_u32, DbtTranslationWorkspace};
     use crate::memory::MachineMemory;
     #[cfg(feature = "dbt-execution-profile")]
     use crate::rv32_dbt::abi::DbtProfileExitKind;
@@ -1573,7 +1566,6 @@ mod tests {
     use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, DbtLinkKind};
     use crate::rv32_dbt::executable::ExecutableScratch;
     use crate::rv32_dbt::x86_64::emitter::{EmitError, Gpr, Mem, X64Emitter};
-    use crate::rv32_dbt::x86_64::register_cache::RegisterCache;
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{
         decode_product_word,
@@ -1582,7 +1574,7 @@ mod tests {
             jal, jalr, lb, lbu, lh, lhu, lui, lw, mul, mulh, mulhsu, mulhu, or, ori, rem, remu, sb,
             sh, sll, slli, slt, slti, sltiu, sltu, sra, srai, srl, srli, sub, sw, xor, xori,
         },
-        Op, Rv32ArchitecturalState, Rv32ResolvedInstruction, Rv32imCpu,
+        Rv32ArchitecturalState, Rv32ResolvedInstruction, Rv32imCpu,
     };
 
     #[test]
@@ -2155,43 +2147,6 @@ mod tests {
         assert_eq!(exit.attempted, 1);
         assert_eq!(cpu.register(1), 19);
         assert_eq!(cpu.register(2), 42);
-    }
-
-    #[test]
-    fn alias_aware_mul_uses_the_register_cache_destination() {
-        fn mul_suffix(rd: usize, rs1: usize, rs2: usize) -> Vec<u8> {
-            let mut cache = RegisterCache::direct();
-            let mut out = X64Emitter::new(128, 1).unwrap();
-            cache.read(1, &[], &[], &mut out).unwrap();
-            cache.read(2, &[], &[], &mut out).unwrap();
-            let operation = out.bytes().len();
-
-            lower_rv32m(Op::Mul, rd, rs1, rs2, &[], &mut cache, &mut out).unwrap();
-
-            out.bytes()[operation..].to_vec()
-        }
-
-        fn encoded(operation: impl FnOnce(&mut X64Emitter) -> Result<(), EmitError>) -> Vec<u8> {
-            let mut out = X64Emitter::new(16, 1).unwrap();
-            operation(&mut out).unwrap();
-            out.finish().unwrap().to_vec()
-        }
-
-        assert_eq!(
-            mul_suffix(1, 1, 2),
-            encoded(|out| out.imul_r32_r32(Gpr::Rbx, Gpr::Rbp))
-        );
-        assert_eq!(
-            mul_suffix(2, 1, 2),
-            encoded(|out| out.imul_r32_r32(Gpr::Rbp, Gpr::Rbx))
-        );
-        assert_eq!(
-            mul_suffix(3, 1, 2),
-            encoded(|out| {
-                out.mov_r32_r32(Gpr::Rsi, Gpr::Rbx)?;
-                out.imul_r32_r32(Gpr::Rsi, Gpr::Rbp)
-            })
-        );
     }
 
     #[test]
