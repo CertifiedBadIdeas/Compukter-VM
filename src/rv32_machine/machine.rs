@@ -84,7 +84,7 @@ pub const DEFAULT_DBT_CACHE_SETS: usize = 256;
 pub const DEFAULT_DBT_MAX_INSTRUCTIONS: usize = 8;
 pub const DEFAULT_DBT_SCRATCH_BYTES: usize = 8 * 1024;
 pub const DEFAULT_DBT_CODE_BYTES: usize = 128 * 1024;
-pub const DEFAULT_DBT_CODE_ALIGNMENT: Rv32DbtCodeAlignment = Rv32DbtCodeAlignment::BlockBase(32);
+pub const DEFAULT_DBT_CODE_ALIGNMENT: Rv32DbtCodeAlignment = Rv32DbtCodeAlignment::BlockBase(64);
 
 impl Default for Rv32ExecutionBackendConfig {
     fn default() -> Self {

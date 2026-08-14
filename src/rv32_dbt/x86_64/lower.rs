@@ -716,6 +716,7 @@ fn emit_jalr<S: FutureValueSource>(
     out: &mut X64Emitter,
     #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
 ) -> Result<(), EmitError> {
+    cache.reserve_fixed_host(Gpr::Rcx, remaining, out)?;
     let base = cache.read(rs1, remaining, &[], out)?;
     cache.record_scratch_clobber(Gpr::Rax);
     cache.record_scratch_clobber(Gpr::Rdx);
@@ -867,7 +868,6 @@ fn lower_load<S: FutureValueSource>(
         Load::Half | Load::HalfU => 2,
         Load::Word => 4,
     };
-    cache.reserve_fixed_host(Gpr::Rcx, remaining, out)?;
     let base = cache.read(rs1, remaining, &[], out)?;
     cache.record_scratch_clobber(Gpr::Rdx);
     cache.record_scratch_clobber(Gpr::Rax);

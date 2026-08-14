@@ -342,7 +342,7 @@ fn comparison_runner_exposes_exact_profile_mode_and_report() {
     }
     assert!(source.contains("enable_dbt_execution_profile"));
     assert!(source.contains("dbt_execution_profile"));
-    assert!(source.contains("Rv32DbtCodeAlignment::BlockBase(32)"));
+    assert!(source.contains("code_alignment: DEFAULT_DBT_CODE_ALIGNMENT"));
 }
 
 #[test]
