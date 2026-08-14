@@ -12,6 +12,7 @@ dbt-chain-stats = []
 dbt-code-audit = []
 dbt-execution-profile = []
 dbt-translation-timing = []
+dbt-tier1-prototype = []
 wasmtime-comparison = ["dep:wasmtime", "dbt-translation-timing"]
 
 [dependencies]

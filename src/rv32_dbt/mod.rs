@@ -29,6 +29,8 @@ pub(crate) mod executable;
 pub(crate) mod ir;
 #[cfg(feature = "dbt-execution-profile")]
 pub(crate) mod profile;
+#[cfg(feature = "dbt-tier1-prototype")]
+pub(crate) mod region;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
 
