@@ -127,9 +127,6 @@ pub(crate) struct RegisterPressureAudit {
     pub(crate) allocation_pressure: u32,
     pub(crate) max_resident: u8,
     pub(crate) scratch_clobber_sites: [u32; 3],
-    pub(crate) forced_rcx_live_stores: u32,
-    pub(crate) forced_rcx_dead_discards: u32,
-    pub(crate) forced_rcx_clean_discards: u32,
 }
 
 #[cfg(feature = "dbt-code-audit")]
@@ -189,9 +186,6 @@ impl RegisterCache {
                 allocation_pressure: 0,
                 max_resident: 0,
                 scratch_clobber_sites: [0; 3],
-                forced_rcx_live_stores: 0,
-                forced_rcx_dead_discards: 0,
-                forced_rcx_clean_discards: 0,
             },
             #[cfg(feature = "dbt-code-audit")]
             audit_phase: RegisterAuditPhase::Body,
@@ -217,9 +211,6 @@ impl RegisterCache {
                 allocation_pressure: 0,
                 max_resident: 0,
                 scratch_clobber_sites: [0; 3],
-                forced_rcx_live_stores: 0,
-                forced_rcx_dead_discards: 0,
-                forced_rcx_clean_discards: 0,
             },
             #[cfg(feature = "dbt-code-audit")]
             audit_phase: RegisterAuditPhase::Body,
@@ -285,16 +276,6 @@ impl RegisterCache {
         };
         let resident = self.entries[index].unwrap();
         let dead = matches!(future_values.value(resident.guest), FutureValue::Dead(_));
-        #[cfg(feature = "dbt-code-audit")]
-        if dead {
-            self.audit.forced_rcx_dead_discards =
-                self.audit.forced_rcx_dead_discards.saturating_add(1);
-        } else if resident.dirty {
-            self.audit.forced_rcx_live_stores = self.audit.forced_rcx_live_stores.saturating_add(1);
-        } else {
-            self.audit.forced_rcx_clean_discards =
-                self.audit.forced_rcx_clean_discards.saturating_add(1);
-        }
         if resident.dirty && !dead {
             out.mov_m32_r32(
                 Mem::base_disp(
@@ -1231,34 +1212,5 @@ mod tests {
         let audit = cache.audit();
         assert_eq!(audit.loop_reconcile_stores, 1);
         assert_eq!(audit.dirty_live_eviction_stores, 0);
-    }
-
-    #[cfg(feature = "dbt-code-audit")]
-    #[test]
-    fn audit_classifies_actual_rcx_forced_releases() {
-        let mut cache = RegisterCache::chainable();
-        let mut out = X64Emitter::new(512, 16).unwrap();
-        for guest in 1..=8 {
-            cache.write(guest, &[], &[], &mut out).unwrap();
-        }
-
-        cache
-            .reserve_fixed_host(Gpr::Rcx, &[slot(addi(8, 8, 1))], &mut out)
-            .unwrap();
-        cache.begin_instruction();
-        cache.write(8, &[], &[], &mut out).unwrap();
-        cache
-            .reserve_fixed_host(Gpr::Rcx, &[slot(addi(8, 0, 1))], &mut out)
-            .unwrap();
-        cache.begin_instruction();
-        cache.read(8, &[], &[], &mut out).unwrap();
-        cache
-            .reserve_fixed_host(Gpr::Rcx, &[slot(addi(9, 8, 1))], &mut out)
-            .unwrap();
-
-        let audit = cache.audit();
-        assert_eq!(audit.forced_rcx_live_stores, 1);
-        assert_eq!(audit.forced_rcx_dead_discards, 1);
-        assert_eq!(audit.forced_rcx_clean_discards, 1);
     }
 }
