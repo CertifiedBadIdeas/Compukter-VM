@@ -10,7 +10,7 @@
  */
 
 use crate::rv32_dbt::ir::DbtIrBlock;
-use crate::rv32im::{DecodedFields, DecodedOp, ImmOp, Load, Op, Store};
+use crate::rv32im::{Branch, DecodedFields, DecodedOp, ImmOp, Load, Op, Store};
 
 pub(crate) const MAX_REGION_INSTRUCTIONS: usize = 16;
 pub(crate) const MAX_REGION_VALUES: usize = 64;
@@ -104,12 +104,35 @@ impl RegionMemoryEffect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegionBranch {
+    pub(crate) kind: Branch,
+    pub(crate) lhs: ValueId,
+    pub(crate) rhs: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegionAddress {
+    pub(crate) base: Option<ValueId>,
+    pub(crate) index: Option<ValueId>,
+    pub(crate) scale: u8,
+    pub(crate) displacement: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegionFallbackReason {
     NotSelfLoop,
     TooManyInstructions,
     UnsupportedInstruction,
     InvalidInstruction,
     Capacity,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RegionOptimizationStats {
+    pub(crate) constants_folded: u16,
+    pub(crate) aliases_removed: u16,
+    pub(crate) dead_values: u16,
+    pub(crate) address_folds: u16,
 }
 
 #[derive(Debug)]
@@ -148,6 +171,32 @@ impl LoopRegion<'_> {
     pub(crate) fn memory_effect(&self, index: usize) -> RegionMemoryEffect {
         self.workspace.memory_effects[index]
     }
+
+    pub(crate) const fn optimization_stats(&self) -> RegionOptimizationStats {
+        self.workspace.optimization_stats
+    }
+
+    pub(crate) const fn value_count(&self) -> usize {
+        self.workspace.value_count
+    }
+
+    pub(crate) fn is_value_live(&self, value: ValueId) -> bool {
+        self.workspace.live_values[usize::from(value.0)]
+    }
+
+    pub(crate) fn address_form(&self, value: ValueId) -> RegionAddress {
+        region_address(self.workspace, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evaluate_pure(
+        &self,
+        value: ValueId,
+        registers: &[u32; 32],
+    ) -> Result<u32, &'static str> {
+        let mut evaluated = [None; MAX_REGION_VALUES];
+        evaluate_pure_value(self.workspace, value, registers, &mut evaluated)
+    }
 }
 
 #[derive(Debug)]
@@ -162,9 +211,12 @@ pub(crate) struct LoopRegionWorkspace {
     value_count: usize,
     entry_values: [ValueId; 32],
     guest_values: [ValueId; 32],
+    live_values: [bool; MAX_REGION_VALUES],
     memory_effects: [RegionMemoryEffect; MAX_REGION_MEMORY_EFFECTS],
     memory_effect_count: usize,
     instruction_count: usize,
+    branch: Option<RegionBranch>,
+    optimization_stats: RegionOptimizationStats,
 }
 
 impl LoopRegionWorkspace {
@@ -174,9 +226,17 @@ impl LoopRegionWorkspace {
             value_count: 0,
             entry_values: [ValueId::INVALID; 32],
             guest_values: [ValueId::INVALID; 32],
+            live_values: [false; MAX_REGION_VALUES],
             memory_effects: [RegionMemoryEffect::EMPTY; MAX_REGION_MEMORY_EFFECTS],
             memory_effect_count: 0,
             instruction_count: 0,
+            branch: None,
+            optimization_stats: RegionOptimizationStats {
+                constants_folded: 0,
+                aliases_removed: 0,
+                dead_values: 0,
+                address_folds: 0,
+            },
         }
     }
 
@@ -205,7 +265,7 @@ impl LoopRegionWorkspace {
             return RegionBuildOutcome::Fallback(RegionFallbackReason::UnsupportedInstruction);
         }
         let fields = last.fields();
-        let DecodedOp::Branch(_) = fields.operation else {
+        let DecodedOp::Branch(branch_kind) = fields.operation else {
             return RegionBuildOutcome::Fallback(RegionFallbackReason::NotSelfLoop);
         };
         let branch_pc = start_pc.wrapping_add((last_index as u32).wrapping_mul(4));
@@ -221,9 +281,33 @@ impl LoopRegionWorkspace {
                 return RegionBuildOutcome::Fallback(RegionFallbackReason::Capacity);
             }
         }
-        if self.read_guest(fields.rs1).is_err() || self.read_guest(fields.rs2).is_err() {
+        let Ok(lhs) = self.read_guest(fields.rs1) else {
             return RegionBuildOutcome::Fallback(RegionFallbackReason::Capacity);
+        };
+        let Ok(rhs) = self.read_guest(fields.rs2) else {
+            return RegionBuildOutcome::Fallback(RegionFallbackReason::Capacity);
+        };
+        self.branch = Some(RegionBranch {
+            kind: branch_kind,
+            lhs,
+            rhs,
+        });
+        RegionBuildOutcome::Built(LoopRegion { workspace: self })
+    }
+
+    pub(crate) fn build_optimized<'a>(
+        &'a mut self,
+        start_pc: u32,
+        ir: &DbtIrBlock,
+    ) -> RegionBuildOutcome<'a> {
+        let fallback = match self.build(start_pc, ir) {
+            RegionBuildOutcome::Built(_) => None,
+            RegionBuildOutcome::Fallback(reason) => Some(reason),
+        };
+        if let Some(reason) = fallback {
+            return RegionBuildOutcome::Fallback(reason);
         }
+        self.optimize();
         RegionBuildOutcome::Built(LoopRegion { workspace: self })
     }
 
@@ -232,9 +316,12 @@ impl LoopRegionWorkspace {
         self.value_count = 0;
         self.entry_values.fill(ValueId::INVALID);
         self.guest_values.fill(ValueId::INVALID);
+        self.live_values.fill(false);
         self.memory_effects.fill(RegionMemoryEffect::EMPTY);
         self.memory_effect_count = 0;
         self.instruction_count = instruction_count;
+        self.branch = None;
+        self.optimization_stats = RegionOptimizationStats::default();
         let zero = self.push_value(RegionValueKind::Constant(0)).unwrap();
         self.entry_values[0] = zero;
         self.guest_values[0] = zero;
@@ -357,6 +444,295 @@ impl LoopRegionWorkspace {
         self.value_count += 1;
         Ok(value)
     }
+
+    fn optimize(&mut self) {
+        let mut aliases = [ValueId::INVALID; MAX_REGION_VALUES];
+        for index in 0..self.value_count {
+            let value = ValueId(index as u8);
+            let optimized = match self.values[index] {
+                RegionValueKind::Binary { op, lhs, rhs } => {
+                    let lhs = canonical_value(lhs, &aliases);
+                    let rhs = canonical_value(rhs, &aliases);
+                    match (
+                        self.values[usize::from(lhs.0)],
+                        self.values[usize::from(rhs.0)],
+                    ) {
+                        (RegionValueKind::Constant(lhs), RegionValueKind::Constant(rhs)) => {
+                            self.optimization_stats.constants_folded += 1;
+                            RegionValueKind::Constant(fold_binary(op, lhs, rhs))
+                        }
+                        _ => RegionValueKind::Binary { op, lhs, rhs },
+                    }
+                }
+                kind => kind,
+            };
+            if matches!(
+                optimized,
+                RegionValueKind::Load { .. } | RegionValueKind::Parameter { .. }
+            ) {
+                self.values[index] = optimized;
+                aliases[index] = value;
+                continue;
+            }
+            let existing = self.values[..index]
+                .iter()
+                .enumerate()
+                .find(|(candidate, kind)| {
+                    canonical_value(ValueId(*candidate as u8), &aliases)
+                        == ValueId(*candidate as u8)
+                        && **kind == optimized
+                })
+                .map(|(candidate, _)| ValueId(candidate as u8));
+            if let Some(existing) = existing {
+                aliases[index] = existing;
+                self.optimization_stats.aliases_removed += 1;
+            } else {
+                self.values[index] = optimized;
+                aliases[index] = value;
+            }
+        }
+        for value in &mut self.entry_values {
+            if valid_value(*value).is_some() {
+                *value = canonical_value(*value, &aliases);
+            }
+        }
+        for value in &mut self.guest_values {
+            if valid_value(*value).is_some() {
+                *value = canonical_value(*value, &aliases);
+            }
+        }
+        for effect in &mut self.memory_effects[..self.memory_effect_count] {
+            effect.kind = match effect.kind {
+                RegionMemoryEffectKind::Load {
+                    kind,
+                    address,
+                    output,
+                } => RegionMemoryEffectKind::Load {
+                    kind,
+                    address: canonical_value(address, &aliases),
+                    output: canonical_value(output, &aliases),
+                },
+                RegionMemoryEffectKind::Store {
+                    kind,
+                    address,
+                    value,
+                } => RegionMemoryEffectKind::Store {
+                    kind,
+                    address: canonical_value(address, &aliases),
+                    value: canonical_value(value, &aliases),
+                },
+                RegionMemoryEffectKind::Empty => RegionMemoryEffectKind::Empty,
+            };
+        }
+        if let Some(branch) = &mut self.branch {
+            branch.lhs = canonical_value(branch.lhs, &aliases);
+            branch.rhs = canonical_value(branch.rhs, &aliases);
+        }
+        self.compute_liveness();
+        self.optimization_stats.address_folds = self.memory_effects[..self.memory_effect_count]
+            .iter()
+            .filter(|effect| {
+                let address = match effect.kind {
+                    RegionMemoryEffectKind::Load { address, .. }
+                    | RegionMemoryEffectKind::Store { address, .. } => address,
+                    RegionMemoryEffectKind::Empty => return false,
+                };
+                let form = region_address(self, address);
+                form.index.is_some() || form.displacement != 0
+            })
+            .count() as u16;
+    }
+
+    fn compute_liveness(&mut self) {
+        self.live_values.fill(false);
+        let mut queued = [false; MAX_REGION_VALUES];
+        let mut stack = [ValueId::INVALID; MAX_REGION_VALUES];
+        let mut stack_len = 0;
+        for guest in 1..32 {
+            let output = self.guest_values[guest];
+            if valid_value(output).is_some() && output != self.entry_values[guest] {
+                push_liveness(output, &mut stack, &mut stack_len, &mut queued);
+            }
+        }
+        for effect in &self.memory_effects[..self.memory_effect_count] {
+            match effect.kind {
+                RegionMemoryEffectKind::Load {
+                    address, output, ..
+                } => {
+                    push_liveness(address, &mut stack, &mut stack_len, &mut queued);
+                    push_liveness(output, &mut stack, &mut stack_len, &mut queued);
+                }
+                RegionMemoryEffectKind::Store { address, value, .. } => {
+                    push_liveness(address, &mut stack, &mut stack_len, &mut queued);
+                    push_liveness(value, &mut stack, &mut stack_len, &mut queued);
+                }
+                RegionMemoryEffectKind::Empty => {}
+            }
+        }
+        if let Some(branch) = self.branch {
+            push_liveness(branch.lhs, &mut stack, &mut stack_len, &mut queued);
+            push_liveness(branch.rhs, &mut stack, &mut stack_len, &mut queued);
+        }
+        while stack_len != 0 {
+            stack_len -= 1;
+            let value = stack[stack_len];
+            let index = usize::from(value.0);
+            self.live_values[index] = true;
+            if let RegionValueKind::Binary { lhs, rhs, .. } = self.values[index] {
+                push_liveness(lhs, &mut stack, &mut stack_len, &mut queued);
+                push_liveness(rhs, &mut stack, &mut stack_len, &mut queued);
+            }
+        }
+        self.optimization_stats.dead_values = self.values[..self.value_count]
+            .iter()
+            .zip(self.live_values)
+            .filter(|(kind, live)| **kind != RegionValueKind::Empty && !*live)
+            .count() as u16;
+    }
+}
+
+fn region_address(workspace: &LoopRegionWorkspace, value: ValueId) -> RegionAddress {
+    let (expression, displacement) = split_add_constant(workspace, value)
+        .map(|(expression, displacement)| (expression, displacement as i32))
+        .unwrap_or((value, 0));
+    if let RegionValueKind::Binary {
+        op: RegionBinaryOp::Add,
+        lhs,
+        rhs,
+    } = workspace.values[usize::from(expression.0)]
+    {
+        if let Some((index, scale)) = scaled_index(workspace, lhs) {
+            return RegionAddress {
+                base: Some(rhs),
+                index: Some(index),
+                scale,
+                displacement,
+            };
+        }
+        if let Some((index, scale)) = scaled_index(workspace, rhs) {
+            return RegionAddress {
+                base: Some(lhs),
+                index: Some(index),
+                scale,
+                displacement,
+            };
+        }
+        return RegionAddress {
+            base: Some(lhs),
+            index: Some(rhs),
+            scale: 1,
+            displacement,
+        };
+    }
+    RegionAddress {
+        base: Some(expression),
+        index: None,
+        scale: 1,
+        displacement,
+    }
+}
+
+#[cfg(test)]
+fn evaluate_pure_value(
+    workspace: &LoopRegionWorkspace,
+    value: ValueId,
+    registers: &[u32; 32],
+    evaluated: &mut [Option<u32>; MAX_REGION_VALUES],
+) -> Result<u32, &'static str> {
+    let index = usize::from(value.0);
+    if let Some(value) = evaluated[index] {
+        return Ok(value);
+    }
+    let value = match workspace.values[index] {
+        RegionValueKind::Parameter { guest } => registers[usize::from(guest)],
+        RegionValueKind::Constant(value) => value,
+        RegionValueKind::Binary { op, lhs, rhs } => fold_binary(
+            op,
+            evaluate_pure_value(workspace, lhs, registers, evaluated)?,
+            evaluate_pure_value(workspace, rhs, registers, evaluated)?,
+        ),
+        RegionValueKind::Load { .. } => return Err("pure evaluation reached a RAM load"),
+        RegionValueKind::Empty => return Err("pure evaluation reached an empty value"),
+    };
+    evaluated[index] = Some(value);
+    Ok(value)
+}
+
+fn split_add_constant(workspace: &LoopRegionWorkspace, value: ValueId) -> Option<(ValueId, u32)> {
+    let RegionValueKind::Binary {
+        op: RegionBinaryOp::Add,
+        lhs,
+        rhs,
+    } = workspace.values[usize::from(value.0)]
+    else {
+        return None;
+    };
+    match (
+        workspace.values[usize::from(lhs.0)],
+        workspace.values[usize::from(rhs.0)],
+    ) {
+        (RegionValueKind::Constant(displacement), _) => Some((rhs, displacement)),
+        (_, RegionValueKind::Constant(displacement)) => Some((lhs, displacement)),
+        _ => None,
+    }
+}
+
+fn scaled_index(workspace: &LoopRegionWorkspace, value: ValueId) -> Option<(ValueId, u8)> {
+    let RegionValueKind::Binary {
+        op: RegionBinaryOp::ShiftLeft,
+        lhs,
+        rhs,
+    } = workspace.values[usize::from(value.0)]
+    else {
+        return None;
+    };
+    let RegionValueKind::Constant(shift) = workspace.values[usize::from(rhs.0)] else {
+        return None;
+    };
+    (shift <= 3).then_some((lhs, 1_u8 << shift))
+}
+
+fn push_liveness(
+    value: ValueId,
+    stack: &mut [ValueId; MAX_REGION_VALUES],
+    stack_len: &mut usize,
+    queued: &mut [bool; MAX_REGION_VALUES],
+) {
+    let Some(value) = valid_value(value) else {
+        return;
+    };
+    let index = usize::from(value.0);
+    if queued[index] {
+        return;
+    }
+    queued[index] = true;
+    stack[*stack_len] = value;
+    *stack_len += 1;
+}
+
+fn canonical_value(mut value: ValueId, aliases: &[ValueId; MAX_REGION_VALUES]) -> ValueId {
+    while aliases[usize::from(value.0)] != ValueId::INVALID
+        && aliases[usize::from(value.0)] != value
+    {
+        value = aliases[usize::from(value.0)];
+    }
+    value
+}
+
+const fn fold_binary(op: RegionBinaryOp, lhs: u32, rhs: u32) -> u32 {
+    match op {
+        RegionBinaryOp::Add => lhs.wrapping_add(rhs),
+        RegionBinaryOp::Sub => lhs.wrapping_sub(rhs),
+        RegionBinaryOp::ShiftLeft => lhs.wrapping_shl(rhs & 31),
+        RegionBinaryOp::SetLessThan => ((lhs as i32) < (rhs as i32)) as u32,
+        RegionBinaryOp::SetLessThanUnsigned => (lhs < rhs) as u32,
+        RegionBinaryOp::Xor => lhs ^ rhs,
+        RegionBinaryOp::ShiftRight => lhs.wrapping_shr(rhs & 31),
+        RegionBinaryOp::ShiftRightArithmetic => ((lhs as i32) >> (rhs & 31)) as u32,
+        RegionBinaryOp::Or => lhs | rhs,
+        RegionBinaryOp::And => lhs & rhs,
+        RegionBinaryOp::Multiply => lhs.wrapping_mul(rhs),
+    }
 }
 
 const fn valid_value(value: ValueId) -> Option<ValueId> {
@@ -422,11 +798,11 @@ const fn is_supported_body_operation(operation: DecodedOp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoopRegionWorkspace, RegionBinaryOp, RegionBuildOutcome, RegionFallbackReason,
-        RegionValueKind,
+        LoopRegionWorkspace, RegionAddress, RegionBinaryOp, RegionBuildOutcome,
+        RegionFallbackReason, RegionMemoryEffectKind, RegionValueKind,
     };
     use crate::rv32_dbt::ir::DbtIrBlock;
-    use crate::rv32im::encoding::{addi, bne, csrrw, div, lr_w, lw, sw};
+    use crate::rv32im::encoding::{add, addi, bne, csrrw, div, lr_w, lw, sll, slli, sw};
 
     fn fallback_for_words(start_pc: u32, words: &[u32]) -> RegionFallbackReason {
         let mut ir = DbtIrBlock::new(words.len().max(1)).unwrap();
@@ -513,5 +889,88 @@ mod tests {
         assert_eq!(region.memory_effect(1).pc(), 0x908);
         assert_eq!(region.memory_effect(1).word(), words[2]);
         assert_eq!(region.memory_effect(1).attempted_index(), 2);
+    }
+
+    #[test]
+    fn optimizer_folds_constants_and_reuses_canonical_values() {
+        let words = [addi(5, 0, 1), addi(6, 0, 1), add(7, 5, 6), bne(7, 0, -12)];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        let mut workspace = LoopRegionWorkspace::new();
+
+        let RegionBuildOutcome::Built(region) = workspace.build_optimized(0xa00, &ir) else {
+            panic!("expected an optimized region")
+        };
+        let output = region.output_value(7).expect("x7 output");
+
+        assert_eq!(region.value_kind(output), RegionValueKind::Constant(2));
+        assert_eq!(region.optimization_stats().constants_folded, 3);
+        assert!(region.optimization_stats().aliases_removed >= 1);
+    }
+
+    #[test]
+    fn optimizer_marks_overwritten_values_dead_but_keeps_branch_outputs_live() {
+        let words = [addi(5, 0, 1), addi(5, 0, 2), bne(5, 6, -8)];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        let mut workspace = LoopRegionWorkspace::new();
+
+        let RegionBuildOutcome::Built(region) = workspace.build_optimized(0xb00, &ir) else {
+            panic!("expected an optimized region")
+        };
+        let overwritten = region.constant_value(1).expect("first addi value");
+        let output = region.output_value(5).expect("x5 output");
+
+        assert!(!region.is_value_live(overwritten));
+        assert!(region.is_value_live(output));
+        assert!(region.optimization_stats().dead_values >= 1);
+    }
+
+    #[test]
+    fn optimizer_folds_scaled_address_trees_for_native_lowering() {
+        let words = [slli(6, 5, 2), add(7, 10, 6), lw(8, 7, 12), bne(5, 9, -12)];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        let mut workspace = LoopRegionWorkspace::new();
+
+        let RegionBuildOutcome::Built(region) = workspace.build_optimized(0xc00, &ir) else {
+            panic!("expected an optimized region")
+        };
+        let RegionMemoryEffectKind::Load { address, .. } = region.memory_effect(0).kind() else {
+            panic!("expected a load effect")
+        };
+
+        assert_eq!(
+            region.address_form(address),
+            RegionAddress {
+                base: region.entry_value(10),
+                index: region.entry_value(5),
+                scale: 4,
+                displacement: 12,
+            }
+        );
+        assert_eq!(region.optimization_stats().address_folds, 1);
+    }
+
+    #[test]
+    fn semantic_oracle_uses_rv32_wrapping_and_shift_masking() {
+        let words = [addi(5, 0, -1), addi(6, 0, 33), sll(7, 5, 6), bne(7, 0, -12)];
+        let mut ir = DbtIrBlock::new(16).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        let mut workspace = LoopRegionWorkspace::new();
+        let RegionBuildOutcome::Built(region) = workspace.build_optimized(0xd00, &ir) else {
+            panic!("expected an optimized region")
+        };
+        let output = region.output_value(7).expect("x7 output");
+
+        assert_eq!(region.evaluate_pure(output, &[0; 32]).unwrap(), 0xffff_fffe);
     }
 }
