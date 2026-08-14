@@ -1022,7 +1022,7 @@ fn run_execution_profile(arguments: &[OsString]) -> Result<(), String> {
                 max_instructions: 16,
                 scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
                 cache_bytes: 128 * 1024,
-                code_alignment: Rv32DbtCodeAlignment::BlockBase(32),
+                code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
             },
         },
     )

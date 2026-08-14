@@ -66,7 +66,7 @@ fn configs() -> [Rv32ExecutionBackendConfig; 5] {
 fn cached_dbt_is_the_default_execution_backend() {
     assert_eq!(
         DEFAULT_DBT_CODE_ALIGNMENT,
-        Rv32DbtCodeAlignment::BlockBase(32)
+        Rv32DbtCodeAlignment::BlockBase(64)
     );
     assert_eq!(
         Rv32ExecutionBackendConfig::default(),
@@ -75,7 +75,7 @@ fn cached_dbt_is_the_default_execution_backend() {
             max_instructions: 8,
             scratch_bytes: 8 * 1024,
             cache_bytes: 128 * 1024,
-            code_alignment: Rv32DbtCodeAlignment::BlockBase(32),
+            code_alignment: Rv32DbtCodeAlignment::BlockBase(64),
         }
     );
 }
