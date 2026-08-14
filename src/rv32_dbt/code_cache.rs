@@ -1077,6 +1077,9 @@ mod tests {
             dirty_live_eviction_stores: 2,
             allocation_pressure: 4,
             scratch_clobber_sites: [5, 6, 7],
+            forced_rcx_live_stores: 8,
+            forced_rcx_dead_discards: 9,
+            forced_rcx_clean_discards: 10,
             ..RegisterPressureAudit::default()
         };
 
@@ -1093,6 +1096,9 @@ mod tests {
         assert_eq!(actual.dirty_live_eviction_stores, 2);
         assert_eq!(actual.allocation_pressure, 4);
         assert_eq!(actual.scratch_clobber_sites, [5, 6, 7]);
+        assert_eq!(actual.forced_rcx_live_stores, 8);
+        assert_eq!(actual.forced_rcx_dead_discards, 9);
+        assert_eq!(actual.forced_rcx_clean_discards, 10);
     }
 
     #[cfg(feature = "dbt-code-audit")]
