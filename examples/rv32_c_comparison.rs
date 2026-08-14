@@ -985,7 +985,7 @@ fn print_compilation_report(
     };
     let mut construct_nanos = Vec::with_capacity(samples);
     let mut first_completion_nanos = Vec::with_capacity(samples);
-    let mut decode_nanos = Vec::with_capacity(samples);
+    let mut lift_nanos = Vec::with_capacity(samples);
     let mut lower_nanos = Vec::with_capacity(samples);
     let mut publish_nanos = Vec::with_capacity(samples);
     let mut last_stats = None;
@@ -1111,7 +1111,7 @@ fn print_compilation_report(
                     let stats = machine
                         .dbt_stats()
                         .ok_or_else(|| "cold Cached DBT did not expose DBT stats".to_string())?;
-                    decode_nanos.push(u128::from(stats.decode_nanos));
+                    lift_nanos.push(u128::from(stats.lift_nanos));
                     lower_nanos.push(u128::from(stats.lower_nanos));
                     publish_nanos.push(u128::from(stats.publish_nanos));
                     if stats.timed_translations != stats.translations {
@@ -1215,8 +1215,8 @@ fn print_compilation_report(
         ),
         phase(
             "rv32-cached-dbt",
-            "decode",
-            decode_nanos,
+            "lift",
+            lift_nanos,
             None,
             blocks,
             instructions,

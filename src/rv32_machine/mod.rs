@@ -188,7 +188,7 @@ pub struct Rv32DbtStats {
     pub reserved_bytes: usize,
     pub metadata_bytes: usize,
     #[cfg(feature = "dbt-translation-timing")]
-    pub decode_nanos: u64,
+    pub lift_nanos: u64,
     #[cfg(feature = "dbt-translation-timing")]
     pub lower_nanos: u64,
     #[cfg(feature = "dbt-translation-timing")]

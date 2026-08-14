@@ -114,7 +114,7 @@ pub(crate) struct Rv32DbtExecution {
     #[cfg(feature = "dbt-translation-timing")]
     translation_timing_enabled: bool,
     #[cfg(feature = "dbt-translation-timing")]
-    decode_nanos: u64,
+    lift_nanos: u64,
     #[cfg(feature = "dbt-translation-timing")]
     lower_nanos: u64,
     #[cfg(feature = "dbt-translation-timing")]
@@ -210,7 +210,7 @@ impl Rv32DbtExecution {
             #[cfg(feature = "dbt-translation-timing")]
             translation_timing_enabled: false,
             #[cfg(feature = "dbt-translation-timing")]
-            decode_nanos: 0,
+            lift_nanos: 0,
             #[cfg(feature = "dbt-translation-timing")]
             lower_nanos: 0,
             #[cfg(feature = "dbt-translation-timing")]
@@ -324,9 +324,9 @@ impl Rv32DbtExecution {
     }
 
     #[cfg(feature = "dbt-translation-timing")]
-    pub(crate) fn record_decode_nanos(&mut self, nanos: u128) {
+    pub(crate) fn record_lift_nanos(&mut self, nanos: u128) {
         if self.translation_timing_enabled {
-            self.decode_nanos = self.decode_nanos.saturating_add(saturating_nanos(nanos));
+            self.lift_nanos = self.lift_nanos.saturating_add(saturating_nanos(nanos));
         }
     }
 
@@ -677,7 +677,7 @@ impl Rv32DbtExecution {
             reserved_bytes,
             metadata_bytes,
             #[cfg(feature = "dbt-translation-timing")]
-            decode_nanos: self.decode_nanos,
+            lift_nanos: self.lift_nanos,
             #[cfg(feature = "dbt-translation-timing")]
             lower_nanos: self.lower_nanos,
             #[cfg(feature = "dbt-translation-timing")]
