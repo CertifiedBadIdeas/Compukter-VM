@@ -49,6 +49,12 @@ pub enum Rv32DbtCodeAlignment {
     ChainEntry(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rv32DbtRegisterProfile {
+    Stable7,
+    RcxOverflow8,
+}
+
 impl Rv32DbtCodeAlignment {
     pub const fn bytes(self) -> usize {
         match self {
@@ -77,6 +83,7 @@ pub enum Rv32ExecutionBackendConfig {
         scratch_bytes: usize,
         cache_bytes: usize,
         code_alignment: Rv32DbtCodeAlignment,
+        register_profile: Rv32DbtRegisterProfile,
     },
 }
 
@@ -85,6 +92,8 @@ pub const DEFAULT_DBT_MAX_INSTRUCTIONS: usize = 8;
 pub const DEFAULT_DBT_SCRATCH_BYTES: usize = 8 * 1024;
 pub const DEFAULT_DBT_CODE_BYTES: usize = 128 * 1024;
 pub const DEFAULT_DBT_CODE_ALIGNMENT: Rv32DbtCodeAlignment = Rv32DbtCodeAlignment::BlockBase(64);
+pub const DEFAULT_DBT_REGISTER_PROFILE: Rv32DbtRegisterProfile =
+    Rv32DbtRegisterProfile::RcxOverflow8;
 
 impl Default for Rv32ExecutionBackendConfig {
     fn default() -> Self {
@@ -94,6 +103,7 @@ impl Default for Rv32ExecutionBackendConfig {
             scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
             cache_bytes: DEFAULT_DBT_CODE_BYTES,
             code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+            register_profile: DEFAULT_DBT_REGISTER_PROFILE,
         }
     }
 }
@@ -281,6 +291,7 @@ impl Rv32Machine {
                 scratch_bytes,
                 cache_bytes,
                 code_alignment,
+                register_profile: _,
             } => build_dbt_backend(
                 Rv32DbtBackendBuild::Cached {
                     sets,

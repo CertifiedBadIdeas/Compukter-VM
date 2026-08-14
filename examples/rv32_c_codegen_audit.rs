@@ -110,6 +110,7 @@ fn execute(build_dir: &Path, batch: u64) -> Result<(), String> {
                 scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: 128 * 1024,
                 code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
         },
     )
@@ -152,6 +153,7 @@ fn export(build_dir: &Path) -> Result<(), String> {
                 scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: 128 * 1024,
                 code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
         },
     )
@@ -185,6 +187,7 @@ fn export(build_dir: &Path) -> Result<(), String> {
                 scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: 128 * 1024,
                 code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
         },
     )

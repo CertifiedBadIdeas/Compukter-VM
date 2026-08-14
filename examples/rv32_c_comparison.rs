@@ -137,6 +137,7 @@ impl Candidate {
                 scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
                 cache_bytes,
                 code_alignment,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             }),
         }
     }
@@ -1023,6 +1024,7 @@ fn run_execution_profile(arguments: &[OsString]) -> Result<(), String> {
                 scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
                 cache_bytes: 128 * 1024,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
         },
     )
@@ -1238,6 +1240,7 @@ fn print_compilation_report(
         scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
         cache_bytes: 128 * 1024,
         code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+        register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
     };
     let mut construct_nanos = Vec::with_capacity(samples);
     let mut first_completion_nanos = Vec::with_capacity(samples);

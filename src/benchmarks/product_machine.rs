@@ -367,6 +367,7 @@ impl ProductMachineBackend {
                 scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: PRODUCT_DBT_CODE_BYTES,
                 code_alignment: crate::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: crate::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
         }
     }
