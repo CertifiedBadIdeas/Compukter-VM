@@ -23,7 +23,7 @@
 )]
 
 use super::emitter::{Condition, EmitError, Gpr, Label, Mem, X64Emitter};
-use super::register_cache::RegisterCache;
+use super::register_cache::{FutureValueSource, RegisterCache};
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::abi::DbtProfileExitKind;
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
@@ -39,8 +39,7 @@ use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_machine::Rv32DbtProfileEdgeKind;
 use crate::rv32im::{
-    Branch, DecodedInstruction, ImmOp, Load, Op, Rv32ArchitecturalState, Rv32ResolvedInstruction,
-    Store,
+    Branch, DecodedFields, DecodedOp, ImmOp, Load, Op, Rv32ArchitecturalState, Store,
 };
 
 const EXECUTION_COUNTER: Gpr = Gpr::Rdi;
@@ -215,7 +214,10 @@ impl DbtTranslationWorkspace {
             .then(|| local_self_branch_target(input))
             .flatten()
             .filter(|target| *target == input.start_pc())
-            .and_then(|_| RegisterCache::local_loop_plan(input.slots()));
+            .and_then(|_| match input.micro_ir() {
+                Some(ir) => RegisterCache::local_loop_plan_ir(ir),
+                None => RegisterCache::local_loop_plan(input.slots()),
+            });
         let (chain_entry_offset, deferred_budget_exit) = if chainable {
             let (offset, cold_exit) = emit_fast_entry_guard(&mut out)
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
@@ -232,9 +234,11 @@ impl DbtTranslationWorkspace {
             (offset, None)
         };
         let local_loop_entry = if let Some(plan) = local_loop_plan {
-            cache
-                .preload_local_loop(plan, input.slots(), &mut out)
-                .map_err(|error| emit_fault(input.start_pc(), None, error))?;
+            match input.micro_ir() {
+                Some(_) => cache.preload_local_loop(plan, input.future_values(0), &mut out),
+                None => cache.preload_local_loop(plan, input.slots(), &mut out),
+            }
+            .map_err(|error| emit_fault(input.start_pc(), None, error))?;
             let entry = out
                 .new_label()
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
@@ -264,7 +268,7 @@ impl DbtTranslationWorkspace {
             DbtBlockMode::DirectFast | DbtBlockMode::ChainableThroughput => None,
             DbtBlockMode::Bounded { max_attempts } => Some(max_attempts as usize),
         };
-        for (index, slot) in input.slots().iter().copied().enumerate() {
+        for index in 0..input.instruction_count() {
             let pc = input.start_pc().wrapping_add(index as u32 * 4);
             if bounded_limit == Some(index) {
                 emit_exit(
@@ -280,30 +284,28 @@ impl DbtTranslationWorkspace {
                 emitted_terminal = true;
                 break;
             }
-            let Rv32ResolvedInstruction::Valid { word, instruction } = slot else {
-                let Rv32ResolvedInstruction::Invalid { word } = slot else {
-                    unreachable!()
-                };
+            let Some(instruction) = input.instruction(index) else {
+                let word = input
+                    .word(index)
+                    .expect("DBT terminal instruction has a word");
                 terminal = Some((pc, word, index as u32 + 1));
                 break;
             };
+            let word = instruction.word();
+            let fields = instruction.fields();
+            let future = input.future_values(index);
             let attempted = index as u32 + 1;
-            match instruction {
-                DecodedInstruction::Branch {
-                    kind,
-                    rs1,
-                    rs2,
-                    offset,
-                } => {
+            match fields.operation {
+                DecodedOp::Branch(kind) => {
                     emit_branch(
                         kind,
-                        rs1,
-                        rs2,
-                        offset,
+                        usize::from(fields.rs1),
+                        usize::from(fields.rs2),
+                        fields.immediate,
                         pc,
                         word,
                         attempted,
-                        &input.slots()[index..],
+                        future,
                         &mut cache,
                         &mut out,
                         chainable,
@@ -321,13 +323,14 @@ impl DbtTranslationWorkspace {
                     emitted_terminal = true;
                     break;
                 }
-                DecodedInstruction::Jal { rd, offset } => {
+                DecodedOp::Jal => {
                     emit_jal(
-                        rd,
-                        offset,
+                        usize::from(fields.rd),
+                        fields.immediate,
                         pc,
                         word,
                         attempted,
+                        future,
                         &mut cache,
                         &mut out,
                         chainable,
@@ -344,15 +347,15 @@ impl DbtTranslationWorkspace {
                     emitted_terminal = true;
                     break;
                 }
-                DecodedInstruction::Jalr { rd, rs1, immediate } => {
+                DecodedOp::Jalr => {
                     emit_jalr(
-                        rd,
-                        rs1,
-                        immediate,
+                        usize::from(fields.rd),
+                        usize::from(fields.rs1),
+                        fields.immediate,
                         pc,
                         word,
                         attempted,
-                        &input.slots()[index..],
+                        future,
                         &mut cache,
                         &mut out,
                         #[cfg(feature = "dbt-execution-profile")]
@@ -362,46 +365,36 @@ impl DbtTranslationWorkspace {
                     emitted_terminal = true;
                     break;
                 }
-                DecodedInstruction::Load {
-                    kind,
-                    rd,
-                    rs1,
-                    immediate,
-                } => {
+                DecodedOp::Load(kind) => {
                     lowered_load_sites += 1;
                     lower_load(
                         kind,
-                        rd,
-                        rs1,
-                        immediate,
+                        usize::from(fields.rd),
+                        usize::from(fields.rs1),
+                        fields.immediate,
                         pc,
                         word,
                         attempted,
                         ram_len,
-                        &input.slots()[index..],
+                        future,
                         &mut cache,
                         &mut out,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     continue;
                 }
-                DecodedInstruction::Store {
-                    kind,
-                    rs1,
-                    rs2,
-                    immediate,
-                } => {
+                DecodedOp::Store(kind) => {
                     lowered_store_sites += 1;
                     lower_store(
                         kind,
-                        rs1,
-                        rs2,
-                        immediate,
+                        usize::from(fields.rs1),
+                        usize::from(fields.rs2),
+                        fields.immediate,
                         pc,
                         word,
                         attempted,
                         ram_len,
-                        &input.slots()[index..],
+                        future,
                         &mut cache,
                         &mut out,
                     )
@@ -410,14 +403,8 @@ impl DbtTranslationWorkspace {
                 }
                 _ => {}
             }
-            if !lower_instruction(
-                instruction,
-                pc,
-                &input.slots()[index..],
-                &mut cache,
-                &mut out,
-            )
-            .map_err(|error| emit_fault(pc, Some(word), error))?
+            if !lower_instruction(fields, pc, future, &mut cache, &mut out)
+                .map_err(|error| emit_fault(pc, Some(word), error))?
             {
                 terminal = Some((pc, word, index as u32 + 1));
                 break;
@@ -438,12 +425,12 @@ impl DbtTranslationWorkspace {
             } else {
                 let next_pc = input
                     .start_pc()
-                    .wrapping_add(input.slots().len() as u32 * 4);
+                    .wrapping_add(input.instruction_count() as u32 * 4);
                 emit_completed_exit(
                     &mut cache,
                     &mut out,
                     next_pc,
-                    input.slots().len() as u32,
+                    input.instruction_count() as u32,
                     DbtLinkKind::Fallthrough,
                     chainable,
                     &mut static_links,
@@ -532,21 +519,18 @@ impl DbtTranslationWorkspace {
 }
 
 fn local_self_branch_target(input: &DbtBlockInput<'_>) -> Option<u32> {
-    let index = input.slots().len().checked_sub(1)?;
+    let index = input.instruction_count().checked_sub(1)?;
     let pc = input.start_pc().wrapping_add(index as u32 * 4);
-    let Rv32ResolvedInstruction::Valid {
-        instruction: DecodedInstruction::Branch { offset, .. },
-        ..
-    } = input.slots()[index]
-    else {
+    let instruction = input.instruction(index)?;
+    let DecodedOp::Branch(_) = instruction.fields().operation else {
         return None;
     };
-    let target = pc.wrapping_add_signed(offset);
+    let target = pc.wrapping_add_signed(instruction.fields().immediate);
     (target & 3 == 0).then_some(target)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_branch(
+fn emit_branch<S: FutureValueSource>(
     kind: Branch,
     rs1: usize,
     rs2: usize,
@@ -554,7 +538,7 @@ fn emit_branch(
     pc: u32,
     word: u32,
     attempted: u32,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
     chainable: bool,
@@ -651,12 +635,13 @@ fn emit_branch(
     }
 }
 
-fn emit_jal(
+fn emit_jal<S: FutureValueSource>(
     rd: usize,
     offset: i32,
     pc: u32,
     word: u32,
     attempted: u32,
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
     chainable: bool,
@@ -678,7 +663,7 @@ fn emit_jal(
             word,
         );
     }
-    if let Some(dst) = cache.write(rd, &[], &[], out)? {
+    if let Some(dst) = cache.write(rd, remaining, &[], out)? {
         out.mov_r32_imm32(dst, pc.wrapping_add(4))?;
     }
     emit_completed_exit(
@@ -700,14 +685,14 @@ fn emit_jal(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_jalr(
+fn emit_jalr<S: FutureValueSource>(
     rd: usize,
     rs1: usize,
     immediate: i32,
     pc: u32,
     word: u32,
     attempted: u32,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
     #[cfg(feature = "dbt-execution-profile")] profile_enabled: bool,
@@ -794,31 +779,31 @@ fn emit_fast_entry_guard(out: &mut X64Emitter) -> Result<(u32, Label), EmitError
     Ok((chain_entry_offset, cold_exit))
 }
 
-fn lower_instruction(
-    instruction: DecodedInstruction,
+fn lower_instruction<S: FutureValueSource>(
+    instruction: DecodedFields,
     pc: u32,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
 ) -> Result<bool, EmitError> {
-    match instruction {
-        DecodedInstruction::Lui { rd, value } => {
+    let rd = usize::from(instruction.rd);
+    let rs1 = usize::from(instruction.rs1);
+    let rs2 = usize::from(instruction.rs2);
+    match instruction.operation {
+        DecodedOp::Lui => {
             if let Some(dst) = cache.write(rd, remaining, &[], out)? {
-                out.mov_r32_imm32(dst, value)?;
+                out.mov_r32_imm32(dst, instruction.immediate as u32)?;
             }
         }
-        DecodedInstruction::Auipc { rd, value } => {
+        DecodedOp::Auipc => {
             if let Some(dst) = cache.write(rd, remaining, &[], out)? {
-                out.mov_r32_imm32(dst, pc.wrapping_add(value))?;
+                out.mov_r32_imm32(dst, pc.wrapping_add(instruction.immediate as u32))?;
             }
         }
-        DecodedInstruction::Immediate {
-            op,
-            rd,
-            rs1,
-            immediate,
-        } => lower_immediate(op, rd, rs1, immediate, remaining, cache, out)?,
-        DecodedInstruction::Register { op, rd, rs1, rs2 }
+        DecodedOp::Immediate(op) => {
+            lower_immediate(op, rd, rs1, instruction.immediate, remaining, cache, out)?
+        }
+        DecodedOp::Register(op)
             if matches!(
                 op,
                 Op::Add
@@ -835,17 +820,15 @@ fn lower_instruction(
         {
             lower_register(op, rd, rs1, rs2, remaining, cache, out)?
         }
-        DecodedInstruction::Register { op, rd, rs1, rs2 } => {
-            lower_rv32m(op, rd, rs1, rs2, remaining, cache, out)?
-        }
-        DecodedInstruction::Fence => {}
+        DecodedOp::Register(op) => lower_rv32m(op, rd, rs1, rs2, remaining, cache, out)?,
+        DecodedOp::Fence => {}
         _ => return Ok(false),
     }
     Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_load(
+fn lower_load<S: FutureValueSource>(
     kind: Load,
     rd: usize,
     rs1: usize,
@@ -854,7 +837,7 @@ fn lower_load(
     word: u32,
     attempted: u32,
     ram_len: u32,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
 ) -> Result<(), EmitError> {
@@ -890,7 +873,7 @@ fn lower_load(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_store(
+fn lower_store<S: FutureValueSource>(
     kind: Store,
     rs1: usize,
     rs2: usize,
@@ -899,7 +882,7 @@ fn lower_store(
     word: u32,
     attempted: u32,
     ram_len: u32,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
 ) -> Result<(), EmitError> {
@@ -993,12 +976,12 @@ fn emit_ram_checks(
     out.jcc(Condition::Equal, slow)
 }
 
-fn lower_immediate(
+fn lower_immediate<S: FutureValueSource>(
     op: ImmOp,
     rd: usize,
     rs1: usize,
     immediate: i32,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
 ) -> Result<(), EmitError> {
@@ -1039,12 +1022,12 @@ fn lower_immediate(
     Ok(())
 }
 
-fn lower_register(
+fn lower_register<S: FutureValueSource>(
     op: Op,
     rd: usize,
     rs1: usize,
     rs2: usize,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
 ) -> Result<(), EmitError> {
@@ -1116,12 +1099,12 @@ fn emit_cl_shift(op: Op, dst: Gpr, out: &mut X64Emitter) -> Result<(), EmitError
     }
 }
 
-fn lower_rv32m(
+fn lower_rv32m<S: FutureValueSource>(
     op: Op,
     rd: usize,
     rs1: usize,
     rs2: usize,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
 ) -> Result<(), EmitError> {
@@ -1188,10 +1171,10 @@ fn lower_rv32m(
     Ok(())
 }
 
-fn write_rv32m_constant(
+fn write_rv32m_constant<S: FutureValueSource>(
     rd: usize,
     value: u32,
-    remaining: &[Rv32ResolvedInstruction],
+    remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
 ) -> Result<(), EmitError> {
@@ -1565,6 +1548,7 @@ mod tests {
     use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
     use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, DbtLinkKind};
     use crate::rv32_dbt::executable::ExecutableScratch;
+    use crate::rv32_dbt::ir::DbtIrBlock;
     use crate::rv32_dbt::x86_64::emitter::{EmitError, Gpr, Mem, X64Emitter};
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::{
@@ -1625,7 +1609,8 @@ mod tests {
         input: &DbtBlockInput<'_>,
         registers: &[(usize, u32)],
     ) -> (Rv32imCpu, DbtExitTag, DbtExitRecord, Vec<u8>) {
-        let mut workspace = DbtTranslationWorkspace::new(64 * 1024, input.slots().len()).unwrap();
+        let mut workspace =
+            DbtTranslationWorkspace::new(64 * 1024, input.instruction_count()).unwrap();
         let compiled = workspace.lower(input, 4096).unwrap();
         let code = compiled.code().to_vec();
         let mut scratch = ExecutableScratch::new(64 * 1024).unwrap();
@@ -1640,7 +1625,7 @@ mod tests {
             ram_len: 0,
             page_permissions: std::ptr::null(),
             page_count: 0,
-            remaining_budget: input.slots().len() as u32,
+            remaining_budget: input.instruction_count() as u32,
             reservation_valid: 0,
             reservation_address: 0,
             chain_transitions: 0,
@@ -1652,6 +1637,26 @@ mod tests {
         let tag = DbtExitTag::try_from(unsafe { entry(&mut context) }).unwrap();
         let exit = context.exit;
         (cpu, tag, exit, code)
+    }
+
+    #[test]
+    fn micro_ir_and_decoded_inputs_emit_identical_direct_arithmetic() {
+        let words = [addi(1, 0, 7), add(2, 1, 1), xor(3, 2, 1)];
+        let decoded = slots(&words);
+        let decoded_input = DbtBlockInput::new(0x1000, &decoded, DbtBlockMode::DirectFast).unwrap();
+        let mut ir = DbtIrBlock::new(words.len()).unwrap();
+        for word in words {
+            ir.lift_word(word).unwrap();
+        }
+        ir.analyze_future_values();
+        let ir_input = DbtBlockInput::new_ir(0x1000, &ir, DbtBlockMode::DirectFast).unwrap();
+
+        let (_, decoded_tag, decoded_exit, decoded_code) = execute(&decoded_input, &[]);
+        let (_, ir_tag, ir_exit, ir_code) = execute(&ir_input, &[]);
+
+        assert_eq!(ir_tag, decoded_tag);
+        assert_eq!(ir_exit, decoded_exit);
+        assert_eq!(ir_code, decoded_code);
     }
 
     fn execute_memory(

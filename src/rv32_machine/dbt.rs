@@ -34,6 +34,7 @@ use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
 use crate::rv32_dbt::code_cache::{DbtCacheHit, DbtCacheKey, DirectDbtCodeCache};
 use crate::rv32_dbt::executable::ExecutableScratch;
+use crate::rv32_dbt::ir::DbtIrBlock;
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::profile::{DbtProfileDynamicExit, ExactDbtProfile};
 use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
@@ -89,6 +90,7 @@ enum Rv32DbtStorage {
 pub(crate) struct Rv32DbtExecution {
     max_instructions: usize,
     decoded: Vec<Rv32ResolvedInstruction>,
+    ir: DbtIrBlock,
     workspace: DbtTranslationWorkspace,
     storage: Rv32DbtStorage,
     translations: u64,
@@ -182,6 +184,8 @@ impl Rv32DbtExecution {
         Ok(Self {
             max_instructions,
             decoded: Vec::with_capacity(max_instructions),
+            ir: DbtIrBlock::new(max_instructions)
+                .map_err(|message| Self::fault(DbtFaultKind::Capacity, message))?,
             workspace: DbtTranslationWorkspace::new(scratch_bytes, max_instructions)?,
             storage,
             translations: 0,
@@ -274,12 +278,26 @@ impl Rv32DbtExecution {
     }
 
     pub(crate) fn decoded_slots_mut(&mut self) -> &mut Vec<Rv32ResolvedInstruction> {
+        self.ir.reset();
         self.decoded.clear();
         &mut self.decoded
     }
 
     pub(crate) fn decoded_slots(&self) -> &[Rv32ResolvedInstruction] {
         &self.decoded
+    }
+
+    pub(crate) fn ir_block_mut(&mut self) -> &mut DbtIrBlock {
+        self.decoded.clear();
+        &mut self.ir
+    }
+
+    pub(crate) fn block_instruction_count(&self) -> usize {
+        if self.ir.attempted_instruction_count() != 0 {
+            self.ir.attempted_instruction_count()
+        } else {
+            self.decoded.len()
+        }
     }
 
     #[cfg(feature = "dbt-translation-timing")]
@@ -328,14 +346,19 @@ impl Rv32DbtExecution {
                 "DBT fast block mode does not match its storage policy",
             ));
         }
-        if self.decoded.is_empty() || self.decoded.len() > self.max_instructions {
+        let instruction_count = self.block_instruction_count();
+        if instruction_count == 0 || instruction_count > self.max_instructions {
             return Err(Self::fault(
                 DbtFaultKind::Translation,
                 "DBT decoded block must contain between 1 and max_instructions slots",
             ));
         }
-        let input = DbtBlockInput::new(pc, &self.decoded, mode)
-            .map_err(|message| Self::fault(DbtFaultKind::Translation, message))?;
+        let input = if self.ir.attempted_instruction_count() != 0 {
+            DbtBlockInput::new_ir(pc, &self.ir, mode)
+        } else {
+            DbtBlockInput::new(pc, &self.decoded, mode)
+        }
+        .map_err(|message| Self::fault(DbtFaultKind::Translation, message))?;
         #[cfg(feature = "dbt-translation-timing")]
         let lower_started = self
             .translation_timing_enabled
@@ -435,7 +458,7 @@ impl Rv32DbtExecution {
         self.emitted_bytes = self.emitted_bytes.saturating_add(emitted_bytes);
         self.decoded_slots_built = self
             .decoded_slots_built
-            .saturating_add(self.decoded.len() as u64);
+            .saturating_add(instruction_count as u64);
         Ok(PreparedDbtBlock {
             location,
             instruction_count,
@@ -561,6 +584,7 @@ impl Rv32DbtExecution {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Rv32ResolvedInstruction>()),
             )
+            .saturating_add(self.ir.retained_bytes())
             .saturating_add(self.workspace.retained_bytes());
         #[cfg(feature = "dbt-execution-profile")]
         let retained = retained.saturating_add(match &self.storage {

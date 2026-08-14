@@ -98,6 +98,7 @@ impl DbtIrInstruction {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct DbtIrBlock {
     instructions: Vec<DbtIrInstruction>,
     future_values: Vec<[FutureValue; 32]>,
@@ -128,6 +129,11 @@ impl DbtIrBlock {
 
     pub(crate) fn instructions(&self) -> &[DbtIrInstruction] {
         &self.instructions
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.instructions.capacity() * std::mem::size_of::<DbtIrInstruction>()
+            + self.future_values.capacity() * std::mem::size_of::<[FutureValue; 32]>()
     }
 
     pub(crate) fn attempted_instruction_count(&self) -> usize {
@@ -307,7 +313,7 @@ fn ends_ir_block(operation: DecodedOp) -> bool {
     )
 }
 
-fn register_effects(fields: DecodedFields) -> ([Option<u8>; 2], Option<u8>) {
+pub(crate) fn register_effects(fields: DecodedFields) -> ([Option<u8>; 2], Option<u8>) {
     match fields.operation {
         DecodedOp::Lui | DecodedOp::Auipc | DecodedOp::Jal => ([None, None], Some(fields.rd)),
         DecodedOp::Jalr | DecodedOp::Load(_) | DecodedOp::LoadReserved(_) => {
@@ -332,7 +338,7 @@ fn register_effects(fields: DecodedFields) -> ([Option<u8>; 2], Option<u8>) {
     }
 }
 
-fn may_exit_before_write(operation: DecodedOp) -> bool {
+pub(crate) fn may_exit_before_write(operation: DecodedOp) -> bool {
     matches!(
         operation,
         DecodedOp::Jal

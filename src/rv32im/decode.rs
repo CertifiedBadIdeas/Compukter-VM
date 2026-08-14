@@ -204,6 +204,95 @@ pub(crate) struct DecodedFields {
 }
 
 impl DecodedFields {
+    pub(crate) fn from_instruction(instruction: DecodedInstruction) -> Self {
+        let fields = |operation, rd: usize, rs1: usize, rs2: usize, immediate| Self {
+            operation,
+            rd: rd as u8,
+            rs1: rs1 as u8,
+            rs2: rs2 as u8,
+            immediate,
+        };
+        match instruction {
+            DecodedInstruction::Lui { rd, value } => fields(DecodedOp::Lui, rd, 0, 0, value as i32),
+            DecodedInstruction::Auipc { rd, value } => {
+                fields(DecodedOp::Auipc, rd, 0, 0, value as i32)
+            }
+            DecodedInstruction::Jal { rd, offset } => fields(DecodedOp::Jal, rd, 0, 0, offset),
+            DecodedInstruction::Jalr { rd, rs1, immediate } => {
+                fields(DecodedOp::Jalr, rd, rs1, 0, immediate)
+            }
+            DecodedInstruction::Branch {
+                kind,
+                rs1,
+                rs2,
+                offset,
+            } => fields(DecodedOp::Branch(kind), 0, rs1, rs2, offset),
+            DecodedInstruction::Load {
+                kind,
+                rd,
+                rs1,
+                immediate,
+            } => fields(DecodedOp::Load(kind), rd, rs1, 0, immediate),
+            DecodedInstruction::Store {
+                kind,
+                rs1,
+                rs2,
+                immediate,
+            } => fields(DecodedOp::Store(kind), 0, rs1, rs2, immediate),
+            DecodedInstruction::Immediate {
+                op,
+                rd,
+                rs1,
+                immediate,
+            } => fields(DecodedOp::Immediate(op), rd, rs1, 0, immediate),
+            DecodedInstruction::Register { op, rd, rs1, rs2 } => {
+                fields(DecodedOp::Register(op), rd, rs1, rs2, 0)
+            }
+            DecodedInstruction::Fence => fields(DecodedOp::Fence, 0, 0, 0, 0),
+            DecodedInstruction::FenceI => fields(DecodedOp::FenceI, 0, 0, 0, 0),
+            DecodedInstruction::LoadReserved { rd, rs1, ordering } => {
+                fields(DecodedOp::LoadReserved(ordering), rd, rs1, 0, 0)
+            }
+            DecodedInstruction::StoreConditional {
+                rd,
+                rs1,
+                rs2,
+                ordering,
+            } => fields(DecodedOp::StoreConditional(ordering), rd, rs1, rs2, 0),
+            DecodedInstruction::Atomic {
+                operation,
+                rd,
+                rs1,
+                rs2,
+                ordering,
+            } => fields(DecodedOp::Atomic(operation, ordering), rd, rs1, rs2, 0),
+            DecodedInstruction::Csr {
+                operation,
+                rd,
+                csr,
+                source,
+            } => {
+                let (rs1, immediate_source) = match source {
+                    CsrSource::Register(rs1) => (rs1, false),
+                    CsrSource::Immediate(value) => (usize::from(value), true),
+                };
+                fields(
+                    DecodedOp::Csr {
+                        operation,
+                        immediate_source,
+                    },
+                    rd,
+                    rs1,
+                    0,
+                    i32::from(csr),
+                )
+            }
+            DecodedInstruction::Ecall => fields(DecodedOp::Ecall, 0, 0, 0, 0),
+            DecodedInstruction::Ebreak => fields(DecodedOp::Ebreak, 0, 0, 0, 0),
+            DecodedInstruction::Mret => fields(DecodedOp::Mret, 0, 0, 0, 0),
+        }
+    }
+
     fn into_instruction(self) -> DecodedInstruction {
         let rd = usize::from(self.rd);
         let rs1 = usize::from(self.rs1);
