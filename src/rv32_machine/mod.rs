@@ -132,7 +132,41 @@ pub struct Rv32DbtCodeBlock {
     pub length: u32,
     pub chain_entry_offset: u32,
     pub guest_instruction_count: u32,
+    pub register_pressure: Rv32DbtRegisterPressure,
     pub edges: Vec<Rv32DbtCodeEdge>,
+}
+
+#[cfg(feature = "dbt-code-audit")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rv32DbtRegisterPressure {
+    pub entry_arch_loads: u32,
+    pub body_arch_loads: u32,
+    pub dirty_live_eviction_stores: u32,
+    pub dead_evictions: u32,
+    pub clean_evictions: u32,
+    pub loop_reconcile_stores: u32,
+    pub allocation_pressure: u32,
+    pub max_resident: u8,
+    pub scratch_clobber_sites: [u32; 3],
+}
+
+#[cfg(feature = "dbt-code-audit")]
+impl From<crate::rv32_dbt::x86_64::register_cache::RegisterPressureAudit>
+    for Rv32DbtRegisterPressure
+{
+    fn from(value: crate::rv32_dbt::x86_64::register_cache::RegisterPressureAudit) -> Self {
+        Self {
+            entry_arch_loads: value.entry_arch_loads,
+            body_arch_loads: value.body_arch_loads,
+            dirty_live_eviction_stores: value.dirty_live_eviction_stores,
+            dead_evictions: value.dead_evictions,
+            clean_evictions: value.clean_evictions,
+            loop_reconcile_stores: value.loop_reconcile_stores,
+            allocation_pressure: value.allocation_pressure,
+            max_resident: value.max_resident,
+            scratch_clobber_sites: value.scratch_clobber_sites,
+        }
+    }
 }
 
 #[cfg(feature = "dbt-code-audit")]

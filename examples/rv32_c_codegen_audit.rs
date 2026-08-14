@@ -661,6 +661,7 @@ mod tests {
                 length: 4,
                 chain_entry_offset: 4,
                 guest_instruction_count: 1,
+                register_pressure: Default::default(),
                 edges: Vec::new(),
             }],
         };
