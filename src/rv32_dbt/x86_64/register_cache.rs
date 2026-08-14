@@ -23,16 +23,39 @@
 )]
 
 use super::emitter::{EmitError, Gpr, Mem, X64Emitter};
+use crate::rv32_dbt::block::DbtFutureValues;
+use crate::rv32_dbt::ir::{may_exit_before_write, register_effects, DbtIrBlock, FutureValue};
 use crate::rv32im::{
     CsrSource, DecodedInstruction, Rv32ArchitecturalState, Rv32ResolvedInstruction,
 };
 use std::cmp::Reverse;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FutureValue {
-    Read(usize),
-    Dead(usize),
-    Unused,
+pub(crate) trait FutureValueSource: Copy {
+    fn value(self, guest: usize) -> FutureValue;
+}
+
+impl FutureValueSource for &[Rv32ResolvedInstruction] {
+    fn value(self, guest: usize) -> FutureValue {
+        future_value(self, guest)
+    }
+}
+
+impl<const N: usize> FutureValueSource for &[Rv32ResolvedInstruction; N] {
+    fn value(self, guest: usize) -> FutureValue {
+        future_value(self.as_slice(), guest)
+    }
+}
+
+impl FutureValueSource for &Vec<Rv32ResolvedInstruction> {
+    fn value(self, guest: usize) -> FutureValue {
+        future_value(self.as_slice(), guest)
+    }
+}
+
+impl FutureValueSource for DbtFutureValues<'_> {
+    fn value(self, guest: usize) -> FutureValue {
+        self.value(guest)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -128,12 +151,33 @@ impl RegisterCache {
     pub(crate) fn local_loop_plan(
         slots: &[Rv32ResolvedInstruction],
     ) -> Option<LocalLoopRegisterPlan> {
+        Self::local_loop_plan_from_accesses(slots.iter().copied().map(instruction_access))
+    }
+
+    pub(crate) fn local_loop_plan_ir(ir: &DbtIrBlock) -> Option<LocalLoopRegisterPlan> {
+        Self::local_loop_plan_from_accesses(ir.instructions().iter().copied().map(|instruction| {
+            let fields = instruction.fields();
+            let (reads, write) = register_effects(fields);
+            let mut access = RegisterAccess::default();
+            for register in reads.into_iter().flatten() {
+                access.reads |= 1_u32 << register;
+            }
+            if let Some(register) = write {
+                access.writes |= 1_u32 << register;
+            }
+            access.may_exit_before_write = may_exit_before_write(fields.operation);
+            access
+        }))
+    }
+
+    fn local_loop_plan_from_accesses(
+        accesses: impl Iterator<Item = RegisterAccess> + Clone,
+    ) -> Option<LocalLoopRegisterPlan> {
         let mut defined = 1_u32;
         let mut carried = 0_u32;
         let mut referenced = 0_u32;
         let mut written = 0_u32;
-        for slot in slots.iter().copied() {
-            let access = instruction_access(slot);
+        for access in accesses.clone() {
             carried |= access.reads & !defined;
             defined |= access.writes;
             referenced |= access.reads | access.writes;
@@ -147,10 +191,7 @@ impl RegisterCache {
             carried
         };
         let resident_count = resident.count_ones() as usize;
-        let temporary_pressure = slots
-            .iter()
-            .copied()
-            .map(instruction_access)
+        let temporary_pressure = accesses
             .map(|access| ((access.reads | access.writes) & !resident & !1).count_ones() as usize)
             .max()
             .unwrap_or(0);
@@ -174,10 +215,10 @@ impl RegisterCache {
         })
     }
 
-    pub(crate) fn preload_local_loop(
+    pub(crate) fn preload_local_loop<S: FutureValueSource>(
         &mut self,
         plan: LocalLoopRegisterPlan,
-        slots: &[Rv32ResolvedInstruction],
+        future: S,
         out: &mut X64Emitter,
     ) -> Result<(), EmitError> {
         debug_assert!(self.is_chainable());
@@ -186,7 +227,7 @@ impl RegisterCache {
             .iter()
             .fold(0_u32, |mask, guest| mask | (1_u32 << guest));
         for guest in plan.guests() {
-            self.read(*guest, slots, &[], out)?;
+            self.read(*guest, future, &[], out)?;
             if plan.written & (1_u32 << guest) != 0 {
                 self.entries[self.index_of(*guest).unwrap()]
                     .as_mut()
@@ -197,10 +238,10 @@ impl RegisterCache {
         Ok(())
     }
 
-    pub(crate) fn read(
+    pub(crate) fn read<S: FutureValueSource>(
         &mut self,
         guest: usize,
-        remaining: &[Rv32ResolvedInstruction],
+        future: S,
         pinned: &[Gpr],
         out: &mut X64Emitter,
     ) -> Result<Gpr, EmitError> {
@@ -211,7 +252,7 @@ impl RegisterCache {
         if let Some(resident) = self.resident(guest) {
             return Ok(resident.host);
         }
-        let index = self.allocate(remaining, pinned, out)?;
+        let index = self.allocate(future, pinned, out)?;
         let host = self.host_pool[index];
         out.mov_r32_m32(
             host,
@@ -228,10 +269,10 @@ impl RegisterCache {
         Ok(host)
     }
 
-    pub(crate) fn write(
+    pub(crate) fn write<S: FutureValueSource>(
         &mut self,
         guest: usize,
-        remaining: &[Rv32ResolvedInstruction],
+        future: S,
         pinned: &[Gpr],
         out: &mut X64Emitter,
     ) -> Result<Option<Gpr>, EmitError> {
@@ -243,7 +284,7 @@ impl RegisterCache {
             resident.dirty = true;
             return Ok(Some(resident.host));
         }
-        let index = self.allocate(remaining, pinned, out)?;
+        let index = self.allocate(future, pinned, out)?;
         let host = self.host_pool[index];
         self.entries[index] = Some(Resident {
             guest,
@@ -291,9 +332,9 @@ impl RegisterCache {
         Ok(())
     }
 
-    fn allocate(
+    fn allocate<S: FutureValueSource>(
         &mut self,
-        remaining: &[Rv32ResolvedInstruction],
+        future_values: S,
         pinned: &[Gpr],
         out: &mut X64Emitter,
     ) -> Result<usize, EmitError> {
@@ -308,7 +349,7 @@ impl RegisterCache {
             .enumerate()
             .filter_map(|(index, resident)| {
                 let resident = resident.unwrap();
-                let future = future_value(remaining, resident.guest);
+                let future = future_values.value(resident.guest);
                 (!pinned.contains(&resident.host)
                     && self.protected_guests & (1_u32 << resident.guest) == 0)
                     .then_some((
@@ -316,7 +357,7 @@ impl RegisterCache {
                         matches!(future, FutureValue::Dead(_)),
                         match future {
                             FutureValue::Read(distance) | FutureValue::Dead(distance) => distance,
-                            FutureValue::Unused => usize::MAX,
+                            FutureValue::Unused => u8::MAX,
                         },
                         !resident.dirty,
                         Reverse(resident.guest),
@@ -328,10 +369,7 @@ impl RegisterCache {
                 "all RV32 register-cache hosts are pinned",
             ))?;
         if let Some(resident) = self.entries[index] {
-            let dead = matches!(
-                future_value(remaining, resident.guest),
-                FutureValue::Dead(_)
-            );
+            let dead = matches!(future_values.value(resident.guest), FutureValue::Dead(_));
             if resident.dirty && !dead {
                 out.mov_m32_r32(
                     Mem::base_disp(
@@ -383,14 +421,14 @@ fn future_value(slots: &[Rv32ResolvedInstruction], guest: usize) -> FutureValue 
     for (distance, slot) in slots.iter().copied().enumerate() {
         let access = instruction_access(slot);
         if access.reads(guest) {
-            return FutureValue::Read(distance);
+            return FutureValue::Read(distance as u8);
         }
         crossed_exit |= access.may_exit_before_write;
         if access.writes(guest) {
             return if crossed_exit {
-                FutureValue::Read(distance)
+                FutureValue::Read(distance as u8)
             } else {
-                FutureValue::Dead(distance)
+                FutureValue::Dead(distance as u8)
             };
         }
     }

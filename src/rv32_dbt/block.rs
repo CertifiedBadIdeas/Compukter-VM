@@ -22,8 +22,10 @@
     reason = "the direct x86_64 translator consumes block metadata in the next task"
 )]
 
+use crate::rv32_dbt::ir::{may_exit_before_write, register_effects, DbtIrBlock, FutureValue};
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::profile::DbtProfileKey;
+use crate::rv32im::DecodedFields;
 use crate::rv32im::Rv32ResolvedInstruction;
 
 pub(crate) const MAX_STATIC_LINKS: usize = 2;
@@ -85,11 +87,73 @@ pub(crate) enum DbtBlockMode {
     Bounded { max_attempts: u32 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct DbtBlockInput<'a> {
     start_pc: u32,
-    slots: &'a [Rv32ResolvedInstruction],
+    source: DbtBlockSource<'a>,
     mode: DbtBlockMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DbtBlockSource<'a> {
+    Decoded(&'a [Rv32ResolvedInstruction]),
+    MicroIr(&'a DbtIrBlock),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DbtLoweringInstruction {
+    word: u32,
+    fields: DecodedFields,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DbtFutureValues<'a> {
+    input: DbtBlockInput<'a>,
+    index: usize,
+}
+
+impl DbtFutureValues<'_> {
+    pub(crate) fn value(self, guest: usize) -> FutureValue {
+        match self.input.source {
+            DbtBlockSource::MicroIr(ir) => ir.future_value(self.index, guest),
+            DbtBlockSource::Decoded(_) => {
+                let mut crossed_exit = false;
+                for distance in 0..self.input.instruction_count().saturating_sub(self.index) {
+                    let Some(instruction) = self.input.instruction(self.index + distance) else {
+                        crossed_exit = true;
+                        continue;
+                    };
+                    let (reads, write) = register_effects(instruction.fields());
+                    if reads
+                        .into_iter()
+                        .flatten()
+                        .any(|read| usize::from(read) == guest)
+                    {
+                        return FutureValue::Read(distance as u8);
+                    }
+                    crossed_exit |= may_exit_before_write(instruction.fields().operation);
+                    if write.is_some_and(|write| usize::from(write) == guest) {
+                        return if crossed_exit {
+                            FutureValue::Read(distance as u8)
+                        } else {
+                            FutureValue::Dead(distance as u8)
+                        };
+                    }
+                }
+                FutureValue::Unused
+            }
+        }
+    }
+}
+
+impl DbtLoweringInstruction {
+    pub(crate) const fn word(self) -> u32 {
+        self.word
+    }
+
+    pub(crate) const fn fields(self) -> DecodedFields {
+        self.fields
+    }
 }
 
 impl<'a> DbtBlockInput<'a> {
@@ -98,20 +162,40 @@ impl<'a> DbtBlockInput<'a> {
         slots: &'a [Rv32ResolvedInstruction],
         mode: DbtBlockMode,
     ) -> Result<Self, String> {
-        if slots.is_empty() {
+        Self::new_source(start_pc, DbtBlockSource::Decoded(slots), mode)
+    }
+
+    pub(crate) fn new_ir(
+        start_pc: u32,
+        ir: &'a DbtIrBlock,
+        mode: DbtBlockMode,
+    ) -> Result<Self, String> {
+        Self::new_source(start_pc, DbtBlockSource::MicroIr(ir), mode)
+    }
+
+    fn new_source(
+        start_pc: u32,
+        source: DbtBlockSource<'a>,
+        mode: DbtBlockMode,
+    ) -> Result<Self, String> {
+        let instruction_count = match source {
+            DbtBlockSource::Decoded(slots) => slots.len(),
+            DbtBlockSource::MicroIr(ir) => ir.attempted_instruction_count(),
+        };
+        if instruction_count == 0 {
             return Err("RV32 DBT block cannot be empty".to_string());
         }
         if let DbtBlockMode::Bounded { max_attempts } = mode {
-            if max_attempts == 0 || max_attempts as usize >= slots.len() {
+            if max_attempts == 0 || max_attempts as usize >= instruction_count {
                 return Err(format!(
                     "RV32 DBT bounded attempt count {max_attempts} must be inside 1..{}",
-                    slots.len()
+                    instruction_count
                 ));
             }
         }
         Ok(Self {
             start_pc,
-            slots,
+            source,
             mode,
         })
     }
@@ -121,7 +205,78 @@ impl<'a> DbtBlockInput<'a> {
     }
 
     pub(crate) fn slots(&self) -> &[Rv32ResolvedInstruction] {
-        self.slots
+        match self.source {
+            DbtBlockSource::Decoded(slots) => slots,
+            DbtBlockSource::MicroIr(_) => {
+                panic!("micro-IR DBT input does not expose decoded slots")
+            }
+        }
+    }
+
+    pub(crate) fn instruction_count(&self) -> usize {
+        match self.source {
+            DbtBlockSource::Decoded(slots) => slots.len(),
+            DbtBlockSource::MicroIr(ir) => ir.attempted_instruction_count(),
+        }
+    }
+
+    pub(crate) fn instruction(&self, index: usize) -> Option<DbtLoweringInstruction> {
+        match self.source {
+            DbtBlockSource::Decoded(slots) => match *slots.get(index)? {
+                Rv32ResolvedInstruction::Valid { word, instruction } => {
+                    Some(DbtLoweringInstruction {
+                        word,
+                        fields: DecodedFields::from_instruction(instruction),
+                    })
+                }
+                Rv32ResolvedInstruction::Invalid { .. } => None,
+            },
+            DbtBlockSource::MicroIr(ir) => {
+                ir.instructions()
+                    .get(index)
+                    .copied()
+                    .map(|instruction| DbtLoweringInstruction {
+                        word: instruction.word(),
+                        fields: instruction.fields(),
+                    })
+            }
+        }
+    }
+
+    pub(crate) fn word(&self, index: usize) -> Option<u32> {
+        match self.source {
+            DbtBlockSource::Decoded(slots) => match *slots.get(index)? {
+                Rv32ResolvedInstruction::Valid { word, .. }
+                | Rv32ResolvedInstruction::Invalid { word } => Some(word),
+            },
+            DbtBlockSource::MicroIr(ir) => ir
+                .instructions()
+                .get(index)
+                .map(|instruction| instruction.word())
+                .or_else(|| {
+                    (index == ir.instructions().len())
+                        .then(|| ir.invalid_word())
+                        .flatten()
+                }),
+        }
+    }
+
+    pub(crate) const fn uses_micro_ir(&self) -> bool {
+        matches!(self.source, DbtBlockSource::MicroIr(_))
+    }
+
+    pub(crate) const fn micro_ir(&self) -> Option<&'a DbtIrBlock> {
+        match self.source {
+            DbtBlockSource::MicroIr(ir) => Some(ir),
+            DbtBlockSource::Decoded(_) => None,
+        }
+    }
+
+    pub(crate) const fn future_values(&self, index: usize) -> DbtFutureValues<'a> {
+        DbtFutureValues {
+            input: *self,
+            index,
+        }
     }
 
     pub(crate) fn mode(&self) -> DbtBlockMode {
@@ -281,7 +436,7 @@ impl<'a> TranslatedBlock<'a> {
         };
         Ok(Self {
             start_pc: input.start_pc(),
-            instruction_count: input.slots().len() as u32,
+            instruction_count: input.instruction_count() as u32,
             mode: input.mode(),
             lowered_load_sites,
             lowered_store_sites,
@@ -358,6 +513,7 @@ mod tests {
         DbtBlockInput, DbtBlockMode, DbtColdExitRelocation, DbtLinkKind, DbtStaticLink,
         TranslatedBlock,
     };
+    use crate::rv32_dbt::ir::DbtIrBlock;
     #[cfg(feature = "dbt-execution-profile")]
     use crate::rv32_dbt::profile::DbtProfileKey;
     use crate::rv32im::{decode_product_word, encoding::addi, Rv32ResolvedInstruction};
@@ -376,6 +532,20 @@ mod tests {
         let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
 
         assert!(std::ptr::eq(input.slots().as_ptr(), slots.as_ptr()));
+    }
+
+    #[test]
+    fn block_input_accepts_analyzed_micro_ir_without_decoded_slots() {
+        let mut ir = DbtIrBlock::new(2).unwrap();
+        ir.lift_word(addi(1, 1, 1)).unwrap();
+        ir.lift_word(addi(2, 1, 1)).unwrap();
+        ir.analyze_future_values();
+
+        let input = DbtBlockInput::new_ir(0x1000, &ir, DbtBlockMode::DirectFast).unwrap();
+
+        assert_eq!(input.instruction_count(), 2);
+        assert_eq!(input.instruction(0).unwrap().word(), addi(1, 1, 1));
+        assert!(input.uses_micro_ir());
     }
 
     #[test]

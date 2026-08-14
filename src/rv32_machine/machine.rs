@@ -31,9 +31,11 @@ use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 #[cfg(target_arch = "x86_64")]
 use crate::rv32_dbt::block::DbtBlockMode;
 #[cfg(target_arch = "x86_64")]
+use crate::rv32_dbt::ir::fill_ir_block;
+#[cfg(target_arch = "x86_64")]
 use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 #[cfg(target_arch = "x86_64")]
-use crate::rv32im::{decode_product_word, fill_decoded_block, DecodedInstruction, Load, Store};
+use crate::rv32im::{decode_product_word, DecodedInstruction, Load, Store};
 use crate::rv32im::{
     ends_basic_block, BoundedCachedRv32imProgram, BoundedDecodedBlockCache, PredecodedRv32imImage,
     Rv32ResolvedInstruction, Rv32imCacheStats,
@@ -551,12 +553,12 @@ impl Rv32Machine {
                         let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
                             unreachable!("DBT loop requires the DBT backend")
                         };
-                        fill_decoded_block(
+                        fill_ir_block(
                             instruction_pc,
                             executable_end,
                             execution.max_instructions(),
                             &self.address_space,
-                            execution.decoded_slots_mut(),
+                            execution.ir_block_mut(),
                         )
                     };
                     #[cfg(feature = "dbt-translation-timing")]
@@ -584,7 +586,7 @@ impl Rv32Machine {
                             unreachable!("DBT loop requires the DBT backend")
                         };
                         if execution.fast_mode() == DbtBlockMode::ChainableThroughput
-                            || execution.decoded_slots().len() as u64 <= remaining
+                            || execution.block_instruction_count() as u64 <= remaining
                         {
                             execution.fast_mode()
                         } else {
