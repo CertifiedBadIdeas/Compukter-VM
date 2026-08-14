@@ -163,3 +163,88 @@ cached forward  1a94c3452de498c21658715ec63b92dfaa06041a54f782f1f4e4a4e683e8587b
 cached reversed 8758926e02ab364232b5ecf45918b7c6b2bb6532c1fe5688ead51be365953e31
 direct          54fc17b93960d46d9a719a831101d925aa5c9e72b76ec94e82439c000afb686d
 ```
+
+## Follow-up: RCX paired with 64-byte block-base alignment
+
+The Phase 2 rejection above remains the result for RCX with the former
+32-byte block-base alignment. A hardware-counter follow-up isolated a separate
+generated-code layout regression: relative to the seven-register baseline,
+RCX/32 reduced retired host instructions by 3.3% but increased cycles by 13.0%
+and frontend op-cache misses by 169%. Changing only block-base alignment from
+32 to 64 bytes removed that frontend regression. In a pinned control, the
+combined RCX/64 candidate reduced time by 5.2%, cycles by 4.2%, and op-cache
+misses by 38.1% relative to the original seven-register/32-byte baseline.
+
+The combined implementation was restored in `fda05e7` and `c1253ef`, then
+made the product default in `42bb39e`. The restore also corrected two latent
+fixed-register declarations discovered by the all-feature lowering audit:
+loads no longer reserve unused `RCX`, while `JALR` now reserves the `RCX` it
+actually uses.
+
+### Shared optimized C / QEMU control
+
+The full 21-warm-sample C matrix used checksum `ee053d58` for every backend.
+The product geometry is a 128 KiB per-VM cache, 256 sets, 16 guest
+instructions per block, and 64-byte block-base alignment.
+
+| System | ns/kernel | Versus native | Versus QEMU |
+|---|---:|---:|---:|
+| Native Clang `-O3 -march=native -flto` | 61,578 | 1.000x | 0.120x |
+| QEMU 11.1.0 TCG | 512,310 | 8.320x | 1.000x |
+| Wasmtime 47.0.3 AOT | 138,509 | 2.249x | 0.270x |
+| RV32 Cached DBT, product geometry | 366,312 | 5.949x | 0.715x |
+
+On this larger register-pressure workload the product DBT is about 1.40x as
+fast as QEMU TCG, while remaining 5.95x slower than native code. Translation
+published 89 blocks: 40,039 bytes of live code and 42,860 bytes including
+alignment padding. Steady execution performed zero allocator allocations.
+
+### Short product workloads
+
+The general product suite was also run against the historical seven-register,
+32-byte-aligned revision with identical `1000 21 7` arguments. Absolute
+Cached-DBT median changes were:
+
+| Workload | Seven-register/32 B, ns | RCX/64 B, ns | Delta |
+|---|---:|---:|---:|
+| compute32 | 10,757 | 10,979 | +2.1% |
+| branch-mix | 8,277 | 9,142 | +10.5% |
+| call-stack | 32,654 | 33,967 | +4.0% |
+| memory-sequential | 10,891 | 11,046 | +1.4% |
+| memory-random | 11,532 | 11,826 | +2.5% |
+| copy-checksum | 274,773 | 284,097 | +3.4% |
+| mmio-control | 53,177 | 54,340 | +2.2% |
+| packet-ring | 34,362 | 34,458 | +0.3% |
+| trap-roundtrip | 76,000 | 78,803 | +3.7% |
+
+The absolute-time geometric mean regressed by 3.3%. The combined change is
+therefore a workload-sensitive trade: it improves the large C workload and
+frontend behavior but is not a universal win for small programs. Keep it as
+the current product default while future work investigates the branch-mix
+outlier and adaptive/shared code layout; do not use the C result alone as a
+claim that every workload became faster.
+
+### Per-machine memory footprint
+
+The resident population benchmark measures 79,656 bytes (77.789 KiB) of live
+Rust heap per constructed Cached-DBT machine. This includes the 16 KiB guest
+RAM and DBT metadata, but the allocator counter cannot see executable `mmap`
+regions.
+
+The 128 KiB code cache and 8 KiB translation scratch each have RW and RX
+aliases. They therefore reserve 278,528 bytes (272 KiB) of virtual address
+space per machine, backed by at most 139,264 unique bytes (136 KiB); the two
+aliases do not duplicate physical backing pages. The useful bounds are:
+
+| Accounting view | One VM | 1,024 VMs |
+|---|---:|---:|
+| Counted Rust heap, guest RAM included | 77.789 KiB | 77.789 MiB |
+| Additional RW+RX virtual mappings | 272.000 KiB | 272.000 MiB |
+| Accounted virtual footprint | 349.789 KiB | 349.789 MiB |
+| Maximum unique backing plus heap | 213.789 KiB | 213.789 MiB |
+
+The physical figure is an upper bound: executable pages are demand-backed and
+an ordinary workload need not fill the whole cache. Conversely it excludes
+allocator/page-table overhead and shared process code, so it is not a whole
+server RSS prediction. RCX itself adds no measurable per-VM storage; the
+resident heap was byte-identical to the historical baseline.
