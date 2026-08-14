@@ -206,6 +206,7 @@ enum Rv32DbtBackendBuild {
         sets: usize,
         cache_bytes: usize,
         code_alignment: Rv32DbtCodeAlignment,
+        register_profile: Rv32DbtRegisterProfile,
     },
 }
 
@@ -222,10 +223,12 @@ fn build_dbt_backend(
             sets,
             cache_bytes,
             code_alignment,
+            register_profile,
         } => Rv32DbtPolicy::Cached {
             sets,
             cache_bytes,
             code_alignment,
+            register_profile,
         },
     };
     Rv32DbtExecution::new(policy, max_instructions, scratch_bytes, ram_len)
@@ -291,12 +294,13 @@ impl Rv32Machine {
                 scratch_bytes,
                 cache_bytes,
                 code_alignment,
-                register_profile: _,
+                register_profile,
             } => build_dbt_backend(
                 Rv32DbtBackendBuild::Cached {
                     sets,
                     cache_bytes,
                     code_alignment,
+                    register_profile,
                 },
                 max_instructions,
                 scratch_bytes,
