@@ -1,0 +1,107 @@
+# RV32 DBT Register-Pressure Audit — 2026-08-14
+
+## Scope
+
+This audit measures the current seven-register chainable cache on the shared
+optimized C workload. It records actual translation-time cache events per live
+guest block and joins them by guest PC with a separate exact execution-profile
+run. The counters diagnose a bounded allocator experiment; they do not claim a
+runtime speedup.
+
+The product geometry is 512 sets, 16 guest instructions per block, 8 KiB
+scratch space, and a 128 KiB per-VM code cache. Both the unprofiled snapshot run
+and the separately instrumented profile run completed with checksum
+`ee053d58`.
+
+## Environment and command
+
+```text
+source revision: 8302658d9837882b9faa196b40a7462d64049216
+Linux 7.1.8-zen1-3-zen x86_64
+CPU: AMD Ryzen 9 9950X3D, 16 cores / 32 threads
+rustc 1.95.0 (59807616e 2026-04-14)
+```
+
+```bash
+./scripts/tests/rv32-c-codegen-audit.sh
+```
+
+The deterministic artifacts are:
+
+```text
+dbt-register-pressure.tsv          fe3cd744e2fb8c717d1bc56386aba9e30a4a8e5c64dd06417a9578403622e9c8
+dbt-register-pressure-weighted.tsv 107ed7049850322946900935808545f55b08b90534e29587c05b7de32d34f700
+dbt-code-cache.bin                 3d187b75e14dee9bdc42c0526b45e393c307d3a99dd894b10f1e3d94fdfdf596
+```
+
+Hardware performance counters were unavailable because `perf` was absent.
+They are not required for this diagnostic selection.
+
+## Weighted result
+
+The profile covers 3,918,206 dynamically executed guest instructions across
+89 live blocks. `entry_arch_loads` are weighted by external entries only;
+body events are weighted by block executions; local-loop reconciliation stores
+are weighted only by taken self-backedges.
+
+| Event | Static total | Weighted total | Per million guest instructions |
+|---|---:|---:|---:|
+| Entry architectural loads | 29 | 23,006 | 5,871.565 |
+| Body architectural loads | 424 | 570,162 | 145,516.086 |
+| Dirty live eviction stores | 65 | 407,531 | 104,009.590 |
+| Dead evictions | 20 | 10,004 | 2,553.209 |
+| Clean evictions | 115 | 174,089 | 44,430.793 |
+| Allocation-pressure events | 200 | 591,624 | 150,993.592 |
+| `RAX` clobber sites | 264 | 1,181,580 | 301,561.480 |
+| `RCX` clobber sites | 102 | 213,129 | 54,394.537 |
+| `RDX` clobber sites | 130 | 606,504 | 154,791.249 |
+
+The cache reaches all seven available stable host registers. Body reloads plus
+dirty live eviction stores total 977,693 dynamic memory operations, about
+249,526 per million guest instructions. This is material pressure rather than
+a cold-block artifact.
+
+## Dominant block
+
+Guest PC `0x00000608` accounts for most of the actionable pressure:
+
+```text
+block executions:             63,000
+self-backedges:               62,000
+external entries:              1,000
+guest instructions per block:     13
+body loads per execution:           6
+dirty live stores per execution:    6
+allocation-pressure events:         8
+RCX clobber sites:                   1
+```
+
+Its weighted contribution is 504,000 allocation-pressure events, 378,000 body
+loads, and 378,000 dirty stores. It therefore contributes about 85.2% of all
+allocation pressure and 92.8% of all dirty live eviction stores. The corrected
+entry weighting contributes only 5,000 loads for this block; multiplying
+preload traffic by all 63,000 loop iterations would be incorrect because the
+self-backedge target is after the preload.
+
+## Decision
+
+Select **`RCX` as the first and only Phase 2 overflow-register candidate**.
+
+`RCX` has by far the lowest fixed-use frequency: 54,395 clobber sites per
+million guest instructions, versus 154,791 for `RDX` and 301,561 for `RAX`.
+In the dominant block, eight allocation-pressure events occur for every one
+`RCX`-clobber site. This gives the candidate useful opportunity while bounding
+the number of forced releases needed for variable shifts, stores, `JALR`, and
+`MULHSU`.
+
+Phase 2 will add `RCX` only as overflow capacity, keep the existing seven
+stable registers preferred, and force-release an `RCX` resident immediately
+before an instruction that actually clobbers it. The audit must then report
+actual forced-release stores/discards; no baseline projection is treated as
+measured behavior.
+
+Keep the allocator candidate only if the focused 21-warm-sample self-A/B shows
+at least a 1.0% Cached DBT median improvement, Direct DBT regresses by no more
+than 1.0%, dynamically weighted spill/reload traffic falls, checksum and full
+correctness remain exact, and steady-state execution allocations remain zero.
+Otherwise remove the candidate and retain this audit infrastructure.
