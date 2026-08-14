@@ -148,9 +148,6 @@ pub struct Rv32DbtRegisterPressure {
     pub allocation_pressure: u32,
     pub max_resident: u8,
     pub scratch_clobber_sites: [u32; 3],
-    pub forced_rcx_live_stores: u32,
-    pub forced_rcx_dead_discards: u32,
-    pub forced_rcx_clean_discards: u32,
 }
 
 #[cfg(feature = "dbt-code-audit")]
@@ -168,9 +165,6 @@ impl From<crate::rv32_dbt::x86_64::register_cache::RegisterPressureAudit>
             allocation_pressure: value.allocation_pressure,
             max_resident: value.max_resident,
             scratch_clobber_sites: value.scratch_clobber_sites,
-            forced_rcx_live_stores: value.forced_rcx_live_stores,
-            forced_rcx_dead_discards: value.forced_rcx_dead_discards,
-            forced_rcx_clean_discards: value.forced_rcx_clean_discards,
         }
     }
 }
