@@ -75,7 +75,17 @@ impl RegisterAccess {
     }
 }
 
-const DIRECT_HOST_POOL: [Gpr; 8] = [
+const CHAINABLE_STABLE_HOSTS: [Gpr; 7] = [
+    Gpr::Rbx,
+    Gpr::Rbp,
+    Gpr::Rsi,
+    Gpr::R8,
+    Gpr::R9,
+    Gpr::R10,
+    Gpr::R11,
+];
+
+const DIRECT_HOST_POOL: [Gpr; 9] = [
     Gpr::Rbx,
     Gpr::Rbp,
     Gpr::Rsi,
@@ -84,9 +94,10 @@ const DIRECT_HOST_POOL: [Gpr; 8] = [
     Gpr::R9,
     Gpr::R10,
     Gpr::R11,
+    Gpr::Rcx,
 ];
 
-const CHAINABLE_HOST_POOL: [Gpr; 7] = [
+const CHAINABLE_HOST_POOL: [Gpr; 8] = [
     Gpr::Rbx,
     Gpr::Rbp,
     Gpr::Rsi,
@@ -94,6 +105,7 @@ const CHAINABLE_HOST_POOL: [Gpr; 7] = [
     Gpr::R9,
     Gpr::R10,
     Gpr::R11,
+    Gpr::Rcx,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +139,7 @@ pub(crate) enum RegisterAuditPhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalLoopRegisterPlan {
-    guests: [usize; CHAINABLE_HOST_POOL.len()],
+    guests: [usize; CHAINABLE_STABLE_HOSTS.len()],
     len: usize,
     written: u32,
 }
@@ -143,6 +155,7 @@ pub(crate) struct RegisterCache {
     host_pool: &'static [Gpr],
     entries: [Option<Resident>; DIRECT_HOST_POOL.len()],
     protected_guests: u32,
+    rcx_reserved: bool,
     #[cfg(feature = "dbt-code-audit")]
     audit: RegisterPressureAudit,
     #[cfg(feature = "dbt-code-audit")]
@@ -161,6 +174,7 @@ impl RegisterCache {
             host_pool: &DIRECT_HOST_POOL,
             entries: [None; DIRECT_HOST_POOL.len()],
             protected_guests: 0,
+            rcx_reserved: false,
             #[cfg(feature = "dbt-code-audit")]
             audit: RegisterPressureAudit {
                 entry_arch_loads: 0,
@@ -185,6 +199,7 @@ impl RegisterCache {
             host_pool: &CHAINABLE_HOST_POOL,
             entries: [None; DIRECT_HOST_POOL.len()],
             protected_guests: 0,
+            rcx_reserved: false,
             #[cfg(feature = "dbt-code-audit")]
             audit: RegisterPressureAudit {
                 entry_arch_loads: 0,
@@ -214,7 +229,8 @@ impl RegisterCache {
         self.audit
     }
 
-    pub(crate) fn begin_instruction_audit(&mut self) {
+    pub(crate) fn begin_instruction(&mut self) {
+        self.rcx_reserved = false;
         #[cfg(feature = "dbt-code-audit")]
         {
             self.instruction_scratch_clobbers = 0;
@@ -238,6 +254,39 @@ impl RegisterCache {
         }
         #[cfg(not(feature = "dbt-code-audit"))]
         let _ = register;
+    }
+
+    pub(crate) fn reserve_fixed_host<S: FutureValueSource>(
+        &mut self,
+        register: Gpr,
+        future_values: S,
+        out: &mut X64Emitter,
+    ) -> Result<(), EmitError> {
+        self.record_scratch_clobber(register);
+        if register != Gpr::Rcx {
+            return Ok(());
+        }
+        self.rcx_reserved = true;
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.is_some_and(|resident| resident.host == register))
+        else {
+            return Ok(());
+        };
+        let resident = self.entries[index].unwrap();
+        let dead = matches!(future_values.value(resident.guest), FutureValue::Dead(_));
+        if resident.dirty && !dead {
+            out.mov_m32_r32(
+                Mem::base_disp(
+                    Gpr::R14,
+                    Rv32ArchitecturalState::register_offset(resident.guest) as i32,
+                ),
+                resident.host,
+            )?;
+        }
+        self.entries[index] = None;
+        Ok(())
     }
 
     #[cfg(feature = "dbt-code-audit")]
@@ -289,7 +338,7 @@ impl RegisterCache {
         }
         carried &= !1;
         referenced &= !1;
-        let resident = if referenced.count_ones() as usize <= CHAINABLE_HOST_POOL.len() {
+        let resident = if referenced.count_ones() as usize <= CHAINABLE_STABLE_HOSTS.len() {
             referenced
         } else {
             carried
@@ -299,12 +348,12 @@ impl RegisterCache {
             .map(|access| ((access.reads | access.writes) & !resident & !1).count_ones() as usize)
             .max()
             .unwrap_or(0);
-        if resident_count > CHAINABLE_HOST_POOL.len()
-            || resident_count.saturating_add(temporary_pressure) > CHAINABLE_HOST_POOL.len()
+        if resident_count > CHAINABLE_STABLE_HOSTS.len()
+            || resident_count.saturating_add(temporary_pressure) > CHAINABLE_STABLE_HOSTS.len()
         {
             return None;
         }
-        let mut guests = [0; CHAINABLE_HOST_POOL.len()];
+        let mut guests = [0; CHAINABLE_STABLE_HOSTS.len()];
         let mut len = 0;
         for guest in 1..32 {
             if resident & (1_u32 << guest) != 0 {
@@ -464,7 +513,10 @@ impl RegisterCache {
     ) -> Result<usize, EmitError> {
         if let Some(index) = self.entries[..self.host_pool.len()]
             .iter()
-            .position(Option::is_none)
+            .enumerate()
+            .find_map(|(index, entry)| {
+                (entry.is_none() && !self.host_is_reserved(self.host_pool[index])).then_some(index)
+            })
         {
             return Ok(index);
         }
@@ -476,9 +528,10 @@ impl RegisterCache {
             .iter()
             .enumerate()
             .filter_map(|(index, resident)| {
-                let resident = resident.unwrap();
+                let resident = resident.as_ref()?;
                 let future = future_values.value(resident.guest);
                 (!pinned.contains(&resident.host)
+                    && !self.host_is_reserved(resident.host)
                     && self.protected_guests & (1_u32 << resident.guest) == 0)
                     .then_some((
                         index,
@@ -529,6 +582,10 @@ impl RegisterCache {
             .flatten()
             .find(|entry| entry.guest == guest)
             .copied()
+    }
+
+    fn host_is_reserved(&self, host: Gpr) -> bool {
+        host == Gpr::Rcx && self.rcx_reserved
     }
 
     fn index_of(&self, guest: usize) -> Option<usize> {
@@ -672,6 +729,7 @@ mod tests {
                 Gpr::R9,
                 Gpr::R10,
                 Gpr::R11,
+                Gpr::Rcx,
             ]
         );
         assert_eq!(
@@ -684,6 +742,7 @@ mod tests {
                 Gpr::R9,
                 Gpr::R10,
                 Gpr::R11,
+                Gpr::Rcx,
             ]
         );
     }
@@ -853,43 +912,85 @@ mod tests {
     }
 
     #[test]
-    fn ninth_guest_evicts_no_future_use_then_farthest_next_use() {
-        let mut cache = RegisterCache::new();
+    fn rcx_is_used_only_after_every_stable_host_is_resident() {
+        let mut chainable = RegisterCache::chainable();
+        let mut direct = RegisterCache::direct();
+        let mut out = X64Emitter::new(512, 16).unwrap();
+
+        for guest in 1..=7 {
+            assert_ne!(
+                chainable.write(guest, &[], &[], &mut out).unwrap(),
+                Some(Gpr::Rcx)
+            );
+        }
+        assert_eq!(
+            chainable.write(8, &[], &[], &mut out).unwrap(),
+            Some(Gpr::Rcx)
+        );
+
+        for guest in 1..=8 {
+            assert_ne!(
+                direct.write(guest, &[], &[], &mut out).unwrap(),
+                Some(Gpr::Rcx)
+            );
+        }
+        assert_eq!(direct.write(9, &[], &[], &mut out).unwrap(), Some(Gpr::Rcx));
+    }
+
+    #[test]
+    fn reserving_rcx_preserves_a_live_dirty_resident_and_blocks_reallocation() {
+        let mut cache = RegisterCache::chainable();
         let mut out = X64Emitter::new(512, 16).unwrap();
         for guest in 1..=8 {
+            cache.write(guest, &[], &[], &mut out).unwrap();
+        }
+        assert_eq!(cache.resident(8).unwrap().host, Gpr::Rcx);
+        let before = out.bytes().len();
+        let future = [slot(addi(8, 8, 1))];
+
+        cache
+            .reserve_fixed_host(Gpr::Rcx, &future, &mut out)
+            .unwrap();
+
+        assert!(out.bytes().len() > before);
+        assert!(cache.resident(8).is_none());
+        assert_ne!(cache.write(9, &[], &[], &mut out).unwrap(), Some(Gpr::Rcx));
+        cache.begin_instruction();
+        assert_eq!(cache.write(10, &[], &[], &mut out).unwrap(), Some(Gpr::Rcx));
+    }
+
+    #[test]
+    fn reserving_rcx_discards_dead_and_clean_residents_without_a_store() {
+        for dirty in [false, true] {
+            let mut cache = RegisterCache::chainable();
+            let mut out = X64Emitter::new(512, 16).unwrap();
+            for guest in 1..=8 {
+                if dirty {
+                    cache.write(guest, &[], &[], &mut out).unwrap();
+                } else {
+                    cache.read(guest, &[], &[], &mut out).unwrap();
+                }
+            }
+            let before = out.bytes().len();
+            let future = [slot(addi(8, 0, 1))];
+
+            cache
+                .reserve_fixed_host(Gpr::Rcx, &future, &mut out)
+                .unwrap();
+
+            assert_eq!(out.bytes().len(), before, "dirty={dirty}");
+            assert!(cache.resident(8).is_none());
+        }
+    }
+
+    #[test]
+    fn tenth_guest_evicts_no_future_use_then_farthest_next_use() {
+        let mut cache = RegisterCache::new();
+        let mut out = X64Emitter::new(512, 16).unwrap();
+        for guest in 1..=9 {
             cache.read(guest, &[], &[], &mut out).unwrap();
         }
-        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
-
-        let future = [
-            slot(addi(1, 1, 1)),
-            slot(addi(2, 2, 1)),
-            slot(addi(3, 3, 1)),
-            slot(addi(4, 4, 1)),
-            slot(addi(5, 5, 1)),
-            slot(addi(6, 6, 1)),
-            slot(addi(7, 7, 1)),
-        ];
-        assert_eq!(
-            cache
-                .read(
-                    9,
-                    &future,
-                    &[
-                        Gpr::Rbx,
-                        Gpr::Rbp,
-                        Gpr::Rsi,
-                        Gpr::Rdi,
-                        Gpr::R8,
-                        Gpr::R9,
-                        Gpr::R10,
-                    ],
-                    &mut out,
-                )
-                .unwrap(),
-            Gpr::R11
-        );
-        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 9]);
+        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         let future = [
             slot(addi(1, 1, 1)),
@@ -901,27 +1002,10 @@ mod tests {
             slot(addi(7, 7, 1)),
             slot(addi(9, 9, 1)),
         ];
-        assert_eq!(cache.read(10, &future, &[], &mut out).unwrap(), Gpr::R11);
-        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 10]);
-    }
-
-    #[test]
-    fn dirty_eviction_writes_canonical_state_before_reusing_host() {
-        let mut cache = RegisterCache::new();
-        let mut out = X64Emitter::new(512, 16).unwrap();
-        for guest in 1..=8 {
-            cache.read(guest, &[], &[], &mut out).unwrap();
-        }
-        cache.write(8, &[], &[], &mut out).unwrap();
-        let before = out.bytes().len();
-        let future = (1..=7)
-            .map(|guest| slot(addi(guest, guest, 1)))
-            .collect::<Vec<_>>();
-
         assert_eq!(
             cache
                 .read(
-                    9,
+                    10,
                     &future,
                     &[
                         Gpr::Rbx,
@@ -931,6 +1015,58 @@ mod tests {
                         Gpr::R8,
                         Gpr::R9,
                         Gpr::R10,
+                        Gpr::Rcx,
+                    ],
+                    &mut out,
+                )
+                .unwrap(),
+            Gpr::R11
+        );
+        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 9, 10]);
+
+        let future = [
+            slot(addi(1, 1, 1)),
+            slot(addi(2, 2, 1)),
+            slot(addi(3, 3, 1)),
+            slot(addi(4, 4, 1)),
+            slot(addi(5, 5, 1)),
+            slot(addi(6, 6, 1)),
+            slot(addi(7, 7, 1)),
+            slot(addi(9, 9, 1)),
+            slot(addi(10, 10, 1)),
+        ];
+        assert_eq!(cache.read(11, &future, &[], &mut out).unwrap(), Gpr::R11);
+        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 9, 11]);
+    }
+
+    #[test]
+    fn dirty_eviction_writes_canonical_state_before_reusing_host() {
+        let mut cache = RegisterCache::new();
+        let mut out = X64Emitter::new(512, 16).unwrap();
+        for guest in 1..=9 {
+            cache.read(guest, &[], &[], &mut out).unwrap();
+        }
+        cache.write(8, &[], &[], &mut out).unwrap();
+        let before = out.bytes().len();
+        let future = (1..=7)
+            .map(|guest| slot(addi(guest, guest, 1)))
+            .chain(std::iter::once(slot(addi(9, 9, 1))))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            cache
+                .read(
+                    10,
+                    &future,
+                    &[
+                        Gpr::Rbx,
+                        Gpr::Rbp,
+                        Gpr::Rsi,
+                        Gpr::Rdi,
+                        Gpr::R8,
+                        Gpr::R9,
+                        Gpr::R10,
+                        Gpr::Rcx,
                     ],
                     &mut out,
                 )
@@ -939,7 +1075,7 @@ mod tests {
         );
         assert_eq!(
             &out.bytes()[before..],
-            [0x45, 0x89, 0x5e, 0x24, 0x45, 0x8b, 0x5e, 0x28]
+            [0x45, 0x89, 0x5e, 0x24, 0x45, 0x8b, 0x5e, 0x2c]
         );
     }
 
@@ -947,15 +1083,15 @@ mod tests {
     fn farthest_read_beats_cleanliness_for_a_live_victim() {
         let mut cache = RegisterCache::new();
         let mut out = X64Emitter::new(512, 16).unwrap();
-        for guest in 1..=8 {
+        for guest in 1..=9 {
             cache.read(guest, &[], &[], &mut out).unwrap();
         }
         cache.write(8, &[], &[], &mut out).unwrap();
-        let future = (1..=8)
+        let future = (1..=9)
             .map(|guest| slot(addi(guest, guest, 1)))
             .collect::<Vec<_>>();
 
-        assert_eq!(cache.read(9, &future, &[], &mut out).unwrap(), Gpr::R11);
+        assert_eq!(cache.read(10, &future, &[], &mut out).unwrap(), Gpr::Rcx);
     }
 
     #[test]
@@ -994,7 +1130,7 @@ mod tests {
     fn proven_dead_dirty_guest_is_evicted_without_a_store() {
         let mut cache = RegisterCache::new();
         let mut out = X64Emitter::new(512, 16).unwrap();
-        for guest in 1..=8 {
+        for guest in 1..=9 {
             cache.read(guest, &[], &[], &mut out).unwrap();
         }
         cache.write(8, &[], &[], &mut out).unwrap();
@@ -1008,27 +1144,28 @@ mod tests {
             slot(addi(5, 5, 1)),
             slot(addi(6, 6, 1)),
             slot(addi(7, 7, 1)),
+            slot(addi(9, 9, 1)),
         ];
 
-        assert_eq!(cache.read(9, &future, &[], &mut out).unwrap(), Gpr::R11);
-        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 9]);
-        assert_eq!(&out.bytes()[before..], [0x45, 0x8b, 0x5e, 0x28]);
+        assert_eq!(cache.read(10, &future, &[], &mut out).unwrap(), Gpr::R11);
+        assert_eq!(cache.resident_guests(), vec![1, 2, 3, 4, 5, 6, 7, 9, 10]);
+        assert_eq!(&out.bytes()[before..], [0x45, 0x8b, 0x5e, 0x2c]);
     }
 
     #[test]
     fn current_instruction_protects_a_not_yet_materialized_source() {
         let mut cache = RegisterCache::new();
         let mut out = X64Emitter::new(512, 16).unwrap();
-        for guest in 1..=8 {
+        for guest in 1..=9 {
             cache.read(guest, &[], &[], &mut out).unwrap();
         }
         cache.write(8, &[], &[], &mut out).unwrap();
         let current_and_future = [
-            slot(crate::rv32im::encoding::sub(9, 10, 8)),
+            slot(crate::rv32im::encoding::sub(10, 11, 8)),
             slot(addi(8, 0, 1)),
         ];
 
-        cache.read(10, &current_and_future, &[], &mut out).unwrap();
+        cache.read(11, &current_and_future, &[], &mut out).unwrap();
 
         assert!(cache.resident_guests().contains(&8));
     }
@@ -1042,7 +1179,7 @@ mod tests {
         cache.read(1, &[], &[], &mut out).unwrap();
         cache.write(1, &[], &[], &mut out).unwrap();
         cache.set_audit_phase(RegisterAuditPhase::Body);
-        for guest in 2..=8 {
+        for guest in 2..=9 {
             cache.write(guest, &[], &[], &mut out).unwrap();
         }
 
@@ -1051,7 +1188,7 @@ mod tests {
         assert_eq!(audit.body_arch_loads, 0);
         assert_eq!(audit.allocation_pressure, 1);
         assert_eq!(audit.dirty_live_eviction_stores, 1);
-        assert_eq!(audit.max_resident, 7);
+        assert_eq!(audit.max_resident, 8);
     }
 
     #[cfg(feature = "dbt-code-audit")]
