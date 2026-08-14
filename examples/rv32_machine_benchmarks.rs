@@ -28,7 +28,8 @@ use compukter_vm::benchmarks::{
     PRODUCT_DEBUG_LIMIT, PRODUCT_RAM_BYTES, PRODUCT_RESIDENT_REPORT_HEADER,
 };
 use compukter_vm::rv32_machine::{
-    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, DEFAULT_DBT_SCRATCH_BYTES,
+    Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig,
+    DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -115,6 +116,17 @@ fn main() -> Result<(), String> {
         }
         return run_alignment_sweep(iterations, warm_samples);
     }
+    if first == "register-alignment-matrix" {
+        let iterations = parse_positive("iterations", arguments.next())?;
+        let warm_samples = parse_positive("warm_samples", arguments.next())?.max(21) as usize;
+        if arguments.next().is_some() {
+            return Err(
+                "usage: rv32_machine_benchmarks register-alignment-matrix <iterations> <warm_samples>"
+                    .to_string(),
+            );
+        }
+        return run_register_alignment_matrix(iterations, warm_samples);
+    }
     let iterations = parse_positive("iterations", Some(first))?;
     let warm_samples = parse_positive("warm_samples", arguments.next())?.max(21) as usize;
     let resident_samples = parse_positive("resident_samples", arguments.next())?.max(7) as usize;
@@ -135,37 +147,66 @@ fn main() -> Result<(), String> {
 const ALIGNMENT_DBT_CACHE_SETS: usize = 512;
 
 #[derive(Clone, Copy)]
-struct AlignmentCandidate {
+struct LayoutCandidate {
     name: &'static str,
+    register_profile: Rv32DbtRegisterProfile,
     alignment: Rv32DbtCodeAlignment,
 }
 
-const ALIGNMENT_CANDIDATES: [AlignmentCandidate; 5] = [
-    AlignmentCandidate {
+const ALIGNMENT_CANDIDATES: [LayoutCandidate; 5] = [
+    LayoutCandidate {
         name: "block-base-16",
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
         alignment: Rv32DbtCodeAlignment::BlockBase(16),
     },
-    AlignmentCandidate {
+    LayoutCandidate {
         name: "block-base-32",
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
         alignment: Rv32DbtCodeAlignment::BlockBase(32),
     },
-    AlignmentCandidate {
+    LayoutCandidate {
         name: "block-base-64",
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
         alignment: Rv32DbtCodeAlignment::BlockBase(64),
     },
-    AlignmentCandidate {
+    LayoutCandidate {
         name: "block-base-128",
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
         alignment: Rv32DbtCodeAlignment::BlockBase(128),
     },
-    AlignmentCandidate {
+    LayoutCandidate {
         name: "chain-entry-32",
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
         alignment: Rv32DbtCodeAlignment::ChainEntry(32),
     },
 ];
 
-struct AlignmentMeasurement {
+const REGISTER_ALIGNMENT_CANDIDATES: [LayoutCandidate; 4] = [
+    LayoutCandidate {
+        name: "stable7-base32",
+        register_profile: Rv32DbtRegisterProfile::Stable7,
+        alignment: Rv32DbtCodeAlignment::BlockBase(32),
+    },
+    LayoutCandidate {
+        name: "stable7-base64",
+        register_profile: Rv32DbtRegisterProfile::Stable7,
+        alignment: Rv32DbtCodeAlignment::BlockBase(64),
+    },
+    LayoutCandidate {
+        name: "rcx8-base32",
+        register_profile: Rv32DbtRegisterProfile::RcxOverflow8,
+        alignment: Rv32DbtCodeAlignment::BlockBase(32),
+    },
+    LayoutCandidate {
+        name: "rcx8-base64",
+        register_profile: Rv32DbtRegisterProfile::RcxOverflow8,
+        alignment: Rv32DbtCodeAlignment::BlockBase(64),
+    },
+];
+
+struct LayoutMeasurement {
     workload: ProductMachineWorkload,
-    candidate: AlignmentCandidate,
+    candidate: LayoutCandidate,
     batch: u64,
     construction_nanos: Vec<u128>,
     execution_nanos: Vec<u128>,
@@ -174,23 +215,51 @@ struct AlignmentMeasurement {
     steady_allocated_bytes: u64,
 }
 
-fn alignment_execution(alignment: Rv32DbtCodeAlignment) -> Rv32ExecutionBackendConfig {
+fn layout_execution(candidate: LayoutCandidate, sets: usize) -> Rv32ExecutionBackendConfig {
     Rv32ExecutionBackendConfig::CachedDbt {
-        sets: ALIGNMENT_DBT_CACHE_SETS,
+        sets,
         max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
         scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
         cache_bytes: PRODUCT_DBT_CODE_BYTES,
-        code_alignment: alignment,
-        register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
+        code_alignment: candidate.alignment,
+        register_profile: candidate.register_profile,
     }
 }
 
 fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), String> {
-    let mut completed =
-        Vec::with_capacity(ProductMachineWorkload::all().len() * ALIGNMENT_CANDIDATES.len());
+    run_layout_sweep(
+        "RV32 Cached DBT code-alignment sweep",
+        iterations,
+        warm_samples,
+        ALIGNMENT_DBT_CACHE_SETS,
+        ALIGNMENT_CANDIDATES,
+        "block-base-32",
+    )
+}
+
+fn run_register_alignment_matrix(iterations: u32, warm_samples: usize) -> Result<(), String> {
+    run_layout_sweep(
+        "RV32 Cached DBT register/alignment matrix",
+        iterations,
+        warm_samples,
+        PRODUCT_DBT_CACHE_SETS,
+        REGISTER_ALIGNMENT_CANDIDATES,
+        "stable7-base32",
+    )
+}
+
+fn run_layout_sweep<const N: usize>(
+    title: &str,
+    iterations: u32,
+    warm_samples: usize,
+    cache_sets: usize,
+    candidates: [LayoutCandidate; N],
+    baseline_name: &str,
+) -> Result<(), String> {
+    let mut completed = Vec::with_capacity(ProductMachineWorkload::all().len() * N);
     for (workload_index, workload) in ProductMachineWorkload::all().iter().copied().enumerate() {
         let image = ProductMachineImage::new(workload, iterations)?;
-        let mut measurements = ALIGNMENT_CANDIDATES.map(|candidate| AlignmentMeasurement {
+        let mut measurements = candidates.map(|candidate| LayoutMeasurement {
             workload,
             candidate,
             batch: 1,
@@ -204,7 +273,7 @@ fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), Strin
         for measurement in &mut measurements {
             let mut probe = image.prepare_with_execution(
                 ProductMachineBackend::CachedDbt,
-                alignment_execution(measurement.candidate.alignment),
+                layout_execution(measurement.candidate, cache_sets),
             )?;
             let started = Instant::now();
             probe.execute()?;
@@ -212,12 +281,12 @@ fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), Strin
         }
 
         for sample_index in 0..warm_samples {
-            for candidate_index in benchmark_rotating_order::<5>(workload_index, sample_index) {
+            for candidate_index in benchmark_rotating_order::<N>(workload_index, sample_index) {
                 let measurement = &mut measurements[candidate_index];
                 let construction_started = Instant::now();
                 let mut machines = image.prepare_batch_with_execution(
                     ProductMachineBackend::CachedDbt,
-                    alignment_execution(measurement.candidate.alignment),
+                    layout_execution(measurement.candidate, cache_sets),
                     measurement.batch,
                 )?;
                 measurement
@@ -253,38 +322,81 @@ fn run_alignment_sweep(iterations: u32, warm_samples: usize) -> Result<(), Strin
                 ));
             }
         }
+        let expected_retired = measurements[0]
+            .observation
+            .as_ref()
+            .ok_or_else(|| "layout row has no observation".to_string())?
+            .retired_instructions;
+        for measurement in &measurements[1..] {
+            let retired = measurement
+                .observation
+                .as_ref()
+                .ok_or_else(|| "layout row has no observation".to_string())?
+                .retired_instructions;
+            if retired != expected_retired {
+                return Err(format!(
+                    "{} retired instruction mismatch: expected {expected_retired}, {} retired {retired}",
+                    workload.name(),
+                    measurement.candidate.name,
+                ));
+            }
+        }
         completed.extend(measurements);
     }
-    print_alignment_report(iterations, warm_samples, &completed)
+    print_layout_report(
+        title,
+        iterations,
+        warm_samples,
+        cache_sets,
+        baseline_name,
+        &candidates,
+        &completed,
+    )
 }
 
 fn normalized_percentile(values: &[u128], percentile: usize, batch: u64) -> Result<f64, String> {
     benchmark_normalize_nanos(product_percentile(values, percentile), batch)
 }
 
-fn print_alignment_report(
+fn register_profile_name(profile: Rv32DbtRegisterProfile) -> &'static str {
+    match profile {
+        Rv32DbtRegisterProfile::Stable7 => "stable7",
+        Rv32DbtRegisterProfile::RcxOverflow8 => "rcx-overflow8",
+    }
+}
+
+fn alignment_parts(alignment: Rv32DbtCodeAlignment) -> (&'static str, usize) {
+    match alignment {
+        Rv32DbtCodeAlignment::BlockBase(bytes) => ("block-base", bytes),
+        Rv32DbtCodeAlignment::ChainEntry(bytes) => ("chain-entry", bytes),
+    }
+}
+
+fn print_layout_report(
+    title: &str,
     iterations: u32,
     warm_samples: usize,
-    rows: &[AlignmentMeasurement],
+    cache_sets: usize,
+    baseline_name: &str,
+    candidates: &[LayoutCandidate],
+    rows: &[LayoutMeasurement],
 ) -> Result<(), String> {
-    println!("RV32 Cached DBT code-alignment sweep");
+    println!("{title}");
     println!("iterations\t{iterations}");
     println!("warm_samples\t{warm_samples}");
-    println!("dbt_cache_sets\t{ALIGNMENT_DBT_CACHE_SETS}");
+    println!("baseline\t{baseline_name}");
+    println!("dbt_cache_sets\t{cache_sets}");
     println!("dbt_max_instructions\t{PRODUCT_DBT_MAX_INSTRUCTIONS}");
     println!("dbt_code_bytes\t{PRODUCT_DBT_CODE_BYTES}");
     println!(
-        "workload\tcandidate\titerations\tchecksum\tbatch\tconstruction_median_ns\tconstruction_p95_ns\twarm_median_ns\twarm_p95_ns\tvs_base_32\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_links_established\tdbt_emitted_bytes\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes\tdbt_reserved_bytes\ttranslation_bytes\tcache_evictions\tsteady_allocations\tsteady_allocated_bytes"
+        "workload\tcandidate\tregister_profile\tcode_alignment\talignment_bytes\titerations\tchecksum\tretired_instructions\tbatch\tconstruction_median_ns\tconstruction_p95_ns\twarm_median_ns\twarm_p95_ns\tvs_baseline\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_links_established\tdbt_emitted_bytes\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes\tdbt_reserved_bytes\ttranslation_bytes\tcache_evictions\tsteady_allocations\tsteady_allocated_bytes"
     );
 
     for workload in ProductMachineWorkload::all() {
         let base = rows
             .iter()
-            .find(|row| {
-                row.workload == *workload
-                    && row.candidate.alignment == Rv32DbtCodeAlignment::BlockBase(32)
-            })
-            .ok_or_else(|| format!("missing block-base-32 row for {}", workload.name()))?;
+            .find(|row| row.workload == *workload && row.candidate.name == baseline_name)
+            .ok_or_else(|| format!("missing {baseline_name} row for {}", workload.name()))?;
         let base_median = normalized_percentile(&base.execution_nanos, 50, base.batch)?;
         for row in rows.iter().filter(|row| row.workload == *workload) {
             let observation = row
@@ -293,14 +405,19 @@ fn print_alignment_report(
                 .ok_or_else(|| "alignment row has no observation".to_string())?;
             let stats = observation
                 .dbt_stats
-                .ok_or_else(|| "alignment row has no DBT statistics".to_string())?;
+                .ok_or_else(|| "layout row has no DBT statistics".to_string())?;
             let median = normalized_percentile(&row.execution_nanos, 50, row.batch)?;
+            let (alignment, alignment_bytes) = alignment_parts(row.candidate.alignment);
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 row.workload.name(),
                 row.candidate.name,
+                register_profile_name(row.candidate.register_profile),
+                alignment,
+                alignment_bytes,
                 iterations,
                 observation.checksum,
+                observation.retired_instructions,
                 row.batch,
                 normalized_percentile(&row.construction_nanos, 50, row.batch)?,
                 normalized_percentile(&row.construction_nanos, 95, row.batch)?,
@@ -325,24 +442,20 @@ fn print_alignment_report(
     }
 
     println!();
-    println!("candidate\texecution_geomean_vs_base_32");
-    for sweep_candidate in ALIGNMENT_CANDIDATES {
+    println!("candidate\texecution_geomean_vs_baseline");
+    for sweep_candidate in candidates {
         let ratios = ProductMachineWorkload::all()
             .iter()
             .map(|workload| {
                 let candidate = rows
                     .iter()
                     .find(|row| {
-                        row.workload == *workload
-                            && row.candidate.alignment == sweep_candidate.alignment
+                        row.workload == *workload && row.candidate.name == sweep_candidate.name
                     })
                     .unwrap();
                 let base = rows
                     .iter()
-                    .find(|row| {
-                        row.workload == *workload
-                            && row.candidate.alignment == Rv32DbtCodeAlignment::BlockBase(32)
-                    })
+                    .find(|row| row.workload == *workload && row.candidate.name == baseline_name)
                     .unwrap();
                 Ok(
                     normalized_percentile(&candidate.execution_nanos, 50, candidate.batch)?
@@ -777,4 +890,44 @@ fn parse_positive(name: &str, value: Option<String>) -> Result<u32, String> {
         return Err(format!("{name} must be positive"));
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_alignment_matrix_executes_all_four_configurations() {
+        assert_eq!(
+            REGISTER_ALIGNMENT_CANDIDATES.map(|candidate| candidate.name),
+            [
+                "stable7-base32",
+                "stable7-base64",
+                "rcx8-base32",
+                "rcx8-base64",
+            ]
+        );
+
+        for workload in ProductMachineWorkload::all().iter().copied() {
+            let image = ProductMachineImage::new(workload, 4).unwrap();
+            let mut expected = None;
+            for candidate in REGISTER_ALIGNMENT_CANDIDATES {
+                let mut machine = image
+                    .prepare_with_execution(
+                        ProductMachineBackend::CachedDbt,
+                        layout_execution(candidate, PRODUCT_DBT_CACHE_SETS),
+                    )
+                    .unwrap();
+                let observation = machine.execute().unwrap();
+                assert_eq!(
+                    *expected
+                        .get_or_insert((observation.checksum, observation.retired_instructions,)),
+                    (observation.checksum, observation.retired_instructions),
+                    "{} produced a different result for {}",
+                    candidate.name,
+                    workload.name(),
+                );
+            }
+        }
+    }
 }
