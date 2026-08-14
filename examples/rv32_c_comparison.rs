@@ -10,19 +10,20 @@
  */
 
 use compukter_vm::benchmarks::{
-    benchmark_normalize_nanos, c_comparison_next_batch, c_comparison_qemu_target_nanos,
-    c_comparison_timeout_nanos, parse_c_comparison_result, product_percentile,
+    benchmark_normalize_nanos, benchmark_rotating_order, c_comparison_next_batch,
+    c_comparison_qemu_target_nanos, c_comparison_timeout_nanos, parse_c_comparison_result,
+    product_percentile,
 };
 #[cfg(feature = "wasmtime-comparison")]
 use compukter_vm::benchmarks::{
-    benchmark_rotating_order, compile_equivalent_calls, optional_phase_rate,
-    COMPILATION_PHASE_REPORT_HEADER,
+    compile_equivalent_calls, optional_phase_rate, COMPILATION_PHASE_REPORT_HEADER,
 };
 #[cfg(feature = "dbt-translation-timing")]
 use compukter_vm::benchmarks::{self_ab_delta, self_ab_order};
 use compukter_vm::rv32_machine::{
-    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig,
-    Rv32MachineOutcome, DEFAULT_DBT_CODE_ALIGNMENT,
+    Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig, Rv32Machine,
+    Rv32MachineConfig, Rv32MachineOutcome, DEFAULT_DBT_CODE_ALIGNMENT,
+    DEFAULT_DBT_REGISTER_PROFILE,
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
@@ -99,6 +100,7 @@ enum CandidateKind {
         cache_bytes: usize,
         max_instructions: usize,
         code_alignment: Rv32DbtCodeAlignment,
+        register_profile: Rv32DbtRegisterProfile,
     },
 }
 
@@ -131,13 +133,14 @@ impl Candidate {
                 cache_bytes,
                 max_instructions,
                 code_alignment,
+                register_profile,
             } => Some(Rv32ExecutionBackendConfig::CachedDbt {
                 sets,
                 max_instructions,
                 scratch_bytes: PRODUCT_DBT_SCRATCH_BYTES,
                 cache_bytes,
                 code_alignment,
-                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
+                register_profile,
             }),
         }
     }
@@ -190,6 +193,26 @@ const fn cached_dbt_candidate_with_block_size(
             cache_bytes,
             max_instructions,
             code_alignment,
+            register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+        },
+    }
+}
+
+const fn cached_dbt_register_alignment_candidate(
+    name: &'static str,
+    register_profile: Rv32DbtRegisterProfile,
+    alignment: usize,
+) -> Candidate {
+    Candidate {
+        name,
+        mode: "product-machine-cached-dbt-register-alignment",
+        artifact_stem: None,
+        kind: CandidateKind::CachedDbt {
+            sets: 256,
+            cache_bytes: 128 * 1024,
+            max_instructions: 16,
+            code_alignment: Rv32DbtCodeAlignment::BlockBase(alignment),
+            register_profile,
         },
     }
 }
@@ -375,6 +398,21 @@ const DBT_MATRIX: [Candidate; 19] = [
     ),
 ];
 
+const REGISTER_ALIGNMENT_MATRIX: [Candidate; 4] = [
+    cached_dbt_register_alignment_candidate("stable7-base32", Rv32DbtRegisterProfile::Stable7, 32),
+    cached_dbt_register_alignment_candidate("stable7-base64", Rv32DbtRegisterProfile::Stable7, 64),
+    cached_dbt_register_alignment_candidate(
+        "rcx8-base32",
+        Rv32DbtRegisterProfile::RcxOverflow8,
+        32,
+    ),
+    cached_dbt_register_alignment_candidate(
+        "rcx8-base64",
+        Rv32DbtRegisterProfile::RcxOverflow8,
+        64,
+    ),
+];
+
 struct ProcessObservation {
     elapsed_nanos: u128,
     checksum: u32,
@@ -457,6 +495,12 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "register-alignment-matrix")
+    {
+        return run_register_alignment_matrix(&arguments[1..]);
+    }
     if arguments
         .first()
         .is_some_and(|argument| argument == "self-ab")
@@ -760,6 +804,155 @@ fn run() -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+fn run_register_alignment_matrix(arguments: &[OsString]) -> Result<(), String> {
+    if arguments.len() != 2 {
+        return Err(
+            "usage: rv32_c_comparison register-alignment-matrix BUILD_DIR WARM_SAMPLES".to_string(),
+        );
+    }
+    let build_dir = Path::new(&arguments[0]);
+    let samples = arguments[1]
+        .to_str()
+        .ok_or_else(|| "register/alignment warm sample count is not UTF-8".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid register/alignment warm sample count: {error}"))?;
+    if samples < MINIMUM_SAMPLES {
+        return Err(format!(
+            "warm sample count must be at least {MINIMUM_SAMPLES}"
+        ));
+    }
+
+    let source_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
+    let mut measurements = Vec::with_capacity(REGISTER_ALIGNMENT_MATRIX.len());
+    let mut elfs = Vec::with_capacity(REGISTER_ALIGNMENT_MATRIX.len());
+    for candidate in REGISTER_ALIGNMENT_MATRIX {
+        let config = candidate.product_config().unwrap();
+        let batch = calibrate_product(&linker, &source_root, build_dir, config)?;
+        elfs.push(link_platform(
+            &linker,
+            &source_root,
+            build_dir,
+            "product",
+            batch,
+        )?);
+        measurements.push(CandidateMeasurements {
+            candidate,
+            batch,
+            samples: Vec::with_capacity(samples),
+            details: ProductDetails::default(),
+        });
+    }
+
+    for sample in 0..samples {
+        for index in benchmark_rotating_order::<4>(0, sample) {
+            let measurement = &mut measurements[index];
+            let (elapsed, details) = run_product(
+                &elfs[index],
+                measurement.batch,
+                measurement.candidate.product_config().unwrap(),
+            )?;
+            measurement.samples.push(elapsed);
+            measurement.details = details;
+        }
+    }
+
+    let expected_retired = measurements[0].details.retired_instructions;
+    if let Some(mismatch) = measurements
+        .iter()
+        .find(|measurement| measurement.details.retired_instructions != expected_retired)
+    {
+        return Err(format!(
+            "register/alignment retired instruction mismatch: expected {expected_retired}, {} retired {}",
+            mismatch.candidate.name, mismatch.details.retired_instructions,
+        ));
+    }
+
+    let normalized = measurements
+        .iter_mut()
+        .map(|measurement| {
+            measurement.samples.sort_unstable();
+            benchmark_normalize_nanos(
+                product_percentile(&measurement.samples, 50),
+                measurement.batch,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let baseline = normalized[0];
+
+    println!("RV32 optimized C register/alignment matrix");
+    println!("iterations\t{ITERATIONS}");
+    println!("seed\t0x{SEED:08x}");
+    println!("warm_samples\t{samples}");
+    println!("baseline\t{}", measurements[0].candidate.name);
+    println!("dbt_cache_sets\t256");
+    println!("dbt_max_instructions\t16");
+    println!("dbt_code_bytes\t{}", 128 * 1024);
+    println!(
+        "candidate\tregister_profile\tcode_alignment\talignment_bytes\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tvs_baseline\tretired_instructions\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_chain_transitions\tdbt_links_established\tdbt_emitted_bytes\tdbt_alignment_padding_bytes\tdbt_live_code_bytes\tdbt_code_prefix_bytes\tdbt_reserved_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes"
+    );
+    for (index, measurement) in measurements.iter().enumerate() {
+        let details = measurement.details;
+        let (profile, alignment) = match measurement.candidate.kind {
+            CandidateKind::CachedDbt {
+                register_profile,
+                code_alignment,
+                ..
+            } => (register_profile, code_alignment),
+            _ => return Err("register/alignment matrix contains a non-cached-DBT row".to_string()),
+        };
+        println!(
+            "{}\t{}\tblock-base\t{}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            measurement.candidate.name,
+            register_profile_name(profile),
+            alignment.bytes(),
+            measurement.batch,
+            EXPECTED_CHECKSUM,
+            product_percentile(&measurement.samples, 50),
+            product_percentile(&measurement.samples, 95),
+            normalized[index],
+            normalized[index] / baseline,
+            details.retired_instructions,
+            option_u64(details.dbt_translations),
+            option_u64(details.dbt_publications),
+            option_u64(details.dbt_native_dispatches),
+            option_u64(details.dbt_chain_transitions),
+            option_u64(details.dbt_links_established),
+            option_u64(details.dbt_emitted_bytes),
+            option_u64(details.dbt_alignment_padding_bytes),
+            option_u64(details.dbt_live_code_bytes),
+            option_u64(details.dbt_code_prefix_bytes),
+            option_u64(details.dbt_reserved_bytes),
+            details.translation_bytes,
+            details.steady_allocations,
+            details.steady_allocated_bytes,
+        );
+    }
+
+    let stable_alignment = normalized[1] / normalized[0];
+    let rcx_alignment = normalized[3] / normalized[2];
+    let rcx_at_32 = normalized[2] / normalized[0];
+    let rcx_at_64 = normalized[3] / normalized[1];
+    println!("effect\tratio");
+    println!("block64_vs_block32_stable7\t{stable_alignment:.6}");
+    println!("block64_vs_block32_rcx8\t{rcx_alignment:.6}");
+    println!("rcx8_vs_stable7_block32\t{rcx_at_32:.6}");
+    println!("rcx8_vs_stable7_block64\t{rcx_at_64:.6}");
+    println!(
+        "register_alignment_interaction\t{:.6}",
+        rcx_alignment / stable_alignment
+    );
+    Ok(())
+}
+
+const fn register_profile_name(profile: Rv32DbtRegisterProfile) -> &'static str {
+    match profile {
+        Rv32DbtRegisterProfile::Stable7 => "stable7",
+        Rv32DbtRegisterProfile::RcxOverflow8 => "rcx-overflow8",
+    }
 }
 
 fn run_self_ab(arguments: &[OsString]) -> Result<(), String> {
