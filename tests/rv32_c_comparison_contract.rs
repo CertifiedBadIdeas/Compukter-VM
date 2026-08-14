@@ -363,7 +363,7 @@ fn comparison_runner_exposes_distinct_compilation_phase_rows() {
         "\"rv32-cached-dbt\"",
         "\"machine-construct\"",
         "\"first-completion\"",
-        "\"decode\"",
+        "\"lift\"",
         "\"lower\"",
         "\"publish\"",
         "\"warm-execution\"",

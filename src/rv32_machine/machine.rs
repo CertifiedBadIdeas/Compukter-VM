@@ -541,7 +541,7 @@ impl Rv32Machine {
                     cached.unwrap()
                 } else {
                     #[cfg(feature = "dbt-translation-timing")]
-                    let decode_started = {
+                    let lift_started = {
                         let Rv32ExecutionBackend::Dbt(execution) = &self.execution else {
                             unreachable!("DBT loop requires the DBT backend")
                         };
@@ -566,8 +566,8 @@ impl Rv32Machine {
                         let Rv32ExecutionBackend::Dbt(execution) = &mut self.execution else {
                             unreachable!("DBT loop requires the DBT backend")
                         };
-                        if let Some(decode_started) = decode_started {
-                            execution.record_decode_nanos(decode_started.elapsed().as_nanos());
+                        if let Some(lift_started) = lift_started {
+                            execution.record_lift_nanos(lift_started.elapsed().as_nanos());
                         }
                     }
                     if let Err(error) = fill_result {

@@ -196,7 +196,7 @@ fn dbt_phase_timing_is_disabled_by_default() {
 
     machine.run(16).unwrap();
     let stats = machine.dbt_stats().unwrap();
-    assert_eq!(stats.decode_nanos, 0);
+    assert_eq!(stats.lift_nanos, 0);
     assert_eq!(stats.lower_nanos, 0);
     assert_eq!(stats.publish_nanos, 0);
     assert_eq!(stats.timed_translations, 0);
@@ -225,7 +225,7 @@ fn dbt_phase_timing_accounts_for_every_translation() {
     machine.enable_dbt_translation_timing();
     machine.run(16).unwrap();
     let stats = machine.dbt_stats().unwrap();
-    assert!(stats.decode_nanos > 0);
+    assert!(stats.lift_nanos > 0);
     assert!(stats.lower_nanos > 0);
     assert!(stats.publish_nanos > 0);
     assert_eq!(stats.timed_translations, stats.translations);
