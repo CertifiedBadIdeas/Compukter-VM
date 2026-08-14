@@ -21,9 +21,11 @@
 mod rv32_elf_support;
 
 use compukter_vm::rv32_machine::{
-    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig,
-    Rv32MachineOutcome, CONTROL_BASE, DEBUG_BASE, DEFAULT_DBT_CODE_ALIGNMENT, STATUS_BOOTING,
-    STATUS_HALTED, STATUS_PANIC,
+    Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig, Rv32Machine,
+    Rv32MachineConfig, Rv32MachineOutcome, CONTROL_BASE, DEBUG_BASE, DEFAULT_DBT_CACHE_SETS,
+    DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_CODE_BYTES, DEFAULT_DBT_MAX_INSTRUCTIONS,
+    DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES, STATUS_BOOTING, STATUS_HALTED,
+    STATUS_PANIC,
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
@@ -58,6 +60,7 @@ fn configs() -> [Rv32ExecutionBackendConfig; 5] {
             scratch_bytes: 4096,
             cache_bytes: 4096,
             code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+            register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
         },
     ]
 }
@@ -76,8 +79,56 @@ fn cached_dbt_is_the_default_execution_backend() {
             scratch_bytes: 8 * 1024,
             cache_bytes: 128 * 1024,
             code_alignment: Rv32DbtCodeAlignment::BlockBase(64),
+            register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
         }
     );
+}
+
+#[test]
+fn cached_dbt_register_profiles_preserve_execution() {
+    assert_eq!(
+        DEFAULT_DBT_REGISTER_PROFILE,
+        Rv32DbtRegisterProfile::RcxOverflow8
+    );
+    let elf = halting_machine_elf(b'R');
+
+    for register_profile in [
+        Rv32DbtRegisterProfile::Stable7,
+        Rv32DbtRegisterProfile::RcxOverflow8,
+    ] {
+        let execution = Rv32ExecutionBackendConfig::CachedDbt {
+            sets: DEFAULT_DBT_CACHE_SETS,
+            max_instructions: DEFAULT_DBT_MAX_INSTRUCTIONS,
+            scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+            cache_bytes: DEFAULT_DBT_CODE_BYTES,
+            code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+            register_profile,
+        };
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 16)).unwrap();
+
+        assert_eq!(
+            machine.run(0).unwrap(),
+            Rv32MachineOutcome::BudgetExhausted {
+                retired_delta: 0,
+                retired_total: 0,
+            }
+        );
+        assert_eq!(
+            machine.run(3).unwrap(),
+            Rv32MachineOutcome::BudgetExhausted {
+                retired_delta: 4,
+                retired_total: 4,
+            }
+        );
+        assert_eq!(
+            machine.run(64).unwrap(),
+            Rv32MachineOutcome::Halted {
+                exit_code: 0,
+                retired_delta: 3,
+                retired_total: 7,
+            }
+        );
+    }
 }
 
 #[test]
@@ -92,6 +143,7 @@ fn cached_dbt_initializes_one_context_per_run_call() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             0,
         ),
@@ -130,6 +182,7 @@ fn cached_dbt_snapshot_owns_final_linked_code() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             0,
         ),
@@ -188,6 +241,7 @@ fn dbt_phase_timing_is_disabled_by_default() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             0,
         ),
@@ -216,6 +270,7 @@ fn dbt_phase_timing_accounts_for_every_translation() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             0,
         ),
@@ -245,6 +300,7 @@ fn cached_dbt_finishes_one_block_past_budget_without_debt() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             0,
         ),
@@ -489,6 +545,7 @@ fn cached_dbt_fence_i_revokes_the_previous_generation() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             0,
         ),
@@ -539,6 +596,7 @@ fn cached_dbt_local_self_branch_flushes_loop_state_before_memory_fault() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             0,
         ),
@@ -655,6 +713,7 @@ fn cached_dbt_reconciles_temporary_state_before_a_later_loop_fault() {
         scratch_bytes: 4096,
         cache_bytes: 4096,
         code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+        register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
     });
 
     assert!(matches!(
@@ -735,6 +794,7 @@ fn cached_dbt_machine(words: &[u32], sets: usize) -> Rv32Machine {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             0,
         ),
@@ -1256,6 +1316,7 @@ fn invalid_cache_and_ram_layouts_fail_before_machine_allocation() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
             8,
         )
@@ -1285,6 +1346,7 @@ fn cached_dbt_rejects_invalid_code_alignments() {
                     scratch_bytes: 4096,
                     cache_bytes: 4096,
                     code_alignment,
+                    register_profile: DEFAULT_DBT_REGISTER_PROFILE,
                 },
                 8,
             ),

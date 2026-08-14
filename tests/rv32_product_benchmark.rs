@@ -52,6 +52,7 @@ fn product_image_accepts_an_explicit_execution_configuration() {
                 scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: PRODUCT_DBT_CODE_BYTES,
                 code_alignment: Rv32DbtCodeAlignment::BlockBase(32),
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
         )
         .unwrap();
@@ -73,6 +74,7 @@ fn every_product_workload_executes_at_each_base_alignment() {
                 scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: PRODUCT_DBT_CODE_BYTES,
                 code_alignment: Rv32DbtCodeAlignment::BlockBase(bytes),
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             };
             let mut machines = image
                 .prepare_batch_with_execution(ProductMachineBackend::CachedDbt, execution, 1)

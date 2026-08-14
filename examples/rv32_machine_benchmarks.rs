@@ -181,6 +181,7 @@ fn alignment_execution(alignment: Rv32DbtCodeAlignment) -> Rv32ExecutionBackendC
         scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
         cache_bytes: PRODUCT_DBT_CODE_BYTES,
         code_alignment: alignment,
+        register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
     }
 }
 

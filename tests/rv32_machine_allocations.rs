@@ -111,6 +111,7 @@ fn assert_steady_state_trap_entry_and_return_allocate_nothing() {
             scratch_bytes: 4096,
             cache_bytes: 4096,
             code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+            register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
         },
     ] {
         let mut machine = Rv32Machine::from_elf(
@@ -182,6 +183,7 @@ fn assert_steady_state_atomic_increment_loop_allocates_nothing() {
             scratch_bytes: 4096,
             cache_bytes: 4096,
             code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+            register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
         },
     ] {
         let mut machine = Rv32Machine::from_elf(
@@ -287,6 +289,7 @@ fn assert_profiled_cached_dbt_steady_state_allocates_nothing() {
                 scratch_bytes: 4096,
                 cache_bytes: 4096,
                 code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
         },
     )
