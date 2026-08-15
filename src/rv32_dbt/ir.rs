@@ -33,6 +33,7 @@ pub(crate) enum DbtIrOp {
     Store,
     Immediate,
     Register,
+    BitManip,
     Fence,
     Atomic,
     Csr,
@@ -216,6 +217,7 @@ impl DbtIrInstruction {
             DecodedOp::Store(_) => DbtIrOp::Store,
             DecodedOp::Immediate(_) => DbtIrOp::Immediate,
             DecodedOp::Register(_) => DbtIrOp::Register,
+            DecodedOp::Zbb(_) => DbtIrOp::BitManip,
             DecodedOp::Fence | DecodedOp::FenceI => DbtIrOp::Fence,
             DecodedOp::StoreConditional(_) | DecodedOp::Atomic(_, _) => DbtIrOp::Atomic,
             DecodedOp::Csr { .. } => DbtIrOp::Csr,
@@ -535,6 +537,13 @@ pub(crate) fn register_effects(fields: DecodedFields) -> ([Option<u8>; 2], Optio
         DecodedOp::Register(_) | DecodedOp::StoreConditional(_) | DecodedOp::Atomic(_, _) => {
             ([Some(fields.rs1), Some(fields.rs2)], Some(fields.rd))
         }
+        DecodedOp::Zbb(op) => (
+            [
+                Some(fields.rs1),
+                op.uses_register_rhs().then_some(fields.rs2),
+            ],
+            Some(fields.rd),
+        ),
         DecodedOp::Csr {
             immediate_source, ..
         } => (

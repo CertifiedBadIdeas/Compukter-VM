@@ -683,6 +683,18 @@ fn instruction_access(slot: Rv32ResolvedInstruction) -> RegisterAccess {
             read(rs1);
             write(rd);
         }
+        DecodedInstruction::Zbb {
+            op,
+            rd,
+            rs1,
+            operand,
+        } => {
+            read(rs1);
+            if op.uses_register_rhs() {
+                read(usize::from(operand));
+            }
+            write(rd);
+        }
         DecodedInstruction::Register { rd, rs1, rs2, .. }
         | DecodedInstruction::StoreConditional { rd, rs1, rs2, .. }
         | DecodedInstruction::Atomic { rd, rs1, rs2, .. } => {

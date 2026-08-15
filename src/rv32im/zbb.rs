@@ -9,11 +9,6 @@
  * (at your option) any later version.
  */
 
-#![allow(
-    dead_code,
-    reason = "Zbb decoder and execution integration follows in issue #18"
-)]
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ZbbOp {
     Andn,
@@ -34,6 +29,23 @@ pub(crate) enum ZbbOp {
     Rori,
     OrcB,
     Rev8,
+}
+
+impl ZbbOp {
+    pub(crate) const fn uses_register_rhs(self) -> bool {
+        matches!(
+            self,
+            Self::Andn
+                | Self::Orn
+                | Self::Xnor
+                | Self::Min
+                | Self::Minu
+                | Self::Max
+                | Self::Maxu
+                | Self::Rol
+                | Self::Ror
+        )
+    }
 }
 
 pub(crate) fn execute_zbb(op: ZbbOp, lhs: u32, operand: u32) -> u32 {
