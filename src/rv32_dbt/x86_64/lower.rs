@@ -43,7 +43,7 @@ use crate::rv32_dbt::{DbtFault, DbtFaultKind};
 use crate::rv32_machine::Rv32DbtProfileEdgeKind;
 use crate::rv32_machine::{Rv32DbtRegisterProfile, DEFAULT_DBT_REGISTER_PROFILE};
 use crate::rv32im::{
-    Branch, DecodedFields, DecodedOp, ImmOp, Load, Op, Rv32ArchitecturalState, Store,
+    Branch, DecodedFields, DecodedOp, ImmOp, Load, Op, Rv32ArchitecturalState, Store, ZbbOp,
 };
 
 const EXECUTION_COUNTER: Gpr = Gpr::Rdi;
@@ -857,10 +857,153 @@ fn lower_instruction<S: FutureValueSource>(
             lower_register(op, rd, rs1, rs2, remaining, cache, out)?
         }
         DecodedOp::Register(op) => lower_rv32m(op, rd, rs1, rs2, remaining, cache, out)?,
+        DecodedOp::Zbb(op) => lower_zbb(op, rd, rs1, instruction.rs2, remaining, cache, out)?,
         DecodedOp::Fence => {}
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+fn lower_zbb<S: FutureValueSource>(
+    op: ZbbOp,
+    rd: usize,
+    rs1: usize,
+    operand: u8,
+    remaining: S,
+    cache: &mut RegisterCache,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    if rd == 0 {
+        return Ok(());
+    }
+    if matches!(op, ZbbOp::Rol | ZbbOp::Ror) {
+        cache.reserve_fixed_host(Gpr::Rcx, remaining, out)?;
+    }
+    let lhs = cache.read(rs1, remaining, &[], out)?;
+    let rhs = if op.uses_register_rhs() {
+        Some(cache.read(usize::from(operand), remaining, &[lhs], out)?)
+    } else {
+        None
+    };
+    let protected = [lhs, rhs.unwrap_or(lhs)];
+    let protected = if rhs.is_some() {
+        &protected[..]
+    } else {
+        &protected[..1]
+    };
+    let dst = cache.write(rd, remaining, protected, out)?.unwrap();
+    cache.record_scratch_clobber(Gpr::Rax);
+    out.mov_r32_r32(Gpr::Rax, lhs)?;
+
+    match op {
+        ZbbOp::Andn | ZbbOp::Orn => {
+            let rhs = rhs.unwrap();
+            cache.record_scratch_clobber(Gpr::Rdx);
+            out.mov_r32_r32(Gpr::Rdx, rhs)?;
+            out.not_r32(Gpr::Rdx)?;
+            if op == ZbbOp::Andn {
+                out.and_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+            } else {
+                out.or_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+            }
+        }
+        ZbbOp::Xnor => {
+            out.xor_r32_r32(Gpr::Rax, rhs.unwrap())?;
+            out.not_r32(Gpr::Rax)?;
+        }
+        ZbbOp::Min | ZbbOp::Minu | ZbbOp::Max | ZbbOp::Maxu => {
+            let rhs = rhs.unwrap();
+            out.cmp_r32_r32(lhs, rhs)?;
+            let condition = match op {
+                ZbbOp::Min => Condition::Greater,
+                ZbbOp::Minu => Condition::Above,
+                ZbbOp::Max => Condition::Less,
+                ZbbOp::Maxu => Condition::Below,
+                _ => unreachable!(),
+            };
+            out.cmovcc_r32_r32(condition, Gpr::Rax, rhs)?;
+        }
+        ZbbOp::Clz | ZbbOp::Ctz => {
+            cache.record_scratch_clobber(Gpr::Rdx);
+            let zero = out.new_label()?;
+            let done = out.new_label()?;
+            out.test_r32_r32(lhs, lhs)?;
+            out.jcc(Condition::Equal, zero)?;
+            if op == ZbbOp::Clz {
+                out.bsr_r32_r32(Gpr::Rdx, lhs)?;
+                out.mov_r32_imm32(Gpr::Rax, 31)?;
+                out.sub_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+            } else {
+                out.bsf_r32_r32(Gpr::Rax, lhs)?;
+            }
+            out.jmp(done)?;
+            out.bind(zero)?;
+            out.mov_r32_imm32(Gpr::Rax, 32)?;
+            out.bind(done)?;
+        }
+        ZbbOp::Cpop => emit_cpop(lhs, cache, out)?,
+        ZbbOp::SextB => {
+            out.shl_r32_imm8(Gpr::Rax, 24)?;
+            out.sar_r32_imm8(Gpr::Rax, 24)?;
+        }
+        ZbbOp::SextH => {
+            out.shl_r32_imm8(Gpr::Rax, 16)?;
+            out.sar_r32_imm8(Gpr::Rax, 16)?;
+        }
+        ZbbOp::ZextH => out.and_r32_imm32(Gpr::Rax, 0xffff)?,
+        ZbbOp::Rol | ZbbOp::Ror => {
+            out.mov_r32_r32(Gpr::Rcx, rhs.unwrap())?;
+            if op == ZbbOp::Rol {
+                out.rol_r32_cl(Gpr::Rax)?;
+            } else {
+                out.ror_r32_cl(Gpr::Rax)?;
+            }
+        }
+        ZbbOp::Rori => out.ror_r32_imm8(Gpr::Rax, operand & 31)?,
+        ZbbOp::OrcB => emit_orc_b(cache, out)?,
+        ZbbOp::Rev8 => out.bswap_r32(Gpr::Rax)?,
+    }
+    if dst != Gpr::Rax {
+        out.mov_r32_r32(dst, Gpr::Rax)?;
+    }
+    Ok(())
+}
+
+fn emit_cpop(lhs: Gpr, cache: &mut RegisterCache, out: &mut X64Emitter) -> Result<(), EmitError> {
+    cache.record_scratch_clobber(Gpr::Rdx);
+    out.mov_r32_r32(Gpr::Rax, lhs)?;
+    out.mov_r32_r32(Gpr::Rdx, Gpr::Rax)?;
+    out.shr_r32_imm8(Gpr::Rdx, 1)?;
+    out.and_r32_imm32(Gpr::Rdx, 0x5555_5555)?;
+    out.sub_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+    out.mov_r32_r32(Gpr::Rdx, Gpr::Rax)?;
+    out.and_r32_imm32(Gpr::Rax, 0x3333_3333)?;
+    out.shr_r32_imm8(Gpr::Rdx, 2)?;
+    out.and_r32_imm32(Gpr::Rdx, 0x3333_3333)?;
+    out.add_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+    out.mov_r32_r32(Gpr::Rdx, Gpr::Rax)?;
+    out.shr_r32_imm8(Gpr::Rdx, 4)?;
+    out.add_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+    out.and_r32_imm32(Gpr::Rax, 0x0f0f_0f0f)?;
+    out.mov_r32_r32(Gpr::Rdx, Gpr::Rax)?;
+    out.shr_r32_imm8(Gpr::Rdx, 8)?;
+    out.add_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+    out.mov_r32_r32(Gpr::Rdx, Gpr::Rax)?;
+    out.shr_r32_imm8(Gpr::Rdx, 16)?;
+    out.add_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+    out.and_r32_imm32(Gpr::Rax, 0x3f)
+}
+
+fn emit_orc_b(cache: &mut RegisterCache, out: &mut X64Emitter) -> Result<(), EmitError> {
+    cache.record_scratch_clobber(Gpr::Rdx);
+    out.mov_r32_r32(Gpr::Rdx, Gpr::Rax)?;
+    out.and_r32_imm32(Gpr::Rdx, 0x7f7f_7f7f)?;
+    out.add_r32_imm32(Gpr::Rdx, 0x7f7f_7f7f)?;
+    out.or_r32_r32(Gpr::Rax, Gpr::Rdx)?;
+    out.and_r32_imm32(Gpr::Rax, 0x8080_8080_u32 as i32)?;
+    out.shr_r32_imm8(Gpr::Rax, 7)?;
+    out.mov_r32_imm32(Gpr::Rdx, 0xff)?;
+    out.imul_r32_r32(Gpr::Rax, Gpr::Rdx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1617,6 +1760,7 @@ mod tests {
     use crate::rv32_dbt::ir::DbtIrBlock;
     use crate::rv32_dbt::x86_64::emitter::{EmitError, Gpr, Mem, X64Emitter};
     use crate::rv32_dbt::DbtFaultKind;
+    use crate::rv32im::encoding as e;
     use crate::rv32im::{
         decode_product_word,
         encoding::{
@@ -2519,6 +2663,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_zbb_operation_matches_canonical_edge_vectors() {
+        let binary: [fn(u8, u8, u8) -> u32; 9] = [
+            e::andn,
+            e::orn,
+            e::xnor,
+            e::min,
+            e::minu,
+            e::max,
+            e::maxu,
+            e::rol,
+            e::ror,
+        ];
+        let unary: [fn(u8, u8) -> u32; 8] = [
+            e::clz,
+            e::ctz,
+            e::cpop,
+            e::sext_b,
+            e::sext_h,
+            e::zext_h,
+            e::orc_b,
+            e::rev8,
+        ];
+        let pairs = [
+            (0, 0),
+            (u32::MAX, 1),
+            (i32::MIN as u32, 31),
+            (0x8001_8080, 33),
+            (0x5555_aaaa, 0xaaaa_5555),
+        ];
+
+        for &(lhs, rhs) in &pairs {
+            for encode in binary {
+                assert_zbb_dbt_matches_canonical(encode(3, 1, 2), lhs, rhs);
+            }
+            for encode in unary {
+                assert_zbb_dbt_matches_canonical(encode(3, 1), lhs, rhs);
+            }
+            assert_zbb_dbt_matches_canonical(e::rori(3, 1, rhs as u8), lhs, rhs);
+        }
+    }
+
+    fn assert_zbb_dbt_matches_canonical(word: u32, lhs: u32, rhs: u32) {
+        let slots = slots(&[word]);
+        let block = DbtBlockInput::new(0xf000, &slots, DbtBlockMode::DirectFast).unwrap();
+        let (actual, tag, exit, _) = execute(&block, &[(1, lhs), (2, rhs), (3, 0xfeed_face)]);
+        let mut expected = Rv32imCpu::new(0xf000);
+        expected.set_register(1, lhs).unwrap();
+        expected.set_register(2, rhs).unwrap();
+        expected.set_register(3, 0xfeed_face).unwrap();
+        let mut bus = MachineMemory::zeroed(4).unwrap();
+        expected
+            .execute_decoded(&mut bus, 0xf000, decode_product_word(word).unwrap())
+            .unwrap();
+
+        assert_eq!(tag, DbtExitTag::Completed, "word={word:#010x}");
+        assert_eq!(exit.attempted, 1, "word={word:#010x}");
+        assert_eq!(actual.pc(), expected.pc(), "word={word:#010x}");
+        assert_eq!(
+            actual.register(3),
+            expected.register(3),
+            "word={word:#010x} lhs={lhs:#010x} rhs={rhs:#010x}"
+        );
     }
 
     #[test]
