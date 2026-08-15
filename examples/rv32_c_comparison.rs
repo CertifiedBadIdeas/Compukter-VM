@@ -22,8 +22,8 @@ use compukter_vm::benchmarks::{
 use compukter_vm::benchmarks::{self_ab_delta, self_ab_order};
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig, Rv32Machine,
-    Rv32MachineConfig, Rv32MachineOutcome, DEFAULT_DBT_CODE_ALIGNMENT,
-    DEFAULT_DBT_REGISTER_PROFILE,
+    Rv32MachineConfig, Rv32MachineOutcome, DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_ALIGNMENT,
+    DEFAULT_DBT_CODE_BYTES, DEFAULT_DBT_REGISTER_PROFILE,
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
@@ -379,8 +379,8 @@ const DBT_MATRIX: [Candidate; 19] = [
     cached_dbt_candidate(
         "rv32-cached-dbt-256-sets",
         "cached-dbt-256-sets",
-        256,
-        128 * 1024,
+        DEFAULT_DBT_CACHE_SETS,
+        DEFAULT_DBT_CODE_BYTES,
     ),
     cached_dbt_candidate(
         "rv32-cached-dbt-512-sets",
@@ -454,6 +454,25 @@ const REGISTER_ALIGNMENT_MATRIX: [Candidate; 4] = [
         "rcx8-base64",
         Rv32DbtRegisterProfile::RcxOverflow8,
         64,
+    ),
+];
+
+const FOCUSED_PRODUCT_BLOCK_CANDIDATES: [Candidate; 2] = [
+    cached_dbt_candidate_with_block_size(
+        "rv32-cached-dbt-product-block-8",
+        "cached-dbt-product-block-8",
+        DEFAULT_DBT_CACHE_SETS,
+        DEFAULT_DBT_CODE_BYTES,
+        8,
+        DEFAULT_DBT_CODE_ALIGNMENT,
+    ),
+    cached_dbt_candidate_with_block_size(
+        "rv32-cached-dbt-product-block-16",
+        "cached-dbt-product-block-16",
+        256,
+        128 * 1024,
+        16,
+        DEFAULT_DBT_CODE_ALIGNMENT,
     ),
 ];
 
@@ -1242,6 +1261,7 @@ fn comparison_candidate(name: &str) -> Option<Candidate> {
     COMMON_CANDIDATES
         .iter()
         .chain(&DBT_MATRIX)
+        .chain(&FOCUSED_PRODUCT_BLOCK_CANDIDATES)
         .chain(&TIER1_CANDIDATES)
         .copied()
         .find(|candidate| candidate.name == name)
