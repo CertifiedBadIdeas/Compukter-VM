@@ -194,7 +194,7 @@ impl MemoryBus for Rv32AddressSpace {
         self.bus.take_yield_signal()
     }
 
-    fn load_i32(&self, address: u32) -> Result<i32, MemoryFault> {
+    fn load_i32(&mut self, address: u32) -> Result<i32, MemoryFault> {
         self.require(address, 4, Access::Read)?;
         self.bus.load_i32(address)
     }
@@ -218,7 +218,7 @@ impl MemoryBus for Rv32AddressSpace {
         self.bus.validate_atomic_i32(address, access)
     }
 
-    fn atomic_load_i32(&self, address: u32) -> Result<i32, MemoryFault> {
+    fn atomic_load_i32(&mut self, address: u32) -> Result<i32, MemoryFault> {
         self.validate_atomic_i32(address, AtomicWordAccess::Load)?;
         self.bus.atomic_load_i32(address)
     }
@@ -237,7 +237,7 @@ impl MemoryBus for Rv32AddressSpace {
         self.bus.atomic_update_i32(address, update)
     }
 
-    fn load_u8(&self, address: u32) -> Result<u8, MemoryFault> {
+    fn load_u8(&mut self, address: u32) -> Result<u8, MemoryFault> {
         self.require(address, 1, Access::Read)?;
         self.bus.load_u8(address)
     }
@@ -247,27 +247,17 @@ impl MemoryBus for Rv32AddressSpace {
         self.bus.store_u8(address, value)
     }
 
-    fn load_u16(&self, address: u32) -> Result<u16, MemoryFault> {
-        if !self.require(address, 2, Access::Read)? {
-            return Err(MemoryFault::at(
-                address,
-                format!("RV32 halfword read at {address:#010x} is unsupported for MMIO"),
-            ));
-        }
+    fn load_u16(&mut self, address: u32) -> Result<u16, MemoryFault> {
+        self.require(address, 2, Access::Read)?;
         self.bus.load_u16(address)
     }
 
     fn store_u16(&mut self, address: u32, value: u16) -> Result<(), MemoryFault> {
-        if !self.require(address, 2, Access::Write)? {
-            return Err(MemoryFault::at(
-                address,
-                format!("RV32 halfword write at {address:#010x} is unsupported for MMIO"),
-            ));
-        }
+        self.require(address, 2, Access::Write)?;
         self.bus.store_u16(address, value)
     }
 
-    fn load_u64(&self, address: u32) -> Result<u64, MemoryFault> {
+    fn load_u64(&mut self, address: u32) -> Result<u64, MemoryFault> {
         self.require(address, 8, Access::Read)?;
         self.bus.load_u64(address)
     }
@@ -281,7 +271,7 @@ impl MemoryBus for Rv32AddressSpace {
 #[cfg(test)]
 mod tests {
     use super::Rv32AddressSpace;
-    use crate::bus::{MachineBus, MmioDevice};
+    use crate::bus::{MachineBus, MmioAccessWidth, MmioContext, MmioDevice};
     use crate::memory::{MemoryBus, MemoryFault};
     use crate::rv32_machine::{Rv32ElfLoader, Rv32PagePermissions};
 
@@ -292,17 +282,28 @@ mod tests {
             4
         }
 
-        fn load_i32(&self, offset: u32) -> Result<i32, MemoryFault> {
-            if offset == 0 {
-                Ok(self.0)
+        fn read(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+        ) -> Result<u64, MemoryFault> {
+            if offset == 0 && width == MmioAccessWidth::Word {
+                Ok(u64::from(self.0 as u32))
             } else {
                 Err(MemoryFault::new("invalid test offset".to_string()))
             }
         }
 
-        fn store_i32(&mut self, offset: u32, value: i32) -> Result<(), MemoryFault> {
-            if offset == 0 {
-                self.0 = value;
+        fn write(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+            value: u64,
+        ) -> Result<(), MemoryFault> {
+            if offset == 0 && width == MmioAccessWidth::Word {
+                self.0 = value as u32 as i32;
                 Ok(())
             } else {
                 Err(MemoryFault::new("invalid test offset".to_string()))

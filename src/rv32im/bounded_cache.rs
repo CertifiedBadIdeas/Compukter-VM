@@ -99,7 +99,7 @@ impl BoundedCachedRv32imProgram {
     pub(crate) fn resolve(
         &mut self,
         instruction_pc: u32,
-        bus: &dyn MemoryBus,
+        bus: &mut dyn MemoryBus,
     ) -> Result<Rv32ResolvedInstruction, MemoryFault> {
         self.resolve_with_decoder(instruction_pc, bus, decode)
     }
@@ -107,7 +107,7 @@ impl BoundedCachedRv32imProgram {
     pub(crate) fn resolve_with_decoder<D>(
         &mut self,
         instruction_pc: u32,
-        bus: &dyn MemoryBus,
+        bus: &mut dyn MemoryBus,
         decoder: D,
     ) -> Result<Rv32ResolvedInstruction, MemoryFault>
     where

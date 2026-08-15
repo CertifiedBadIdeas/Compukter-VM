@@ -91,7 +91,7 @@ impl BoundedDecodedBlockCache {
         &mut self,
         start_pc: u32,
         executable_end: u32,
-        bus: &dyn MemoryBus,
+        bus: &mut dyn MemoryBus,
     ) -> Result<&[Rv32ResolvedInstruction], MemoryFault> {
         let set_index = ((start_pc >> 2) as usize) & (self.sets.len() - 1);
         if let Some(way_index) = self.sets[set_index]
@@ -177,12 +177,12 @@ mod tests {
 
     #[test]
     fn cache_builds_bounded_prefixes_and_reuses_preallocated_ways() {
-        let memory = memory(&[addi(1, 1, 1), addi(2, 2, 1), jal(0, 0)]);
+        let mut memory = memory(&[addi(1, 1, 1), addi(2, 2, 1), jal(0, 0)]);
         let mut cache = BoundedDecodedBlockCache::new(1, 8).unwrap();
         let retained = cache.retained_bytes();
 
-        assert_eq!(cache.resolve(0, 12, &memory).unwrap().len(), 3);
-        assert_eq!(cache.resolve(0, 12, &memory).unwrap().len(), 3);
+        assert_eq!(cache.resolve(0, 12, &mut memory).unwrap().len(), 3);
+        assert_eq!(cache.resolve(0, 12, &mut memory).unwrap().len(), 3);
         assert_eq!(
             cache.stats(),
             Rv32BlockCacheStats {
@@ -199,17 +199,20 @@ mod tests {
     #[test]
     fn construction_stops_at_maximum_page_and_executable_boundaries() {
         let words = vec![addi(1, 1, 1); 1025];
-        let memory = memory(&words);
+        let mut memory = memory(&words);
 
         let mut max_cache = BoundedDecodedBlockCache::new(1, 2).unwrap();
-        assert_eq!(max_cache.resolve(0, 16, &memory).unwrap().len(), 2);
+        assert_eq!(max_cache.resolve(0, 16, &mut memory).unwrap().len(), 2);
 
         let mut range_cache = BoundedDecodedBlockCache::new(1, 8).unwrap();
-        assert_eq!(range_cache.resolve(0, 4, &memory).unwrap().len(), 1);
+        assert_eq!(range_cache.resolve(0, 4, &mut memory).unwrap().len(), 1);
 
         let mut page_cache = BoundedDecodedBlockCache::new(1, 8).unwrap();
         assert_eq!(
-            page_cache.resolve(0x0ffc, 0x1004, &memory).unwrap().len(),
+            page_cache
+                .resolve(0x0ffc, 0x1004, &mut memory)
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -226,9 +229,9 @@ mod tests {
             fence_i(),
             0xffff_ffff,
         ] {
-            let memory = memory(&[word, addi(1, 1, 1)]);
+            let mut memory = memory(&[word, addi(1, 1, 1)]);
             let mut cache = BoundedDecodedBlockCache::new(1, 8).unwrap();
-            let block = cache.resolve(0, 8, &memory).unwrap();
+            let block = cache.resolve(0, 8, &mut memory).unwrap();
             assert_eq!(block.len(), 1, "word {word:#010x}");
             assert!(ends_basic_block(block[0]));
         }
@@ -244,10 +247,12 @@ mod tests {
             lr_w(1, 2, false, false),
             jal(0, 0),
         ];
-        let memory = memory(&words);
+        let mut memory = memory(&words);
         let mut cache = BoundedDecodedBlockCache::new(1, 8).unwrap();
 
-        let block = cache.resolve(0, words.len() as u32 * 4, &memory).unwrap();
+        let block = cache
+            .resolve(0, words.len() as u32 * 4, &mut memory)
+            .unwrap();
 
         assert_eq!(block.len(), words.len());
         assert!(block[..block.len() - 1]
@@ -259,17 +264,17 @@ mod tests {
 
     #[test]
     fn invalid_words_are_cached_and_two_way_eviction_is_deterministic() {
-        let memory = memory(&[0xffff_ffff, jal(0, 0), jal(0, 0)]);
+        let mut memory = memory(&[0xffff_ffff, jal(0, 0), jal(0, 0)]);
         let mut cache = BoundedDecodedBlockCache::new(1, 1).unwrap();
 
         assert!(matches!(
-            cache.resolve(0, 12, &memory).unwrap()[0],
+            cache.resolve(0, 12, &mut memory).unwrap()[0],
             Rv32ResolvedInstruction::Invalid { word: 0xffff_ffff }
         ));
-        cache.resolve(0, 12, &memory).unwrap();
-        cache.resolve(4, 12, &memory).unwrap();
-        cache.resolve(8, 12, &memory).unwrap();
-        cache.resolve(0, 12, &memory).unwrap();
+        cache.resolve(0, 12, &mut memory).unwrap();
+        cache.resolve(4, 12, &mut memory).unwrap();
+        cache.resolve(8, 12, &mut memory).unwrap();
+        cache.resolve(0, 12, &mut memory).unwrap();
 
         assert_eq!(cache.stats().hits, 1);
         assert_eq!(cache.stats().misses, 4);
@@ -278,15 +283,15 @@ mod tests {
 
     #[test]
     fn entry_fetch_fault_is_precise_and_later_fault_caches_only_valid_prefix() {
-        let memory = memory(&[addi(1, 1, 1)]);
+        let mut memory = memory(&[addi(1, 1, 1)]);
         let mut cache = BoundedDecodedBlockCache::new(1, 8).unwrap();
 
-        let entry_fault = cache.resolve(4, 8, &memory).unwrap_err();
+        let entry_fault = cache.resolve(4, 8, &mut memory).unwrap_err();
         assert_eq!(entry_fault.address(), Some(4));
         assert_eq!(cache.stats().blocks_built, 0);
 
-        assert_eq!(cache.resolve(0, 8, &memory).unwrap().len(), 1);
-        assert_eq!(cache.resolve(0, 8, &memory).unwrap().len(), 1);
+        assert_eq!(cache.resolve(0, 8, &mut memory).unwrap().len(), 1);
+        assert_eq!(cache.resolve(0, 8, &mut memory).unwrap().len(), 1);
         assert_eq!(cache.stats().blocks_built, 1);
         assert_eq!(cache.stats().hits, 1);
     }

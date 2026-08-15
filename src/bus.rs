@@ -4,6 +4,43 @@ use std::cell::Cell;
 
 pub type MmioDeviceId = usize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioAccessWidth {
+    Byte,
+    Halfword,
+    Word,
+    Doubleword,
+}
+
+impl MmioAccessWidth {
+    pub const fn bytes(self) -> u32 {
+        match self {
+            Self::Byte => 1,
+            Self::Halfword => 2,
+            Self::Word => 4,
+            Self::Doubleword => 8,
+        }
+    }
+}
+
+pub struct MmioContext<'a> {
+    memory: &'a mut MachineMemory,
+}
+
+impl<'a> MmioContext<'a> {
+    fn new(memory: &'a mut MachineMemory) -> Self {
+        Self { memory }
+    }
+
+    pub fn memory(&self) -> &MachineMemory {
+        self.memory
+    }
+
+    pub fn memory_mut(&mut self) -> &mut MachineMemory {
+        self.memory
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MachineBusTrafficSnapshot {
     pub loads: u64,
@@ -65,26 +102,20 @@ pub trait MmioDevice: Any {
         false
     }
 
-    fn load_i32(&self, offset: u32) -> Result<i32, MemoryFault>;
-
-    fn store_i32(&mut self, offset: u32, value: i32) -> Result<(), MemoryFault>;
-
-    fn store_i32_with_memory(
+    fn read(
         &mut self,
+        context: &mut MmioContext<'_>,
         offset: u32,
-        value: i32,
-        _memory: &mut MachineMemory,
-    ) -> Result<(), MemoryFault> {
-        self.store_i32(offset, value)
-    }
+        width: MmioAccessWidth,
+    ) -> Result<u64, MemoryFault>;
 
-    fn load_u8(&self, offset: u32) -> Result<u8, MemoryFault> {
-        Ok(self.load_i32(offset)?.to_le_bytes()[0])
-    }
-
-    fn store_u8(&mut self, offset: u32, value: u8) -> Result<(), MemoryFault> {
-        self.store_i32(offset, i32::from(value))
-    }
+    fn write(
+        &mut self,
+        context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+        value: u64,
+    ) -> Result<(), MemoryFault>;
 }
 
 struct MmioRegion {
@@ -104,9 +135,9 @@ impl MmioRegion {
         })
     }
 
-    fn offset_for_i32(&self, address: u32) -> Option<u32> {
+    fn offset_for(&self, address: u32, width: MmioAccessWidth) -> Option<u32> {
         let end = self.end().ok()?;
-        let access_end = address.checked_add(4)?;
+        let access_end = address.checked_add(width.bytes())?;
         if address >= self.base && access_end <= end {
             Some(address - self.base)
         } else {
@@ -122,35 +153,6 @@ impl MmioRegion {
             return false;
         };
         address < region_end && self.base < access_end
-    }
-
-    fn offset_for_u8(&self, address: u32) -> Option<u32> {
-        let end = self.end().ok()?;
-        if address >= self.base && address < end {
-            Some(address - self.base)
-        } else {
-            None
-        }
-    }
-
-    fn offset_for_u16(&self, address: u32) -> Option<u32> {
-        let end = self.end().ok()?;
-        let access_end = address.checked_add(2)?;
-        if address >= self.base && access_end <= end {
-            Some(address - self.base)
-        } else {
-            None
-        }
-    }
-
-    fn offset_for_u64(&self, address: u32) -> Option<u32> {
-        let end = self.end().ok()?;
-        let access_end = address.checked_add(8)?;
-        if address >= self.base && access_end <= end {
-            Some(address - self.base)
-        } else {
-            None
-        }
     }
 }
 
@@ -197,6 +199,12 @@ impl MachineBus {
             traffic: MachineBusTrafficCounters::default(),
         };
         let region_end = region.end()?;
+        if u64::from(base) < self.memory.len() as u64 {
+            return Err(MemoryFault::new(format!(
+                "mmio region {base:#010x}..{region_end:#010x} overlaps RAM 0x00000000..{:#010x}",
+                self.memory.len(),
+            )));
+        }
         for existing in &self.regions {
             let existing_end = existing.end()?;
             if base < existing_end && existing.base < region_end {
@@ -229,7 +237,7 @@ impl MachineBus {
             .map(|region| (region.base, region.size))
     }
 
-    pub fn load_i32(&self, address: u32) -> Result<i32, MemoryFault> {
+    pub fn load_i32(&mut self, address: u32) -> Result<i32, MemoryFault> {
         <Self as MemoryBus>::load_i32(self, address)
     }
 
@@ -237,7 +245,7 @@ impl MachineBus {
         <Self as MemoryBus>::store_i32(self, address, value)
     }
 
-    pub fn load_u8(&self, address: u32) -> Result<u8, MemoryFault> {
+    pub fn load_u8(&mut self, address: u32) -> Result<u8, MemoryFault> {
         <Self as MemoryBus>::load_u8(self, address)
     }
 
@@ -245,7 +253,7 @@ impl MachineBus {
         <Self as MemoryBus>::store_u8(self, address, value)
     }
 
-    pub fn load_u16(&self, address: u32) -> Result<u16, MemoryFault> {
+    pub fn load_u16(&mut self, address: u32) -> Result<u16, MemoryFault> {
         <Self as MemoryBus>::load_u16(self, address)
     }
 
@@ -253,7 +261,7 @@ impl MachineBus {
         <Self as MemoryBus>::store_u16(self, address, value)
     }
 
-    pub fn load_u64(&self, address: u32) -> Result<u64, MemoryFault> {
+    pub fn load_u64(&mut self, address: u32) -> Result<u64, MemoryFault> {
         <Self as MemoryBus>::load_u64(self, address)
     }
 
@@ -298,13 +306,16 @@ impl MemoryBus for MachineBus {
             .any(|region| region.device.take_yield_signal())
     }
 
-    fn load_i32(&self, address: u32) -> Result<i32, MemoryFault> {
-        for region in &self.regions {
-            if let Some(offset) = region.offset_for_i32(address) {
-                let value = region.device.load_i32(offset)?;
+    fn load_i32(&mut self, address: u32) -> Result<i32, MemoryFault> {
+        for region in &mut self.regions {
+            if let Some(offset) = region.offset_for(address, MmioAccessWidth::Word) {
+                let mut context = MmioContext::new(&mut self.memory);
+                let value = region
+                    .device
+                    .read(&mut context, offset, MmioAccessWidth::Word)?;
                 region.traffic.record_load(4);
                 self.mmio_traffic.record_load(4);
-                return Ok(value);
+                return Ok(value as u32 as i32);
             }
         }
         let value = self.memory.load_i32(address)?;
@@ -314,10 +325,14 @@ impl MemoryBus for MachineBus {
 
     fn store_i32(&mut self, address: u32, value: i32) -> Result<(), MemoryFault> {
         for region in &mut self.regions {
-            if let Some(offset) = region.offset_for_i32(address) {
-                region
-                    .device
-                    .store_i32_with_memory(offset, value, &mut self.memory)?;
+            if let Some(offset) = region.offset_for(address, MmioAccessWidth::Word) {
+                let mut context = MmioContext::new(&mut self.memory);
+                region.device.write(
+                    &mut context,
+                    offset,
+                    MmioAccessWidth::Word,
+                    u64::from(value as u32),
+                )?;
                 region.traffic.record_store(4);
                 self.mmio_traffic.record_store(4);
                 return Ok(());
@@ -346,7 +361,7 @@ impl MemoryBus for MachineBus {
         self.memory.validate_atomic_i32(address)
     }
 
-    fn atomic_load_i32(&self, address: u32) -> Result<i32, MemoryFault> {
+    fn atomic_load_i32(&mut self, address: u32) -> Result<i32, MemoryFault> {
         self.validate_atomic_i32(address, AtomicWordAccess::Load)?;
         let value = self.memory.atomic_load_i32(address)?;
         self.ram_traffic.record_load(4);
@@ -372,13 +387,16 @@ impl MemoryBus for MachineBus {
         Ok(old)
     }
 
-    fn load_u8(&self, address: u32) -> Result<u8, MemoryFault> {
-        for region in &self.regions {
-            if let Some(offset) = region.offset_for_u8(address) {
-                let value = region.device.load_u8(offset)?;
+    fn load_u8(&mut self, address: u32) -> Result<u8, MemoryFault> {
+        for region in &mut self.regions {
+            if let Some(offset) = region.offset_for(address, MmioAccessWidth::Byte) {
+                let mut context = MmioContext::new(&mut self.memory);
+                let value = region
+                    .device
+                    .read(&mut context, offset, MmioAccessWidth::Byte)?;
                 region.traffic.record_load(1);
                 self.mmio_traffic.record_load(1);
-                return Ok(value);
+                return Ok(value as u8);
             }
         }
         let value = self.memory.load_u8(address)?;
@@ -388,8 +406,14 @@ impl MemoryBus for MachineBus {
 
     fn store_u8(&mut self, address: u32, value: u8) -> Result<(), MemoryFault> {
         for region in &mut self.regions {
-            if let Some(offset) = region.offset_for_u8(address) {
-                region.device.store_u8(offset, value)?;
+            if let Some(offset) = region.offset_for(address, MmioAccessWidth::Byte) {
+                let mut context = MmioContext::new(&mut self.memory);
+                region.device.write(
+                    &mut context,
+                    offset,
+                    MmioAccessWidth::Byte,
+                    u64::from(value),
+                )?;
                 region.traffic.record_store(1);
                 self.mmio_traffic.record_store(1);
                 return Ok(());
@@ -400,16 +424,16 @@ impl MemoryBus for MachineBus {
         Ok(())
     }
 
-    fn load_u16(&self, address: u32) -> Result<u16, MemoryFault> {
-        for region in &self.regions {
-            if let Some(offset) = region.offset_for_u16(address) {
-                let value = u16::from_le_bytes([
-                    region.device.load_u8(offset)?,
-                    region.device.load_u8(offset + 1)?,
-                ]);
+    fn load_u16(&mut self, address: u32) -> Result<u16, MemoryFault> {
+        for region in &mut self.regions {
+            if let Some(offset) = region.offset_for(address, MmioAccessWidth::Halfword) {
+                let mut context = MmioContext::new(&mut self.memory);
+                let value = region
+                    .device
+                    .read(&mut context, offset, MmioAccessWidth::Halfword)?;
                 region.traffic.record_load(2);
                 self.mmio_traffic.record_load(2);
-                return Ok(value);
+                return Ok(value as u16);
             }
         }
         let value = self.memory.load_u16(address)?;
@@ -419,10 +443,14 @@ impl MemoryBus for MachineBus {
 
     fn store_u16(&mut self, address: u32, value: u16) -> Result<(), MemoryFault> {
         for region in &mut self.regions {
-            if let Some(offset) = region.offset_for_u16(address) {
-                let [lo, hi] = value.to_le_bytes();
-                region.device.store_u8(offset, lo)?;
-                region.device.store_u8(offset + 1, hi)?;
+            if let Some(offset) = region.offset_for(address, MmioAccessWidth::Halfword) {
+                let mut context = MmioContext::new(&mut self.memory);
+                region.device.write(
+                    &mut context,
+                    offset,
+                    MmioAccessWidth::Halfword,
+                    u64::from(value),
+                )?;
                 region.traffic.record_store(2);
                 self.mmio_traffic.record_store(2);
                 return Ok(());
@@ -433,16 +461,17 @@ impl MemoryBus for MachineBus {
         Ok(())
     }
 
-    fn load_u64(&self, address: u32) -> Result<u64, MemoryFault> {
-        for region in &self.regions {
-            if let Some(offset) = region.offset_for_u64(address) {
-                let mut bytes = [0_u8; 8];
-                for (index, byte) in bytes.iter_mut().enumerate() {
-                    *byte = region.device.load_u8(offset + index as u32)?;
-                }
+    fn load_u64(&mut self, address: u32) -> Result<u64, MemoryFault> {
+        for region in &mut self.regions {
+            if let Some(offset) = region.offset_for(address, MmioAccessWidth::Doubleword) {
+                let mut context = MmioContext::new(&mut self.memory);
+                let value =
+                    region
+                        .device
+                        .read(&mut context, offset, MmioAccessWidth::Doubleword)?;
                 region.traffic.record_load(8);
                 self.mmio_traffic.record_load(8);
-                return Ok(u64::from_le_bytes(bytes));
+                return Ok(value);
             }
         }
         let value = self.memory.load_u64(address)?;
@@ -452,10 +481,11 @@ impl MemoryBus for MachineBus {
 
     fn store_u64(&mut self, address: u32, value: u64) -> Result<(), MemoryFault> {
         for region in &mut self.regions {
-            if let Some(offset) = region.offset_for_u64(address) {
-                for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
-                    region.device.store_u8(offset + index as u32, byte)?;
-                }
+            if let Some(offset) = region.offset_for(address, MmioAccessWidth::Doubleword) {
+                let mut context = MmioContext::new(&mut self.memory);
+                region
+                    .device
+                    .write(&mut context, offset, MmioAccessWidth::Doubleword, value)?;
                 region.traffic.record_store(8);
                 self.mmio_traffic.record_store(8);
                 return Ok(());
@@ -469,10 +499,8 @@ impl MemoryBus for MachineBus {
 
 #[cfg(test)]
 mod tests {
-    use crate::bus::{MachineBus, MmioDevice};
+    use crate::bus::{MachineBus, MmioAccessWidth, MmioContext, MmioDevice};
     use crate::memory::{MemoryBus, MemoryFault};
-    use std::fs;
-    use std::path::Path;
 
     struct RegisterDevice {
         value: i32,
@@ -484,17 +512,30 @@ mod tests {
             4
         }
 
-        fn load_i32(&self, offset: u32) -> Result<i32, MemoryFault> {
+        fn read(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+        ) -> Result<u64, MemoryFault> {
             assert_eq!(offset, 0);
-            Ok(self.value)
+            assert_eq!(width, MmioAccessWidth::Word);
+            Ok(u64::from(self.value as u32))
         }
 
-        fn store_i32(&mut self, offset: u32, value: i32) -> Result<(), MemoryFault> {
+        fn write(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+            value: u64,
+        ) -> Result<(), MemoryFault> {
             assert_eq!(offset, 0);
+            assert_eq!(width, MmioAccessWidth::Word);
             if self.read_only {
                 return Err(MemoryFault::new("register is read-only".to_string()));
             }
-            self.value = value;
+            self.value = value as u32 as i32;
             Ok(())
         }
     }
@@ -503,61 +544,182 @@ mod tests {
         bytes: Vec<u8>,
     }
 
+    struct DmaDevice {
+        destination: u32,
+    }
+
+    impl MmioDevice for DmaDevice {
+        fn size(&self) -> u32 {
+            4
+        }
+
+        fn read(
+            &mut self,
+            context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+        ) -> Result<u64, MemoryFault> {
+            assert_eq!((offset, width), (0, MmioAccessWidth::Word));
+            Ok(u64::from(
+                context.memory().load_i32(self.destination)? as u32
+            ))
+        }
+
+        fn write(
+            &mut self,
+            context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+            value: u64,
+        ) -> Result<(), MemoryFault> {
+            assert_eq!((offset, width), (0, MmioAccessWidth::Word));
+            context
+                .memory_mut()
+                .store_i32(self.destination, value as u32 as i32)
+        }
+    }
+
+    struct CountingDevice {
+        accesses: Vec<MmioAccessWidth>,
+    }
+
+    impl MmioDevice for CountingDevice {
+        fn size(&self) -> u32 {
+            8
+        }
+
+        fn read(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+        ) -> Result<u64, MemoryFault> {
+            self.accesses.push(width);
+            Ok(match width {
+                MmioAccessWidth::Byte => u64::from(offset + 1),
+                MmioAccessWidth::Halfword => 0x0201,
+                MmioAccessWidth::Word => 0x0403_0201,
+                MmioAccessWidth::Doubleword => 0x0807_0605_0403_0201,
+            })
+        }
+
+        fn write(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            _offset: u32,
+            width: MmioAccessWidth,
+            _value: u64,
+        ) -> Result<(), MemoryFault> {
+            self.accesses.push(width);
+            Ok(())
+        }
+    }
+
     impl MmioDevice for ByteWindowDevice {
         fn size(&self) -> u32 {
             self.bytes.len() as u32
         }
 
-        fn load_i32(&self, offset: u32) -> Result<i32, MemoryFault> {
+        fn read(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+        ) -> Result<u64, MemoryFault> {
             let offset = offset as usize;
+            let width = width.bytes() as usize;
             let bytes = self
                 .bytes
-                .get(offset..offset + 4)
-                .ok_or_else(|| MemoryFault::new(format!("invalid i32 offset {offset}")))?;
-            Ok(i32::from_le_bytes(
-                bytes.try_into().expect("slice has length 4"),
-            ))
+                .get(offset..offset + width)
+                .ok_or_else(|| MemoryFault::new(format!("invalid read at offset {offset}")))?;
+            let mut value = [0_u8; 8];
+            value[..width].copy_from_slice(bytes);
+            Ok(u64::from_le_bytes(value))
         }
 
-        fn store_i32(&mut self, offset: u32, value: i32) -> Result<(), MemoryFault> {
+        fn write(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            offset: u32,
+            width: MmioAccessWidth,
+            value: u64,
+        ) -> Result<(), MemoryFault> {
             let offset = offset as usize;
+            let width = width.bytes() as usize;
             let bytes = self
                 .bytes
-                .get_mut(offset..offset + 4)
-                .ok_or_else(|| MemoryFault::new(format!("invalid i32 offset {offset}")))?;
-            bytes.copy_from_slice(&value.to_le_bytes());
-            Ok(())
-        }
-
-        fn load_u8(&self, offset: u32) -> Result<u8, MemoryFault> {
-            self.bytes
-                .get(offset as usize)
-                .copied()
-                .ok_or_else(|| MemoryFault::new(format!("invalid u8 offset {offset}")))
-        }
-
-        fn store_u8(&mut self, offset: u32, value: u8) -> Result<(), MemoryFault> {
-            let byte = self
-                .bytes
-                .get_mut(offset as usize)
-                .ok_or_else(|| MemoryFault::new(format!("invalid u8 offset {offset}")))?;
-            *byte = value;
+                .get_mut(offset..offset + width)
+                .ok_or_else(|| MemoryFault::new(format!("invalid write at offset {offset}")))?;
+            bytes.copy_from_slice(&value.to_le_bytes()[..width]);
             Ok(())
         }
     }
 
     #[test]
-    fn machine_bus_overrides_word_access_for_fetch_path() {
-        let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bus.rs");
-        let source = fs::read_to_string(source_path).unwrap();
-        let impl_start = source.find("impl MemoryBus for MachineBus").unwrap();
-        let impl_end = source[impl_start..].find("\n}\n\n#[cfg(test)]").unwrap();
-        let impl_source = &source[impl_start..impl_start + impl_end];
+    fn machine_bus_delivers_each_width_as_one_mutable_device_access() {
+        let mut bus = MachineBus::new(16).unwrap();
+        let device_id = bus
+            .map_mmio(
+                0x1000,
+                Box::new(CountingDevice {
+                    accesses: Vec::new(),
+                }),
+            )
+            .unwrap();
 
-        assert!(impl_source.contains("fn load_u16("));
-        assert!(impl_source.contains("fn store_u16("));
-        assert!(impl_source.contains("fn load_u64("));
-        assert!(impl_source.contains("fn store_u64("));
+        assert_eq!(bus.load_u8(0x1000).unwrap(), 0x01);
+        assert_eq!(bus.load_u16(0x1000).unwrap(), 0x0201);
+        assert_eq!(bus.load_i32(0x1000).unwrap(), 0x0403_0201);
+        assert_eq!(bus.load_u64(0x1000).unwrap(), 0x0807_0605_0403_0201);
+        bus.store_u8(0x1000, 1).unwrap();
+        bus.store_u16(0x1000, 2).unwrap();
+        bus.store_i32(0x1000, 3).unwrap();
+        bus.store_u64(0x1000, 4).unwrap();
+        assert_eq!(
+            bus.device::<CountingDevice>(device_id)
+                .unwrap()
+                .accesses
+                .as_slice(),
+            &[
+                MmioAccessWidth::Byte,
+                MmioAccessWidth::Halfword,
+                MmioAccessWidth::Word,
+                MmioAccessWidth::Doubleword,
+                MmioAccessWidth::Byte,
+                MmioAccessWidth::Halfword,
+                MmioAccessWidth::Word,
+                MmioAccessWidth::Doubleword,
+            ]
+        );
+    }
+
+    #[test]
+    fn machine_bus_gives_devices_bounded_ram_access() {
+        let mut bus = MachineBus::new(16).unwrap();
+        bus.map_mmio(0x1000, Box::new(DmaDevice { destination: 4 }))
+            .unwrap();
+
+        bus.store_i32(0x1000, 0x1122_3344).unwrap();
+
+        assert_eq!(bus.memory().load_i32(4).unwrap(), 0x1122_3344);
+        assert_eq!(bus.load_i32(0x1000).unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn machine_bus_rejects_mmio_that_overlaps_ram() {
+        let mut bus = MachineBus::new(16).unwrap();
+
+        let error = bus
+            .map_mmio(
+                8,
+                Box::new(RegisterDevice {
+                    value: 7,
+                    read_only: false,
+                }),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("overlaps RAM"));
     }
 
     #[test]
@@ -612,7 +774,7 @@ mod tests {
         let mut bus = MachineBus::new(16).unwrap();
         let device_id = bus
             .map_mmio(
-                8,
+                0x1000,
                 Box::new(RegisterDevice {
                     value: 7,
                     read_only: false,
@@ -621,9 +783,9 @@ mod tests {
             .unwrap();
         let mut increment = |old: i32| old.wrapping_add(1);
 
-        let error = bus.atomic_update_i32(8, &mut increment).unwrap_err();
+        let error = bus.atomic_update_i32(0x1000, &mut increment).unwrap_err();
 
-        assert_eq!(error.address(), Some(8));
+        assert_eq!(error.address(), Some(0x1000));
         assert_eq!(bus.device::<RegisterDevice>(device_id).unwrap().value, 7);
         assert_eq!(bus.stats_snapshot().mmio.loads, 0);
         assert_eq!(bus.stats_snapshot().mmio.stores, 0);
@@ -650,7 +812,7 @@ mod tests {
         let mut bus = MachineBus::new(16).unwrap();
         let device_id = bus
             .map_mmio(
-                8,
+                0x1000,
                 Box::new(RegisterDevice {
                     value: 7,
                     read_only: false,
@@ -660,8 +822,8 @@ mod tests {
 
         bus.store_u8(0, 1).unwrap();
         assert_eq!(bus.load_u16(0).unwrap(), 1);
-        bus.store_i32(8, 11).unwrap();
-        assert_eq!(bus.load_i32(8).unwrap(), 11);
+        bus.store_i32(0x1000, 11).unwrap();
+        assert_eq!(bus.load_i32(0x1000).unwrap(), 11);
 
         let stats = bus.stats_snapshot();
 
@@ -675,7 +837,7 @@ mod tests {
         assert_eq!(stats.mmio.bytes_written, 4);
         assert_eq!(stats.mmio_devices.len(), 1);
         assert_eq!(stats.mmio_devices[0].device_id, device_id);
-        assert_eq!(stats.mmio_devices[0].base, 8);
+        assert_eq!(stats.mmio_devices[0].base, 0x1000);
         assert_eq!(stats.mmio_devices[0].size, 4);
         assert_eq!(stats.mmio_devices[0].traffic, stats.mmio);
     }
@@ -684,7 +846,7 @@ mod tests {
     fn machine_bus_stats_snapshot_counts_u64_as_single_bus_access() {
         let mut bus = MachineBus::new(32).unwrap();
         bus.map_mmio(
-            16,
+            0x1000,
             Box::new(ByteWindowDevice {
                 bytes: vec![0_u8; 8],
             }),
@@ -693,8 +855,8 @@ mod tests {
 
         bus.store_u64(0, 0x0102_0304_0506_0708).unwrap();
         assert_eq!(bus.load_u64(0).unwrap(), 0x0102_0304_0506_0708);
-        bus.store_u64(16, 0x1112_1314_1516_1718).unwrap();
-        assert_eq!(bus.load_u64(16).unwrap(), 0x1112_1314_1516_1718);
+        bus.store_u64(0x1000, 0x1112_1314_1516_1718).unwrap();
+        assert_eq!(bus.load_u64(0x1000).unwrap(), 0x1112_1314_1516_1718);
 
         let stats = bus.stats_snapshot();
 
@@ -707,41 +869,6 @@ mod tests {
         assert_eq!(stats.mmio.bytes_read, 8);
         assert_eq!(stats.mmio.bytes_written, 8);
         assert_eq!(stats.mmio_devices[0].traffic, stats.mmio);
-    }
-
-    #[test]
-    fn machine_bus_routes_word_load_to_overlapping_mmio_before_ram() {
-        let mut bus = MachineBus::new(16).unwrap();
-        bus.memory_mut().store_u16(0, 0x1122).unwrap();
-        bus.map_mmio(
-            0,
-            Box::new(ByteWindowDevice {
-                bytes: vec![0x78, 0x56, 0x34, 0x12],
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(bus.load_u16(0).unwrap(), 0x5678);
-    }
-
-    #[test]
-    fn machine_bus_routes_word_store_to_overlapping_mmio_before_ram() {
-        let mut bus = MachineBus::new(16).unwrap();
-        bus.memory_mut().store_u16(0, 0x1122).unwrap();
-        let device_id = bus
-            .map_mmio(
-                0,
-                Box::new(ByteWindowDevice {
-                    bytes: vec![0x78, 0x56, 0x34, 0x12],
-                }),
-            )
-            .unwrap();
-
-        bus.store_u16(0, 0xa1b2).unwrap();
-
-        assert_eq!(bus.memory().load_u16(0).unwrap(), 0x1122);
-        let device = bus.device::<ByteWindowDevice>(device_id).unwrap();
-        assert_eq!(device.bytes, vec![0xb2, 0xa1, 0x34, 0x12]);
     }
 
     #[test]
