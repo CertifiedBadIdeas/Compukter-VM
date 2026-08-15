@@ -426,7 +426,7 @@ fn self_ab_mode_calibrates_and_reports_only_the_selected_product_pair() {
         "self_ab_phase\\trole\\tcandidate\\tphase\\tsamples\\tmedian_ns\\tp95_ns\\tdelta_vs_baseline_percent",
         "baseline",
         "candidate",
-        "self-A/B retired instruction mismatch",
+        "self-A/B normalized retired instruction mismatch",
         "DBT phase timer did not cover every translation",
     ] {
         assert!(source.contains(contract), "missing self-A/B report contract {contract}");
