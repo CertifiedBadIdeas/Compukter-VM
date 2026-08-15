@@ -21,10 +21,14 @@
 use super::dbt::{PreparedDbtBlock, Rv32DbtExecution, Rv32DbtPolicy};
 use super::hart::{Rv32HartStep, Rv32MachineHart};
 use super::platform::{self, ControlDevice, DebugDevice};
-use super::{Rv32AddressSpace, Rv32AddressSpaceError, Rv32DbtStats, Rv32ElfError, Rv32ElfLoader};
+use super::{
+    builder::{PendingMmioDevice, Rv32DeviceHandle},
+    Rv32AddressSpace, Rv32AddressSpaceError, Rv32DbtStats, Rv32ElfError, Rv32LoadedImage,
+    Rv32MachineBuilder,
+};
 #[cfg(feature = "dbt-code-audit")]
 use super::{Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError};
-use crate::bus::{MachineBus, MmioDeviceId};
+use crate::bus::{MachineBus, MmioDevice, MmioDeviceId};
 use crate::memory::{MemoryBus, MemoryFault};
 #[cfg(target_arch = "x86_64")]
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
@@ -283,12 +287,20 @@ pub struct Rv32Machine {
     executable_ranges: Vec<Range<u32>>,
     control_device: MmioDeviceId,
     debug_device: MmioDeviceId,
+    first_custom_device: MmioDeviceId,
+    custom_device_count: usize,
 }
 
 impl Rv32Machine {
     pub fn from_elf(elf: &[u8], config: Rv32MachineConfig) -> Result<Self, Rv32MachineBuildError> {
-        validate_config(config)?;
-        let image = Rv32ElfLoader::load(elf, config.ram_size)?;
+        Rv32MachineBuilder::from_elf(elf, config)?.build()
+    }
+
+    pub(super) fn from_loaded_image(
+        image: Rv32LoadedImage,
+        config: Rv32MachineConfig,
+        custom_devices: Vec<PendingMmioDevice>,
+    ) -> Result<Self, Rv32MachineBuildError> {
         let ram_len = u32::try_from(config.ram_size).map_err(|_| {
             Rv32MachineBuildError::Config("RAM size exceeds the RV32 address space".to_string())
         })?;
@@ -367,6 +379,14 @@ impl Rv32Machine {
             platform::DEBUG_BASE,
             Box::new(DebugDevice::with_limit(config.debug_limit)),
         )?;
+        let custom_device_count = custom_devices.len();
+        let mut first_custom_device = 0;
+        for (index, pending) in custom_devices.into_iter().enumerate() {
+            let device_id = bus.map_mmio(pending.base, pending.device)?;
+            if index == 0 {
+                first_custom_device = device_id;
+            }
+        }
         let address_space = Rv32AddressSpace::from_parts(bus, page_permissions)?;
 
         Ok(Self {
@@ -376,6 +396,8 @@ impl Rv32Machine {
             executable_ranges,
             control_device,
             debug_device,
+            first_custom_device,
+            custom_device_count,
         })
     }
 
@@ -898,6 +920,23 @@ impl Rv32Machine {
             .bytes()
     }
 
+    pub fn device<T: MmioDevice>(&self, handle: Rv32DeviceHandle<T>) -> Option<&T> {
+        let device_id = self.custom_device_id(handle)?;
+        self.address_space.bus().device(device_id)
+    }
+
+    pub fn device_mut<T: MmioDevice>(&mut self, handle: Rv32DeviceHandle<T>) -> Option<&mut T> {
+        let device_id = self.custom_device_id(handle)?;
+        self.address_space.bus_mut().device_mut(device_id)
+    }
+
+    fn custom_device_id<T>(&self, handle: Rv32DeviceHandle<T>) -> Option<MmioDeviceId> {
+        let ordinal = handle.ordinal();
+        (ordinal < self.custom_device_count)
+            .then(|| self.first_custom_device.checked_add(ordinal))
+            .flatten()
+    }
+
     pub fn control_status(&self) -> i32 {
         self.control().status
     }
@@ -1190,7 +1229,7 @@ fn terminal_outcome(
     }
 }
 
-fn validate_config(config: Rv32MachineConfig) -> Result<(), Rv32MachineBuildError> {
+pub(super) fn validate_config(config: Rv32MachineConfig) -> Result<(), Rv32MachineBuildError> {
     if config.ram_size == 0 {
         return Err(Rv32MachineBuildError::Config(
             "RAM size must be positive".to_string(),

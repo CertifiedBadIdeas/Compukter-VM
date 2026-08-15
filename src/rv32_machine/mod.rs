@@ -18,6 +18,7 @@
  */
 
 mod address_space;
+mod builder;
 mod csr;
 #[cfg(target_arch = "x86_64")]
 mod dbt;
@@ -27,6 +28,7 @@ mod machine;
 mod platform;
 
 pub use address_space::{Rv32AddressSpace, Rv32AddressSpaceError};
+pub use builder::{Rv32DeviceHandle, Rv32MachineBuilder};
 pub use elf::{
     Rv32ElfError, Rv32ElfErrorKind, Rv32ElfLoader, Rv32LoadedImage, Rv32PagePermissions,
 };
