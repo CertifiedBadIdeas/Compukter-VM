@@ -22,10 +22,10 @@ mod rv32_elf_support;
 
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig, Rv32Machine,
-    Rv32MachineConfig, Rv32MachineOutcome, CONTROL_BASE, DEBUG_BASE, DEFAULT_DBT_CACHE_SETS,
-    DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_CODE_BYTES, DEFAULT_DBT_MAX_INSTRUCTIONS,
-    DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES, STATUS_BOOTING, STATUS_HALTED,
-    STATUS_PANIC,
+    Rv32MachineBuilder, Rv32MachineConfig, Rv32MachineOutcome, CONTROL_BASE, DEBUG_BASE,
+    DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_CODE_BYTES,
+    DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES,
+    STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC,
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
@@ -36,12 +36,146 @@ use compukter_vm::rv32im::encoding::{
     lr_w, lui, lw, materialize, max, maxu, min, minu, orc_b, orn, rev8, rol, ror, rori, sb, sc_w,
     sext_b, sext_h, sh, slli, sw, xnor, zext_h,
 };
+use compukter_vm::{
+    bus::{MmioAccessWidth, MmioContext, MmioDevice},
+    memory::MemoryFault,
+};
 use rv32_elf_support::{halting_machine_elf, machine_program_elf, Elf32Builder, LoadSegment};
 
 const CSR_MTVEC: u16 = 0x305;
 const CSR_MEPC: u16 = 0x341;
 const CSR_MCAUSE: u16 = 0x342;
 const CSR_MTVAL: u16 = 0x343;
+
+struct TestRegister(i32);
+
+impl MmioDevice for TestRegister {
+    fn size(&self) -> u32 {
+        4
+    }
+
+    fn read(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+    ) -> Result<u64, MemoryFault> {
+        if offset == 0 && width == MmioAccessWidth::Word {
+            Ok(u64::from(self.0 as u32))
+        } else {
+            Err(MemoryFault::new("invalid test register read".to_string()))
+        }
+    }
+
+    fn write(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+        value: u64,
+    ) -> Result<(), MemoryFault> {
+        if offset == 0 && width == MmioAccessWidth::Word {
+            self.0 = value as u32 as i32;
+            Ok(())
+        } else {
+            Err(MemoryFault::new("invalid test register write".to_string()))
+        }
+    }
+}
+
+#[test]
+fn builder_installs_a_device_with_a_typed_host_handle() {
+    let elf = halting_machine_elf(b'B');
+    let mut builder = Rv32MachineBuilder::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 16),
+    )
+    .unwrap();
+    let register = builder.add_mmio_device(0x1000_1000, TestRegister(7));
+
+    let mut machine = builder.build().unwrap();
+
+    assert_eq!(machine.device(register).unwrap().0, 7);
+    machine.device_mut(register).unwrap().0 = 11;
+    assert_eq!(machine.device(register).unwrap().0, 11);
+}
+
+#[test]
+fn builder_device_is_visible_to_guest_mmio() {
+    const REGISTER_BASE: u32 = 0x1000_1000;
+    let [base_hi, base_lo] = materialize(1, REGISTER_BASE);
+    let elf = machine_program_elf(&[
+        base_hi,
+        base_lo,
+        addi(2, 0, 42),
+        sw(1, 2, 0),
+        lw(3, 1, 0),
+        jal(0, 0),
+    ]);
+    let mut builder = Rv32MachineBuilder::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+    )
+    .unwrap();
+    let register = builder.add_mmio_device(REGISTER_BASE, TestRegister(0));
+    let mut machine = builder.build().unwrap();
+
+    assert_eq!(
+        machine.run(5).unwrap(),
+        Rv32MachineOutcome::BudgetExhausted {
+            retired_delta: 5,
+            retired_total: 5,
+        }
+    );
+    assert_eq!(machine.device(register).unwrap().0, 42);
+}
+
+#[test]
+fn builder_rejects_invalid_complete_topologies() {
+    let elf = halting_machine_elf(b'T');
+
+    for base in [0x1000, CONTROL_BASE, DEBUG_BASE, u32::MAX - 1] {
+        let mut builder = Rv32MachineBuilder::from_elf(
+            &elf,
+            config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+        )
+        .unwrap();
+        let _handle = builder.add_mmio_device(base, TestRegister(0));
+        assert!(builder.build().is_err(), "base {base:#010x}");
+    }
+
+    let mut builder = Rv32MachineBuilder::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+    )
+    .unwrap();
+    let _first = builder.add_mmio_device(0x1000_1000, TestRegister(0));
+    let _second = builder.add_mmio_device(0x1000_1002, TestRegister(0));
+    assert!(builder.build().is_err());
+}
+
+#[test]
+fn typed_handle_outside_a_machine_topology_returns_none() {
+    let elf = halting_machine_elf(b'H');
+    let mut source = Rv32MachineBuilder::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+    )
+    .unwrap();
+    let _first = source.add_mmio_device(0x1000_1000, TestRegister(1));
+    let second = source.add_mmio_device(0x1000_1010, TestRegister(2));
+
+    let mut target = Rv32MachineBuilder::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+    )
+    .unwrap();
+    let _only = target.add_mmio_device(0x1000_1000, TestRegister(3));
+    let mut machine = target.build().unwrap();
+
+    assert!(machine.device(second).is_none());
+    assert!(machine.device_mut(second).is_none());
+}
 
 fn configs() -> [Rv32ExecutionBackendConfig; 5] {
     [

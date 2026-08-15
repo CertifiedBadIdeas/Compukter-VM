@@ -107,6 +107,10 @@ impl Rv32AddressSpace {
         &self.bus
     }
 
+    pub(super) fn bus_mut(&mut self) -> &mut MachineBus {
+        &mut self.bus
+    }
+
     pub(super) fn direct_ram_view(&mut self) -> Rv32DirectRamView<'_> {
         let (base, len) = {
             let memory = self.bus.memory_mut();
