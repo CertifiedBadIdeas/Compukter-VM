@@ -42,7 +42,7 @@ pub(crate) use decode::{
 };
 pub(crate) use decode::{Branch, ImmOp, Load, Op, Store};
 use std::fmt::{Display, Formatter};
-pub(crate) use zbb::execute_zbb;
+pub(crate) use zbb::{execute_zbb, ZbbOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rv32imStop {
