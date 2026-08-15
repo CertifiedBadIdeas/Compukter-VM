@@ -2,8 +2,10 @@
 
 Compukter VM is the standalone deterministic RV32 virtual machine used by
 [Compukter Kraft](https://github.com/CertifiedBadIdeas/Compukter-Kraft). It
-implements the product RV32IMA_Zicsr_Zifencei, ELF32/ILP32 execution model,
-bounded translation caches, and the VM-owned performance suite.
+implements the product RV32IMA_Zicsr_Zifencei ISA plus the complete ratified
+RV32 Zbb 1.0 subset, ELF32/ILP32 execution model, bounded translation caches,
+and the VM-owned performance suite. Because Zba and Zbs are not implemented
+yet, `misa.B` remains zero and the VM does not claim the complete B extension.
 
 ## Local verification
 
@@ -17,6 +19,7 @@ The stock-toolchain ELF contracts additionally require Clang and LLD:
 bash scripts/tests/rv32-elf-boot-contract.sh
 bash scripts/tests/rv32-elf-trap-contract.sh
 bash scripts/tests/rv32-elf-atomic-contract.sh
+bash scripts/tests/rv32-elf-zbb-contract.sh
 ```
 
 ## Benchmarks
