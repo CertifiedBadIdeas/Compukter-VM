@@ -12,6 +12,9 @@
 use super::emitter::{Condition, EmitError, Gpr, Mem, X64Emitter};
 use super::lower::emit_store_reservation_invalidation;
 use super::region_alloc::{HostLocation, RegionAllocation};
+use super::region_copy::{
+    plan_loop_reconciliation, CopyPlanError, CopySource, ReconciliationAction, ReconciliationPlan,
+};
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{
     DbtBlockInput, DbtColdExitRelocation, DbtLinkKind, DbtStaticLink, TranslatedBlock,
@@ -26,12 +29,23 @@ const EXECUTION_COUNTER: Gpr = Gpr::Rdi;
 
 pub(crate) struct RegionTranslationWorkspace {
     emitter: X64Emitter,
+    #[cfg(test)]
+    last_frame_bytes: usize,
 }
 
 impl RegionTranslationWorkspace {
     pub(crate) fn new(code_capacity: usize) -> Result<Self, DbtFault> {
         let emitter = X64Emitter::new(code_capacity, 128).map_err(|error| emit_fault(0, error))?;
-        Ok(Self { emitter })
+        Ok(Self {
+            emitter,
+            #[cfg(test)]
+            last_frame_bytes: 0,
+        })
+    }
+
+    #[cfg(test)]
+    const fn last_frame_bytes(&self) -> usize {
+        self.last_frame_bytes
     }
 
     pub(crate) fn lower<'a>(
@@ -57,6 +71,8 @@ impl RegionTranslationWorkspace {
                 "Tier 1 region and DBT input instruction counts differ",
             ));
         }
+        let reconciliation = plan_loop_reconciliation(region, allocation)
+            .map_err(|error| copy_plan_fault(input.start_pc(), error))?;
         self.emitter.reset();
         let out = &mut self.emitter;
         emit_prologue(out).map_err(|error| emit_fault(input.start_pc(), error))?;
@@ -76,9 +92,11 @@ impl RegionTranslationWorkspace {
         out.bind(external_entry)
             .map_err(|error| emit_fault(input.start_pc(), error))?;
 
-        let carried = carried_guest_count(region);
-        let frame_slots = usize::from(allocation.spill_slots()) + carried;
-        let frame_bytes = (frame_slots * 8).next_multiple_of(16);
+        let frame_bytes = allocation.spill_frame_bytes();
+        #[cfg(test)]
+        {
+            self.last_frame_bytes = frame_bytes;
+        }
         if frame_bytes != 0 {
             out.add_r64_imm32(Gpr::Rsp, -(frame_bytes as i32))
                 .map_err(|error| emit_fault(input.start_pc(), error))?;
@@ -132,7 +150,7 @@ impl RegionTranslationWorkspace {
 
         out.bind(taken)
             .map_err(|error| emit_fault(input.start_pc(), error))?;
-        emit_loop_reconciliation(region, allocation, out)
+        emit_loop_reconciliation(&reconciliation, out)
             .map_err(|error| emit_fault(input.start_pc(), error))?;
         out.add_r64_imm32(EXECUTION_COUNTER, region.instruction_count() as i32)
             .map_err(|error| emit_fault(input.start_pc(), error))?;
@@ -637,38 +655,75 @@ fn store_value(
 }
 
 fn emit_loop_reconciliation(
-    region: &LoopRegion<'_>,
-    allocation: &RegionAllocation,
+    plan: &ReconciliationPlan,
     out: &mut X64Emitter,
 ) -> Result<(), EmitError> {
-    let phi_base = usize::from(allocation.spill_slots());
-    let mut phi = 0;
-    for guest in 1..32 {
-        let (Some(entry), Some(output)) = (region.entry_value(guest), region.output_value(guest))
-        else {
-            continue;
-        };
-        if entry == output || !region.is_value_live(entry) {
-            continue;
+    for action in plan.actions() {
+        match *action {
+            ReconciliationAction::Save(location) => {
+                emit_copy_to_register(CopySource::Location(location), Gpr::Rdx, out)?;
+            }
+            ReconciliationAction::Move {
+                source,
+                destination,
+            } => emit_copy(source, destination, out)?,
         }
-        load_value(allocation, output, Gpr::Rax, out)?;
-        out.mov_m32_r32(stack_slot(phi_base + phi), Gpr::Rax)?;
-        phi += 1;
-    }
-    phi = 0;
-    for guest in 1..32 {
-        let (Some(entry), Some(output)) = (region.entry_value(guest), region.output_value(guest))
-        else {
-            continue;
-        };
-        if entry == output || !region.is_value_live(entry) {
-            continue;
-        }
-        out.mov_r32_m32(Gpr::Rax, stack_slot(phi_base + phi))?;
-        store_value(allocation, entry, Gpr::Rax, out)?;
-        phi += 1;
     }
     Ok(())
+}
+
+fn emit_copy(
+    source: CopySource,
+    destination: HostLocation,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    match destination {
+        HostLocation::Register(register) => emit_copy_to_register(source, register, out),
+        HostLocation::Spill(slot) => match source {
+            CopySource::Scratch => out.mov_m32_r32(spill_mem(slot), Gpr::Rdx),
+            CopySource::Location(HostLocation::Constant(value)) => {
+                out.mov_r32_imm32(Gpr::Rax, value)?;
+                out.mov_m32_r32(spill_mem(slot), Gpr::Rax)
+            }
+            CopySource::Location(HostLocation::Register(register)) => {
+                out.mov_m32_r32(spill_mem(slot), register)
+            }
+            CopySource::Location(HostLocation::Spill(source_slot)) => {
+                out.mov_r32_m32(Gpr::Rax, spill_mem(source_slot))?;
+                out.mov_m32_r32(spill_mem(slot), Gpr::Rax)
+            }
+            CopySource::Location(HostLocation::Empty) => Err(EmitError::InvalidOperand(
+                "Tier 1 copy source is unallocated",
+            )),
+        },
+        HostLocation::Constant(_) | HostLocation::Empty => Err(EmitError::InvalidOperand(
+            "Tier 1 copy destination is not writable",
+        )),
+    }
+}
+
+fn emit_copy_to_register(
+    source: CopySource,
+    destination: Gpr,
+    out: &mut X64Emitter,
+) -> Result<(), EmitError> {
+    match source {
+        CopySource::Scratch if destination == Gpr::Rdx => Ok(()),
+        CopySource::Scratch => out.mov_r32_r32(destination, Gpr::Rdx),
+        CopySource::Location(HostLocation::Constant(value)) => {
+            out.mov_r32_imm32(destination, value)
+        }
+        CopySource::Location(HostLocation::Register(source)) if source == destination => Ok(()),
+        CopySource::Location(HostLocation::Register(source)) => {
+            out.mov_r32_r32(destination, source)
+        }
+        CopySource::Location(HostLocation::Spill(slot)) => {
+            out.mov_r32_m32(destination, spill_mem(slot))
+        }
+        CopySource::Location(HostLocation::Empty) => Err(EmitError::InvalidOperand(
+            "Tier 1 copy source is unallocated",
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -803,17 +858,6 @@ const fn stack_slot(slot: usize) -> Mem {
     Mem::base_disp(Gpr::Rsp, (slot * 8) as i32)
 }
 
-fn carried_guest_count(region: &LoopRegion<'_>) -> usize {
-    (1..32)
-        .filter(|guest| {
-            matches!(
-                (region.entry_value(*guest), region.output_value(*guest)),
-                (Some(entry), Some(output)) if entry != output && region.is_value_live(entry)
-            )
-        })
-        .count()
-}
-
 const fn branch_condition(branch: Branch) -> Condition {
     match branch {
         Branch::Eq => Condition::Equal,
@@ -823,6 +867,19 @@ const fn branch_condition(branch: Branch) -> Condition {
         Branch::Ltu => Condition::Below,
         Branch::Geu => Condition::AboveEqual,
     }
+}
+
+fn copy_plan_fault(pc: u32, error: CopyPlanError) -> DbtFault {
+    let message = match error {
+        CopyPlanError::Capacity => "Tier 1 reconciliation plan exceeded fixed capacity",
+        CopyPlanError::InvalidSource => "Tier 1 reconciliation has an invalid source",
+        CopyPlanError::InvalidDestination => "Tier 1 reconciliation has a non-writable destination",
+        CopyPlanError::DuplicateDestination => "Tier 1 reconciliation has duplicate destinations",
+        CopyPlanError::ScratchDependency => {
+            "Tier 1 reconciliation could not resolve its scratch dependency"
+        }
+    };
+    DbtFault::new(DbtFaultKind::Translation, pc, None, message)
 }
 
 fn emit_fault(pc: u32, error: EmitError) -> DbtFault {
@@ -929,6 +986,11 @@ mod tests {
             .publish(DbtCacheKey::new(0x1000, 0), &tier1)
             .unwrap()
             .entry();
+        assert_eq!(
+            tier1_workspace.last_frame_bytes(),
+            allocation.spill_frame_bytes(),
+            "loop-carried copies must not reserve runtime stack staging"
+        );
 
         for budget in 0..=7 {
             assert_eq!(
