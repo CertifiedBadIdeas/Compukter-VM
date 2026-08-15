@@ -19,6 +19,7 @@ fn elf_fixture_builders_only_read_local_fixture_sources() {
         "compile-rv32-elf-boot-fixture.sh",
         "compile-rv32-elf-trap-fixture.sh",
         "compile-rv32-elf-atomic-fixture.sh",
+        "compile-rv32-elf-zbb-fixture.sh",
     ] {
         let source = fs::read_to_string(root.join("scripts").join(script)).unwrap();
         assert!(source.contains("$ROOT/fixtures/"));
