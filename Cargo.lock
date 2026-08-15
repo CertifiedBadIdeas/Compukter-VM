@@ -106,6 +106,14 @@ dependencies = [
  "memmap2",
  "rvsim",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "compukter-vm-benchmarks"
+version = "0.1.0"
+dependencies = [
+ "compukter-vm",
+ "rvsim",
  "wasmtime",
 ]
 

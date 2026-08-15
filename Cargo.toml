@@ -1,26 +1,31 @@
+[workspace]
+members = ["tools/compukter-vm-benchmarks"]
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "compukter-vm"
 version = "0.1.0"
 edition = "2021"
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md"]
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
 default = []
+unstable-benchmark-support = []
 dbt-chain-stats = []
 dbt-code-audit = []
 dbt-execution-profile = []
 dbt-translation-timing = []
 dbt-tier1-prototype = []
-wasmtime-comparison = ["dep:wasmtime", "dbt-translation-timing"]
 
 [dependencies]
 rvsim = { version = "=0.2.2", default-features = false }
 thiserror = "1.0"
 memmap2 = "=0.9.9"
 libc = "=0.2.189"
-wasmtime = { version = "=47.0.3", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [profile.release]
 codegen-units = 1

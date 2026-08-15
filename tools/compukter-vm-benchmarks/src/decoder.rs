@@ -17,12 +17,12 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use crate::bus::MachineBus;
-use crate::rv32im::encoding as e;
-use crate::rv32im::{
-    decode_eager_reference, decode_product_word, BoundedCachedRv32imProgram, DecodedInstruction,
-    Rv32ResolvedInstruction,
+use compukter_vm::benchmark_support::{
+    decode_eager_reference_for_benchmark, decode_product_word_for_benchmark,
+    BenchmarkBoundedDecodeCache, BenchmarkDecodedInstruction, BenchmarkResolvedInstruction,
 };
+use compukter_vm::bus::MachineBus;
+use compukter_vm::rv32im::encoding as e;
 use std::hint::black_box;
 use std::mem::size_of;
 
@@ -44,10 +44,10 @@ impl DecoderBenchmarkImplementation {
         }
     }
 
-    fn decoder(self) -> fn(u32) -> Result<DecodedInstruction, String> {
+    fn decoder(self) -> fn(u32) -> Result<BenchmarkDecodedInstruction, String> {
         match self {
-            Self::Eager => decode_eager_reference,
-            Self::Product => decode_product_word,
+            Self::Eager => decode_eager_reference_for_benchmark,
+            Self::Product => decode_product_word_for_benchmark,
         }
     }
 }
@@ -87,7 +87,7 @@ pub struct PreparedDecoderBenchmark {
     operations: u32,
     words: Vec<u32>,
     bus: MachineBus,
-    cache: BoundedCachedRv32imProgram,
+    cache: BenchmarkBoundedDecodeCache,
 }
 
 impl PreparedDecoderBenchmark {
@@ -111,7 +111,7 @@ impl PreparedDecoderBenchmark {
             operations,
             words,
             bus,
-            cache: BoundedCachedRv32imProgram::new(1)?,
+            cache: BenchmarkBoundedDecodeCache::new(1)?,
         })
     }
 
@@ -130,7 +130,7 @@ impl PreparedDecoderBenchmark {
                 (checksum, 0)
             }
             DecoderBenchmarkScenario::BoundedCacheForcedMiss => {
-                self.cache.reset_for_benchmark();
+                self.cache.reset();
                 let mut checksum = 0_u64;
                 for index in 0..self.operations {
                     let pc = (index % 3) * 4;
@@ -139,8 +139,8 @@ impl PreparedDecoderBenchmark {
                         .resolve_with_decoder(pc, &self.bus, decoder)
                         .map_err(|error| error.to_string())?;
                     let word = match black_box(resolved) {
-                        Rv32ResolvedInstruction::Valid { word, .. } => word,
-                        Rv32ResolvedInstruction::Invalid { word } => {
+                        BenchmarkResolvedInstruction::Valid { word } => word,
+                        BenchmarkResolvedInstruction::Invalid { word } => {
                             return Err(format!(
                                 "legal forced-miss word decoded as illegal: {word:#010x}"
                             ));
@@ -149,7 +149,7 @@ impl PreparedDecoderBenchmark {
                     checksum = checksum.rotate_left(7) ^ u64::from(word);
                     checksum = checksum.wrapping_add(1);
                 }
-                (checksum, self.cache.stats().misses)
+                (checksum, self.cache.misses())
             }
         };
         Ok(DecoderBenchmarkObservation {

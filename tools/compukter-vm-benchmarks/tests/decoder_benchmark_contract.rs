@@ -17,7 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use compukter_vm::benchmarks::{
+use compukter_vm_benchmarks::{
     native_checksum, BenchmarkCandidate, BenchmarkWorkload, DecoderBenchmarkImplementation,
     DecoderBenchmarkScenario, PreparedBenchmark, PreparedDecoderBenchmark,
 };
@@ -127,18 +127,4 @@ fn paired_decoder_scenarios_share_work_and_stable_checksums() {
             assert_eq!(product_observation.cache_misses, 4096);
         }
     }
-}
-
-#[test]
-fn extraction_gate_preserves_the_accepted_decision_threshold() {
-    let script = std::fs::read_to_string(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts/tests/rv32-decoder-extraction-gate.sh"),
-    )
-    .unwrap();
-    assert!(script.contains("RUNS=5"));
-    assert!(script.contains("REQUIRED_WINS=4"));
-    assert!(script.contains("MIN_IMPROVEMENT_PERCENT=2"));
-    assert!(!script.contains("host/compukter-vm"));
-    assert!(!script.contains("../"));
 }

@@ -27,7 +27,8 @@ bash scripts/tests/rv32-elf-zbb-contract.sh
 The complete-machine benchmark has no external tool dependency:
 
 ```bash
-cargo run --release --locked --offline --example rv32_machine_benchmarks -- 1000 21 7
+cargo run -p compukter-vm-benchmarks --release --locked --offline \
+    --bin rv32_machine_benchmarks -- 1000 21 7
 ```
 
 The shared native, QEMU, and product comparison is intentionally strict. It
@@ -47,12 +48,12 @@ bash scripts/tests/rv32-c-zbb-self-ab.sh
 For focused measurements of only the current product-default Cached DBT:
 
 ```bash
-cargo run --release --locked --offline --example rv32_c_comparison -- \
-    product-default target/rv32-c-comparison 21
+cargo run -p compukter-vm-benchmarks --release --locked --offline \
+    --bin rv32_c_comparison -- product-default target/rv32-c-comparison 21
 ```
 
 Its C kernel, linker scripts, and startup code live in
-`benchmarks/rv32-c-comparison`. Generated benchmark artifacts are local to
+`tools/compukter-vm-benchmarks/assets/rv32-c-comparison`. Generated benchmark artifacts are local to
 `target/` and are not committed.
 
 ## Compukter Kraft integration

@@ -11,8 +11,8 @@ plus a native Rust reference.
 Run it from the repository root:
 
 ```bash
-cargo run --manifest-path Cargo.toml --release \
-  --example rv32_decoder_benchmarks -- 1000 21
+cargo run --manifest-path Cargo.toml -p compukter-vm-benchmarks --release \
+  --bin rv32_decoder_benchmarks -- 1000 21
 ```
 
 The first argument is the positive workload iteration count. The second is the
@@ -64,8 +64,8 @@ loop, ELF-owned address space, machine-mode traps, or platform MMIO.
 Measure public `Rv32Machine::run` and resident many-VM construction separately:
 
 ```bash
-cargo run --manifest-path Cargo.toml --release \
-  --example rv32_machine_benchmarks --locked --offline -- 1000 21 7
+cargo run --manifest-path Cargo.toml -p compukter-vm-benchmarks --release \
+  --bin rv32_machine_benchmarks --locked --offline -- 1000 21 7
 ```
 
 The arguments are workload iterations, warm execution samples, and resident

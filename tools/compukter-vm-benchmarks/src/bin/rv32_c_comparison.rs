@@ -9,16 +9,6 @@
  * (at your option) any later version.
  */
 
-use compukter_vm::benchmarks::{
-    benchmark_normalize_nanos, benchmark_rotating_order, c_comparison_next_batch,
-    c_comparison_qemu_target_nanos, c_comparison_timeout_nanos, parse_c_comparison_result,
-    product_percentile,
-};
-#[cfg(feature = "wasmtime-comparison")]
-use compukter_vm::benchmarks::{
-    compile_equivalent_calls, optional_phase_rate, COMPILATION_PHASE_REPORT_HEADER,
-};
-use compukter_vm::benchmarks::{self_ab_delta, self_ab_order};
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig, Rv32Machine,
     Rv32MachineConfig, Rv32MachineOutcome, DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_ALIGNMENT,
@@ -27,6 +17,16 @@ use compukter_vm::rv32_machine::{
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
+use compukter_vm_benchmarks::{
+    benchmark_normalize_nanos, benchmark_rotating_order, c_comparison_next_batch,
+    c_comparison_qemu_target_nanos, c_comparison_timeout_nanos, parse_c_comparison_result,
+    product_percentile,
+};
+#[cfg(feature = "wasmtime-comparison")]
+use compukter_vm_benchmarks::{
+    compile_equivalent_calls, optional_phase_rate, COMPILATION_PHASE_REPORT_HEADER,
+};
+use compukter_vm_benchmarks::{self_ab_delta, self_ab_order};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::env;
@@ -614,8 +614,7 @@ fn run() -> Result<(), String> {
         .copied()
         .collect::<Vec<_>>();
 
-    let source_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/rv32-c-comparison");
     let native = build_dir.join("native-kernel");
     let manifest = read_manifest(&build_dir.join("manifest.tsv"))?;
     let qemu = env::var_os("RV32_C_QEMU").unwrap_or_else(|| "qemu-system-riscv32".into());
@@ -904,8 +903,7 @@ fn run_register_alignment_matrix(arguments: &[OsString]) -> Result<(), String> {
         ));
     }
 
-    let source_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/rv32-c-comparison");
     let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
     let mut measurements = Vec::with_capacity(REGISTER_ALIGNMENT_MATRIX.len());
     let mut elfs = Vec::with_capacity(REGISTER_ALIGNMENT_MATRIX.len());
@@ -1106,8 +1104,7 @@ fn run_codegen_self_ab(arguments: &[OsString]) -> Result<(), String> {
         return Err("codegen self-A/B requires distinct RV32 compiler flags".to_string());
     }
 
-    let source_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/rv32-c-comparison");
     let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
     let dbt_sets = arguments
         .get(3)
@@ -1222,8 +1219,7 @@ fn run_product_default(arguments: &[OsString]) -> Result<(), String> {
         .unwrap_or(DEFAULT_DBT_CACHE_SETS);
 
     let build_dir = Path::new(&arguments[0]);
-    let source_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/rv32-c-comparison");
     let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
     let execution = Rv32ExecutionBackendConfig::CachedDbt {
         sets: dbt_sets,
@@ -1283,8 +1279,7 @@ fn run_self_ab_measurement(
     candidates: [Candidate; 2],
     samples: usize,
 ) -> Result<(), String> {
-    let source_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/rv32-c-comparison");
     let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
     let mut measurements = Vec::with_capacity(2);
     let mut elfs = Vec::with_capacity(2);
