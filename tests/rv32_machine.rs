@@ -76,7 +76,7 @@ fn cached_dbt_is_the_default_execution_backend() {
         Rv32ExecutionBackendConfig::default(),
         Rv32ExecutionBackendConfig::CachedDbt {
             sets: 256,
-            max_instructions: 8,
+            max_instructions: 16,
             scratch_bytes: 8 * 1024,
             cache_bytes: 128 * 1024,
             code_alignment: Rv32DbtCodeAlignment::BlockBase(64),

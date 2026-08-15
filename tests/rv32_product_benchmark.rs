@@ -33,9 +33,9 @@ use compukter_vm::rv32_machine::{
 };
 
 #[test]
-fn product_benchmark_tests_block_16_without_changing_the_vm_default() {
+fn product_benchmark_and_vm_default_use_block_16() {
     assert_eq!(PRODUCT_DBT_MAX_INSTRUCTIONS, 16);
-    assert_eq!(DEFAULT_DBT_MAX_INSTRUCTIONS, 8);
+    assert_eq!(DEFAULT_DBT_MAX_INSTRUCTIONS, 16);
 }
 
 #[test]
