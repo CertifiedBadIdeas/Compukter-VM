@@ -18,12 +18,12 @@ use compukter_vm::benchmarks::{
 use compukter_vm::benchmarks::{
     compile_equivalent_calls, optional_phase_rate, COMPILATION_PHASE_REPORT_HEADER,
 };
-#[cfg(feature = "dbt-translation-timing")]
 use compukter_vm::benchmarks::{self_ab_delta, self_ab_order};
 use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig, Rv32Machine,
     Rv32MachineConfig, Rv32MachineOutcome, DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_ALIGNMENT,
-    DEFAULT_DBT_CODE_BYTES, DEFAULT_DBT_REGISTER_PROFILE,
+    DEFAULT_DBT_CODE_BYTES, DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_REGISTER_PROFILE,
+    DEFAULT_DBT_SCRATCH_BYTES,
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
@@ -574,6 +574,12 @@ fn run() -> Result<(), String> {
     }
     if arguments
         .first()
+        .is_some_and(|argument| argument == "codegen-self-ab")
+    {
+        return run_codegen_self_ab(&arguments[1..]);
+    }
+    if arguments
+        .first()
         .is_some_and(|argument| argument == "profile")
     {
         #[cfg(feature = "dbt-execution-profile")]
@@ -1061,6 +1067,123 @@ fn run_self_ab(arguments: &[OsString]) -> Result<(), String> {
 
     #[cfg(feature = "dbt-translation-timing")]
     run_self_ab_measurement(Path::new(&arguments[0]), [baseline, candidate], samples)
+}
+
+fn run_codegen_self_ab(arguments: &[OsString]) -> Result<(), String> {
+    if !(3..=4).contains(&arguments.len()) {
+        return Err(
+            "usage: rv32_c_comparison codegen-self-ab BASELINE_DIR CANDIDATE_DIR WARM_SAMPLES [DBT_SETS]"
+                .to_string(),
+        );
+    }
+    let samples = arguments[2]
+        .to_str()
+        .ok_or_else(|| "codegen self-A/B warm sample count is not UTF-8".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid codegen self-A/B warm sample count: {error}"))?;
+    if samples < MINIMUM_SAMPLES {
+        return Err(format!(
+            "codegen self-A/B warm sample count must be at least {MINIMUM_SAMPLES}"
+        ));
+    }
+
+    let build_dirs = [PathBuf::from(&arguments[0]), PathBuf::from(&arguments[1])];
+    let manifests = [
+        read_manifest(&build_dirs[0].join("manifest.tsv"))?,
+        read_manifest(&build_dirs[1].join("manifest.tsv"))?,
+    ];
+    let march = [
+        manifest_value(&manifests[0], "rv32-flags")?.to_string(),
+        manifest_value(&manifests[1], "rv32-flags")?.to_string(),
+    ];
+    if march[0] == march[1] {
+        return Err("codegen self-A/B requires distinct RV32 compiler flags".to_string());
+    }
+
+    let source_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
+    let dbt_sets = arguments
+        .get(3)
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "codegen self-A/B DBT sets are not UTF-8".to_string())?
+                .parse::<usize>()
+                .map_err(|error| format!("invalid codegen self-A/B DBT sets: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_DBT_CACHE_SETS);
+    let execution = Rv32ExecutionBackendConfig::CachedDbt {
+        sets: dbt_sets,
+        max_instructions: DEFAULT_DBT_MAX_INSTRUCTIONS,
+        scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+        cache_bytes: DEFAULT_DBT_CODE_BYTES,
+        code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+    };
+    let mut batches = [0_u64; 2];
+    let mut elfs = Vec::with_capacity(2);
+    for index in 0..2 {
+        batches[index] = calibrate_product(&linker, &source_root, &build_dirs[index], execution)?;
+        elfs.push(link_platform(
+            &linker,
+            &source_root,
+            &build_dirs[index],
+            "product",
+            batches[index],
+        )?);
+    }
+
+    let mut timings = [Vec::with_capacity(samples), Vec::with_capacity(samples)];
+    let mut details = [ProductDetails::default(), ProductDetails::default()];
+    for sample in 0..samples {
+        for index in self_ab_order(sample) {
+            let (elapsed, observation) = run_product(&elfs[index], batches[index], execution)?;
+            timings[index].push(elapsed);
+            details[index] = observation;
+        }
+    }
+    for timing in &mut timings {
+        timing.sort_unstable();
+    }
+    let normalized = [
+        benchmark_normalize_nanos(product_percentile(&timings[0], 50), batches[0])?,
+        benchmark_normalize_nanos(product_percentile(&timings[1], 50), batches[1])?,
+    ];
+
+    println!("codegen_self_ab\tbaseline_flags\tcandidate_flags\twarm_samples\tdbt_sets");
+    println!(
+        "codegen_self_ab\t{}\t{}\t{}\t{}",
+        march[0], march[1], samples, dbt_sets
+    );
+    println!(
+        "role\trv32_flags\tbatch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tdelta_vs_baseline_percent\tretired_per_kernel\tfixed_retired\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_emitted_bytes\tsteady_allocations\tsteady_allocated_bytes"
+    );
+    for index in 0..2 {
+        let retired_per_kernel = details[index].retired_instructions / batches[index];
+        let fixed_retired = details[index].retired_instructions % batches[index];
+        println!(
+            "{}\t{}\t{}\t{:08x}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            if index == 0 { "baseline" } else { "candidate" },
+            march[index],
+            batches[index],
+            EXPECTED_CHECKSUM,
+            product_percentile(&timings[index], 50),
+            product_percentile(&timings[index], 95),
+            normalized[index],
+            self_ab_delta(normalized[0], normalized[index])? * 100.0,
+            retired_per_kernel,
+            fixed_retired,
+            option_u64(details[index].dbt_translations),
+            option_u64(details[index].dbt_publications),
+            option_u64(details[index].dbt_native_dispatches),
+            option_u64(details[index].dbt_emitted_bytes),
+            details[index].steady_allocations,
+            details[index].steady_allocated_bytes,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "dbt-translation-timing")]

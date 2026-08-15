@@ -37,6 +37,13 @@ requires `clang`, `ld.lld`, LLVM inspection tools, and `qemu-system-riscv32`:
 bash scripts/tests/rv32-c-qemu-comparison.sh
 ```
 
+To measure the effect of compiler-generated Zbb instructions against the same
+current Cached DBT configuration:
+
+```bash
+bash scripts/tests/rv32-c-zbb-self-ab.sh
+```
+
 Its C kernel, linker scripts, and startup code live in
 `benchmarks/rv32-c-comparison`. Generated benchmark artifacts are local to
 `target/` and are not committed.
