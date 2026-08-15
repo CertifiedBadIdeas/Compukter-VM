@@ -77,3 +77,37 @@ values through fixed scratch registers and performs every loop-carried reconcili
 stack staging. The next optimization should measure and reduce reconciliation moves, beginning
 with cycle-aware register-to-register parallel copies and coalescing entry/output locations where
 safe. The result above is the baseline for that work.
+
+## 2026-08-15 cycle-aware parallel-copy reconciliation
+
+Decision: **KEEP** commits `a79fffb` and `29fdef2`.
+
+The lowerer now plans loop-carried assignments in a fixed-capacity parallel-copy scheduler. It
+emits acyclic register/spill transfers directly and breaks cycles through the unallocated `RDX`
+scratch register. Runtime stack staging is gone; the frame contains allocator spill slots only.
+
+The same 21-sample command shown above produced:
+
+| Metric | Current Tier 0 | Previous Tier 1 | Parallel-copy Tier 1 | New Tier 1 vs current Tier 0 |
+|---|---:|---:|---:|---:|
+| Median ns/kernel | 353,570.208 | 650,254.684 | 517,431.053 | +46.345% |
+| p95 total ns | 365,790,675 @ 1,024 | 337,015,259 @ 512 | 266,563,301 @ 512 | +45.746% per kernel |
+| Retired instructions/kernel | 3,918,182 | 3,918,182 | 3,918,182 | equal |
+| Native dispatches | 2,135 | 1,111 | 1,111 | equivalent after batch normalization |
+| Links / typed slow exits | 114 / 2 | 114 / 2 | 114 / 2 | equal |
+| Tier 1 regions / fallbacks | 0 / 0 | 5 / 84 | 5 / 84 | unchanged |
+| Emitted bytes | 39,999 | 41,907 | 41,668 | +4.17% |
+| Steady allocations / bytes | 0 / 0 | 0 / 0 | 0 / 0 | equal |
+
+Translation medians in the new run were 19,070 ns for lift, 101,780 ns for lower, and 58,610 ns
+for publish. Relative to the preserved Tier 1 result, candidate median improved by 20.426%,
+candidate p95 by 20.905%, lower by 21.851%, and emitted bytes by 0.570%. Because the two runs were
+not interleaved, the host-wide timing shift is visible in Tier 0 as well. Normalizing each Tier 1
+result to its accompanying Tier 0 still improves the median ratio from 1.787783x to 1.463446x
+(-18.142%) and the p95-per-kernel ratio from 1.775260x to 1.457464x (-17.901%).
+
+Checksums, retired shape, dispatch/link counts, precise fault behavior, and zero-allocation
+steady-state behavior are unchanged. The speedup is therefore consistent with removing repeated
+stack loads/stores from the hot loop rather than with doing less guest work. Entry/output
+coalescing remains a separate possible slice; this result measures only reconciliation planning
+and direct move emission.
