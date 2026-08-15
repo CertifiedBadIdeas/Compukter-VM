@@ -580,6 +580,12 @@ fn run() -> Result<(), String> {
     }
     if arguments
         .first()
+        .is_some_and(|argument| argument == "product-default")
+    {
+        return run_product_default(&arguments[1..]);
+    }
+    if arguments
+        .first()
         .is_some_and(|argument| argument == "profile")
     {
         #[cfg(feature = "dbt-execution-profile")]
@@ -1183,6 +1189,91 @@ fn run_codegen_self_ab(arguments: &[OsString]) -> Result<(), String> {
             details[index].steady_allocated_bytes,
         );
     }
+    Ok(())
+}
+
+fn run_product_default(arguments: &[OsString]) -> Result<(), String> {
+    if !(2..=3).contains(&arguments.len()) {
+        return Err(
+            "usage: rv32_c_comparison product-default BUILD_DIR WARM_SAMPLES [DBT_SETS]"
+                .to_string(),
+        );
+    }
+    let samples = arguments[1]
+        .to_str()
+        .ok_or_else(|| "product-default warm sample count is not UTF-8".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid product-default warm sample count: {error}"))?;
+    if samples < MINIMUM_SAMPLES {
+        return Err(format!(
+            "product-default warm sample count must be at least {MINIMUM_SAMPLES}"
+        ));
+    }
+    let dbt_sets = arguments
+        .get(2)
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "product-default DBT sets are not UTF-8".to_string())?
+                .parse::<usize>()
+                .map_err(|error| format!("invalid product-default DBT sets: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_DBT_CACHE_SETS);
+
+    let build_dir = Path::new(&arguments[0]);
+    let source_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/rv32-c-comparison");
+    let linker = env::var_os("RV32_C_LLD").unwrap_or_else(|| "ld.lld".into());
+    let execution = Rv32ExecutionBackendConfig::CachedDbt {
+        sets: dbt_sets,
+        max_instructions: DEFAULT_DBT_MAX_INSTRUCTIONS,
+        scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
+        cache_bytes: DEFAULT_DBT_CODE_BYTES,
+        code_alignment: DEFAULT_DBT_CODE_ALIGNMENT,
+        register_profile: DEFAULT_DBT_REGISTER_PROFILE,
+    };
+    let batch = calibrate_product(&linker, &source_root, build_dir, execution)?;
+    let elf = link_platform(&linker, &source_root, build_dir, "product", batch)?;
+    let mut timings = Vec::with_capacity(samples);
+    let mut details = ProductDetails::default();
+    for _ in 0..samples {
+        let (elapsed, observation) = run_product(&elf, batch, execution)?;
+        timings.push(elapsed);
+        details = observation;
+    }
+    timings.sort_unstable();
+    let normalized = benchmark_normalize_nanos(product_percentile(&timings, 50), batch)?;
+    let retired_per_kernel = details.retired_instructions / batch;
+    let fixed_retired = details.retired_instructions % batch;
+
+    println!("product_default\twarm_samples\tdbt_sets\tmax_instructions");
+    println!(
+        "product_default\t{}\t{}\t{}",
+        samples, dbt_sets, DEFAULT_DBT_MAX_INSTRUCTIONS
+    );
+    println!(
+        "batch\tchecksum\ttotal_median_ns\ttotal_p95_ns\tns_per_kernel\tretired_per_kernel\tfixed_retired\tdbt_translations\tdbt_publications\tdbt_native_dispatches\tdbt_emitted_bytes\tdbt_live_code_bytes\tdbt_reserved_bytes\ttranslation_bytes\tsteady_allocations\tsteady_allocated_bytes"
+    );
+    println!(
+        "{}\t{:08x}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        batch,
+        EXPECTED_CHECKSUM,
+        product_percentile(&timings, 50),
+        product_percentile(&timings, 95),
+        normalized,
+        retired_per_kernel,
+        fixed_retired,
+        option_u64(details.dbt_translations),
+        option_u64(details.dbt_publications),
+        option_u64(details.dbt_native_dispatches),
+        option_u64(details.dbt_emitted_bytes),
+        option_u64(details.dbt_live_code_bytes),
+        option_u64(details.dbt_reserved_bytes),
+        details.translation_bytes,
+        details.steady_allocations,
+        details.steady_allocated_bytes,
+    );
     Ok(())
 }
 

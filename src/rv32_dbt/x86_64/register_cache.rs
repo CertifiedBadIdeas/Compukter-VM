@@ -116,6 +116,32 @@ struct Resident {
     dirty: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlushEntry {
+    guest: u8,
+    host: Gpr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegisterFlushPlan {
+    entries: [Option<FlushEntry>; DIRECT_HOST_POOL.len()],
+}
+
+impl RegisterFlushPlan {
+    pub(crate) fn emit(self, out: &mut X64Emitter) -> Result<(), EmitError> {
+        for entry in self.entries.into_iter().flatten() {
+            out.mov_m32_r32(
+                Mem::base_disp(
+                    Gpr::R14,
+                    Rv32ArchitecturalState::register_offset(usize::from(entry.guest)) as i32,
+                ),
+                entry.host,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "dbt-code-audit")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RegisterPressureAudit {
@@ -499,6 +525,21 @@ impl RegisterCache {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn flush_plan(&self) -> RegisterFlushPlan {
+        let mut plan = RegisterFlushPlan {
+            entries: [None; DIRECT_HOST_POOL.len()],
+        };
+        let mut len = 0;
+        for resident in self.entries.iter().flatten().filter(|entry| entry.dirty) {
+            plan.entries[len] = Some(FlushEntry {
+                guest: resident.guest as u8,
+                host: resident.host,
+            });
+            len += 1;
+        }
+        plan
     }
 
     pub(crate) fn reconcile_local_loop(&mut self, out: &mut X64Emitter) -> Result<(), EmitError> {
