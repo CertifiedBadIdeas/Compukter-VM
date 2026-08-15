@@ -21,7 +21,9 @@ use super::{
     IsaBenchmarkCandidate, IsaBenchmarkObservation, IsaBenchmarkWorkload, IsaTraffic, DATA_BASE,
     MEMORY_SIZE, MMIO_BASE, STACK_TOP,
 };
-use compukter_vm::bus::{MachineBus, MachineBusTrafficSnapshot, MmioDevice};
+use compukter_vm::bus::{
+    MachineBus, MachineBusTrafficSnapshot, MmioAccessWidth, MmioContext, MmioDevice,
+};
 use compukter_vm::memory::MemoryFault;
 use compukter_vm::rv32im::encoding::{
     add, addi, and, andi, beq, bne, ebreak, ecall, jal, jalr, lbu, lw, materialize, mul, or, sb,
@@ -672,7 +674,7 @@ impl Memory for RvsimMemory<'_> {
     }
 }
 fn load_value<T: Copy>(
-    bus: &MachineBus,
+    bus: &mut MachineBus,
     address: u32,
     destination: &mut T,
 ) -> Result<(), MemoryFault> {
@@ -743,18 +745,29 @@ impl MmioDevice for BenchmarkRegisterDevice {
     fn size(&self) -> u32 {
         4
     }
-    fn load_i32(&self, offset: u32) -> Result<i32, MemoryFault> {
-        if offset == 0 {
-            Ok(self.value)
+    fn read(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+    ) -> Result<u64, MemoryFault> {
+        if offset == 0 && width == MmioAccessWidth::Word {
+            Ok(u64::from(self.value as u32))
         } else {
             Err(MemoryFault::new(format!(
                 "benchmark register offset {offset} is not mapped"
             )))
         }
     }
-    fn store_i32(&mut self, offset: u32, value: i32) -> Result<(), MemoryFault> {
-        if offset == 0 {
-            self.value = value;
+    fn write(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+        value: u64,
+    ) -> Result<(), MemoryFault> {
+        if offset == 0 && width == MmioAccessWidth::Word {
+            self.value = value as u32 as i32;
             Ok(())
         } else {
             Err(MemoryFault::new(format!(

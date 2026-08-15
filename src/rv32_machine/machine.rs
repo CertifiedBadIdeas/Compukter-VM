@@ -411,7 +411,7 @@ impl Rv32Machine {
             } else {
                 let resolved = match &mut self.execution {
                     Rv32ExecutionBackend::Cached(cache) => {
-                        match cache.resolve(instruction_pc, &self.address_space) {
+                        match cache.resolve(instruction_pc, &mut self.address_space) {
                             Ok(resolved) => resolved,
                             Err(error) => {
                                 self.hart.take_instruction_access_fault(
@@ -492,25 +492,25 @@ impl Rv32Machine {
                 let Rv32ExecutionBackend::BlockCached(cache) = &mut self.execution else {
                     unreachable!("block execution loop requires the block backend")
                 };
-                let block = match cache.resolve(instruction_pc, executable_end, &self.address_space)
-                {
-                    Ok(block) => block,
-                    Err(error) => {
-                        attempted += 1;
-                        self.hart.take_instruction_access_fault(
-                            error.address().unwrap_or(instruction_pc),
-                        );
-                        if let Some(outcome) = terminal_outcome(
-                            &self.hart,
-                            &self.address_space,
-                            self.control_device,
-                            retired_before,
-                        ) {
-                            return Ok(outcome);
+                let block =
+                    match cache.resolve(instruction_pc, executable_end, &mut self.address_space) {
+                        Ok(block) => block,
+                        Err(error) => {
+                            attempted += 1;
+                            self.hart.take_instruction_access_fault(
+                                error.address().unwrap_or(instruction_pc),
+                            );
+                            if let Some(outcome) = terminal_outcome(
+                                &self.hart,
+                                &self.address_space,
+                                self.control_device,
+                                retired_before,
+                            ) {
+                                return Ok(outcome);
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
                 for (slot_index, slot) in block.iter().copied().enumerate() {
                     if attempted >= instruction_budget {
                         break;
@@ -619,7 +619,7 @@ impl Rv32Machine {
                             instruction_pc,
                             executable_end,
                             execution.max_instructions(),
-                            &self.address_space,
+                            &mut self.address_space,
                             execution.ir_block_mut(),
                         )
                     };

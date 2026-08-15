@@ -17,7 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use crate::bus::MmioDevice;
+use crate::bus::{MmioAccessWidth, MmioContext, MmioDevice};
 use crate::memory::MemoryFault;
 
 pub const CONTROL_BASE: u32 = 0x1000_0000;
@@ -49,18 +49,40 @@ impl MmioDevice for ControlDevice {
         MMIO_PAGE_SIZE
     }
 
-    fn load_i32(&self, offset: u32) -> Result<i32, MemoryFault> {
+    fn read(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+    ) -> Result<u64, MemoryFault> {
+        if width != MmioAccessWidth::Word {
+            return Err(MemoryFault::new(format!(
+                "RV32 control does not support {width:?} reads"
+            )));
+        }
         match offset {
-            0 => Ok(self.status),
-            4 => Ok(self.panic_code),
-            8 => Ok(self.exit_code),
+            0 => Ok(u64::from(self.status as u32)),
+            4 => Ok(u64::from(self.panic_code as u32)),
+            8 => Ok(u64::from(self.exit_code as u32)),
             _ => Err(MemoryFault::new(format!(
                 "RV32 control offset {offset} is not mapped"
             ))),
         }
     }
 
-    fn store_i32(&mut self, offset: u32, value: i32) -> Result<(), MemoryFault> {
+    fn write(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+        value: u64,
+    ) -> Result<(), MemoryFault> {
+        if width != MmioAccessWidth::Word {
+            return Err(MemoryFault::new(format!(
+                "RV32 control does not support {width:?} writes"
+            )));
+        }
+        let value = value as u32 as i32;
         match offset {
             0 => self.status = value,
             4 => self.panic_code = value,
@@ -109,8 +131,13 @@ impl MmioDevice for DebugDevice {
         MMIO_PAGE_SIZE
     }
 
-    fn load_i32(&self, offset: u32) -> Result<i32, MemoryFault> {
-        if offset == 0 {
+    fn read(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+    ) -> Result<u64, MemoryFault> {
+        if offset == 0 && matches!(width, MmioAccessWidth::Byte | MmioAccessWidth::Word) {
             Ok(0)
         } else {
             Err(MemoryFault::new(format!(
@@ -119,19 +146,15 @@ impl MmioDevice for DebugDevice {
         }
     }
 
-    fn store_i32(&mut self, offset: u32, value: i32) -> Result<(), MemoryFault> {
-        if offset == 0 {
-            self.push(value.to_le_bytes()[0])
-        } else {
-            Err(MemoryFault::new(format!(
-                "RV32 debug offset {offset} is not mapped"
-            )))
-        }
-    }
-
-    fn store_u8(&mut self, offset: u32, value: u8) -> Result<(), MemoryFault> {
-        if offset == 0 {
-            self.push(value)
+    fn write(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+        value: u64,
+    ) -> Result<(), MemoryFault> {
+        if offset == 0 && matches!(width, MmioAccessWidth::Byte | MmioAccessWidth::Word) {
+            self.push(value as u8)
         } else {
             Err(MemoryFault::new(format!(
                 "RV32 debug offset {offset} is not mapped"

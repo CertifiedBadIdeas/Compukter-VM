@@ -75,7 +75,7 @@ impl BenchmarkBoundedDecodeCache {
     pub fn resolve_with_decoder(
         &mut self,
         instruction_pc: u32,
-        bus: &dyn crate::memory::MemoryBus,
+        bus: &mut dyn crate::memory::MemoryBus,
         decoder: fn(u32) -> Result<BenchmarkDecodedInstruction, String>,
     ) -> Result<BenchmarkResolvedInstruction, crate::memory::MemoryFault> {
         match self
@@ -185,7 +185,7 @@ impl PreparedDirectDbtCompute32 {
                 cpu.pc(),
                 executable_end,
                 MAX_BLOCK_INSTRUCTIONS,
-                &self.memory,
+                &mut self.memory,
                 &mut self.decoded,
             )
             .map_err(|error| error.to_string())?;
@@ -388,7 +388,7 @@ impl PreparedCachedDbtCompute32 {
                     cpu.pc(),
                     executable_end,
                     MAX_BLOCK_INSTRUCTIONS,
-                    &self.memory,
+                    &mut self.memory,
                     &mut self.decoded,
                 )
                 .map_err(|error| error.to_string())?;

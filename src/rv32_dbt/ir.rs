@@ -458,7 +458,7 @@ pub(crate) fn fill_ir_block(
     start_pc: u32,
     executable_end: u32,
     max_instructions: usize,
-    bus: &dyn MemoryBus,
+    bus: &mut dyn MemoryBus,
     block: &mut DbtIrBlock,
 ) -> Result<(), MemoryFault> {
     if max_instructions == 0 || max_instructions > block.capacity {
@@ -679,18 +679,18 @@ mod tests {
 
     #[test]
     fn fused_builder_stops_at_control_flow_and_reuses_its_storage() {
-        let first = memory(&[addi(1, 1, 1), jal(0, 0), addi(2, 2, 1)]);
-        let second = memory(&[addi(3, 3, 1)]);
+        let mut first = memory(&[addi(1, 1, 1), jal(0, 0), addi(2, 2, 1)]);
+        let mut second = memory(&[addi(3, 3, 1)]);
         let mut block = DbtIrBlock::new(8).unwrap();
         let instruction_capacity = block.instruction_capacity();
         let analysis_capacity = block.analysis_capacity();
 
-        fill_ir_block(0, 12, 8, &first, &mut block).unwrap();
+        fill_ir_block(0, 12, 8, &mut first, &mut block).unwrap();
         assert_eq!(block.instructions().len(), 2);
         assert_eq!(block.attempted_instruction_count(), 2);
         assert_eq!(block.invalid_word(), None);
 
-        fill_ir_block(0, 4, 8, &second, &mut block).unwrap();
+        fill_ir_block(0, 4, 8, &mut second, &mut block).unwrap();
         assert_eq!(block.instructions().len(), 1);
         assert_eq!(block.instruction_capacity(), instruction_capacity);
         assert_eq!(block.analysis_capacity(), analysis_capacity);
@@ -698,10 +698,10 @@ mod tests {
 
     #[test]
     fn fused_builder_retains_an_invalid_terminal_word_without_a_decoded_enum() {
-        let memory = memory(&[addi(1, 1, 1), 0xffff_ffff, addi(2, 2, 1)]);
+        let mut memory = memory(&[addi(1, 1, 1), 0xffff_ffff, addi(2, 2, 1)]);
         let mut block = DbtIrBlock::new(8).unwrap();
 
-        fill_ir_block(0, 12, 8, &memory, &mut block).unwrap();
+        fill_ir_block(0, 12, 8, &mut memory, &mut block).unwrap();
 
         assert_eq!(block.instructions().len(), 1);
         assert_eq!(block.attempted_instruction_count(), 2);

@@ -54,7 +54,7 @@ pub trait MemoryBus {
         false
     }
 
-    fn load_i32(&self, address: u32) -> Result<i32, MemoryFault>;
+    fn load_i32(&mut self, address: u32) -> Result<i32, MemoryFault>;
 
     fn store_i32(&mut self, address: u32, value: i32) -> Result<(), MemoryFault>;
 
@@ -64,7 +64,7 @@ pub trait MemoryBus {
         access: AtomicWordAccess,
     ) -> Result<(), MemoryFault>;
 
-    fn atomic_load_i32(&self, address: u32) -> Result<i32, MemoryFault>;
+    fn atomic_load_i32(&mut self, address: u32) -> Result<i32, MemoryFault>;
 
     fn atomic_store_i32(&mut self, address: u32, value: i32) -> Result<(), MemoryFault>;
 
@@ -74,11 +74,11 @@ pub trait MemoryBus {
         update: &mut dyn FnMut(i32) -> i32,
     ) -> Result<i32, MemoryFault>;
 
-    fn load_u8(&self, address: u32) -> Result<u8, MemoryFault>;
+    fn load_u8(&mut self, address: u32) -> Result<u8, MemoryFault>;
 
     fn store_u8(&mut self, address: u32, value: u8) -> Result<(), MemoryFault>;
 
-    fn load_u16(&self, address: u32) -> Result<u16, MemoryFault> {
+    fn load_u16(&mut self, address: u32) -> Result<u16, MemoryFault> {
         let next = address.checked_add(1).ok_or_else(|| {
             MemoryFault::at(
                 address,
@@ -103,7 +103,7 @@ pub trait MemoryBus {
         self.store_u8(next, hi)
     }
 
-    fn load_u64(&self, address: u32) -> Result<u64, MemoryFault> {
+    fn load_u64(&mut self, address: u32) -> Result<u64, MemoryFault> {
         let mut bytes = [0_u8; 8];
         for (offset, byte) in bytes.iter_mut().enumerate() {
             let address = address.checked_add(offset as u32).ok_or_else(|| {
@@ -293,8 +293,8 @@ impl MemoryBus for MachineMemory {
         self.len()
     }
 
-    fn load_i32(&self, address: u32) -> Result<i32, MemoryFault> {
-        self.load_i32(address)
+    fn load_i32(&mut self, address: u32) -> Result<i32, MemoryFault> {
+        MachineMemory::load_i32(self, address)
     }
 
     fn store_i32(&mut self, address: u32, value: i32) -> Result<(), MemoryFault> {
@@ -309,8 +309,8 @@ impl MemoryBus for MachineMemory {
         self.validate_atomic_i32(address)
     }
 
-    fn atomic_load_i32(&self, address: u32) -> Result<i32, MemoryFault> {
-        self.atomic_load_i32(address)
+    fn atomic_load_i32(&mut self, address: u32) -> Result<i32, MemoryFault> {
+        MachineMemory::atomic_load_i32(self, address)
     }
 
     fn atomic_store_i32(&mut self, address: u32, value: i32) -> Result<(), MemoryFault> {
@@ -325,24 +325,24 @@ impl MemoryBus for MachineMemory {
         self.atomic_update_i32(address, update)
     }
 
-    fn load_u8(&self, address: u32) -> Result<u8, MemoryFault> {
-        self.load_u8(address)
+    fn load_u8(&mut self, address: u32) -> Result<u8, MemoryFault> {
+        MachineMemory::load_u8(self, address)
     }
 
     fn store_u8(&mut self, address: u32, value: u8) -> Result<(), MemoryFault> {
         self.store_u8(address, value)
     }
 
-    fn load_u16(&self, address: u32) -> Result<u16, MemoryFault> {
-        self.load_u16(address)
+    fn load_u16(&mut self, address: u32) -> Result<u16, MemoryFault> {
+        MachineMemory::load_u16(self, address)
     }
 
     fn store_u16(&mut self, address: u32, value: u16) -> Result<(), MemoryFault> {
         self.store_u16(address, value)
     }
 
-    fn load_u64(&self, address: u32) -> Result<u64, MemoryFault> {
-        self.load_u64(address)
+    fn load_u64(&mut self, address: u32) -> Result<u64, MemoryFault> {
+        MachineMemory::load_u64(self, address)
     }
 
     fn store_u64(&mut self, address: u32, value: u64) -> Result<(), MemoryFault> {

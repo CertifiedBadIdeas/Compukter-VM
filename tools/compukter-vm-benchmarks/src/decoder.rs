@@ -136,7 +136,7 @@ impl PreparedDecoderBenchmark {
                     let pc = (index % 3) * 4;
                     let resolved = self
                         .cache
-                        .resolve_with_decoder(pc, &self.bus, decoder)
+                        .resolve_with_decoder(pc, &mut self.bus, decoder)
                         .map_err(|error| error.to_string())?;
                     let word = match black_box(resolved) {
                         BenchmarkResolvedInstruction::Valid { word } => word,
