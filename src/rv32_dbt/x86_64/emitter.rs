@@ -473,6 +473,25 @@ impl X64Emitter {
         self.group_register_wide(register, &[0xf7], 3, true)
     }
 
+    pub(crate) fn not_r32(&mut self, register: Gpr) -> Result<(), EmitError> {
+        self.group_register(register, &[0xf7], 2)
+    }
+
+    pub(crate) fn bswap_r32(&mut self, register: Gpr) -> Result<(), EmitError> {
+        self.with_rollback(|out| {
+            out.emit_rex(false, false, false, register.high(), false)?;
+            out.emit_bytes(&[0x0f, 0xc8 + register.low()])
+        })
+    }
+
+    pub(crate) fn bsf_r32_r32(&mut self, dst: Gpr, src: Gpr) -> Result<(), EmitError> {
+        self.reg_reg(&[0x0f, 0xbc], false, dst, src, false)
+    }
+
+    pub(crate) fn bsr_r32_r32(&mut self, dst: Gpr, src: Gpr) -> Result<(), EmitError> {
+        self.reg_reg(&[0x0f, 0xbd], false, dst, src, false)
+    }
+
     pub(crate) fn shl_r32_imm8(&mut self, dst: Gpr, value: u8) -> Result<(), EmitError> {
         self.group_shift_imm8(dst, 4, value)
     }
@@ -485,6 +504,10 @@ impl X64Emitter {
         self.group_shift_imm8(dst, 7, value)
     }
 
+    pub(crate) fn ror_r32_imm8(&mut self, dst: Gpr, value: u8) -> Result<(), EmitError> {
+        self.group_shift_imm8(dst, 1, value)
+    }
+
     pub(crate) fn shl_r32_cl(&mut self, dst: Gpr) -> Result<(), EmitError> {
         self.group_register(dst, &[0xd3], 4)
     }
@@ -495,6 +518,14 @@ impl X64Emitter {
 
     pub(crate) fn sar_r32_cl(&mut self, dst: Gpr) -> Result<(), EmitError> {
         self.group_register(dst, &[0xd3], 7)
+    }
+
+    pub(crate) fn rol_r32_cl(&mut self, dst: Gpr) -> Result<(), EmitError> {
+        self.group_register(dst, &[0xd3], 0)
+    }
+
+    pub(crate) fn ror_r32_cl(&mut self, dst: Gpr) -> Result<(), EmitError> {
+        self.group_register(dst, &[0xd3], 1)
     }
 
     pub(crate) fn setcc_r8(&mut self, condition: Condition, dst: Gpr) -> Result<(), EmitError> {
@@ -988,6 +1019,26 @@ mod tests {
                 0xf9, 0xff, 0xff, 0xff, 0x41, 0xc1, 0xe0, 0x05, 0xd3, 0xeb, 0x41, 0xd3, 0xf9, 0x85,
                 0xd8, 0x40, 0x0f, 0x9c, 0xc6, 0x45, 0x0f, 0x43, 0xc1, 0x45, 0x0f, 0xaf, 0xd3, 0x41,
                 0xf7, 0xe0, 0x41, 0xf7, 0xe9, 0x41, 0xf7, 0xf2, 0x41, 0xf7, 0xfb, 0x99,
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_zbb_surface() {
+        let mut out = X64Emitter::new(64, 1).unwrap();
+        out.not_r32(Gpr::R8).unwrap();
+        out.bswap_r32(Gpr::R9).unwrap();
+        out.bsf_r32_r32(Gpr::R10, Gpr::R11).unwrap();
+        out.bsr_r32_r32(Gpr::R10, Gpr::R11).unwrap();
+        out.rol_r32_cl(Gpr::Rbx).unwrap();
+        out.ror_r32_cl(Gpr::R8).unwrap();
+        out.ror_r32_imm8(Gpr::R9, 7).unwrap();
+
+        assert_eq!(
+            out.finish().unwrap(),
+            [
+                0x41, 0xf7, 0xd0, 0x41, 0x0f, 0xc9, 0x45, 0x0f, 0xbc, 0xd3, 0x45, 0x0f, 0xbd, 0xd3,
+                0xd3, 0xc3, 0x41, 0xd3, 0xc8, 0x41, 0xc1, 0xc9, 0x07,
             ]
         );
     }
