@@ -36,9 +36,11 @@ pub use predecode::{PredecodedRv32imImage, PredecodedRv32imProgram};
 
 use crate::memory::{AtomicWordAccess, MemoryBus};
 use atomic::{apply_atomic, Rv32Reservation};
+#[cfg(feature = "unstable-benchmark-support")]
+pub(crate) use decode::decode_eager_reference;
 pub(crate) use decode::{
-    decode as decode_product_word, decode_eager_reference, decode_fields, CsrOperation, CsrSource,
-    DecodedFields, DecodedInstruction, DecodedOp,
+    decode as decode_product_word, decode_fields, CsrOperation, CsrSource, DecodedFields,
+    DecodedInstruction, DecodedOp,
 };
 pub(crate) use decode::{Branch, ImmOp, Load, Op, Store};
 use std::fmt::{Display, Formatter};

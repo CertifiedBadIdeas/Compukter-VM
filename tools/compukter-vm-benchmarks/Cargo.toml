@@ -1,0 +1,19 @@
+[package]
+name = "compukter-vm-benchmarks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+dbt-chain-stats = ["compukter-vm/dbt-chain-stats"]
+dbt-code-audit = ["compukter-vm/dbt-code-audit"]
+dbt-execution-profile = ["compukter-vm/dbt-execution-profile"]
+dbt-translation-timing = ["compukter-vm/dbt-translation-timing"]
+dbt-tier1-prototype = ["compukter-vm/dbt-tier1-prototype"]
+wasmtime-comparison = ["dep:wasmtime", "dbt-translation-timing"]
+
+[dependencies]
+compukter-vm = { path = "../..", features = ["unstable-benchmark-support"] }
+rvsim = { version = "=0.2.2", default-features = false }
+wasmtime = { version = "=47.0.3", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }

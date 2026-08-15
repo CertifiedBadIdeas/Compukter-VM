@@ -9,12 +9,6 @@
  * (at your option) any later version.
  */
 
-#[cfg(feature = "dbt-code-audit")]
-use compukter_vm::benchmarks::{
-    classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_llvm_symbol_range,
-    parse_wasmtime_function, DecodedHostInstruction, InstructionGroup, PRODUCT_DBT_CACHE_SETS,
-    PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_RAM_BYTES,
-};
 #[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
 use compukter_vm::rv32_machine::Rv32DbtExecutionProfile;
 #[cfg(all(feature = "dbt-code-audit", feature = "dbt-execution-profile"))]
@@ -24,6 +18,12 @@ use compukter_vm::rv32_machine::{
     Rv32DbtCodeAlignment, Rv32DbtCodeSnapshot, Rv32DbtRegisterProfile, Rv32DbtSupportCodeKind,
     Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
     DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES,
+};
+#[cfg(feature = "dbt-code-audit")]
+use compukter_vm_benchmarks::{
+    classify_x86_instruction, has_x86_memory_operand, parse_llvm_symbol, parse_llvm_symbol_range,
+    parse_wasmtime_function, DecodedHostInstruction, InstructionGroup, PRODUCT_DBT_CACHE_SETS,
+    PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_RAM_BYTES,
 };
 #[cfg(feature = "dbt-code-audit")]
 use std::env;
@@ -1057,10 +1057,6 @@ mod tests {
         hot_block_report, instruction_counts, metric_row, parse_block_report, parse_profile_blocks,
         parse_support_report, AuditBlock,
     };
-    use compukter_vm::benchmarks::{
-        DecodedHostInstruction, InstructionGroup, PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES,
-        PRODUCT_DBT_MAX_INSTRUCTIONS,
-    };
     use compukter_vm::rv32_machine::{
         Rv32DbtCodeBlock, Rv32DbtCodeSnapshot, Rv32DbtSupportCodeKind, Rv32DbtSupportCodeRange,
         Rv32ExecutionBackendConfig, DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_REGISTER_PROFILE,
@@ -1070,6 +1066,10 @@ mod tests {
     use compukter_vm::rv32_machine::{
         Rv32DbtDynamicExitCounts, Rv32DbtExecutionProfile, Rv32DbtProfileBlock, Rv32DbtProfileEdge,
         Rv32DbtProfileEdgeKind,
+    };
+    use compukter_vm_benchmarks::{
+        DecodedHostInstruction, InstructionGroup, PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES,
+        PRODUCT_DBT_MAX_INSTRUCTIONS,
     };
 
     #[test]

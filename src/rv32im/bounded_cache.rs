@@ -152,6 +152,7 @@ impl BoundedCachedRv32imProgram {
         Ok(Rv32ResolvedInstruction::Valid { word, instruction })
     }
 
+    #[cfg(feature = "unstable-benchmark-support")]
     pub(crate) fn reset_for_benchmark(&mut self) {
         for set in &mut self.sets {
             *set = CacheSet::default();

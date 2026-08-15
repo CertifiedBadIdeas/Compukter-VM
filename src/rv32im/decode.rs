@@ -429,6 +429,7 @@ fn decode_zbb_register(word: u32) -> Option<ZbbOp> {
     }
 }
 
+#[cfg(any(test, feature = "unstable-benchmark-support"))]
 pub(crate) fn decode_eager_reference(word: u32) -> Result<DecodedInstruction, String> {
     let opcode = word & 0x7f;
     let rd = ((word >> 7) & 31) as usize;

@@ -17,7 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use compukter_vm::benchmarks::{
+use compukter_vm_benchmarks::{
     format_summary, format_timing_sample, populate_vs_native, timing_report_header,
     BenchmarkCandidate, BenchmarkTiming, BenchmarkWorkload, DecoderBenchmarkImplementation,
     DecoderBenchmarkObservation, DecoderBenchmarkScenario, PreparedBenchmark,
@@ -111,7 +111,7 @@ fn main() -> Result<(), String> {
 struct CandidateMeasurement {
     candidate: BenchmarkCandidate,
     prepared: PreparedBenchmark,
-    observation: compukter_vm::benchmarks::BenchmarkObservation,
+    observation: compukter_vm_benchmarks::BenchmarkObservation,
     cold_nanos: u128,
     warm_nanos: Vec<u128>,
     steady_allocations: u64,

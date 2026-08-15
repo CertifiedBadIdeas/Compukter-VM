@@ -144,8 +144,8 @@ pub struct BenchmarkTraffic {
 
 pub(crate) type IsaTraffic = BenchmarkTraffic;
 
-impl From<crate::bus::MachineBusTrafficSnapshot> for BenchmarkTraffic {
-    fn from(value: crate::bus::MachineBusTrafficSnapshot) -> Self {
+impl From<compukter_vm::bus::MachineBusTrafficSnapshot> for BenchmarkTraffic {
+    fn from(value: compukter_vm::bus::MachineBusTrafficSnapshot) -> Self {
         Self {
             loads: value.loads,
             stores: value.stores,
@@ -283,7 +283,7 @@ impl PreparedBenchmark {
                     instruction_fetch: BenchmarkTraffic::default(),
                     data_ram: BenchmarkTraffic::default(),
                     mmio: BenchmarkTraffic::default(),
-                    cpu_state_bytes: crate::rv32im::Rv32imCpu::cpu_state_bytes(),
+                    cpu_state_bytes: compukter_vm::rv32im::Rv32imCpu::cpu_state_bytes(),
                     translation_bytes: observation.translated_bytes as usize,
                     cache_hits: 0,
                     cache_misses: 0,
@@ -306,7 +306,7 @@ impl PreparedBenchmark {
                     instruction_fetch: BenchmarkTraffic::default(),
                     data_ram: BenchmarkTraffic::default(),
                     mmio: BenchmarkTraffic::default(),
-                    cpu_state_bytes: crate::rv32im::Rv32imCpu::cpu_state_bytes(),
+                    cpu_state_bytes: compukter_vm::rv32im::Rv32imCpu::cpu_state_bytes(),
                     translation_bytes: observation.translated_bytes as usize,
                     cache_hits: observation.cache_hits,
                     cache_misses: observation.cache_misses,

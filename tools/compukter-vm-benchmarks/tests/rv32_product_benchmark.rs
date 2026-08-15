@@ -17,7 +17,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use compukter_vm::benchmarks::{
+use compukter_vm::rv32_machine::{
+    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32TranslationLookupUnit,
+    DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_SCRATCH_BYTES,
+};
+use compukter_vm_benchmarks::{
     benchmark_geomean, benchmark_normalize_nanos, benchmark_rotating_order,
     execute_product_machine_batch, format_product_active_row, native_checksum,
     populate_product_ratios, product_backend_order, product_machine_batch, product_percentile,
@@ -26,10 +30,6 @@ use compukter_vm::benchmarks::{
     ProductMachineWorkload, PRODUCT_ACTIVE_REPORT_HEADER, PRODUCT_DBT_CACHE_SETS,
     PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS, PRODUCT_MACHINE_MAX_BATCH,
     PRODUCT_MACHINE_TARGET_NANOS, PRODUCT_RESIDENT_REPORT_HEADER,
-};
-use compukter_vm::rv32_machine::{
-    Rv32DbtCodeAlignment, Rv32ExecutionBackendConfig, Rv32TranslationLookupUnit,
-    DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_SCRATCH_BYTES,
 };
 
 #[test]

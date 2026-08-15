@@ -19,12 +19,14 @@
 
 use super::rv32::{mmio_control_program, rv32_workload, ProgramImage};
 use super::{native_checksum, BenchmarkWorkload, DATA_BASE};
-use crate::rv32_machine::{
+use compukter_vm::rv32_machine::{
     Rv32DbtStats, Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
     Rv32TranslationStats, CONTROL_BASE, DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_BYTES,
     DEFAULT_DBT_SCRATCH_BYTES, STATUS_HALTED,
 };
-use crate::rv32im::encoding::{addi, bne, csrrs, csrrw, ebreak, ecall, jal, materialize, mret, sw};
+use compukter_vm::rv32im::encoding::{
+    addi, bne, csrrs, csrrw, ebreak, ecall, jal, materialize, mret, sw,
+};
 use std::collections::HashMap;
 use std::hint::black_box;
 
@@ -366,8 +368,8 @@ impl ProductMachineBackend {
                 max_instructions: PRODUCT_DBT_MAX_INSTRUCTIONS,
                 scratch_bytes: DEFAULT_DBT_SCRATCH_BYTES,
                 cache_bytes: PRODUCT_DBT_CODE_BYTES,
-                code_alignment: crate::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
-                register_profile: crate::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
+                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
             },
         }
     }

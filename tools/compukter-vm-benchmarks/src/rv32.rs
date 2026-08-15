@@ -21,13 +21,13 @@ use super::{
     IsaBenchmarkCandidate, IsaBenchmarkObservation, IsaBenchmarkWorkload, IsaTraffic, DATA_BASE,
     MEMORY_SIZE, MMIO_BASE, STACK_TOP,
 };
-use crate::bus::{MachineBus, MachineBusTrafficSnapshot, MmioDevice};
-use crate::memory::MemoryFault;
-use crate::rv32im::encoding::{
+use compukter_vm::bus::{MachineBus, MachineBusTrafficSnapshot, MmioDevice};
+use compukter_vm::memory::MemoryFault;
+use compukter_vm::rv32im::encoding::{
     add, addi, and, andi, beq, bne, ebreak, ecall, jal, jalr, lbu, lw, materialize, mul, or, sb,
     sll, srl, sub, sw, xor,
 };
-use crate::rv32im::{CachedRv32imProgram, PredecodedRv32imProgram, Rv32imCpu, Rv32imStop};
+use compukter_vm::rv32im::{CachedRv32imProgram, PredecodedRv32imProgram, Rv32imCpu, Rv32imStop};
 use rvsim::{Clock, CpuError, CpuState, Interp, Memory, MemoryAccess};
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -777,7 +777,7 @@ fn subtract(
 
 #[cfg(test)]
 fn assert_stepwise_differential(mut seed: u64, instruction_count: usize) {
-    use crate::rv32im::encoding::{
+    use compukter_vm::rv32im::encoding::{
         div, divu, lb, lbu, lh, lhu, lui, mulh, mulhsu, mulhu, ori, rem, remu, sb, sh, slli, slt,
         slti, sltiu, sltu, srai, srli, xori,
     };

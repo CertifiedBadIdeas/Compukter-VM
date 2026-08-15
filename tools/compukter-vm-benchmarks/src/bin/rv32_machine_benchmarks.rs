@@ -17,7 +17,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use compukter_vm::benchmarks::{
+use compukter_vm::rv32_machine::{
+    Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig,
+    DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES,
+};
+use compukter_vm_benchmarks::{
     benchmark_geomean, benchmark_normalize_nanos, benchmark_rotating_order,
     execute_product_machine_batch, format_product_active_row, populate_product_ratios,
     product_backend_order, product_machine_batch, product_percentile, PreparedProductNative,
@@ -26,10 +30,6 @@ use compukter_vm::benchmarks::{
     PRODUCT_BLOCK_CACHE_SETS, PRODUCT_BLOCK_MAX_INSTRUCTIONS, PRODUCT_CACHE_SETS,
     PRODUCT_DBT_CACHE_SETS, PRODUCT_DBT_CODE_BYTES, PRODUCT_DBT_MAX_INSTRUCTIONS,
     PRODUCT_DEBUG_LIMIT, PRODUCT_RAM_BYTES, PRODUCT_RESIDENT_REPORT_HEADER,
-};
-use compukter_vm::rv32_machine::{
-    Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig,
-    DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

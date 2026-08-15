@@ -17,8 +17,6 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use super::rv32::rv32_workload;
-use super::IsaBenchmarkWorkload;
 use crate::memory::MachineMemory;
 use crate::rv32_dbt::abi::{DbtContext, DbtEntry, DbtExitRecord, DbtExitTag};
 use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode};
@@ -26,7 +24,8 @@ use crate::rv32_dbt::code_cache::{DbtCacheKey, DirectDbtCodeCache};
 use crate::rv32_dbt::executable::ExecutableScratch;
 use crate::rv32_dbt::x86_64::lower::DbtTranslationWorkspace;
 use crate::rv32im::{
-    decode_product_word, fill_decoded_block, DecodedInstruction, Rv32ResolvedInstruction, Rv32imCpu,
+    decode_eager_reference, decode_product_word, fill_decoded_block, BoundedCachedRv32imProgram,
+    DecodedInstruction, Rv32ResolvedInstruction, Rv32imCpu,
 };
 use std::time::Instant;
 
@@ -34,6 +33,81 @@ const DIRECT_EXECUTABLE_BYTES: usize = 8 * 1024;
 const CACHED_EXECUTABLE_BYTES: usize = 64 * 1024;
 const CACHE_SETS: usize = 64;
 const MAX_BLOCK_INSTRUCTIONS: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BenchmarkDecodedInstruction(DecodedInstruction);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkResolvedInstruction {
+    Valid { word: u32 },
+    Invalid { word: u32 },
+}
+
+#[inline(always)]
+pub fn decode_eager_reference_for_benchmark(
+    word: u32,
+) -> Result<BenchmarkDecodedInstruction, String> {
+    decode_eager_reference(word).map(BenchmarkDecodedInstruction)
+}
+
+#[inline(always)]
+pub fn decode_product_word_for_benchmark(word: u32) -> Result<BenchmarkDecodedInstruction, String> {
+    decode_product_word(word).map(BenchmarkDecodedInstruction)
+}
+
+pub struct BenchmarkBoundedDecodeCache {
+    inner: BoundedCachedRv32imProgram,
+}
+
+impl BenchmarkBoundedDecodeCache {
+    pub fn new(sets: usize) -> Result<Self, String> {
+        Ok(Self {
+            inner: BoundedCachedRv32imProgram::new(sets)?,
+        })
+    }
+
+    #[inline(always)]
+    pub fn reset(&mut self) {
+        self.inner.reset_for_benchmark();
+    }
+
+    #[inline(always)]
+    pub fn resolve_with_decoder(
+        &mut self,
+        instruction_pc: u32,
+        bus: &dyn crate::memory::MemoryBus,
+        decoder: fn(u32) -> Result<BenchmarkDecodedInstruction, String>,
+    ) -> Result<BenchmarkResolvedInstruction, crate::memory::MemoryFault> {
+        match self
+            .inner
+            .resolve_with_decoder(instruction_pc, bus, |word| {
+                decoder(word).map(|decoded| decoded.0)
+            })? {
+            Rv32ResolvedInstruction::Valid { word, .. } => {
+                Ok(BenchmarkResolvedInstruction::Valid { word })
+            }
+            Rv32ResolvedInstruction::Invalid { word } => {
+                Ok(BenchmarkResolvedInstruction::Invalid { word })
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn misses(&self) -> u64 {
+        self.inner.stats().misses
+    }
+
+    #[inline(always)]
+    pub fn retained_bytes(&self) -> usize {
+        self.inner.retained_bytes()
+    }
+}
+
+pub struct DbtComputeImage {
+    pub words: Vec<u32>,
+    pub result_register: u8,
+    pub iterations: u32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectDbtComputeObservation {
@@ -58,11 +132,10 @@ pub struct PreparedDirectDbtCompute32 {
 }
 
 impl PreparedDirectDbtCompute32 {
-    pub fn new(iterations: u32) -> Result<Self, String> {
-        if iterations == 0 {
+    pub fn new(image: DbtComputeImage) -> Result<Self, String> {
+        if image.iterations == 0 {
             return Err("direct DBT compute32 iterations must be positive".to_string());
         }
-        let image = rv32_workload(IsaBenchmarkWorkload::Compute32, iterations)?;
         let code = image
             .words
             .iter()
@@ -71,7 +144,7 @@ impl PreparedDirectDbtCompute32 {
         let memory = MachineMemory::from_sections(code.len(), &code, &[], 0)
             .map_err(|error| error.to_string())?;
         Ok(Self {
-            iterations,
+            iterations: image.iterations,
             words: image.words,
             result_register: image.result_register,
             memory,
@@ -225,10 +298,6 @@ impl PreparedDirectDbtCompute32 {
             }
         }
     }
-
-    pub(crate) const fn iterations(&self) -> u32 {
-        self.iterations
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,11 +328,10 @@ pub struct PreparedCachedDbtCompute32 {
 }
 
 impl PreparedCachedDbtCompute32 {
-    pub fn new(iterations: u32) -> Result<Self, String> {
-        if iterations == 0 {
+    pub fn new(image: DbtComputeImage) -> Result<Self, String> {
+        if image.iterations == 0 {
             return Err("cached DBT compute32 iterations must be positive".to_string());
         }
-        let image = rv32_workload(IsaBenchmarkWorkload::Compute32, iterations)?;
         let code = image
             .words
             .iter()
@@ -272,7 +340,7 @@ impl PreparedCachedDbtCompute32 {
         let memory = MachineMemory::from_sections(code.len(), &code, &[], 0)
             .map_err(|error| error.to_string())?;
         Ok(Self {
-            iterations,
+            iterations: image.iterations,
             words: image.words,
             result_register: image.result_register,
             memory,
@@ -427,53 +495,5 @@ impl PreparedCachedDbtCompute32 {
                 }
             }
         }
-    }
-
-    pub(crate) const fn iterations(&self) -> u32 {
-        self.iterations
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{PreparedCachedDbtCompute32, PreparedDirectDbtCompute32};
-    use crate::benchmarks::{native_checksum, BenchmarkWorkload};
-
-    #[test]
-    fn direct_dbt_executes_the_existing_compute32_program() {
-        for iterations in [1, 2, 17, 257] {
-            let mut prepared = PreparedDirectDbtCompute32::new(iterations).unwrap();
-
-            let observation = prepared.execute().unwrap();
-
-            assert_eq!(
-                observation.checksum,
-                native_checksum(BenchmarkWorkload::Compute32, iterations)
-            );
-            assert!(observation.dispatches >= 3);
-            assert!(observation.attempted_instructions > u64::from(iterations));
-            assert!(observation.translated_bytes > 0);
-            assert_eq!(observation.reserved_bytes, 16 * 1024);
-        }
-    }
-
-    #[test]
-    fn cached_dbt_reuses_resident_compute32_blocks() {
-        let mut prepared = PreparedCachedDbtCompute32::new(257).unwrap();
-
-        let cold = prepared.execute().unwrap();
-        let warm = prepared.execute().unwrap();
-
-        assert_eq!(
-            cold.checksum,
-            native_checksum(BenchmarkWorkload::Compute32, 257)
-        );
-        assert_eq!(warm.checksum, cold.checksum);
-        assert!(cold.translations > 0);
-        assert_eq!(warm.translations, 0);
-        assert_eq!(warm.publications, 0);
-        assert!(warm.cache_hits > 0);
-        assert_eq!(warm.cache_misses, 0);
-        assert_eq!(warm.translated_bytes, 0);
     }
 }
