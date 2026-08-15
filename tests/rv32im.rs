@@ -18,6 +18,7 @@
  */
 
 use compukter_vm::bus::MachineBus;
+use compukter_vm::rv32im::encoding as e;
 use compukter_vm::rv32im::encoding::{
     add, addi, amoadd_w, amoand_w, amomax_w, amomaxu_w, amomin_w, amominu_w, amoor_w, amoswap_w,
     amoxor_w, auipc, beq, bge, bgeu, blt, bltu, bne, csrrc, csrrci, csrrs, csrrsi, csrrw, csrrwi,
@@ -420,6 +421,85 @@ fn predecoded_program_matches_direct_execution_and_reports_retained_bytes() {
         predecoded.retired_instructions()
     );
     assert_eq!(direct_bus.memory(), predecoded_bus.memory());
+}
+
+#[test]
+fn zbb_program_matches_direct_predecoded_and_bounded_cached_execution() {
+    let mut words = Vec::from(e::materialize(1, 0x8001_8080));
+    words.extend([
+        e::addi(2, 0, 1),
+        e::andn(3, 1, 2),
+        e::orn(4, 1, 2),
+        e::xnor(5, 1, 2),
+        e::clz(6, 1),
+        e::ctz(7, 1),
+        e::cpop(8, 1),
+        e::min(9, 1, 2),
+        e::minu(10, 1, 2),
+        e::max(11, 1, 2),
+        e::maxu(12, 1, 2),
+        e::sext_b(13, 1),
+        e::sext_h(14, 1),
+        e::zext_h(15, 1),
+        e::rol(16, 1, 2),
+        e::ror(17, 1, 2),
+        e::rori(18, 1, 1),
+        e::orc_b(19, 1),
+        e::rev8(20, 1),
+        e::andn(0, 1, 2),
+        e::ror(1, 1, 2),
+        e::ebreak(),
+    ]);
+    let bytes = words
+        .iter()
+        .copied()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+
+    let mut direct_bus = MachineBus::new(256).unwrap();
+    write_program(&mut direct_bus, &words);
+    let mut direct = Rv32imCpu::new(0);
+    assert_eq!(
+        direct.run_until_stop(&mut direct_bus, 64).unwrap(),
+        Rv32imStop::Ebreak
+    );
+
+    let program = PredecodedRv32imProgram::new(0, &bytes).unwrap();
+    let mut predecoded_bus = MachineBus::new(256).unwrap();
+    write_program(&mut predecoded_bus, &words);
+    let mut predecoded = Rv32imCpu::new(0);
+    assert_eq!(
+        program
+            .run_until_stop(&mut predecoded, &mut predecoded_bus, 64)
+            .unwrap(),
+        Rv32imStop::Ebreak
+    );
+
+    let mut cached_bus = MachineBus::new(256).unwrap();
+    write_program(&mut cached_bus, &words);
+    let mut cached = Rv32imCpu::new(0);
+    let mut cache = BoundedCachedRv32imProgram::new(32).unwrap();
+    let mut stop = None;
+    for _ in 0..64 {
+        stop = cache.step(&mut cached, &mut cached_bus).unwrap();
+        if stop.is_some() {
+            break;
+        }
+    }
+    assert_eq!(stop, Some(Rv32imStop::Ebreak));
+
+    for register in 0..32 {
+        assert_eq!(predecoded.register(register), direct.register(register));
+        assert_eq!(cached.register(register), direct.register(register));
+    }
+    assert_eq!(direct.register(0), 0);
+    assert_eq!(direct.register(1), 0x4000_c040);
+    assert_eq!(direct.register(8), 4);
+    assert_eq!(direct.register(19), u32::MAX);
+    assert_eq!(direct.register(20), 0x8080_0180);
+    assert_eq!(direct.retired_instructions(), words.len() as u64);
+    assert_eq!(predecoded.retired_instructions(), words.len() as u64);
+    assert_eq!(cached.retired_instructions(), words.len() as u64);
 }
 
 #[test]

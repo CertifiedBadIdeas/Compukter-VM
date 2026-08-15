@@ -18,6 +18,7 @@
  */
 
 use super::atomic::{AtomicOp, MemoryOrdering};
+use super::zbb::ZbbOp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -138,6 +139,12 @@ pub(crate) enum DecodedInstruction {
         rs1: usize,
         rs2: usize,
     },
+    Zbb {
+        op: ZbbOp,
+        rd: usize,
+        rs1: usize,
+        operand: u8,
+    },
     Fence,
     FenceI,
     LoadReserved {
@@ -180,6 +187,7 @@ pub(crate) enum DecodedOp {
     Store(Store),
     Immediate(ImmOp),
     Register(Op),
+    Zbb(ZbbOp),
     Fence,
     FenceI,
     LoadReserved(MemoryOrdering),
@@ -248,6 +256,12 @@ impl DecodedFields {
             DecodedInstruction::Register { op, rd, rs1, rs2 } => {
                 fields(DecodedOp::Register(op), rd, rs1, rs2, 0)
             }
+            DecodedInstruction::Zbb {
+                op,
+                rd,
+                rs1,
+                operand,
+            } => fields(DecodedOp::Zbb(op), rd, rs1, usize::from(operand), 0),
             DecodedInstruction::Fence => fields(DecodedOp::Fence, 0, 0, 0, 0),
             DecodedInstruction::FenceI => fields(DecodedOp::FenceI, 0, 0, 0, 0),
             DecodedInstruction::LoadReserved { rd, rs1, ordering } => {
@@ -340,6 +354,12 @@ impl DecodedFields {
                 immediate: self.immediate,
             },
             DecodedOp::Register(op) => DecodedInstruction::Register { op, rd, rs1, rs2 },
+            DecodedOp::Zbb(op) => DecodedInstruction::Zbb {
+                op,
+                rd,
+                rs1,
+                operand: self.rs2,
+            },
             DecodedOp::Fence => DecodedInstruction::Fence,
             DecodedOp::FenceI => DecodedInstruction::FenceI,
             DecodedOp::LoadReserved(ordering) => {
@@ -375,6 +395,37 @@ impl DecodedFields {
             DecodedOp::Ebreak => DecodedInstruction::Ebreak,
             DecodedOp::Mret => DecodedInstruction::Mret,
         }
+    }
+}
+
+fn decode_zbb_immediate(word: u32) -> Option<(ZbbOp, u8)> {
+    let selector = rs2(word) as u8;
+    match (word >> 20, funct3(word)) {
+        (0x600, 1) => Some((ZbbOp::Clz, 0)),
+        (0x601, 1) => Some((ZbbOp::Ctz, 0)),
+        (0x602, 1) => Some((ZbbOp::Cpop, 0)),
+        (0x604, 1) => Some((ZbbOp::SextB, 0)),
+        (0x605, 1) => Some((ZbbOp::SextH, 0)),
+        (0x287, 5) => Some((ZbbOp::OrcB, 0)),
+        (0x698, 5) => Some((ZbbOp::Rev8, 0)),
+        (_, 5) if funct7(word) == 0x30 => Some((ZbbOp::Rori, selector)),
+        _ => None,
+    }
+}
+
+fn decode_zbb_register(word: u32) -> Option<ZbbOp> {
+    match (funct7(word), funct3(word), rs2(word)) {
+        (0x20, 7, _) => Some(ZbbOp::Andn),
+        (0x20, 6, _) => Some(ZbbOp::Orn),
+        (0x20, 4, _) => Some(ZbbOp::Xnor),
+        (0x05, 4, _) => Some(ZbbOp::Min),
+        (0x05, 5, _) => Some(ZbbOp::Minu),
+        (0x05, 6, _) => Some(ZbbOp::Max),
+        (0x05, 7, _) => Some(ZbbOp::Maxu),
+        (0x04, 4, 0) => Some(ZbbOp::ZextH),
+        (0x30, 1, _) => Some(ZbbOp::Rol),
+        (0x30, 5, _) => Some(ZbbOp::Ror),
+        _ => None,
     }
 }
 
@@ -462,6 +513,14 @@ pub(crate) fn decode_eager_reference(word: u32) -> Result<DecodedInstruction, St
             })
         }
         0x13 => {
+            if let Some((op, operand)) = decode_zbb_immediate(word) {
+                return Ok(DecodedInstruction::Zbb {
+                    op,
+                    rd,
+                    rs1,
+                    operand,
+                });
+            }
             let (op, immediate) = match funct3 {
                 0 => (ImmOp::Add, i_imm),
                 2 => (ImmOp::Slt, i_imm),
@@ -482,6 +541,14 @@ pub(crate) fn decode_eager_reference(word: u32) -> Result<DecodedInstruction, St
             })
         }
         0x33 => {
+            if let Some(op) = decode_zbb_register(word) {
+                return Ok(DecodedInstruction::Zbb {
+                    op,
+                    rd,
+                    rs1,
+                    operand: rs2 as u8,
+                });
+            }
             let op = match (funct7, funct3) {
                 (0, 0) => Op::Add,
                 (0x20, 0) => Op::Sub,
@@ -702,6 +769,15 @@ pub(crate) fn decode_fields(word: u32) -> Result<DecodedFields, String> {
             )
         }
         0x13 => {
+            if let Some((op, operand)) = decode_zbb_immediate(word) {
+                return fields(
+                    DecodedOp::Zbb(op),
+                    rd(word),
+                    rs1(word),
+                    usize::from(operand),
+                    0,
+                );
+            }
             let instruction_funct3 = funct3(word);
             let (op, immediate) = match instruction_funct3 {
                 0 => (ImmOp::Add, i_immediate(word)),
@@ -718,6 +794,9 @@ pub(crate) fn decode_fields(word: u32) -> Result<DecodedFields, String> {
             fields(DecodedOp::Immediate(op), rd(word), rs1(word), 0, immediate)
         }
         0x33 => {
+            if let Some(op) = decode_zbb_register(word) {
+                return fields(DecodedOp::Zbb(op), rd(word), rs1(word), rs2(word), 0);
+            }
             let op = match (funct7(word), funct3(word)) {
                 (0, 0) => Op::Add,
                 (0x20, 0) => Op::Sub,
@@ -897,6 +976,14 @@ pub(crate) fn decode_opcode_first_reference(word: u32) -> Result<DecodedInstruct
             })
         }
         0x13 => {
+            if let Some((op, operand)) = decode_zbb_immediate(word) {
+                return Ok(DecodedInstruction::Zbb {
+                    op,
+                    rd: rd(word),
+                    rs1: rs1(word),
+                    operand,
+                });
+            }
             let instruction_funct3 = funct3(word);
             let (op, immediate) = match instruction_funct3 {
                 0 => (ImmOp::Add, i_immediate(word)),
@@ -918,6 +1005,14 @@ pub(crate) fn decode_opcode_first_reference(word: u32) -> Result<DecodedInstruct
             })
         }
         0x33 => {
+            if let Some(op) = decode_zbb_register(word) {
+                return Ok(DecodedInstruction::Zbb {
+                    op,
+                    rd: rd(word),
+                    rs1: rs1(word),
+                    operand: rs2(word) as u8,
+                });
+            }
             let op = match (funct7(word), funct3(word)) {
                 (0, 0) => Op::Add,
                 (0x20, 0) => Op::Sub,
@@ -1027,6 +1122,7 @@ pub(crate) fn decode_opcode_first_reference(word: u32) -> Result<DecodedInstruct
 mod tests {
     use super::super::encoding as e;
     use super::{decode, decode_eager_reference, DecodedInstruction};
+    use crate::rv32im::zbb::ZbbOp;
 
     fn normalized(result: Result<DecodedInstruction, String>) -> Result<DecodedInstruction, ()> {
         result.map_err(|_| ())
@@ -1137,6 +1233,51 @@ mod tests {
     fn eager_reference_matches_architectural_words() {
         for word in architectural_words() {
             assert_matches_eager(word);
+        }
+    }
+
+    #[test]
+    fn zbb_decoders_match_ratified_encodings() {
+        let cases = [
+            (e::andn(3, 1, 2), ZbbOp::Andn, 2),
+            (e::orn(3, 1, 2), ZbbOp::Orn, 2),
+            (e::xnor(3, 1, 2), ZbbOp::Xnor, 2),
+            (e::clz(3, 1), ZbbOp::Clz, 0),
+            (e::ctz(3, 1), ZbbOp::Ctz, 0),
+            (e::cpop(3, 1), ZbbOp::Cpop, 0),
+            (e::min(3, 1, 2), ZbbOp::Min, 2),
+            (e::minu(3, 1, 2), ZbbOp::Minu, 2),
+            (e::max(3, 1, 2), ZbbOp::Max, 2),
+            (e::maxu(3, 1, 2), ZbbOp::Maxu, 2),
+            (e::sext_b(3, 1), ZbbOp::SextB, 0),
+            (e::sext_h(3, 1), ZbbOp::SextH, 0),
+            (e::zext_h(3, 1), ZbbOp::ZextH, 0),
+            (e::rol(3, 1, 2), ZbbOp::Rol, 2),
+            (e::ror(3, 1, 2), ZbbOp::Ror, 2),
+            (e::rori(3, 1, 31), ZbbOp::Rori, 31),
+            (e::orc_b(3, 1), ZbbOp::OrcB, 0),
+            (e::rev8(3, 1), ZbbOp::Rev8, 0),
+        ];
+        for (word, op, operand) in cases {
+            let expected = DecodedInstruction::Zbb {
+                op,
+                rd: 3,
+                rs1: 1,
+                operand,
+            };
+            assert_eq!(decode_eager_reference(word), Ok(expected), "{word:#010x}");
+            assert_eq!(decode(word), Ok(expected), "{word:#010x}");
+        }
+
+        let reserved = [
+            e::rori(3, 1, 0) | 1 << 25,
+            0x6030_9193,
+            e::orc_b(3, 1) ^ 1 << 20,
+            e::zext_h(3, 1) | 1 << 20,
+        ];
+        for word in reserved {
+            assert!(decode_eager_reference(word).is_err(), "{word:#010x}");
+            assert!(decode(word).is_err(), "{word:#010x}");
         }
     }
 

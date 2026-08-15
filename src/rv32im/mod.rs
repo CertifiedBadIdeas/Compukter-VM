@@ -42,6 +42,7 @@ pub(crate) use decode::{
 };
 pub(crate) use decode::{Branch, ImmOp, Load, Op, Store};
 use std::fmt::{Display, Formatter};
+pub(crate) use zbb::execute_zbb;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rv32imStop {
@@ -442,6 +443,20 @@ impl Rv32imCpu {
                 let lhs = self.state.registers[rs1];
                 let rhs = self.state.registers[rs2];
                 self.state.registers[rd] = execute_op(op, lhs, rhs);
+            }
+            DecodedInstruction::Zbb {
+                op,
+                rd,
+                rs1,
+                operand,
+            } => {
+                let lhs = self.state.registers[rs1];
+                let operand = if op.uses_register_rhs() {
+                    self.state.registers[usize::from(operand)]
+                } else {
+                    u32::from(operand)
+                };
+                self.state.registers[rd] = execute_zbb(op, lhs, operand);
             }
             DecodedInstruction::Fence | DecodedInstruction::FenceI => {}
             DecodedInstruction::LoadReserved { rd, rs1, ordering } => {
