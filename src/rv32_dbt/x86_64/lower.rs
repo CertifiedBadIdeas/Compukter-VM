@@ -25,7 +25,7 @@
 use super::emitter::{Condition, EmitError, Gpr, Label, Mem, X64Emitter};
 #[cfg(feature = "dbt-code-audit")]
 use super::register_cache::RegisterAuditPhase;
-use super::register_cache::{FutureValueSource, RegisterCache};
+use super::register_cache::{FutureValueSource, RegisterCache, RegisterFlushPlan};
 #[cfg(feature = "dbt-execution-profile")]
 use crate::rv32_dbt::abi::DbtProfileExitKind;
 use crate::rv32_dbt::abi::{DbtContext, DbtExitRecord, DbtExitTag};
@@ -51,6 +51,17 @@ const EXECUTION_COUNTER: Gpr = Gpr::Rdi;
 pub(crate) struct DbtTranslationWorkspace {
     emitter: X64Emitter,
     register_profile: Rv32DbtRegisterProfile,
+    memory_exits: Vec<PendingMemoryExit>,
+}
+
+struct PendingMemoryExit {
+    label: Label,
+    flush: RegisterFlushPlan,
+    chainable: bool,
+    instruction_pc: u32,
+    instruction_word: u32,
+    attempted: u32,
+    access_size: u32,
 }
 
 struct StaticLinkCollector {
@@ -174,9 +185,14 @@ impl DbtTranslationWorkspace {
         })?;
         let emitter = X64Emitter::new(code_capacity, control_capacity)
             .map_err(|error| fault(DbtFaultKind::Capacity, 0, None, error.to_string()))?;
+        let mut memory_exits = Vec::new();
+        memory_exits
+            .try_reserve_exact(max_block_instructions)
+            .map_err(|error| fault(DbtFaultKind::Capacity, 0, None, error.to_string()))?;
         Ok(Self {
             emitter,
             register_profile,
+            memory_exits,
         })
     }
 
@@ -217,6 +233,9 @@ impl DbtTranslationWorkspace {
             ));
         }
         self.emitter.reset();
+        self.memory_exits.clear();
+        let register_profile = self.register_profile;
+        let memory_exits = &mut self.memory_exits;
         let mut out = &mut self.emitter;
         let chainable = matches!(input.mode(), DbtBlockMode::ChainableThroughput);
         emit_prologue(&mut out, chainable)
@@ -226,7 +245,7 @@ impl DbtTranslationWorkspace {
         #[cfg(feature = "dbt-execution-profile")]
         let mut profile_relocations = ProfileRelocationCollector::new();
         let mut cache = if chainable {
-            RegisterCache::chainable(self.register_profile)
+            RegisterCache::chainable(register_profile)
         } else {
             RegisterCache::direct()
         };
@@ -409,6 +428,7 @@ impl DbtTranslationWorkspace {
                         future,
                         &mut cache,
                         &mut out,
+                        memory_exits,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     continue;
@@ -427,6 +447,7 @@ impl DbtTranslationWorkspace {
                         future,
                         &mut cache,
                         &mut out,
+                        memory_exits,
                     )
                     .map_err(|error| emit_fault(pc, Some(word), error))?;
                     continue;
@@ -498,6 +519,32 @@ impl DbtTranslationWorkspace {
             emit_completed_trampoline(&mut out, input.start_pc(), &mut cold_exits)
                 .map_err(|error| emit_fault(input.start_pc(), None, error))?;
         }
+        for memory_exit in memory_exits.drain(..) {
+            out.bind(memory_exit.label).map_err(|error| {
+                emit_fault(
+                    memory_exit.instruction_pc,
+                    Some(memory_exit.instruction_word),
+                    error,
+                )
+            })?;
+            emit_memory_exit(
+                memory_exit.flush,
+                memory_exit.chainable,
+                &mut out,
+                memory_exit.instruction_pc,
+                memory_exit.instruction_word,
+                memory_exit.attempted,
+                Gpr::Rdx,
+                memory_exit.access_size,
+            )
+            .map_err(|error| {
+                emit_fault(
+                    memory_exit.instruction_pc,
+                    Some(memory_exit.instruction_word),
+                    error,
+                )
+            })?;
+        }
         let code = out
             .finish()
             .map_err(|error| emit_fault(input.start_pc(), None, error))?;
@@ -551,6 +598,7 @@ impl DbtTranslationWorkspace {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         self.emitter.retained_bytes()
+            + self.memory_exits.capacity() * std::mem::size_of::<PendingMemoryExit>()
     }
 }
 
@@ -1019,6 +1067,7 @@ fn lower_load<S: FutureValueSource>(
     remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
+    memory_exits: &mut Vec<PendingMemoryExit>,
 ) -> Result<(), EmitError> {
     let width = match kind {
         Load::Byte | Load::ByteU => 1,
@@ -1032,9 +1081,8 @@ fn lower_load<S: FutureValueSource>(
     if immediate != 0 {
         out.add_r32_imm32(Gpr::Rdx, immediate)?;
     }
-    let mut slow_cache = cache.clone();
+    let flush = cache.flush_plan();
     let slow = out.new_label()?;
-    let done = out.new_label()?;
     emit_ram_checks(Gpr::Rdx, width, 0b001, ram_len, slow, out)?;
 
     let dst = cache.write(rd, remaining, &[], out)?.unwrap_or(Gpr::Rax);
@@ -1046,11 +1094,16 @@ fn lower_load<S: FutureValueSource>(
         Load::ByteU => out.movzx_r32_m8(dst, memory)?,
         Load::HalfU => out.movzx_r32_m16(dst, memory)?,
     }
-    out.jmp(done)?;
-
-    out.bind(slow)?;
-    emit_memory_exit(&mut slow_cache, out, pc, word, attempted, Gpr::Rdx, width)?;
-    out.bind(done)
+    memory_exits.push(PendingMemoryExit {
+        label: slow,
+        flush,
+        chainable: cache.is_chainable(),
+        instruction_pc: pc,
+        instruction_word: word,
+        attempted,
+        access_size: width,
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1066,6 +1119,7 @@ fn lower_store<S: FutureValueSource>(
     remaining: S,
     cache: &mut RegisterCache,
     out: &mut X64Emitter,
+    memory_exits: &mut Vec<PendingMemoryExit>,
 ) -> Result<(), EmitError> {
     let width = match kind {
         Store::Byte => 1,
@@ -1080,9 +1134,8 @@ fn lower_store<S: FutureValueSource>(
     if immediate != 0 {
         out.add_r32_imm32(Gpr::Rdx, immediate)?;
     }
-    let mut slow_cache = cache.clone();
+    let flush = cache.flush_plan();
     let slow = out.new_label()?;
-    let done = out.new_label()?;
     emit_ram_checks(Gpr::Rdx, width, 0b010, ram_len, slow, out)?;
 
     let value = cache.read(rs2, remaining, &[Gpr::Rdx], out)?;
@@ -1093,11 +1146,16 @@ fn lower_store<S: FutureValueSource>(
         Store::Word => out.mov_m32_r32(memory, value)?,
     }
     emit_store_reservation_invalidation(Gpr::Rdx, width, out)?;
-    out.jmp(done)?;
-
-    out.bind(slow)?;
-    emit_memory_exit(&mut slow_cache, out, pc, word, attempted, Gpr::Rdx, width)?;
-    out.bind(done)
+    memory_exits.push(PendingMemoryExit {
+        label: slow,
+        flush,
+        chainable: cache.is_chainable(),
+        instruction_pc: pc,
+        instruction_word: word,
+        attempted,
+        access_size: width,
+    });
+    Ok(())
 }
 
 pub(super) fn emit_store_reservation_invalidation(
@@ -1447,7 +1505,8 @@ fn emit_signed_division(op: Op, lhs: Gpr, rhs: Gpr, out: &mut X64Emitter) -> Res
 }
 
 fn emit_memory_exit(
-    cache: &mut RegisterCache,
+    flush: RegisterFlushPlan,
+    chainable: bool,
     out: &mut X64Emitter,
     instruction_pc: u32,
     instruction_word: u32,
@@ -1455,7 +1514,7 @@ fn emit_memory_exit(
     address: Gpr,
     access_size: u32,
 ) -> Result<(), EmitError> {
-    cache.flush(out)?;
+    flush.emit(out)?;
     write_u32(out, Gpr::R14, Rv32ArchitecturalState::register_offset(0), 0)?;
     write_u32(
         out,
@@ -1469,7 +1528,7 @@ fn emit_memory_exit(
         DbtContext::EXIT_OFFSET + DbtExitRecord::NEXT_PC_OFFSET,
         instruction_pc,
     )?;
-    write_cumulative_attempted(cache, out, attempted)?;
+    write_cumulative_attempted_for_mode(chainable, out, attempted)?;
     write_u32(
         out,
         Gpr::R15,
@@ -1711,7 +1770,15 @@ fn write_cumulative_attempted(
     out: &mut X64Emitter,
     local_attempted: u32,
 ) -> Result<(), EmitError> {
-    if cache.is_chainable() {
+    write_cumulative_attempted_for_mode(cache.is_chainable(), out, local_attempted)
+}
+
+fn write_cumulative_attempted_for_mode(
+    chainable: bool,
+    out: &mut X64Emitter,
+    local_attempted: u32,
+) -> Result<(), EmitError> {
+    if chainable {
         out.mov_r32_m32(
             Gpr::Rax,
             Mem::base_disp(Gpr::R15, DbtContext::REMAINING_BUDGET_OFFSET as i32),
@@ -1758,7 +1825,7 @@ mod tests {
     use crate::rv32_dbt::block::{DbtBlockInput, DbtBlockMode, DbtLinkKind};
     use crate::rv32_dbt::executable::ExecutableScratch;
     use crate::rv32_dbt::ir::DbtIrBlock;
-    use crate::rv32_dbt::x86_64::emitter::{EmitError, Gpr, Mem, X64Emitter};
+    use crate::rv32_dbt::x86_64::emitter::{EmitError, Gpr, Mem, Scale, X64Emitter};
     use crate::rv32_dbt::DbtFaultKind;
     use crate::rv32im::encoding as e;
     use crate::rv32im::{
@@ -2134,6 +2201,29 @@ mod tests {
         assert_eq!(pattern_count(&short, &ram_len_load), 0);
         assert_eq!(pattern_count(&short, &page_count_load), 0);
         assert_ne!(short, long);
+    }
+
+    #[test]
+    fn native_ram_success_falls_through_without_a_near_jump() {
+        let slots = slots(&[lw(0, 1, 0), addi(2, 2, 1)]);
+        let input = DbtBlockInput::new(0x1000, &slots, DbtBlockMode::DirectFast).unwrap();
+        let mut workspace = DbtTranslationWorkspace::new(4096, slots.len()).unwrap();
+        let block = workspace.lower(&input, 4096).unwrap();
+        let mut expected = X64Emitter::new(16, 1).unwrap();
+        expected
+            .mov_r32_m32(
+                Gpr::Rax,
+                Mem::base_index_disp(Gpr::R13, Gpr::Rdx, Scale::One, 0),
+            )
+            .unwrap();
+        let expected = expected.finish().unwrap();
+        let load_offset = block
+            .code()
+            .windows(expected.len())
+            .position(|window| window == expected)
+            .expect("translated block must contain the native RAM load");
+
+        assert_ne!(block.code()[load_offset + expected.len()], 0xe9);
     }
 
     #[test]

@@ -44,6 +44,13 @@ current Cached DBT configuration:
 bash scripts/tests/rv32-c-zbb-self-ab.sh
 ```
 
+For focused measurements of only the current product-default Cached DBT:
+
+```bash
+cargo run --release --locked --offline --example rv32_c_comparison -- \
+    product-default target/rv32-c-comparison 21
+```
+
 Its C kernel, linker scripts, and startup code live in
 `benchmarks/rv32-c-comparison`. Generated benchmark artifacts are local to
 `target/` and are not committed.
