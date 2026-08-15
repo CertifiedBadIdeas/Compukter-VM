@@ -14,6 +14,7 @@ BUILD_DIR="$1"
 : "${RV32_C_READOBJ:=llvm-readobj}"
 : "${RV32_C_OBJDUMP:=llvm-objdump}"
 : "${RV32_C_SIZE:=llvm-size}"
+: "${RV32_C_RV32_MARCH:=rv32im_zicsr}"
 
 for tool in "$RV32_C_CLANG" "$RV32_C_LLD" "$RV32_C_READOBJ" "$RV32_C_OBJDUMP" "$RV32_C_SIZE" sha256sum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -28,7 +29,7 @@ native_flags=(-O3 -march=native -flto -Wall -Wextra -Werror)
 rv32_flags=(
     --target=riscv32-unknown-elf
     -O3
-    -march=rv32im_zicsr
+    -march="$RV32_C_RV32_MARCH"
     -mabi=ilp32
     -ffreestanding
     -fno-builtin
@@ -105,7 +106,7 @@ wasm_bytes="$(wc -c <"$BUILD_DIR/module.wasm")"
 {
     echo -e "key\tvalue"
     echo -e "native-flags\t-O3 -march=native -flto"
-    echo -e "rv32-flags\t-O3 -march=rv32im_zicsr -mabi=ilp32 -ffreestanding -fno-builtin"
+    echo -e "rv32-flags\t-O3 -march=$RV32_C_RV32_MARCH -mabi=ilp32 -ffreestanding -fno-builtin"
     echo -e "wasm-flags\t-O3 -flto -msimd128 -ffreestanding -fno-builtin"
     echo -e "kernel-object-sha256\t$kernel_hash"
     echo -e "native-sha256\t$native_hash"

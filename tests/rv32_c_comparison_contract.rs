@@ -142,7 +142,8 @@ fn comparison_build_keeps_shared_rv32_and_wasm_kernel_sources() {
     assert_eq!(script.matches("-c \"$SOURCE_ROOT/kernel.c\"").count(), 2);
     assert!(script.matches("\"$BUILD_DIR/kernel-rv32.o\"").count() >= 3);
     assert!(script.contains("-O3 -march=native -flto"));
-    assert!(script.contains("-march=rv32im_zicsr"));
+    assert!(script.contains("RV32_C_RV32_MARCH:=rv32im_zicsr"));
+    assert!(script.contains("-march=\"$RV32_C_RV32_MARCH\""));
     assert!(script.contains("-mabi=ilp32"));
     assert!(script.contains("kernel-object-sha256"));
     assert!(script.contains("product.elf"));
