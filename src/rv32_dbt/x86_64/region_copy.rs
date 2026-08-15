@@ -10,6 +10,8 @@
  */
 
 use super::region_alloc::HostLocation;
+use super::region_alloc::RegionAllocation;
+use crate::rv32_dbt::region::LoopRegion;
 
 const MAX_COPY_PAIRS: usize = 31;
 const MAX_COPY_ACTIONS: usize = MAX_COPY_PAIRS * 2;
@@ -127,6 +129,33 @@ impl ReconciliationPlan {
         self.action_count += 1;
         Ok(())
     }
+}
+
+pub(crate) fn plan_loop_reconciliation(
+    region: &LoopRegion<'_>,
+    allocation: &RegionAllocation,
+) -> Result<ReconciliationPlan, CopyPlanError> {
+    let mut copies = [CopyPair {
+        source: HostLocation::Empty,
+        destination: HostLocation::Empty,
+    }; MAX_COPY_PAIRS];
+    let mut count = 0;
+    for guest in 1..32 {
+        let (Some(entry), Some(output)) = (region.entry_value(guest), region.output_value(guest))
+        else {
+            continue;
+        };
+        if entry == output || !region.is_value_live(entry) {
+            continue;
+        }
+        let slot = copies.get_mut(count).ok_or(CopyPlanError::Capacity)?;
+        *slot = CopyPair {
+            source: allocation.location(output),
+            destination: allocation.location(entry),
+        };
+        count += 1;
+    }
+    ReconciliationPlan::build(&copies[..count])
 }
 
 fn validate_pair(copy: CopyPair) -> Result<(), CopyPlanError> {
