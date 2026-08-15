@@ -25,6 +25,7 @@ mod cache;
 mod decode;
 pub mod encoding;
 mod predecode;
+pub(crate) mod zbb;
 
 pub(crate) use block::{ends_basic_block, fill_decoded_block, validate_block_max_instructions};
 pub(crate) use bounded_block_cache::BoundedDecodedBlockCache;

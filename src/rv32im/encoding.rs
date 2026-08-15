@@ -193,6 +193,60 @@ pub fn or(rd: u8, rs1: u8, rs2: u8) -> u32 {
 pub fn and(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(0, rs2, rs1, 7, rd)
 }
+pub fn andn(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x20, rs2, rs1, 7, rd)
+}
+pub fn orn(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x20, rs2, rs1, 6, rd)
+}
+pub fn xnor(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x20, rs2, rs1, 4, rd)
+}
+pub fn clz(rd: u8, rs1: u8) -> u32 {
+    i(0x13, 0x600, rs1, 1, rd)
+}
+pub fn ctz(rd: u8, rs1: u8) -> u32 {
+    i(0x13, 0x601, rs1, 1, rd)
+}
+pub fn cpop(rd: u8, rs1: u8) -> u32 {
+    i(0x13, 0x602, rs1, 1, rd)
+}
+pub fn min(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x05, rs2, rs1, 4, rd)
+}
+pub fn minu(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x05, rs2, rs1, 5, rd)
+}
+pub fn max(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x05, rs2, rs1, 6, rd)
+}
+pub fn maxu(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x05, rs2, rs1, 7, rd)
+}
+pub fn sext_b(rd: u8, rs1: u8) -> u32 {
+    i(0x13, 0x604, rs1, 1, rd)
+}
+pub fn sext_h(rd: u8, rs1: u8) -> u32 {
+    i(0x13, 0x605, rs1, 1, rd)
+}
+pub fn zext_h(rd: u8, rs1: u8) -> u32 {
+    r(0x04, 0, rs1, 4, rd)
+}
+pub fn rol(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x30, rs2, rs1, 1, rd)
+}
+pub fn ror(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r(0x30, rs2, rs1, 5, rd)
+}
+pub fn rori(rd: u8, rs1: u8, shift: u8) -> u32 {
+    i(0x13, 0x600 | i32::from(shift & 31), rs1, 5, rd)
+}
+pub fn orc_b(rd: u8, rs1: u8) -> u32 {
+    i(0x13, 0x287, rs1, 5, rd)
+}
+pub fn rev8(rd: u8, rs1: u8) -> u32 {
+    i(0x13, 0x698, rs1, 5, rd)
+}
 pub fn mul(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 0, rd)
 }
