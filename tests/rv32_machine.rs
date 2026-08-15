@@ -32,8 +32,9 @@ use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32im::encoding::jalr;
 use compukter_vm::rv32im::encoding::{
-    add, addi, amoswap_w, bne, csrrs, csrrw, ebreak, ecall, fence_i, jal, lr_w, lui, lw,
-    materialize, sb, sc_w, sh, slli, sw,
+    add, addi, amoswap_w, andn, bne, clz, cpop, csrrs, csrrw, ctz, ebreak, ecall, fence_i, jal,
+    lr_w, lui, lw, materialize, max, maxu, min, minu, orc_b, orn, rev8, rol, ror, rori, sb, sc_w,
+    sext_b, sext_h, sh, slli, sw, xnor, zext_h,
 };
 use rv32_elf_support::{halting_machine_elf, machine_program_elf, Elf32Builder, LoadSegment};
 
@@ -472,6 +473,58 @@ fn all_backends_execute_the_same_rv32a_reservation_and_amo_program() {
             }
         );
         assert_eq!(machine.debug_bytes(), &[0, 41, 0, 42, 1]);
+    }
+}
+
+#[test]
+fn all_backends_execute_every_zbb_operation() {
+    let [lhs_hi, lhs_lo] = materialize(1, 0x8001_8080);
+    let [rhs_hi, rhs_lo] = materialize(2, 5);
+    let [debug_hi, debug_lo] = materialize(10, DEBUG_BASE);
+    let operations = [
+        andn(3, 1, 2),
+        orn(3, 1, 2),
+        xnor(3, 1, 2),
+        min(3, 1, 2),
+        minu(3, 1, 2),
+        max(3, 1, 2),
+        maxu(3, 1, 2),
+        clz(3, 1),
+        ctz(3, 1),
+        cpop(3, 1),
+        sext_b(3, 1),
+        sext_h(3, 1),
+        zext_h(3, 1),
+        rol(3, 1, 2),
+        ror(3, 1, 2),
+        rori(3, 1, 7),
+        orc_b(3, 1),
+        rev8(3, 1),
+    ];
+    let mut words = vec![lhs_hi, lhs_lo, rhs_hi, rhs_lo, debug_hi, debug_lo];
+    for operation in operations {
+        words.push(operation);
+        words.push(sb(10, 3, 0));
+    }
+    words.extend([
+        addi(10, 10, -0x100),
+        sw(10, 0, 8),
+        addi(11, 0, STATUS_HALTED),
+        sw(10, 11, 0),
+    ]);
+    let elf = machine_program_elf(&words);
+    let expected = [
+        0x80, 0xfa, 0x7a, 0x80, 0x05, 0x05, 0x80, 0x00, 0x07, 0x04, 0x80, 0x80, 0x80, 0x10, 0x04,
+        0x01, 0xff, 0x80,
+    ];
+
+    for execution in configs() {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, expected.len())).unwrap();
+        assert!(matches!(
+            machine.run(256).unwrap(),
+            Rv32MachineOutcome::Halted { .. }
+        ));
+        assert_eq!(machine.debug_bytes(), expected, "{execution:?}");
     }
 }
 

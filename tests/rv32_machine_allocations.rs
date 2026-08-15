@@ -25,7 +25,8 @@ use compukter_vm::rv32_machine::{
     Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
 };
 use compukter_vm::rv32im::encoding::{
-    addi, bne, csrrs, csrrw, ecall, jal, lr_w, materialize, mret, sc_w,
+    addi, andn, bne, clz, cpop, csrrs, csrrw, ecall, jal, lr_w, materialize, mret, orc_b, rev8,
+    rol, rori, sc_w,
 };
 use rv32_elf_support::{Elf32Builder, LoadSegment};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -267,6 +268,61 @@ fn assert_block_cache_evictions_allocate_nothing() {
     );
 }
 
+fn assert_cached_dbt_zbb_loop_allocates_nothing() {
+    let words = [
+        andn(3, 1, 2),
+        clz(4, 3),
+        cpop(5, 3),
+        rol(6, 3, 2),
+        rori(7, 6, 7),
+        orc_b(8, 7),
+        rev8(9, 8),
+        jal(0, -28),
+    ];
+    let code = words
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, code))
+        .load(LoadSegment::rw_with_mem_size(0x3000, [], 0x1000))
+        .finish();
+    let execution = Rv32ExecutionBackendConfig::CachedDbt {
+        sets: 32,
+        max_instructions: 8,
+        scratch_bytes: 4096,
+        cache_bytes: 4096,
+        code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+        register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
+    };
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        Rv32MachineConfig {
+            ram_size: 0x10_000,
+            debug_limit: 0,
+            execution,
+        },
+    )
+    .unwrap();
+    machine.run(128).unwrap();
+
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    let outcome = machine.run(4096).unwrap();
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+
+    assert!(matches!(
+        outcome,
+        Rv32MachineOutcome::BudgetExhausted { .. }
+    ));
+    assert_eq!(allocations, 0, "Cached DBT allocated in a Zbb loop");
+    assert_eq!(
+        allocated_bytes, 0,
+        "Cached DBT allocated bytes in a Zbb loop"
+    );
+}
+
 #[cfg(feature = "dbt-execution-profile")]
 fn assert_profiled_cached_dbt_steady_state_allocates_nothing() {
     let words = [addi(1, 1, 1), jal(0, -4)];
@@ -328,6 +384,7 @@ fn steady_state_machine_paths_allocate_nothing() {
     assert_steady_state_trap_entry_and_return_allocate_nothing();
     assert_steady_state_atomic_increment_loop_allocates_nothing();
     assert_block_cache_evictions_allocate_nothing();
+    assert_cached_dbt_zbb_loop_allocates_nothing();
     #[cfg(feature = "dbt-execution-profile")]
     assert_profiled_cached_dbt_steady_state_allocates_nothing();
 }
