@@ -37,6 +37,9 @@ pub(super) const MSTATUS_MPP_MACHINE: u32 = 3 << 11;
 const MSTATUS_WRITABLE: u32 = MSTATUS_MIE | MSTATUS_MPIE;
 pub(super) const MIE_MTIE: u32 = 1 << 7;
 pub(super) const MIP_MTIP: u32 = 1 << 7;
+pub(super) const MIE_MEIE: u32 = 1 << 11;
+pub(super) const MIP_MEIP: u32 = 1 << 11;
+const MIE_WRITABLE: u32 = MIE_MTIE | MIE_MEIE;
 
 const MISA_MXL_RV32: u32 = 1 << 30;
 const MISA_A: u32 = 1 << 0;
@@ -129,14 +132,13 @@ impl Rv32MachineCsrs {
         vector
     }
 
-    pub(super) fn enter_machine_timer_interrupt(&mut self, pc: u32) -> u32 {
-        const MACHINE_TIMER_CAUSE: u32 = 7;
+    pub(super) fn enter_machine_interrupt(&mut self, pc: u32, cause: u32) -> u32 {
         let vector = if self.mtvec & 3 == 1 {
-            self.trap_base().wrapping_add(4 * MACHINE_TIMER_CAUSE)
+            self.trap_base().wrapping_add(4 * cause)
         } else {
             self.trap_base()
         };
-        self.enter_trap_state(pc, 1 << 31 | MACHINE_TIMER_CAUSE, 0);
+        self.enter_trap_state(pc, 1 << 31 | cause, 0);
         vector
     }
 
@@ -148,12 +150,29 @@ impl Rv32MachineCsrs {
         }
     }
 
-    pub(super) fn timer_wake_pending(&self) -> bool {
-        self.mie & self.mip & MIE_MTIE != 0
+    pub(super) fn set_machine_external_pending(&mut self, pending: bool) {
+        if pending {
+            self.mip |= MIP_MEIP;
+        } else {
+            self.mip &= !MIP_MEIP;
+        }
     }
 
-    pub(super) fn timer_interrupt_actionable(&self) -> bool {
-        self.mstatus & MSTATUS_MIE != 0 && self.timer_wake_pending()
+    pub(super) fn enabled_interrupt_pending(&self) -> bool {
+        self.mie & self.mip & MIE_WRITABLE != 0
+    }
+
+    pub(super) fn highest_actionable_machine_interrupt(&self) -> Option<u32> {
+        if self.mstatus & MSTATUS_MIE == 0 {
+            return None;
+        }
+        if self.mie & self.mip & MIE_MEIE != 0 {
+            return Some(11);
+        }
+        if self.mie & self.mip & MIE_MTIE != 0 {
+            return Some(7);
+        }
+        None
     }
 
     fn enter_trap_state(&mut self, pc: u32, cause: u32, value: u32) {
@@ -185,7 +204,7 @@ impl Rv32MachineCsrs {
             CSR_MSTATUS => {
                 self.mstatus = value & MSTATUS_WRITABLE | MSTATUS_MPP_MACHINE;
             }
-            CSR_MIE => self.mie = value & MIE_MTIE,
+            CSR_MIE => self.mie = value & MIE_WRITABLE,
             CSR_MTVEC => {
                 let mode = value & 3;
                 self.mtvec = value & !3 | u32::from(mode == 1);
@@ -269,17 +288,17 @@ mod tests {
         assert_eq!(csrs.read(CSR_MIP).unwrap(), 0);
 
         csrs.write_software(CSR_MIE, u32::MAX).unwrap();
-        assert_eq!(csrs.read(CSR_MIE).unwrap(), MIE_MTIE);
+        assert_eq!(csrs.read(CSR_MIE).unwrap(), MIE_WRITABLE);
         csrs.write_software(CSR_MIP, u32::MAX).unwrap();
         assert_eq!(csrs.read(CSR_MIP).unwrap(), 0);
 
         csrs.set_machine_timer_pending(true);
         assert_eq!(csrs.read(CSR_MIP).unwrap(), MIP_MTIP);
-        assert!(csrs.timer_wake_pending());
-        assert!(!csrs.timer_interrupt_actionable());
+        assert!(csrs.enabled_interrupt_pending());
+        assert_eq!(csrs.highest_actionable_machine_interrupt(), None);
 
         csrs.write_software(CSR_MSTATUS, MSTATUS_MIE).unwrap();
-        assert!(csrs.timer_interrupt_actionable());
+        assert_eq!(csrs.highest_actionable_machine_interrupt(), Some(7));
         csrs.set_machine_timer_pending(false);
         assert_eq!(csrs.read(CSR_MIP).unwrap(), 0);
     }
@@ -293,7 +312,7 @@ mod tests {
             csrs.write_software(CSR_MIE, MIE_MTIE).unwrap();
             csrs.set_machine_timer_pending(true);
 
-            assert_eq!(csrs.enter_machine_timer_interrupt(0x1234), expected_vector);
+            assert_eq!(csrs.enter_machine_interrupt(0x1234, 7), expected_vector);
             assert_eq!(csrs.read(CSR_MEPC).unwrap(), 0x1234);
             assert_eq!(csrs.read(CSR_MCAUSE).unwrap(), 0x8000_0007);
             assert_eq!(csrs.read(CSR_MTVAL).unwrap(), 0);
@@ -301,6 +320,39 @@ mod tests {
                 csrs.read(CSR_MSTATUS).unwrap(),
                 MSTATUS_MPIE | MSTATUS_MPP_MACHINE
             );
+        }
+    }
+
+    #[test]
+    fn machine_external_interrupt_is_hardware_owned_and_precedes_timer() {
+        let mut csrs = Rv32MachineCsrs::new();
+        csrs.write_software(CSR_MIE, u32::MAX).unwrap();
+        assert_eq!(csrs.read(CSR_MIE).unwrap(), MIE_MEIE | MIE_MTIE);
+
+        csrs.write_software(CSR_MIP, u32::MAX).unwrap();
+        assert_eq!(csrs.read(CSR_MIP).unwrap(), 0);
+        csrs.set_machine_timer_pending(true);
+        csrs.set_machine_external_pending(true);
+        assert_eq!(csrs.read(CSR_MIP).unwrap(), MIP_MEIP | MIP_MTIP);
+        assert!(csrs.enabled_interrupt_pending());
+        assert_eq!(csrs.highest_actionable_machine_interrupt(), None);
+
+        csrs.write_software(CSR_MSTATUS, MSTATUS_MIE).unwrap();
+        assert_eq!(csrs.highest_actionable_machine_interrupt(), Some(11));
+        csrs.set_machine_external_pending(false);
+        assert_eq!(csrs.highest_actionable_machine_interrupt(), Some(7));
+    }
+
+    #[test]
+    fn machine_external_interrupt_uses_direct_and_vectored_mtvec_modes() {
+        for (mtvec, expected_vector) in [(0x2000, 0x2000), (0x2001, 0x202c)] {
+            let mut csrs = Rv32MachineCsrs::new();
+            csrs.write_software(CSR_MTVEC, mtvec).unwrap();
+
+            assert_eq!(csrs.enter_machine_interrupt(0x1234, 11), expected_vector);
+            assert_eq!(csrs.read(CSR_MEPC).unwrap(), 0x1234);
+            assert_eq!(csrs.read(CSR_MCAUSE).unwrap(), 0x8000_000b);
+            assert_eq!(csrs.read(CSR_MTVAL).unwrap(), 0);
         }
     }
 }

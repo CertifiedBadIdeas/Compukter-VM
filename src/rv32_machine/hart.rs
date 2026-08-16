@@ -74,12 +74,16 @@ impl Rv32MachineHart {
         self.csrs.set_machine_timer_pending(pending);
     }
 
+    pub(super) fn sync_machine_external_pending(&mut self, pending: bool) {
+        self.csrs.set_machine_external_pending(pending);
+    }
+
     pub(super) fn is_waiting_for_interrupt(&self) -> bool {
         self.waiting_for_interrupt
     }
 
     pub(super) fn wake_for_pending_interrupt(&mut self) -> bool {
-        if self.waiting_for_interrupt && self.csrs.timer_wake_pending() {
+        if self.waiting_for_interrupt && self.csrs.enabled_interrupt_pending() {
             self.waiting_for_interrupt = false;
             true
         } else {
@@ -87,12 +91,12 @@ impl Rv32MachineHart {
         }
     }
 
-    pub(super) fn take_pending_machine_timer_interrupt(&mut self) -> bool {
-        if !self.csrs.timer_interrupt_actionable() {
+    pub(super) fn take_pending_machine_interrupt(&mut self) -> bool {
+        let Some(cause) = self.csrs.highest_actionable_machine_interrupt() else {
             return false;
-        }
+        };
         self.cpu.clear_reservation();
-        let vector = self.csrs.enter_machine_timer_interrupt(self.cpu.pc());
+        let vector = self.csrs.enter_machine_interrupt(self.cpu.pc(), cause);
         self.cpu.set_pc_internal(vector);
         self.waiting_for_interrupt = false;
         true
@@ -295,7 +299,7 @@ mod tests {
     use super::{Rv32HartStep, Rv32MachineHart};
     use crate::rv32_machine::csr::{
         CSR_MCAUSE, CSR_MEPC, CSR_MHARTID, CSR_MIE, CSR_MSCRATCH, CSR_MSTATUS, CSR_MTVAL,
-        CSR_MTVEC, MIE_MTIE, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP_MACHINE,
+        CSR_MTVEC, MIE_MEIE, MIE_MTIE, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP_MACHINE,
     };
     use crate::rv32im::encoding::{
         amoswap_w, csrrc, csrrci, csrrs, csrrsi, csrrw, csrrwi, ebreak, ecall, jal, lr_w, lw, mret,
@@ -384,7 +388,7 @@ mod tests {
             hart.write_csr_for_test(CSR_MIE, MIE_MTIE).unwrap();
             hart.sync_machine_timer_pending(true);
 
-            assert!(hart.take_pending_machine_timer_interrupt());
+            assert!(hart.take_pending_machine_interrupt());
             assert_eq!(hart.pc(), expected_vector);
             assert_eq!(hart.read_csr(CSR_MEPC).unwrap(), 0x1000);
             assert_eq!(hart.read_csr(CSR_MCAUSE).unwrap(), 0x8000_0007);
@@ -395,6 +399,29 @@ mod tests {
             assert_eq!(hart.pc(), 0x1000);
             assert_eq!(hart.retired_instructions(), 1);
         }
+    }
+
+    #[test]
+    fn machine_external_interrupt_wakes_without_global_mie_and_precedes_timer() {
+        let mut hart = Rv32MachineHart::new(0x1000);
+        hart.write_csr_for_test(CSR_MTVEC, 0x2001).unwrap();
+        hart.write_csr_for_test(CSR_MIE, MIE_MEIE | MIE_MTIE)
+            .unwrap();
+        assert_eq!(
+            hart.execute_word_for_test(wfi()),
+            Rv32HartStep::WaitingForInterrupt
+        );
+
+        hart.sync_machine_timer_pending(true);
+        hart.sync_machine_external_pending(true);
+        assert!(hart.wake_for_pending_interrupt());
+        assert!(!hart.take_pending_machine_interrupt());
+        assert_eq!(hart.pc(), 0x1004);
+
+        hart.write_csr_for_test(CSR_MSTATUS, MSTATUS_MIE).unwrap();
+        assert!(hart.take_pending_machine_interrupt());
+        assert_eq!(hart.pc(), 0x202c);
+        assert_eq!(hart.read_csr(CSR_MCAUSE).unwrap(), 0x8000_000b);
     }
 
     #[test]
