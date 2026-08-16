@@ -33,10 +33,15 @@ const ENABLE_END: u32 = 0x002080;
 const CONTEXT_BASE: u32 = 0x200000;
 const CLAIM_COMPLETE: u32 = CONTEXT_BASE + 4;
 
+/// Guest-visible PLIC source metadata assigned by `Rv32MachineBuilder`.
+///
+/// This value identifies a source in guest drivers and future platform
+/// descriptions. It is not a live interrupt-line handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rv32PlicSource(u32);
 
 impl Rv32PlicSource {
+    /// Returns the non-zero PLIC source number.
     pub fn get(self) -> u32 {
         self.0
     }
@@ -224,7 +229,7 @@ impl MmioDevice for PlicDevice {
         offset: u32,
         width: MmioAccessWidth,
     ) -> Result<u64, MemoryFault> {
-        if width != MmioAccessWidth::Word || offset % 4 != 0 {
+        if width != MmioAccessWidth::Word || !offset.is_multiple_of(4) {
             return Err(MemoryFault::new(format!(
                 "RV32 PLIC requires aligned word reads, got {width:?} at offset {offset:#x}"
             )));
@@ -239,7 +244,7 @@ impl MmioDevice for PlicDevice {
         width: MmioAccessWidth,
         value: u64,
     ) -> Result<(), MemoryFault> {
-        if width != MmioAccessWidth::Word || offset % 4 != 0 {
+        if width != MmioAccessWidth::Word || !offset.is_multiple_of(4) {
             return Err(MemoryFault::new(format!(
                 "RV32 PLIC requires aligned word writes, got {width:?} at offset {offset:#x}"
             )));

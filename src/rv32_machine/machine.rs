@@ -306,6 +306,14 @@ struct Rv32IrqRoute {
     source: Rv32PlicSource,
 }
 
+struct Rv32InterruptSync<'a> {
+    timer_device: MmioDeviceId,
+    plic_device: MmioDeviceId,
+    irq_routes: &'a [Rv32IrqRoute],
+    last_irq_mmio_epoch: &'a mut u64,
+    force_external_sources: bool,
+}
+
 impl Rv32Machine {
     pub fn from_elf(elf: &[u8], config: Rv32MachineConfig) -> Result<Self, Rv32MachineBuildError> {
         Rv32MachineBuilder::from_elf(elf, config)?.build()
@@ -633,11 +641,13 @@ impl Rv32Machine {
                     if let Some(outcome) = synchronize_interrupts(
                         &mut self.hart,
                         &mut self.address_space,
-                        self.timer_device,
-                        self.plic_device,
-                        &self.irq_routes,
-                        &mut self.last_irq_mmio_epoch,
-                        false,
+                        Rv32InterruptSync {
+                            timer_device: self.timer_device,
+                            plic_device: self.plic_device,
+                            irq_routes: &self.irq_routes,
+                            last_irq_mmio_epoch: &mut self.last_irq_mmio_epoch,
+                            force_external_sources: false,
+                        },
                         retired_before,
                     ) {
                         return Ok(outcome);
@@ -1159,11 +1169,13 @@ impl Rv32Machine {
         synchronize_interrupts(
             &mut self.hart,
             &mut self.address_space,
-            self.timer_device,
-            self.plic_device,
-            &self.irq_routes,
-            &mut self.last_irq_mmio_epoch,
-            force_external_sources,
+            Rv32InterruptSync {
+                timer_device: self.timer_device,
+                plic_device: self.plic_device,
+                irq_routes: &self.irq_routes,
+                last_irq_mmio_epoch: &mut self.last_irq_mmio_epoch,
+                force_external_sources,
+            },
             retired_before,
         )
     }
@@ -1350,36 +1362,32 @@ fn execute_slot(
 fn synchronize_interrupts(
     hart: &mut Rv32MachineHart,
     address_space: &mut Rv32AddressSpace,
-    timer_device: MmioDeviceId,
-    plic_device: MmioDeviceId,
-    irq_routes: &[Rv32IrqRoute],
-    last_irq_mmio_epoch: &mut u64,
-    force_external_sources: bool,
+    sync: Rv32InterruptSync<'_>,
     retired_before: u64,
 ) -> Option<Rv32MachineOutcome> {
     let mmio_epoch = address_space.bus().mmio_epoch();
-    if force_external_sources || mmio_epoch != *last_irq_mmio_epoch {
-        for route in irq_routes {
+    if sync.force_external_sources || mmio_epoch != *sync.last_irq_mmio_epoch {
+        for route in sync.irq_routes {
             let level = address_space
                 .bus()
                 .interrupt_level(route.device_id)
                 .expect("RV32 IRQ route invariant");
             address_space
                 .bus_mut()
-                .device_mut::<PlicDevice>(plic_device)
+                .device_mut::<PlicDevice>(sync.plic_device)
                 .expect("RV32 PLIC invariant")
                 .set_source_level(route.source, level);
         }
-        *last_irq_mmio_epoch = mmio_epoch;
+        *sync.last_irq_mmio_epoch = mmio_epoch;
     }
     let timer_pending = address_space
         .bus()
-        .device::<TimerDevice>(timer_device)
+        .device::<TimerDevice>(sync.timer_device)
         .expect("RV32 machine timer device invariant")
         .pending();
     let external_pending = address_space
         .bus()
-        .device::<PlicDevice>(plic_device)
+        .device::<PlicDevice>(sync.plic_device)
         .expect("RV32 PLIC invariant")
         .machine_notification();
     hart.sync_machine_timer_pending(timer_pending);

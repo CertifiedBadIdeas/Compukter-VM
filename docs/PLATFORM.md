@@ -42,14 +42,62 @@ embedding application owns the mapping between its clock and timer ticks.
 interrupt is pending. Repeated `run()` calls return immediately without
 spending instruction budget while the hart remains asleep.
 
-Wakeup considers the individual pending/enable pair (`mip.MTIP` and
-`mie.MTIE`) even when global `mstatus.MIE` is clear. Global `MIE` controls
-whether wakeup also enters the interrupt handler. Machine timer interrupt
-entry writes interrupt cause `0x8000_0007` to `mcause` and supports direct and
-vectored `mtvec` modes.
+Wakeup considers individually enabled pending interrupts even when global
+`mstatus.MIE` is clear. This currently includes the timer pair
+`mip.MTIP`/`mie.MTIE` and external pair `mip.MEIP`/`mie.MEIE`. Global `MIE`
+controls whether wakeup also enters an interrupt handler. Machine timer
+interrupt entry writes `0x8000_0007` to `mcause`; machine external interrupt
+entry writes `0x8000_000b`. Both support direct and vectored `mtvec` modes.
+
+When timer and external interrupts are simultaneously actionable, the machine
+external interrupt is taken first.
 
 ## External interrupts
 
-External interrupt aggregation, PLIC/`MEIP`, and device IRQ routing are not yet
-part of this platform ABI. They are the next platform-infrastructure slice
-before interrupt-driven UART and other peripheral controllers.
+The standard platform installs a ratified PLIC 1.0-compatible, single-hart,
+machine-mode controller at `0x0c00_0000`. This base matches QEMU `virt` to
+reduce driver porting, but Compukter does not claim compatibility with the rest
+of that board.
+
+PLIC registers accept aligned 32-bit little-endian MMIO accesses only. Its
+single-context region has size `0x201000`:
+
+| Offset | Register block |
+|---:|---|
+| `0x000000` | Source priorities; source 0 is reserved |
+| `0x001000` | Read-only pending bits |
+| `0x002000` | Enable bits for machine context 0 |
+| `0x200000` | Priority threshold for machine context 0 |
+| `0x200004` | Claim/complete for machine context 0 |
+
+Reserved and unassigned registers in this window read as zero and ignore
+writes. Priority and threshold are three-bit WARL values from 0 through 7.
+Priority 0 disables delivery; a source is eligible only when its priority is
+strictly greater than the context threshold. The highest priority wins, with
+the lowest source ID breaking ties.
+
+Reading claim returns the winning source ID, clears its pending bit, and marks
+the gateway in flight. Writing that ID to the same register completes it. A
+level source that is still asserted after completion immediately becomes
+pending again. Deassertion does not discard a request that was already
+accepted as pending. Invalid and non-in-flight completion IDs are ignored.
+
+Hosts install an interrupt-capable device before machine construction:
+
+```rust
+let (device, irq) = builder.add_mmio_device_with_irq(base, device);
+assert_eq!(irq.get(), 1);
+```
+
+IRQ sources are assigned densely from 1 in interrupt-device insertion order.
+The built machine accepts at most 1023 sources. `Rv32PlicSource` is
+guest-visible metadata for drivers and future platform descriptions; it is not
+a mutable interrupt handle. The device exposes its active-high level through
+`MmioDevice::interrupt_level()`.
+
+Topology is immutable after `build()`. Host mutations made through
+`machine.device_mut(handle)` are sampled at the next non-zero-budget `run()`
+entry. Guest MMIO mutations are sampled after the MMIO slow path. A wrapping
+bus MMIO epoch prevents interpreted non-MMIO instructions from rescanning IRQ
+routes, and generated DBT code contains no per-instruction IRQ poll. Host state
+must not be mutated concurrently with `run()`.

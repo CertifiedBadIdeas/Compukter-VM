@@ -98,6 +98,7 @@ impl MachineBusTrafficCounters {
 pub trait MmioDevice: Any {
     fn size(&self) -> u32;
 
+    /// Returns the current active-high level for a builder-routed PLIC source.
     fn interrupt_level(&self) -> bool {
         false
     }
@@ -249,6 +250,7 @@ impl MachineBus {
             .map(|region| region.device.interrupt_level())
     }
 
+    /// Changes after every successful MMIO access and never for RAM traffic.
     pub fn mmio_epoch(&self) -> u64 {
         self.mmio_epoch
     }
