@@ -1308,8 +1308,9 @@ fn synchronize_interrupts(
         .expect("RV32 machine timer device invariant")
         .pending();
     hart.sync_machine_timer_pending(pending);
+    hart.sync_machine_external_pending(false);
     hart.wake_for_pending_interrupt();
-    hart.take_pending_machine_timer_interrupt();
+    hart.take_pending_machine_interrupt();
     if hart.is_waiting_for_interrupt() {
         let retired_total = hart.retired_instructions();
         Some(Rv32MachineOutcome::WaitingForInterrupt {
