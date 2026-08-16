@@ -67,3 +67,8 @@ git submodule update --init --recursive
 
 The VM does not read sources, assets, scripts, or build outputs from the parent
 repository.
+
+## Platform ABI
+
+The built-in MMIO layout, deterministic machine timer, and `WFI` host contract
+are documented in [docs/PLATFORM.md](docs/PLATFORM.md).

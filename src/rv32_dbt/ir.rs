@@ -221,7 +221,9 @@ impl DbtIrInstruction {
             DecodedOp::Fence | DecodedOp::FenceI => DbtIrOp::Fence,
             DecodedOp::StoreConditional(_) | DecodedOp::Atomic(_, _) => DbtIrOp::Atomic,
             DecodedOp::Csr { .. } => DbtIrOp::Csr,
-            DecodedOp::Ecall | DecodedOp::Ebreak | DecodedOp::Mret => DbtIrOp::Trap,
+            DecodedOp::Ecall | DecodedOp::Ebreak | DecodedOp::Mret | DecodedOp::Wfi => {
+                DbtIrOp::Trap
+            }
         }
     }
 }
@@ -522,6 +524,7 @@ fn ends_ir_block(operation: DecodedOp) -> bool {
             | DecodedOp::Ecall
             | DecodedOp::Ebreak
             | DecodedOp::Mret
+            | DecodedOp::Wfi
             | DecodedOp::FenceI
     )
 }
@@ -555,6 +558,7 @@ pub(crate) fn register_effects(fields: DecodedFields) -> ([Option<u8>; 2], Optio
         | DecodedOp::Ecall
         | DecodedOp::Ebreak
         | DecodedOp::Mret => ([None, None], None),
+        DecodedOp::Wfi => ([None, None], None),
     }
 }
 
@@ -573,6 +577,7 @@ pub(crate) fn may_exit_before_write(operation: DecodedOp) -> bool {
             | DecodedOp::Ecall
             | DecodedOp::Ebreak
             | DecodedOp::Mret
+            | DecodedOp::Wfi
     )
 }
 

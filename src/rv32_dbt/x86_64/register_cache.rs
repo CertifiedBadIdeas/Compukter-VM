@@ -754,6 +754,7 @@ fn instruction_access(slot: Rv32ResolvedInstruction) -> RegisterAccess {
         | DecodedInstruction::Ecall
         | DecodedInstruction::Ebreak
         | DecodedInstruction::Mret => {}
+        DecodedInstruction::Wfi => {}
     }
     access.may_exit_before_write = matches!(
         instruction,
@@ -769,6 +770,7 @@ fn instruction_access(slot: Rv32ResolvedInstruction) -> RegisterAccess {
             | DecodedInstruction::Ecall
             | DecodedInstruction::Ebreak
             | DecodedInstruction::Mret
+            | DecodedInstruction::Wfi
     );
     access
 }

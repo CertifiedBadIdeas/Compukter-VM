@@ -298,6 +298,9 @@ pub fn csrrci(rd: u8, csr: u16, immediate: u8) -> u32 {
 pub fn mret() -> u32 {
     0x3020_0073
 }
+pub fn wfi() -> u32 {
+    0x1050_0073
+}
 pub fn fence() -> u32 {
     0x0ff0_000f
 }

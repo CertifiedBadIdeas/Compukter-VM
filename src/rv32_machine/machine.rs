@@ -20,7 +20,7 @@
 #[cfg(target_arch = "x86_64")]
 use super::dbt::{PreparedDbtBlock, Rv32DbtExecution, Rv32DbtPolicy};
 use super::hart::{Rv32HartStep, Rv32MachineHart};
-use super::platform::{self, ControlDevice, DebugDevice};
+use super::platform::{self, ControlDevice, DebugDevice, TimerDevice};
 use super::{
     builder::{PendingMmioDevice, Rv32DeviceHandle},
     Rv32AddressSpace, Rv32AddressSpaceError, Rv32DbtStats, Rv32ElfError, Rv32LoadedImage,
@@ -169,6 +169,10 @@ pub enum Rv32MachineOutcome {
         retired_delta: u64,
         retired_total: u64,
     },
+    WaitingForInterrupt {
+        retired_delta: u64,
+        retired_total: u64,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -287,6 +291,7 @@ pub struct Rv32Machine {
     executable_ranges: Vec<Range<u32>>,
     control_device: MmioDeviceId,
     debug_device: MmioDeviceId,
+    timer_device: MmioDeviceId,
     first_custom_device: MmioDeviceId,
     custom_device_count: usize,
 }
@@ -379,6 +384,7 @@ impl Rv32Machine {
             platform::DEBUG_BASE,
             Box::new(DebugDevice::with_limit(config.debug_limit)),
         )?;
+        let timer_device = bus.map_mmio(platform::TIMER_BASE, Box::new(TimerDevice::new()))?;
         let custom_device_count = custom_devices.len();
         let mut first_custom_device = 0;
         for (index, pending) in custom_devices.into_iter().enumerate() {
@@ -396,6 +402,7 @@ impl Rv32Machine {
             executable_ranges,
             control_device,
             debug_device,
+            timer_device,
             first_custom_device,
             custom_device_count,
         })
@@ -415,12 +422,36 @@ impl Rv32Machine {
         }
     }
 
+    pub fn virtual_time(&self) -> u64 {
+        self.timer().time()
+    }
+
+    pub fn advance_time(&mut self, delta_ticks: u64) {
+        let pending = {
+            let timer_device = self.timer_device;
+            let timer = self
+                .address_space
+                .bus_mut()
+                .device_mut::<TimerDevice>(timer_device)
+                .expect("RV32 machine timer device invariant");
+            timer.advance(delta_ticks);
+            timer.pending()
+        };
+        self.hart.sync_machine_timer_pending(pending);
+    }
+
     fn run_single_instruction(
         &mut self,
         instruction_budget: u64,
     ) -> Result<Rv32MachineOutcome, Rv32MachineExecutionError> {
         let retired_before = self.hart.retired_instructions();
         if let Some(outcome) = self.terminal_outcome(retired_before) {
+            return Ok(outcome);
+        }
+        if instruction_budget == 0 {
+            return Ok(self.budget_or_waiting_outcome(retired_before));
+        }
+        if let Some(outcome) = self.synchronize_interrupts(retired_before) {
             return Ok(outcome);
         }
         for _ in 0..instruction_budget {
@@ -474,6 +505,9 @@ impl Rv32Machine {
             if let Some(outcome) = self.terminal_outcome(retired_before) {
                 return Ok(outcome);
             }
+            if let Some(outcome) = self.synchronize_interrupts(retired_before) {
+                return Ok(outcome);
+            }
         }
         Ok(Rv32MachineOutcome::BudgetExhausted {
             retired_delta: self
@@ -495,6 +529,12 @@ impl Rv32Machine {
             self.control_device,
             retired_before,
         ) {
+            return Ok(outcome);
+        }
+        if instruction_budget == 0 {
+            return Ok(self.budget_or_waiting_outcome(retired_before));
+        }
+        if let Some(outcome) = self.synchronize_interrupts(retired_before) {
             return Ok(outcome);
         }
         let mut attempted = 0;
@@ -551,6 +591,14 @@ impl Rv32Machine {
                     ) {
                         return Ok(outcome);
                     }
+                    if let Some(outcome) = synchronize_interrupts(
+                        &mut self.hart,
+                        &self.address_space,
+                        self.timer_device,
+                        retired_before,
+                    ) {
+                        return Ok(outcome);
+                    }
                     if step == Rv32HartStep::TrapTaken
                         || ends_basic_block(slot)
                         || self.hart.pc() != slot_pc.wrapping_add(4)
@@ -584,6 +632,12 @@ impl Rv32Machine {
     ) -> Result<Rv32MachineOutcome, Rv32MachineExecutionError> {
         let retired_before = self.hart.retired_instructions();
         if let Some(outcome) = self.terminal_outcome(retired_before) {
+            return Ok(outcome);
+        }
+        if instruction_budget == 0 {
+            return Ok(self.budget_or_waiting_outcome(retired_before));
+        }
+        if let Some(outcome) = self.synchronize_interrupts(retired_before) {
             return Ok(outcome);
         }
         let mut context =
@@ -833,6 +887,10 @@ impl Rv32Machine {
                             };
                             execution.invalidate_all();
                         }
+                        if let Some(outcome) = self.synchronize_interrupts(retired_before) {
+                            self.record_dbt_profile_terminal();
+                            return Ok(outcome);
+                        }
                     }
                 }
             }
@@ -1050,11 +1108,47 @@ impl Rv32Machine {
         }
     }
 
+    fn synchronize_interrupts(&mut self, retired_before: u64) -> Option<Rv32MachineOutcome> {
+        synchronize_interrupts(
+            &mut self.hart,
+            &self.address_space,
+            self.timer_device,
+            retired_before,
+        )
+    }
+
+    fn waiting_outcome(&self, retired_before: u64) -> Rv32MachineOutcome {
+        let retired_total = self.hart.retired_instructions();
+        Rv32MachineOutcome::WaitingForInterrupt {
+            retired_delta: retired_total.saturating_sub(retired_before),
+            retired_total,
+        }
+    }
+
+    fn budget_or_waiting_outcome(&self, retired_before: u64) -> Rv32MachineOutcome {
+        if self.hart.is_waiting_for_interrupt() {
+            self.waiting_outcome(retired_before)
+        } else {
+            let retired_total = self.hart.retired_instructions();
+            Rv32MachineOutcome::BudgetExhausted {
+                retired_delta: retired_total.saturating_sub(retired_before),
+                retired_total,
+            }
+        }
+    }
+
     fn control(&self) -> &ControlDevice {
         self.address_space
             .bus()
             .device::<ControlDevice>(self.control_device)
             .expect("RV32 machine control device invariant")
+    }
+
+    fn timer(&self) -> &TimerDevice {
+        self.address_space
+            .bus()
+            .device::<TimerDevice>(self.timer_device)
+            .expect("RV32 machine timer device invariant")
     }
 
     fn execution_error(&self, pc: u32, message: String) -> Rv32MachineExecutionError {
@@ -1199,6 +1293,31 @@ fn execute_slot(
             hart.execute_resolved(address_space, instruction_pc, word, instruction)
         }
         Rv32ResolvedInstruction::Invalid { word } => hart.take_illegal_instruction(word),
+    }
+}
+
+fn synchronize_interrupts(
+    hart: &mut Rv32MachineHart,
+    address_space: &Rv32AddressSpace,
+    timer_device: MmioDeviceId,
+    retired_before: u64,
+) -> Option<Rv32MachineOutcome> {
+    let pending = address_space
+        .bus()
+        .device::<TimerDevice>(timer_device)
+        .expect("RV32 machine timer device invariant")
+        .pending();
+    hart.sync_machine_timer_pending(pending);
+    hart.wake_for_pending_interrupt();
+    hart.take_pending_machine_timer_interrupt();
+    if hart.is_waiting_for_interrupt() {
+        let retired_total = hart.retired_instructions();
+        Some(Rv32MachineOutcome::WaitingForInterrupt {
+            retired_delta: retired_total.saturating_sub(retired_before),
+            retired_total,
+        })
+    } else {
+        None
     }
 }
 
