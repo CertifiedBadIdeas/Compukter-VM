@@ -17,6 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use super::inspection::Rv32CsrInspection;
 use crate::rv32im::CsrOperation;
 use thiserror::Error;
 
@@ -78,6 +79,19 @@ impl Rv32MachineCsrs {
             mcause: 0,
             mtval: 0,
             mip: 0,
+        }
+    }
+
+    pub(super) fn inspection(&self) -> Rv32CsrInspection {
+        Rv32CsrInspection {
+            mstatus: self.mstatus,
+            mie: self.mie,
+            mip: self.mip,
+            mtvec: self.mtvec,
+            mscratch: self.mscratch,
+            mepc: self.mepc,
+            mcause: self.mcause,
+            mtval: self.mtval,
         }
     }
 

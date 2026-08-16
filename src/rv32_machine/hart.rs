@@ -18,6 +18,7 @@
  */
 
 use super::csr::Rv32MachineCsrs;
+use super::inspection::Rv32HartInspection;
 use crate::memory::MemoryBus;
 use crate::rv32im::{CsrOperation, CsrSource, DecodedInstruction, Rv32RegularFault, Rv32imCpu};
 
@@ -60,6 +61,16 @@ impl Rv32MachineHart {
 
     pub(super) fn pc(&self) -> u32 {
         self.cpu.pc()
+    }
+
+    pub(super) fn inspection(&self) -> Rv32HartInspection {
+        Rv32HartInspection {
+            registers: core::array::from_fn(|index| self.register(index)),
+            pc: self.pc(),
+            retired_instructions: self.retired_instructions(),
+            waiting_for_interrupt: self.waiting_for_interrupt,
+            csrs: self.csrs.inspection(),
+        }
     }
 
     pub(super) fn register(&self, register: usize) -> u32 {
@@ -298,7 +309,7 @@ impl Rv32MachineHart {
 mod tests {
     use super::{Rv32HartStep, Rv32MachineHart};
     use crate::rv32_machine::csr::{
-        CSR_MCAUSE, CSR_MEPC, CSR_MHARTID, CSR_MIE, CSR_MSCRATCH, CSR_MSTATUS, CSR_MTVAL,
+        CSR_MCAUSE, CSR_MEPC, CSR_MHARTID, CSR_MIE, CSR_MIP, CSR_MSCRATCH, CSR_MSTATUS, CSR_MTVAL,
         CSR_MTVEC, MIE_MEIE, MIE_MTIE, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP_MACHINE,
     };
     use crate::rv32im::encoding::{
@@ -435,6 +446,46 @@ mod tests {
         assert_eq!(hart.pc(), 0x1004);
         assert_eq!(hart.retired_instructions(), 1);
         assert!(hart.is_waiting_for_interrupt());
+    }
+
+    #[test]
+    fn inspection_copies_register_csr_and_wfi_state_without_mutation() {
+        let mut hart = Rv32MachineHart::new(0x1000);
+        hart.set_register_for_test(1, 0xfeed_beef).unwrap();
+        hart.write_csr_for_test(CSR_MSCRATCH, 0x1234_5678).unwrap();
+        assert_eq!(
+            hart.execute_word_for_test(wfi()),
+            Rv32HartStep::WaitingForInterrupt
+        );
+
+        let first = hart.inspection();
+        let second = hart.inspection();
+
+        assert_eq!(first, second);
+        assert_eq!(first.registers[0], 0);
+        assert_eq!(first.registers[1], 0xfeed_beef);
+        assert_eq!(first.pc, 0x1004);
+        assert_eq!(first.retired_instructions, 1);
+        assert!(first.waiting_for_interrupt);
+        assert_eq!(first.csrs.mscratch, 0x1234_5678);
+        assert_eq!(first.csrs.mip, hart.read_csr(CSR_MIP).unwrap());
+    }
+
+    #[test]
+    fn inspection_reports_trap_state() {
+        let mut hart = Rv32MachineHart::new(0x1234);
+        hart.write_csr_for_test(CSR_MTVEC, 0x2000).unwrap();
+        assert_eq!(
+            hart.execute_word_for_test(ebreak()),
+            Rv32HartStep::TrapTaken
+        );
+
+        let inspection = hart.inspection();
+
+        assert_eq!(inspection.pc, 0x2000);
+        assert_eq!(inspection.csrs.mepc, 0x1234);
+        assert_eq!(inspection.csrs.mcause, 3);
+        assert_eq!(inspection.csrs.mtval, 0x1234);
     }
 
     #[test]
