@@ -9,7 +9,21 @@
  * (at your option) any later version.
  */
 
+use compukter_vm::bus::{MmioAccessWidth, MmioContext, MmioDevice};
+use compukter_vm::memory::MemoryFault;
+
 const FIFO_CAPACITY: usize = 16;
+const UART_REGISTER_BYTES: u32 = 8;
+const FCR_ENABLE: u8 = 1 << 0;
+const FCR_RX_RESET: u8 = 1 << 1;
+const FCR_TX_RESET: u8 = 1 << 2;
+const FCR_STORED: u8 = FCR_ENABLE | 0xc0;
+const LCR_DLAB: u8 = 1 << 7;
+const LSR_DR: u8 = 1 << 0;
+const LSR_OE: u8 = 1 << 1;
+const LSR_THRE: u8 = 1 << 5;
+const LSR_TEMT: u8 = 1 << 6;
+const MSR_CONNECTED: u8 = 0xb0;
 
 #[derive(Default)]
 struct ByteFifo {
@@ -92,6 +106,12 @@ pub struct Uart16550 {
     receive_overrun: bool,
     rx_dropped: u64,
     tx_dropped: u64,
+    ier: u8,
+    lcr: u8,
+    mcr: u8,
+    scr: u8,
+    divisor: u16,
+    fcr: u8,
 }
 
 impl Default for Uart16550 {
@@ -111,6 +131,12 @@ impl Uart16550 {
             receive_overrun: false,
             rx_dropped: 0,
             tx_dropped: 0,
+            ier: 0,
+            lcr: 0,
+            mcr: 0,
+            scr: 0,
+            divisor: 0,
+            fcr: 0,
         }
     }
 
@@ -209,15 +235,140 @@ impl Uart16550 {
         !self.connected || self.tx.len() < self.effective_capacity()
     }
 
+    fn line_status(&self) -> u8 {
+        let mut status = 0;
+        if !self.rx.is_empty() {
+            status |= LSR_DR;
+        }
+        if self.receive_overrun {
+            status |= LSR_OE;
+        }
+        if self.transmitter_ready() {
+            status |= LSR_THRE;
+        }
+        if self.tx.is_empty() {
+            status |= LSR_TEMT;
+        }
+        status
+    }
+
+    fn write_fifo_control(&mut self, value: u8) {
+        let enabled = value & FCR_ENABLE != 0;
+        if enabled != self.fifo_enabled {
+            self.rx.clear();
+            self.tx.clear();
+        }
+        if value & FCR_RX_RESET != 0 {
+            self.rx.clear();
+        }
+        if value & FCR_TX_RESET != 0 {
+            self.tx.clear();
+        }
+        self.fifo_enabled = enabled;
+        self.fcr = value & FCR_STORED;
+    }
+
+    fn read_register(&mut self, offset: u32) -> Result<u8, MemoryFault> {
+        let value = match offset {
+            0 if self.lcr & LCR_DLAB != 0 => self.divisor as u8,
+            0 => self.read_receive_byte().unwrap_or(0),
+            1 if self.lcr & LCR_DLAB != 0 => (self.divisor >> 8) as u8,
+            1 => self.ier,
+            2 => 1 | if self.fifo_enabled { 0xc0 } else { 0 },
+            3 => self.lcr,
+            4 => self.mcr,
+            5 => {
+                let status = self.line_status();
+                self.receive_overrun = false;
+                status
+            }
+            6 => {
+                if self.connected {
+                    MSR_CONNECTED
+                } else {
+                    0
+                }
+            }
+            7 => self.scr,
+            _ => return Err(invalid_uart_access(offset, MmioAccessWidth::Byte)),
+        };
+        Ok(value)
+    }
+
+    fn write_register(&mut self, offset: u32, value: u8) -> Result<(), MemoryFault> {
+        match offset {
+            0 if self.lcr & LCR_DLAB != 0 => {
+                self.divisor = (self.divisor & 0xff00) | u16::from(value);
+            }
+            0 => self.write_transmit_byte(value),
+            1 if self.lcr & LCR_DLAB != 0 => {
+                self.divisor = (self.divisor & 0x00ff) | (u16::from(value) << 8);
+            }
+            1 => self.ier = value & 0x07,
+            2 => self.write_fifo_control(value),
+            3 => self.lcr = value,
+            4 => self.mcr = value & 0x1f,
+            5 | 6 => {}
+            7 => self.scr = value,
+            _ => return Err(invalid_uart_access(offset, MmioAccessWidth::Byte)),
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn set_fifo_enabled_for_test(&mut self, enabled: bool) {
-        self.fifo_enabled = enabled;
+        self.write_fifo_control(if enabled { FCR_ENABLE } else { 0 });
     }
+}
+
+impl MmioDevice for Uart16550 {
+    fn size(&self) -> u32 {
+        UART_REGISTER_BYTES
+    }
+
+    fn read(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+    ) -> Result<u64, MemoryFault> {
+        if width != MmioAccessWidth::Byte {
+            return Err(invalid_uart_access(offset, width));
+        }
+        self.read_register(offset).map(u64::from)
+    }
+
+    fn write(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+        value: u64,
+    ) -> Result<(), MemoryFault> {
+        if width != MmioAccessWidth::Byte {
+            return Err(invalid_uart_access(offset, width));
+        }
+        self.write_register(offset, value as u8)
+    }
+}
+
+fn invalid_uart_access(offset: u32, width: MmioAccessWidth) -> MemoryFault {
+    MemoryFault::new(format!(
+        "invalid UART access at offset {offset:#x} with width {width:?}"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compukter_vm::bus::{MachineBus, MmioDeviceId};
+
+    const UART_BASE: u32 = 0x1000;
+    fn mapped_uart() -> (MachineBus, MmioDeviceId) {
+        let mut bus = MachineBus::new(UART_BASE as usize).unwrap();
+        let id = bus.map_mmio(UART_BASE, Box::new(Uart16550::new())).unwrap();
+        (bus, id)
+    }
 
     #[test]
     fn fixed_fifo_preserves_order_and_rejects_the_seventeenth_byte() {
@@ -304,5 +455,85 @@ mod tests {
         assert_eq!(uart.drain_tx(&mut [0; 2]), 0);
         assert_eq!(uart.diagnostics().tx_dropped, 2);
         assert_eq!(uart.read_receive_byte(), Some(7));
+    }
+
+    #[test]
+    fn register_reset_state_and_access_width_are_strict() {
+        let (mut bus, _) = mapped_uart();
+        assert_eq!(bus.load_u8(UART_BASE + 5).unwrap(), LSR_THRE | LSR_TEMT);
+        assert_eq!(bus.load_u8(UART_BASE + 6).unwrap(), 0);
+        assert!(bus.load_i32(UART_BASE).is_err());
+        assert!(bus.load_u8(UART_BASE + 8).is_err());
+        assert_eq!(bus.load_u8(UART_BASE + 5).unwrap(), LSR_THRE | LSR_TEMT);
+    }
+
+    #[test]
+    fn dlab_multiplexes_divisor_without_touching_data_or_ier() {
+        let (mut bus, _) = mapped_uart();
+        bus.store_u8(UART_BASE + 3, LCR_DLAB | 3).unwrap();
+        bus.store_u8(UART_BASE, 0x34).unwrap();
+        bus.store_u8(UART_BASE + 1, 0x12).unwrap();
+        assert_eq!(bus.load_u8(UART_BASE).unwrap(), 0x34);
+        assert_eq!(bus.load_u8(UART_BASE + 1).unwrap(), 0x12);
+
+        bus.store_u8(UART_BASE + 3, 3).unwrap();
+        assert_eq!(bus.load_u8(UART_BASE + 1).unwrap(), 0);
+        assert_eq!(bus.load_u8(UART_BASE).unwrap(), 0);
+    }
+
+    #[test]
+    fn fcr_switches_one_and_sixteen_byte_modes_and_resets_queues() {
+        let (mut bus, id) = mapped_uart();
+        bus.device_mut::<Uart16550>(id).unwrap().connect();
+        assert_eq!(
+            bus.device_mut::<Uart16550>(id)
+                .unwrap()
+                .inject_rx(&[1, 2])
+                .transferred,
+            1
+        );
+
+        bus.store_u8(UART_BASE + 2, FCR_ENABLE | FCR_RX_RESET | FCR_TX_RESET)
+            .unwrap();
+        assert_eq!(bus.load_u8(UART_BASE + 5).unwrap() & LSR_DR, 0);
+        assert_eq!(
+            bus.device_mut::<Uart16550>(id)
+                .unwrap()
+                .inject_rx(&[1; 16])
+                .transferred,
+            16
+        );
+
+        bus.store_u8(UART_BASE + 2, 0).unwrap();
+        assert_eq!(bus.load_u8(UART_BASE + 5).unwrap() & LSR_DR, 0);
+        assert_eq!(
+            bus.device_mut::<Uart16550>(id)
+                .unwrap()
+                .inject_rx(&[3, 4])
+                .transferred,
+            1
+        );
+    }
+
+    #[test]
+    fn line_and_modem_registers_have_stable_readback_and_acknowledgement() {
+        let (mut bus, id) = mapped_uart();
+        bus.store_u8(UART_BASE + 3, 0x1b).unwrap();
+        bus.store_u8(UART_BASE + 4, 0xff).unwrap();
+        bus.store_u8(UART_BASE + 7, 0xa5).unwrap();
+        assert_eq!(bus.load_u8(UART_BASE + 3).unwrap(), 0x1b);
+        assert_eq!(bus.load_u8(UART_BASE + 4).unwrap(), 0x1f);
+        assert_eq!(bus.load_u8(UART_BASE + 7).unwrap(), 0xa5);
+
+        bus.device_mut::<Uart16550>(id).unwrap().connect();
+        assert_eq!(bus.load_u8(UART_BASE + 6).unwrap(), 0xb0);
+        let result = bus.device_mut::<Uart16550>(id).unwrap().inject_rx(&[1, 2]);
+        assert_eq!(result, UartTransferResult::new(1, 1));
+        assert_ne!(bus.load_u8(UART_BASE + 5).unwrap() & LSR_OE, 0);
+        assert_eq!(bus.load_u8(UART_BASE + 5).unwrap() & LSR_OE, 0);
+
+        bus.store_u8(UART_BASE + 5, 0xff).unwrap();
+        bus.store_u8(UART_BASE + 6, 0xff).unwrap();
+        assert_eq!(bus.load_u8(UART_BASE + 6).unwrap(), 0xb0);
     }
 }
