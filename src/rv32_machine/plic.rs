@@ -41,7 +41,8 @@ impl Rv32PlicSource {
         self.0
     }
 
-    pub(crate) fn new(id: u32) -> Option<Self> {
+    #[cfg(test)]
+    fn new(id: u32) -> Option<Self> {
         (1..=MAX_SOURCES).contains(&id).then_some(Self(id))
     }
 
