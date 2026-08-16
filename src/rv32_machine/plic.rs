@@ -17,6 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use super::inspection::{Rv32PlicInspection, Rv32PlicSourceInspection};
 use crate::bus::{MmioAccessWidth, MmioContext, MmioDevice};
 use crate::memory::MemoryFault;
 
@@ -94,6 +95,29 @@ impl PlicDevice {
 
     pub(super) fn machine_notification(&self) -> bool {
         self.best_eligible_source().is_some()
+    }
+
+    pub(super) fn inspection(&self) -> Rv32PlicInspection {
+        let source_count = self.gateways.len().saturating_sub(1);
+        let mut inspection = Rv32PlicInspection {
+            source_count,
+            threshold: self.threshold,
+            best_eligible_source: self
+                .best_eligible_source()
+                .map_or(0, |source| source as u32),
+            ..Rv32PlicInspection::default()
+        };
+        for source in 1..=source_count {
+            let gateway = self.gateways[source];
+            inspection.sources[source - 1] = Rv32PlicSourceInspection {
+                priority: self.priorities[source],
+                level: gateway.level,
+                pending: gateway.pending,
+                in_flight: gateway.in_flight,
+                enabled: self.source_enabled(source),
+            };
+        }
+        inspection
     }
 
     fn best_eligible_source(&self) -> Option<usize> {
@@ -290,6 +314,28 @@ mod tests {
         plic.set_source_level(Rv32PlicSource::new(1).unwrap(), false);
         plic.write_register(CLAIM_COMPLETE, 1);
         assert_eq!(plic.read_register(CLAIM_COMPLETE), 2);
+    }
+
+    #[test]
+    fn plic_inspection_does_not_claim_or_acknowledge_a_source() {
+        let mut plic = PlicDevice::new(1);
+        let source = Rv32PlicSource::new(1).unwrap();
+        plic.write_register(PRIORITY_BASE + 4, 3);
+        plic.write_register(ENABLE_BASE, 1 << 1);
+        plic.set_source_level(source, true);
+
+        let first = plic.inspection();
+        let second = plic.inspection();
+
+        assert_eq!(first, second);
+        assert_eq!(first.source_count, 1);
+        assert_eq!(first.best_eligible_source, 1);
+        assert_eq!(first.sources[0].priority, 3);
+        assert!(first.sources[0].level);
+        assert!(first.sources[0].pending);
+        assert!(first.sources[0].enabled);
+        assert!(!first.sources[0].in_flight);
+        assert_eq!(plic.read_register(CLAIM_COMPLETE), 1);
     }
 
     #[test]

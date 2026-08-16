@@ -17,6 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use super::inspection::Rv32TimerInspection;
 use crate::bus::{MmioAccessWidth, MmioContext, MmioDevice};
 use crate::memory::MemoryFault;
 
@@ -44,6 +45,14 @@ impl TimerDevice {
 
     pub(super) fn time(&self) -> u64 {
         self.mtime
+    }
+
+    pub(super) fn inspection(&self) -> Rv32TimerInspection {
+        Rv32TimerInspection {
+            time: self.mtime,
+            compare: self.mtimecmp,
+            pending: self.pending(),
+        }
     }
 
     #[cfg(test)]
@@ -313,5 +322,21 @@ mod tests {
         timer.set_time(u64::MAX);
         timer.advance(2);
         assert_eq!(timer.time(), 1);
+    }
+
+    #[test]
+    fn timer_inspection_is_repeatable_and_side_effect_free() {
+        let mut timer = TimerDevice::new();
+        timer.set_compare(5);
+        timer.advance(5);
+
+        let first = timer.inspection();
+        let second = timer.inspection();
+
+        assert_eq!(first, second);
+        assert_eq!(first.time, 5);
+        assert_eq!(first.compare, 5);
+        assert!(first.pending);
+        assert!(timer.pending());
     }
 }
