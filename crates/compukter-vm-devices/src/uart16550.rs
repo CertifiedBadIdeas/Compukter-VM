@@ -90,6 +90,7 @@ pub struct UartTransferResult {
 }
 
 impl UartTransferResult {
+    /// Creates an exact transfer summary.
     pub const fn new(transferred: usize, dropped: usize) -> Self {
         Self {
             transferred,
@@ -101,8 +102,11 @@ impl UartTransferResult {
 /// Allocation-free snapshot of host-visible UART loss diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Uart16550Diagnostics {
+    /// Host RX bytes rejected due to disconnection or bounded overflow.
     pub rx_dropped: u64,
+    /// Guest TX bytes lost due to disconnection or bounded overflow.
     pub tx_dropped: u64,
+    /// Current guest-visible `LSR.OE` latch.
     pub receive_overrun: bool,
 }
 
@@ -165,6 +169,7 @@ impl Uart16550 {
         self.connected = false;
     }
 
+    /// Returns whether a host byte-stream attachment is connected.
     pub fn is_connected(&self) -> bool {
         self.connected
     }
@@ -208,6 +213,7 @@ impl Uart16550 {
         drained
     }
 
+    /// Returns an allocation-free diagnostic snapshot.
     pub fn diagnostics(&self) -> Uart16550Diagnostics {
         Uart16550Diagnostics {
             rx_dropped: self.rx_dropped,
