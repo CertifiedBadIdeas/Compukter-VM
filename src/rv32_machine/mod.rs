@@ -26,6 +26,8 @@ mod elf;
 mod hart;
 mod machine;
 mod platform;
+#[allow(dead_code)] // Removed when the PLIC is installed by the machine integration slice.
+mod plic;
 
 pub use address_space::{Rv32AddressSpace, Rv32AddressSpaceError};
 pub use builder::{Rv32DeviceHandle, Rv32MachineBuilder};
@@ -42,6 +44,7 @@ pub use machine::{
 pub use platform::{
     CONTROL_BASE, DEBUG_BASE, STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC, TIMER_BASE,
 };
+pub use plic::{Rv32PlicSource, PLIC_BASE};
 
 #[cfg(feature = "dbt-execution-profile")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
