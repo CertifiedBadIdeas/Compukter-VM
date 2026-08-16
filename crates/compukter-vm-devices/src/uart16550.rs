@@ -18,6 +18,15 @@ const FCR_ENABLE: u8 = 1 << 0;
 const FCR_RX_RESET: u8 = 1 << 1;
 const FCR_TX_RESET: u8 = 1 << 2;
 const FCR_STORED: u8 = FCR_ENABLE | 0xc0;
+const IER_RX: u8 = 1 << 0;
+const IER_TX: u8 = 1 << 1;
+const IER_LINE_STATUS: u8 = 1 << 2;
+const IER_SUPPORTED: u8 = IER_RX | IER_TX | IER_LINE_STATUS;
+const IIR_NO_PENDING: u8 = 0x01;
+const IIR_TX_READY: u8 = 0x02;
+const IIR_RX_READY: u8 = 0x04;
+const IIR_LINE_STATUS: u8 = 0x06;
+const IIR_FIFO_ENABLED: u8 = 0xc0;
 const LCR_DLAB: u8 = 1 << 7;
 const LSR_DR: u8 = 1 << 0;
 const LSR_OE: u8 = 1 << 1;
@@ -252,6 +261,24 @@ impl Uart16550 {
         status
     }
 
+    fn interrupt_identification(&self) -> u8 {
+        let fifo = if self.fifo_enabled {
+            IIR_FIFO_ENABLED
+        } else {
+            0
+        };
+        let reason = if self.ier & IER_LINE_STATUS != 0 && self.receive_overrun {
+            IIR_LINE_STATUS
+        } else if self.ier & IER_RX != 0 && !self.rx.is_empty() {
+            IIR_RX_READY
+        } else if self.ier & IER_TX != 0 && self.transmitter_ready() {
+            IIR_TX_READY
+        } else {
+            IIR_NO_PENDING
+        };
+        fifo | reason
+    }
+
     fn write_fifo_control(&mut self, value: u8) {
         let enabled = value & FCR_ENABLE != 0;
         if enabled != self.fifo_enabled {
@@ -274,7 +301,7 @@ impl Uart16550 {
             0 => self.read_receive_byte().unwrap_or(0),
             1 if self.lcr & LCR_DLAB != 0 => (self.divisor >> 8) as u8,
             1 => self.ier,
-            2 => 1 | if self.fifo_enabled { 0xc0 } else { 0 },
+            2 => self.interrupt_identification(),
             3 => self.lcr,
             4 => self.mcr,
             5 => {
@@ -304,7 +331,7 @@ impl Uart16550 {
             1 if self.lcr & LCR_DLAB != 0 => {
                 self.divisor = (self.divisor & 0x00ff) | (u16::from(value) << 8);
             }
-            1 => self.ier = value & 0x07,
+            1 => self.ier = value & IER_SUPPORTED,
             2 => self.write_fifo_control(value),
             3 => self.lcr = value,
             4 => self.mcr = value & 0x1f,
@@ -324,6 +351,10 @@ impl Uart16550 {
 impl MmioDevice for Uart16550 {
     fn size(&self) -> u32 {
         UART_REGISTER_BYTES
+    }
+
+    fn interrupt_level(&self) -> bool {
+        self.interrupt_identification() & IIR_NO_PENDING == 0
     }
 
     fn read(
@@ -535,5 +566,88 @@ mod tests {
         bus.store_u8(UART_BASE + 5, 0xff).unwrap();
         bus.store_u8(UART_BASE + 6, 0xff).unwrap();
         assert_eq!(bus.load_u8(UART_BASE + 6).unwrap(), 0xb0);
+    }
+
+    #[test]
+    fn interrupt_reason_prioritizes_line_status_then_rx_then_tx() {
+        const IER_RX: u8 = 1 << 0;
+        const IER_TX: u8 = 1 << 1;
+        const IER_LINE_STATUS: u8 = 1 << 2;
+        const IIR_REASON_MASK: u8 = 0x0f;
+        const IIR_TX_READY: u8 = 0x02;
+        const IIR_RX_READY: u8 = 0x04;
+        const IIR_LINE_STATUS: u8 = 0x06;
+        const IIR_NO_PENDING: u8 = 0x01;
+
+        let (mut bus, id) = mapped_uart();
+        bus.device_mut::<Uart16550>(id).unwrap().connect();
+        bus.store_u8(UART_BASE + 1, IER_RX | IER_TX | IER_LINE_STATUS)
+            .unwrap();
+        assert_eq!(
+            bus.load_u8(UART_BASE + 2).unwrap() & IIR_REASON_MASK,
+            IIR_TX_READY
+        );
+
+        bus.device_mut::<Uart16550>(id).unwrap().inject_rx(&[7]);
+        assert_eq!(
+            bus.load_u8(UART_BASE + 2).unwrap() & IIR_REASON_MASK,
+            IIR_RX_READY
+        );
+
+        bus.device_mut::<Uart16550>(id).unwrap().inject_rx(&[8]);
+        assert_eq!(
+            bus.load_u8(UART_BASE + 2).unwrap() & IIR_REASON_MASK,
+            IIR_LINE_STATUS
+        );
+        assert!(bus.device::<Uart16550>(id).unwrap().interrupt_level());
+
+        assert_ne!(bus.load_u8(UART_BASE + 5).unwrap() & LSR_OE, 0);
+        assert_eq!(
+            bus.load_u8(UART_BASE + 2).unwrap() & IIR_REASON_MASK,
+            IIR_RX_READY
+        );
+        assert_eq!(bus.load_u8(UART_BASE).unwrap(), 7);
+        assert_eq!(
+            bus.load_u8(UART_BASE + 2).unwrap() & IIR_REASON_MASK,
+            IIR_TX_READY
+        );
+
+        bus.store_u8(UART_BASE, 9).unwrap();
+        assert_eq!(
+            bus.load_u8(UART_BASE + 2).unwrap() & IIR_REASON_MASK,
+            IIR_NO_PENDING
+        );
+        assert!(!bus.device::<Uart16550>(id).unwrap().interrupt_level());
+
+        let mut output = [0_u8; 1];
+        assert_eq!(
+            bus.device_mut::<Uart16550>(id)
+                .unwrap()
+                .drain_tx(&mut output),
+            1
+        );
+        assert_eq!(output, [9]);
+        assert_eq!(
+            bus.load_u8(UART_BASE + 2).unwrap() & IIR_REASON_MASK,
+            IIR_TX_READY
+        );
+    }
+
+    #[test]
+    fn iir_is_level_derived_and_reports_fifo_mode() {
+        let (mut bus, id) = mapped_uart();
+        bus.device_mut::<Uart16550>(id).unwrap().connect();
+        bus.store_u8(UART_BASE + 1, 1).unwrap();
+        bus.store_u8(UART_BASE + 2, FCR_ENABLE | 0xc0).unwrap();
+        bus.device_mut::<Uart16550>(id).unwrap().inject_rx(&[1]);
+
+        assert_eq!(bus.load_u8(UART_BASE + 2).unwrap(), 0xc4);
+        assert_eq!(bus.load_u8(UART_BASE + 2).unwrap(), 0xc4);
+        assert!(bus.device::<Uart16550>(id).unwrap().interrupt_level());
+
+        bus.store_u8(UART_BASE + 1, 1 << 3).unwrap();
+        assert_eq!(bus.load_u8(UART_BASE + 1).unwrap(), 0);
+        assert_eq!(bus.load_u8(UART_BASE + 2).unwrap(), 0xc1);
+        assert!(!bus.device::<Uart16550>(id).unwrap().interrupt_level());
     }
 }
