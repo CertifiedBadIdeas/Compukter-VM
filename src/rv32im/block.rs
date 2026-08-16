@@ -104,6 +104,7 @@ pub(crate) const fn ends_basic_block(slot: Rv32ResolvedInstruction) -> bool {
                     | DecodedInstruction::Ecall
                     | DecodedInstruction::Ebreak
                     | DecodedInstruction::Mret
+                    | DecodedInstruction::Wfi
                     | DecodedInstruction::FenceI,
                 ..
             }

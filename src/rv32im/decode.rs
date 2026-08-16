@@ -174,6 +174,7 @@ pub(crate) enum DecodedInstruction {
     Ecall,
     Ebreak,
     Mret,
+    Wfi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +201,7 @@ pub(crate) enum DecodedOp {
     Ecall,
     Ebreak,
     Mret,
+    Wfi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +306,7 @@ impl DecodedFields {
             DecodedInstruction::Ecall => fields(DecodedOp::Ecall, 0, 0, 0, 0),
             DecodedInstruction::Ebreak => fields(DecodedOp::Ebreak, 0, 0, 0, 0),
             DecodedInstruction::Mret => fields(DecodedOp::Mret, 0, 0, 0, 0),
+            DecodedInstruction::Wfi => fields(DecodedOp::Wfi, 0, 0, 0, 0),
         }
     }
 
@@ -394,6 +397,7 @@ impl DecodedFields {
             DecodedOp::Ecall => DecodedInstruction::Ecall,
             DecodedOp::Ebreak => DecodedInstruction::Ebreak,
             DecodedOp::Mret => DecodedInstruction::Mret,
+            DecodedOp::Wfi => DecodedInstruction::Wfi,
         }
     }
 }
@@ -614,6 +618,7 @@ pub(crate) fn decode_eager_reference(word: u32) -> Result<DecodedInstruction, St
         0x73 if word == 0x0000_0073 => Ok(DecodedInstruction::Ecall),
         0x73 if word == 0x0010_0073 => Ok(DecodedInstruction::Ebreak),
         0x73 if word == 0x3020_0073 => Ok(DecodedInstruction::Mret),
+        0x73 if word == 0x1050_0073 => Ok(DecodedInstruction::Wfi),
         0x73 => {
             let operation = match funct3 {
                 1 | 5 => CsrOperation::Write,
@@ -872,6 +877,7 @@ pub(crate) fn decode_fields(word: u32) -> Result<DecodedFields, String> {
         0x73 if word == 0x0000_0073 => fields(DecodedOp::Ecall, 0, 0, 0, 0),
         0x73 if word == 0x0010_0073 => fields(DecodedOp::Ebreak, 0, 0, 0, 0),
         0x73 if word == 0x3020_0073 => fields(DecodedOp::Mret, 0, 0, 0, 0),
+        0x73 if word == 0x1050_0073 => fields(DecodedOp::Wfi, 0, 0, 0, 0),
         0x73 => {
             let instruction_funct3 = funct3(word);
             let operation = match instruction_funct3 {
@@ -1094,6 +1100,7 @@ pub(crate) fn decode_opcode_first_reference(word: u32) -> Result<DecodedInstruct
         0x73 if word == 0x0000_0073 => Ok(DecodedInstruction::Ecall),
         0x73 if word == 0x0010_0073 => Ok(DecodedInstruction::Ebreak),
         0x73 if word == 0x3020_0073 => Ok(DecodedInstruction::Mret),
+        0x73 if word == 0x1050_0073 => Ok(DecodedInstruction::Wfi),
         0x73 => {
             let instruction_funct3 = funct3(word);
             let operation = match instruction_funct3 {

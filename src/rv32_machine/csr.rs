@@ -22,17 +22,21 @@ use thiserror::Error;
 
 pub(super) const CSR_MSTATUS: u16 = 0x300;
 pub(super) const CSR_MISA: u16 = 0x301;
+pub(super) const CSR_MIE: u16 = 0x304;
 pub(super) const CSR_MTVEC: u16 = 0x305;
 pub(super) const CSR_MSCRATCH: u16 = 0x340;
 pub(super) const CSR_MEPC: u16 = 0x341;
 pub(super) const CSR_MCAUSE: u16 = 0x342;
 pub(super) const CSR_MTVAL: u16 = 0x343;
+pub(super) const CSR_MIP: u16 = 0x344;
 pub(super) const CSR_MHARTID: u16 = 0xf14;
 
 pub(super) const MSTATUS_MIE: u32 = 1 << 3;
 pub(super) const MSTATUS_MPIE: u32 = 1 << 7;
 pub(super) const MSTATUS_MPP_MACHINE: u32 = 3 << 11;
 const MSTATUS_WRITABLE: u32 = MSTATUS_MIE | MSTATUS_MPIE;
+pub(super) const MIE_MTIE: u32 = 1 << 7;
+pub(super) const MIP_MTIP: u32 = 1 << 7;
 
 const MISA_MXL_RV32: u32 = 1 << 30;
 const MISA_A: u32 = 1 << 0;
@@ -51,22 +55,26 @@ pub(super) enum Rv32CsrError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Rv32MachineCsrs {
     mstatus: u32,
+    mie: u32,
     mtvec: u32,
     mscratch: u32,
     mepc: u32,
     mcause: u32,
     mtval: u32,
+    mip: u32,
 }
 
 impl Rv32MachineCsrs {
     pub(super) fn new() -> Self {
         Self {
             mstatus: MSTATUS_MPP_MACHINE,
+            mie: 0,
             mtvec: 0,
             mscratch: 0,
             mepc: 0,
             mcause: 0,
             mtval: 0,
+            mip: 0,
         }
     }
 
@@ -74,11 +82,13 @@ impl Rv32MachineCsrs {
         match csr {
             CSR_MSTATUS => Ok(self.mstatus),
             CSR_MISA => Ok(MISA_RV32IMA),
+            CSR_MIE => Ok(self.mie),
             CSR_MTVEC => Ok(self.mtvec),
             CSR_MSCRATCH => Ok(self.mscratch),
             CSR_MEPC => Ok(self.mepc),
             CSR_MCAUSE => Ok(self.mcause),
             CSR_MTVAL => Ok(self.mtval),
+            CSR_MIP => Ok(self.mip),
             CSR_MHARTID => Ok(0),
             _ => Err(Rv32CsrError::Absent(csr)),
         }
@@ -114,6 +124,39 @@ impl Rv32MachineCsrs {
     }
 
     pub(super) fn enter_trap(&mut self, pc: u32, cause: u32, value: u32) -> u32 {
+        let vector = self.trap_base();
+        self.enter_trap_state(pc, cause, value);
+        vector
+    }
+
+    pub(super) fn enter_machine_timer_interrupt(&mut self, pc: u32) -> u32 {
+        const MACHINE_TIMER_CAUSE: u32 = 7;
+        let vector = if self.mtvec & 3 == 1 {
+            self.trap_base().wrapping_add(4 * MACHINE_TIMER_CAUSE)
+        } else {
+            self.trap_base()
+        };
+        self.enter_trap_state(pc, 1 << 31 | MACHINE_TIMER_CAUSE, 0);
+        vector
+    }
+
+    pub(super) fn set_machine_timer_pending(&mut self, pending: bool) {
+        if pending {
+            self.mip |= MIP_MTIP;
+        } else {
+            self.mip &= !MIP_MTIP;
+        }
+    }
+
+    pub(super) fn timer_wake_pending(&self) -> bool {
+        self.mie & self.mip & MIE_MTIE != 0
+    }
+
+    pub(super) fn timer_interrupt_actionable(&self) -> bool {
+        self.mstatus & MSTATUS_MIE != 0 && self.timer_wake_pending()
+    }
+
+    fn enter_trap_state(&mut self, pc: u32, cause: u32, value: u32) {
         let previous_mie = self.mstatus & MSTATUS_MIE != 0;
         self.mstatus = MSTATUS_MPP_MACHINE;
         if previous_mie {
@@ -122,7 +165,10 @@ impl Rv32MachineCsrs {
         self.mepc = pc & !3;
         self.mcause = cause;
         self.mtval = value;
-        self.mtvec
+    }
+
+    fn trap_base(&self) -> u32 {
+        self.mtvec & !3
     }
 
     pub(super) fn return_from_trap(&mut self) -> u32 {
@@ -139,11 +185,16 @@ impl Rv32MachineCsrs {
             CSR_MSTATUS => {
                 self.mstatus = value & MSTATUS_WRITABLE | MSTATUS_MPP_MACHINE;
             }
-            CSR_MTVEC => self.mtvec = value & !3,
+            CSR_MIE => self.mie = value & MIE_MTIE,
+            CSR_MTVEC => {
+                let mode = value & 3;
+                self.mtvec = value & !3 | u32::from(mode == 1);
+            }
             CSR_MSCRATCH => self.mscratch = value,
             CSR_MEPC => self.mepc = value & !3,
             CSR_MCAUSE => self.mcause = value,
             CSR_MTVAL => self.mtval = value,
+            CSR_MIP => {}
             CSR_MISA | CSR_MHARTID => return Err(Rv32CsrError::ReadOnly(csr)),
             _ => return Err(Rv32CsrError::Absent(csr)),
         }
@@ -209,5 +260,47 @@ mod tests {
             Err(Rv32CsrError::Absent(0x07ff))
         );
         assert_eq!(csrs.read(CSR_MHARTID).unwrap(), 0);
+    }
+
+    #[test]
+    fn machine_timer_interrupt_bits_are_masked_and_hardware_owned() {
+        let mut csrs = Rv32MachineCsrs::new();
+        assert_eq!(csrs.read(CSR_MIE).unwrap(), 0);
+        assert_eq!(csrs.read(CSR_MIP).unwrap(), 0);
+
+        csrs.write_software(CSR_MIE, u32::MAX).unwrap();
+        assert_eq!(csrs.read(CSR_MIE).unwrap(), MIE_MTIE);
+        csrs.write_software(CSR_MIP, u32::MAX).unwrap();
+        assert_eq!(csrs.read(CSR_MIP).unwrap(), 0);
+
+        csrs.set_machine_timer_pending(true);
+        assert_eq!(csrs.read(CSR_MIP).unwrap(), MIP_MTIP);
+        assert!(csrs.timer_wake_pending());
+        assert!(!csrs.timer_interrupt_actionable());
+
+        csrs.write_software(CSR_MSTATUS, MSTATUS_MIE).unwrap();
+        assert!(csrs.timer_interrupt_actionable());
+        csrs.set_machine_timer_pending(false);
+        assert_eq!(csrs.read(CSR_MIP).unwrap(), 0);
+    }
+
+    #[test]
+    fn machine_timer_interrupt_uses_direct_and_vectored_mtvec_modes() {
+        for (mtvec, expected_vector) in [(0x2000, 0x2000), (0x2001, 0x201c)] {
+            let mut csrs = Rv32MachineCsrs::new();
+            csrs.write_software(CSR_MTVEC, mtvec).unwrap();
+            csrs.write_software(CSR_MSTATUS, MSTATUS_MIE).unwrap();
+            csrs.write_software(CSR_MIE, MIE_MTIE).unwrap();
+            csrs.set_machine_timer_pending(true);
+
+            assert_eq!(csrs.enter_machine_timer_interrupt(0x1234), expected_vector);
+            assert_eq!(csrs.read(CSR_MEPC).unwrap(), 0x1234);
+            assert_eq!(csrs.read(CSR_MCAUSE).unwrap(), 0x8000_0007);
+            assert_eq!(csrs.read(CSR_MTVAL).unwrap(), 0);
+            assert_eq!(
+                csrs.read(CSR_MSTATUS).unwrap(),
+                MSTATUS_MPIE | MSTATUS_MPP_MACHINE
+            );
+        }
     }
 }

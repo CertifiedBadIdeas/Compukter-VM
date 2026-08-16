@@ -23,7 +23,7 @@ use compukter_vm::rv32im::encoding::{
     add, addi, amoadd_w, amoand_w, amomax_w, amomaxu_w, amomin_w, amominu_w, amoor_w, amoswap_w,
     amoxor_w, auipc, beq, bge, bgeu, blt, bltu, bne, csrrc, csrrci, csrrs, csrrsi, csrrw, csrrwi,
     div, divu, ebreak, fence, fence_i, jal, jalr, lb, lbu, lh, lhu, lr_w, lui, lw, mret, mul, rem,
-    remu, sb, sc_w, sh, sw,
+    remu, sb, sc_w, sh, sw, wfi,
 };
 use compukter_vm::rv32im::{
     BoundedCachedRv32imProgram, PredecodedRv32imImage, PredecodedRv32imProgram, Rv32imCacheStats,
@@ -198,6 +198,20 @@ fn zicsr_and_mret_words_decode_but_remain_machine_only_in_direct_benchmarks() {
         assert_eq!(cpu.pc(), 0);
         assert_eq!(cpu.retired_instructions(), 0);
     }
+}
+
+#[test]
+fn wfi_word_decodes_but_remains_machine_only_in_direct_benchmarks() {
+    let word = wfi();
+    assert_eq!(word, 0x1050_0073);
+    assert!(PredecodedRv32imProgram::new(0, &word.to_le_bytes()).is_ok());
+
+    let mut bus = MachineBus::new(16).unwrap();
+    bus.store_i32(0, word as i32).unwrap();
+    let mut cpu = Rv32imCpu::new(0);
+    assert!(cpu.step(&mut bus).is_err());
+    assert_eq!(cpu.pc(), 0);
+    assert_eq!(cpu.retired_instructions(), 0);
 }
 
 #[test]

@@ -521,6 +521,9 @@ impl Rv32imCpu {
             DecodedInstruction::Mret => {
                 return Err(Rv32RegularFault::MachineInstructionRequired);
             }
+            DecodedInstruction::Wfi => {
+                return Err(Rv32RegularFault::MachineInstructionRequired);
+            }
         }
         Ok(None)
     }

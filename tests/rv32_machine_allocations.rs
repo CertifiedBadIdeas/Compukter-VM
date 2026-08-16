@@ -22,17 +22,19 @@
 mod rv32_elf_support;
 
 use compukter_vm::rv32_machine::{
-    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome,
+    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome, TIMER_BASE,
 };
 use compukter_vm::rv32im::encoding::{
     addi, andn, bne, clz, cpop, csrrs, csrrw, ecall, jal, lr_w, materialize, mret, orc_b, rev8,
-    rol, rori, sc_w,
+    rol, rori, sc_w, sw, wfi,
 };
 use rv32_elf_support::{Elf32Builder, LoadSegment};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CSR_MTVEC: u16 = 0x305;
+const CSR_MSTATUS: u16 = 0x300;
+const CSR_MIE: u16 = 0x304;
 const CSR_MEPC: u16 = 0x341;
 
 struct CountingAllocator;
@@ -323,6 +325,97 @@ fn assert_cached_dbt_zbb_loop_allocates_nothing() {
     );
 }
 
+fn assert_waiting_and_timer_wakeup_allocate_nothing() {
+    let [timer_hi, timer_lo] = materialize(1, TIMER_BASE);
+    let [vector_hi, vector_lo] = materialize(3, 0x2000);
+    let main = [
+        timer_hi,
+        timer_lo,
+        addi(2, 0, 1),
+        sw(1, 2, 0),
+        sw(1, 0, 4),
+        vector_hi,
+        vector_lo,
+        csrrw(0, CSR_MTVEC, 3),
+        addi(4, 0, 1 << 7),
+        csrrw(0, CSR_MIE, 4),
+        addi(5, 0, 1 << 3),
+        csrrw(0, CSR_MSTATUS, 5),
+        wfi(),
+        jal(0, 0),
+    ];
+    let handler = [csrrw(0, CSR_MIE, 0), mret()];
+    let words = |words: &[u32]| {
+        words
+            .iter()
+            .copied()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, words(&main)))
+        .load(LoadSegment::rx(0x2000, words(&handler)))
+        .load(LoadSegment::rw_with_mem_size(0x3000, [], 0x1000))
+        .finish();
+
+    for execution in [
+        Rv32ExecutionBackendConfig::Cached { sets: 64 },
+        Rv32ExecutionBackendConfig::Predecoded,
+        Rv32ExecutionBackendConfig::BlockCached {
+            sets: 32,
+            max_instructions: 8,
+        },
+        Rv32ExecutionBackendConfig::DirectDbt {
+            max_instructions: 8,
+            scratch_bytes: 4096,
+        },
+        Rv32ExecutionBackendConfig::CachedDbt {
+            sets: 32,
+            max_instructions: 8,
+            scratch_bytes: 4096,
+            cache_bytes: 4096,
+            code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+            register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
+        },
+    ] {
+        let mut machine = Rv32Machine::from_elf(
+            &elf,
+            Rv32MachineConfig {
+                ram_size: 0x10_000,
+                debug_limit: 0,
+                execution,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            machine.run(13).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt { .. }
+        ));
+
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        for _ in 0..32 {
+            assert!(matches!(
+                machine.run(4096).unwrap(),
+                Rv32MachineOutcome::WaitingForInterrupt { .. }
+            ));
+        }
+        machine.advance_time(1);
+        assert!(matches!(
+            machine.run(8).unwrap(),
+            Rv32MachineOutcome::BudgetExhausted { .. }
+        ));
+        let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+        let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+
+        assert_eq!(allocations, 0, "{execution:?} allocated around WFI/timer");
+        assert_eq!(
+            allocated_bytes, 0,
+            "{execution:?} allocated bytes around WFI/timer"
+        );
+    }
+}
+
 #[cfg(feature = "dbt-execution-profile")]
 fn assert_profiled_cached_dbt_steady_state_allocates_nothing() {
     let words = [addi(1, 1, 1), jal(0, -4)];
@@ -385,6 +478,7 @@ fn steady_state_machine_paths_allocate_nothing() {
     assert_steady_state_atomic_increment_loop_allocates_nothing();
     assert_block_cache_evictions_allocate_nothing();
     assert_cached_dbt_zbb_loop_allocates_nothing();
+    assert_waiting_and_timer_wakeup_allocate_nothing();
     #[cfg(feature = "dbt-execution-profile")]
     assert_profiled_cached_dbt_steady_state_allocates_nothing();
 }

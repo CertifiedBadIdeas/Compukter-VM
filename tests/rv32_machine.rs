@@ -25,7 +25,7 @@ use compukter_vm::rv32_machine::{
     Rv32MachineBuilder, Rv32MachineConfig, Rv32MachineOutcome, CONTROL_BASE, DEBUG_BASE,
     DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_CODE_BYTES,
     DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES,
-    STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC,
+    STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC, TIMER_BASE,
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
@@ -33,8 +33,8 @@ use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind
 use compukter_vm::rv32im::encoding::jalr;
 use compukter_vm::rv32im::encoding::{
     add, addi, amoswap_w, andn, bne, clz, cpop, csrrs, csrrw, ctz, ebreak, ecall, fence_i, jal,
-    lr_w, lui, lw, materialize, max, maxu, min, minu, orc_b, orn, rev8, rol, ror, rori, sb, sc_w,
-    sext_b, sext_h, sh, slli, sw, xnor, zext_h,
+    lr_w, lui, lw, materialize, max, maxu, min, minu, mret, orc_b, orn, rev8, rol, ror, rori, sb,
+    sc_w, sext_b, sext_h, sh, slli, sw, wfi, xnor, zext_h,
 };
 use compukter_vm::{
     bus::{MmioAccessWidth, MmioContext, MmioDevice},
@@ -43,9 +43,13 @@ use compukter_vm::{
 use rv32_elf_support::{halting_machine_elf, machine_program_elf, Elf32Builder, LoadSegment};
 
 const CSR_MTVEC: u16 = 0x305;
+const CSR_MSTATUS: u16 = 0x300;
+const CSR_MIE: u16 = 0x304;
 const CSR_MEPC: u16 = 0x341;
 const CSR_MCAUSE: u16 = 0x342;
 const CSR_MTVAL: u16 = 0x343;
+const MSTATUS_MIE: i32 = 1 << 3;
+const MIE_MTIE: i32 = 1 << 7;
 
 struct TestRegister(i32);
 
@@ -134,7 +138,7 @@ fn builder_device_is_visible_to_guest_mmio() {
 fn builder_rejects_invalid_complete_topologies() {
     let elf = halting_machine_elf(b'T');
 
-    for base in [0x1000, CONTROL_BASE, DEBUG_BASE, u32::MAX - 1] {
+    for base in [0x1000, CONTROL_BASE, DEBUG_BASE, TIMER_BASE, u32::MAX - 1] {
         let mut builder = Rv32MachineBuilder::from_elf(
             &elf,
             config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
@@ -175,6 +179,244 @@ fn typed_handle_outside_a_machine_topology_returns_none() {
 
     assert!(machine.device(second).is_none());
     assert!(machine.device_mut(second).is_none());
+}
+
+#[test]
+fn host_controls_wrapping_virtual_time_explicitly() {
+    let elf = halting_machine_elf(b'T');
+    let mut machine = Rv32Machine::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+    )
+    .unwrap();
+
+    assert_eq!(machine.virtual_time(), 0);
+    machine.advance_time(u64::MAX);
+    assert_eq!(machine.virtual_time(), u64::MAX);
+    machine.advance_time(2);
+    assert_eq!(machine.virtual_time(), 1);
+}
+
+#[test]
+fn all_backends_stop_at_wfi_without_spending_later_budgets() {
+    let elf = machine_program_elf(&[wfi(), addi(1, 0, 1), jal(0, 0)]);
+
+    for execution in configs() {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 0)).unwrap();
+        assert_eq!(
+            machine.run(8).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 1,
+                retired_total: 1,
+            }
+        );
+        assert_eq!(machine.pc(), 0x1004);
+        assert_eq!(
+            machine.run(1_000).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 0,
+                retired_total: 1,
+            }
+        );
+        assert_eq!(machine.pc(), 0x1004);
+    }
+}
+
+#[test]
+fn all_backends_wake_wfi_and_take_machine_timer_interrupt() {
+    let [timer_hi, timer_lo] = materialize(1, TIMER_BASE);
+    let [handler_hi, handler_lo] = materialize(3, 0x2000);
+    let main = [
+        timer_hi,
+        timer_lo,
+        addi(2, 0, 5),
+        sw(1, 2, 0),
+        sw(1, 0, 4),
+        handler_hi,
+        handler_lo,
+        csrrw(0, CSR_MTVEC, 3),
+        addi(4, 0, MIE_MTIE),
+        csrrw(0, CSR_MIE, 4),
+        addi(5, 0, MSTATUS_MIE),
+        csrrw(0, CSR_MSTATUS, 5),
+        wfi(),
+        lui(10, 0x10000),
+        addi(11, 0, STATUS_HALTED),
+        sw(10, 11, 0),
+    ];
+    let [debug_hi, debug_lo] = materialize(6, DEBUG_BASE);
+    let handler = [
+        csrrs(7, CSR_MCAUSE, 0),
+        debug_hi,
+        debug_lo,
+        sb(6, 7, 0),
+        csrrw(0, CSR_MIE, 0),
+        mret(),
+    ];
+    let words = |words: &[u32]| {
+        words
+            .iter()
+            .copied()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, words(&main)))
+        .load(LoadSegment::rx(0x2000, words(&handler)))
+        .load(LoadSegment::rw_with_mem_size(0x3000, [], 0x1000))
+        .finish();
+
+    for execution in configs() {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 1)).unwrap();
+        assert_eq!(
+            machine.run(13).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 13,
+                retired_total: 13,
+            }
+        );
+
+        machine.advance_time(4);
+        assert_eq!(
+            machine.run(16).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 0,
+                retired_total: 13,
+            }
+        );
+        machine.advance_time(1);
+        assert_eq!(
+            machine.run(16).unwrap(),
+            Rv32MachineOutcome::Halted {
+                exit_code: 0,
+                retired_delta: 9,
+                retired_total: 22,
+            }
+        );
+        assert_eq!(machine.debug_bytes(), &[7]);
+    }
+}
+
+#[test]
+fn all_backends_wake_wfi_without_trapping_when_global_mie_is_clear() {
+    let [timer_hi, timer_lo] = materialize(1, TIMER_BASE);
+    let elf = machine_program_elf(&[
+        timer_hi,
+        timer_lo,
+        addi(2, 0, 5),
+        sw(1, 2, 0),
+        sw(1, 0, 4),
+        addi(4, 0, MIE_MTIE),
+        csrrw(0, CSR_MIE, 4),
+        wfi(),
+        lui(10, 0x10000),
+        addi(11, 0, STATUS_HALTED),
+        sw(10, 11, 0),
+    ]);
+
+    for execution in configs() {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 0)).unwrap();
+        assert!(matches!(
+            machine.run(8).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 8,
+                retired_total: 8,
+            }
+        ));
+        machine.advance_time(5);
+        assert_eq!(
+            machine.run(3).unwrap(),
+            Rv32MachineOutcome::Halted {
+                exit_code: 0,
+                retired_delta: 3,
+                retired_total: 11,
+            }
+        );
+    }
+}
+
+#[test]
+fn all_backends_keep_wfi_asleep_when_pending_timer_is_individually_masked() {
+    let [timer_hi, timer_lo] = materialize(1, TIMER_BASE);
+    let elf = machine_program_elf(&[
+        timer_hi,
+        timer_lo,
+        addi(2, 0, 5),
+        sw(1, 2, 0),
+        sw(1, 0, 4),
+        wfi(),
+        jal(0, 0),
+    ]);
+
+    for execution in configs() {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 0)).unwrap();
+        assert!(matches!(
+            machine.run(6).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 6,
+                retired_total: 6,
+            }
+        ));
+        machine.advance_time(5);
+        assert_eq!(
+            machine.run(1_000).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 0,
+                retired_total: 6,
+            }
+        );
+    }
+}
+
+#[test]
+fn all_backends_route_machine_timer_interrupt_through_vectored_mtvec() {
+    let [timer_hi, timer_lo] = materialize(1, TIMER_BASE);
+    let [vector_hi, vector_lo] = materialize(3, 0x2001);
+    let main = [
+        timer_hi,
+        timer_lo,
+        addi(2, 0, 1),
+        sw(1, 2, 0),
+        sw(1, 0, 4),
+        vector_hi,
+        vector_lo,
+        csrrw(0, CSR_MTVEC, 3),
+        addi(4, 0, MIE_MTIE),
+        csrrw(0, CSR_MIE, 4),
+        addi(5, 0, MSTATUS_MIE),
+        csrrw(0, CSR_MSTATUS, 5),
+        wfi(),
+    ];
+    let handler = [lui(10, 0x10000), addi(11, 0, STATUS_HALTED), sw(10, 11, 0)];
+    let words = |words: &[u32]| {
+        words
+            .iter()
+            .copied()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, words(&main)))
+        .load(LoadSegment::rx(0x201c, words(&handler)))
+        .load(LoadSegment::rw_with_mem_size(0x3000, [], 0x1000))
+        .finish();
+
+    for execution in configs() {
+        let mut machine = Rv32Machine::from_elf(&elf, config(execution, 0)).unwrap();
+        assert!(matches!(
+            machine.run(13).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt { .. }
+        ));
+        machine.advance_time(1);
+        assert_eq!(
+            machine.run(3).unwrap(),
+            Rv32MachineOutcome::Halted {
+                exit_code: 0,
+                retired_delta: 3,
+                retired_total: 16,
+            }
+        );
+    }
 }
 
 fn configs() -> [Rv32ExecutionBackendConfig; 5] {

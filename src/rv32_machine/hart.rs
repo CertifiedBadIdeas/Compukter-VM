@@ -39,12 +39,14 @@ pub(super) enum Rv32ExceptionCause {
 pub(super) enum Rv32HartStep {
     Retired,
     TrapTaken,
+    WaitingForInterrupt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Rv32MachineHart {
     cpu: Rv32imCpu,
     csrs: Rv32MachineCsrs,
+    waiting_for_interrupt: bool,
 }
 
 impl Rv32MachineHart {
@@ -52,6 +54,7 @@ impl Rv32MachineHart {
         Self {
             cpu: Rv32imCpu::new(pc),
             csrs: Rv32MachineCsrs::new(),
+            waiting_for_interrupt: false,
         }
     }
 
@@ -65,6 +68,34 @@ impl Rv32MachineHart {
 
     pub(super) fn retired_instructions(&self) -> u64 {
         self.cpu.retired_instructions()
+    }
+
+    pub(super) fn sync_machine_timer_pending(&mut self, pending: bool) {
+        self.csrs.set_machine_timer_pending(pending);
+    }
+
+    pub(super) fn is_waiting_for_interrupt(&self) -> bool {
+        self.waiting_for_interrupt
+    }
+
+    pub(super) fn wake_for_pending_interrupt(&mut self) -> bool {
+        if self.waiting_for_interrupt && self.csrs.timer_wake_pending() {
+            self.waiting_for_interrupt = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn take_pending_machine_timer_interrupt(&mut self) -> bool {
+        if !self.csrs.timer_interrupt_actionable() {
+            return false;
+        }
+        self.cpu.clear_reservation();
+        let vector = self.csrs.enter_machine_timer_interrupt(self.cpu.pc());
+        self.cpu.set_pc_internal(vector);
+        self.waiting_for_interrupt = false;
+        true
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -121,6 +152,12 @@ impl Rv32MachineHart {
                 self.cpu.set_pc_internal(pc);
                 self.cpu.commit_instruction();
                 Rv32HartStep::Retired
+            }
+            DecodedInstruction::Wfi => {
+                self.cpu.set_pc_internal(instruction_pc.wrapping_add(4));
+                self.cpu.commit_instruction();
+                self.waiting_for_interrupt = true;
+                Rv32HartStep::WaitingForInterrupt
             }
             DecodedInstruction::Ecall => self.take_trap(
                 instruction_pc,
@@ -257,12 +294,12 @@ impl Rv32MachineHart {
 mod tests {
     use super::{Rv32HartStep, Rv32MachineHart};
     use crate::rv32_machine::csr::{
-        CSR_MCAUSE, CSR_MEPC, CSR_MHARTID, CSR_MSCRATCH, CSR_MSTATUS, CSR_MTVAL, CSR_MTVEC,
-        MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP_MACHINE,
+        CSR_MCAUSE, CSR_MEPC, CSR_MHARTID, CSR_MIE, CSR_MSCRATCH, CSR_MSTATUS, CSR_MTVAL,
+        CSR_MTVEC, MIE_MTIE, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP_MACHINE,
     };
     use crate::rv32im::encoding::{
         amoswap_w, csrrc, csrrci, csrrs, csrrsi, csrrw, csrrwi, ebreak, ecall, jal, lr_w, lw, mret,
-        sc_w, sw,
+        sc_w, sw, wfi,
     };
 
     #[test]
@@ -336,6 +373,41 @@ mod tests {
             MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MACHINE
         );
         assert_eq!(hart.retired_instructions(), 1);
+    }
+
+    #[test]
+    fn machine_timer_interrupt_enters_direct_or_vectored_handler_and_mret_returns() {
+        for (mtvec, expected_vector) in [(0x2000, 0x2000), (0x2001, 0x201c)] {
+            let mut hart = Rv32MachineHart::new(0x1000);
+            hart.write_csr_for_test(CSR_MTVEC, mtvec).unwrap();
+            hart.write_csr_for_test(CSR_MSTATUS, MSTATUS_MIE).unwrap();
+            hart.write_csr_for_test(CSR_MIE, MIE_MTIE).unwrap();
+            hart.sync_machine_timer_pending(true);
+
+            assert!(hart.take_pending_machine_timer_interrupt());
+            assert_eq!(hart.pc(), expected_vector);
+            assert_eq!(hart.read_csr(CSR_MEPC).unwrap(), 0x1000);
+            assert_eq!(hart.read_csr(CSR_MCAUSE).unwrap(), 0x8000_0007);
+            assert_eq!(hart.read_csr(CSR_MTVAL).unwrap(), 0);
+            assert_eq!(hart.retired_instructions(), 0);
+
+            assert_eq!(hart.execute_word_for_test(mret()), Rv32HartStep::Retired);
+            assert_eq!(hart.pc(), 0x1000);
+            assert_eq!(hart.retired_instructions(), 1);
+        }
+    }
+
+    #[test]
+    fn wfi_retires_and_waits_at_the_following_instruction() {
+        let mut hart = Rv32MachineHart::new(0x1000);
+
+        assert_eq!(
+            hart.execute_word_for_test(wfi()),
+            Rv32HartStep::WaitingForInterrupt
+        );
+        assert_eq!(hart.pc(), 0x1004);
+        assert_eq!(hart.retired_instructions(), 1);
+        assert!(hart.is_waiting_for_interrupt());
     }
 
     #[test]

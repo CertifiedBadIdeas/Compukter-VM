@@ -7,7 +7,13 @@ resolver = "2"
 name = "compukter-vm"
 version = "0.1.0"
 edition = "2021"
-include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md"]
+include = [
+    "src/**",
+    "docs/PLATFORM.md",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+]
 
 [lib]
 crate-type = ["rlib"]
