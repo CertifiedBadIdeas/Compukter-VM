@@ -95,7 +95,12 @@ impl MachineBusTrafficCounters {
     }
 }
 
-pub trait MmioDevice: Any {
+/// A fixed guest MMIO device owned by its containing machine.
+///
+/// Devices must be movable between host threads so an assembled machine can
+/// be transferred to a dedicated execution worker. Access remains exclusive
+/// through `&mut self`; this contract does not make devices concurrently shared.
+pub trait MmioDevice: Any + Send {
     fn size(&self) -> u32;
 
     /// Returns the current active-high level for a builder-routed PLIC source.

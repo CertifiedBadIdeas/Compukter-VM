@@ -16,10 +16,17 @@ mod rv32_elf_support;
 use compukter_vm::bus::{MmioAccessWidth, MmioContext, MmioDevice};
 use compukter_vm::memory::MemoryFault;
 use compukter_vm::rv32_machine::{
-    Rv32ExecutionBackendConfig, Rv32MachineBuilder, Rv32MachineConfig,
+    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineBuilder, Rv32MachineConfig,
 };
 use compukter_vm::rv32im::encoding::{jal, wfi};
 use rv32_elf_support::machine_program_elf;
+
+fn assert_send<T: Send>() {}
+
+#[test]
+fn assembled_machine_can_be_moved_to_a_dedicated_worker_thread() {
+    assert_send::<Rv32Machine>();
+}
 
 struct TestIrqDevice {
     level: bool,
