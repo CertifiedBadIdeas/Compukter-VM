@@ -55,7 +55,7 @@ fn every_backend_wakes_for_uart_rx_and_transmits_a_response() {
             machine
                 .device_mut(uart)
                 .unwrap()
-                .inject_rx(&[b'A'])
+                .inject_rx(b"A")
                 .transferred,
             1
         );

@@ -101,3 +101,17 @@ entry. Guest MMIO mutations are sampled after the MMIO slow path. A wrapping
 bus MMIO epoch prevents interpreted non-MMIO instructions from rescanning IRQ
 routes, and generated DBT code contains no per-instruction IRQ poll. Host state
 must not be mutated concurrently with `run()`.
+
+## Optional concrete devices
+
+The core `compukter-vm` crate installs only its standard control, debug, timer,
+and PLIC devices. Reusable optional controllers live in the one-way-dependent
+`compukter-vm-devices` workspace crate, keeping the VM core independent of
+concrete peripherals.
+
+The first optional controller is a bounded, interrupt-capable 16550-style UART.
+It is installed with `add_mmio_device_with_irq` at a host-selected free address;
+`0x1000_1000` is used by current examples and tests. The QEMU-typical UART
+address `0x1000_0000` is unavailable because the Compukter control device
+already owns it. UART register, FIFO, attachment, and interrupt behavior is
+specified in `crates/compukter-vm-devices/README.md`.
