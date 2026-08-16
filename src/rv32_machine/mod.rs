@@ -24,6 +24,7 @@ mod csr;
 mod dbt;
 mod elf;
 mod hart;
+mod inspection;
 mod machine;
 mod platform;
 mod plic;
@@ -32,6 +33,10 @@ pub use address_space::{Rv32AddressSpace, Rv32AddressSpaceError};
 pub use builder::{Rv32DeviceHandle, Rv32MachineBuilder};
 pub use elf::{
     Rv32ElfError, Rv32ElfErrorKind, Rv32ElfLoader, Rv32LoadedImage, Rv32PagePermissions,
+};
+pub use inspection::{
+    Rv32CsrInspection, Rv32HartInspection, Rv32IrqRouteInspection, Rv32MachineInspection,
+    Rv32PlicInspection, Rv32PlicSourceInspection, Rv32TimerInspection, RV32_PLIC_MAX_SOURCES,
 };
 pub use machine::{
     Rv32DbtCodeAlignment, Rv32DbtRegisterProfile, Rv32ExecutionBackendConfig, Rv32Machine,
