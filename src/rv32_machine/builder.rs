@@ -104,6 +104,8 @@ impl Rv32MachineBuilder {
         self.push_device(base, device, None)
     }
 
+    /// Adds a fixed MMIO device and assigns its active-high interrupt output a
+    /// stable guest-visible PLIC source ID.
     pub fn add_mmio_device_with_irq<T: MmioDevice>(
         &mut self,
         base: u32,

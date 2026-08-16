@@ -22,11 +22,16 @@
 mod rv32_elf_support;
 
 use compukter_vm::rv32_machine::{
-    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineConfig, Rv32MachineOutcome, TIMER_BASE,
+    Rv32ExecutionBackendConfig, Rv32Machine, Rv32MachineBuilder, Rv32MachineConfig,
+    Rv32MachineOutcome, PLIC_BASE, TIMER_BASE,
 };
 use compukter_vm::rv32im::encoding::{
-    addi, andn, bne, clz, cpop, csrrs, csrrw, ecall, jal, lr_w, materialize, mret, orc_b, rev8,
+    addi, andn, bne, clz, cpop, csrrs, csrrw, ecall, jal, lr_w, lw, materialize, mret, orc_b, rev8,
     rol, rori, sc_w, sw, wfi,
+};
+use compukter_vm::{
+    bus::{MmioAccessWidth, MmioContext, MmioDevice},
+    memory::MemoryFault,
 };
 use rv32_elf_support::{Elf32Builder, LoadSegment};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -68,6 +73,48 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
+
+struct AllocationIrqDevice {
+    level: bool,
+}
+
+impl MmioDevice for AllocationIrqDevice {
+    fn size(&self) -> u32 {
+        4
+    }
+
+    fn interrupt_level(&self) -> bool {
+        self.level
+    }
+
+    fn read(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+    ) -> Result<u64, MemoryFault> {
+        if offset == 0 && width == MmioAccessWidth::Word {
+            Ok(u64::from(self.level))
+        } else {
+            Err(MemoryFault::new("invalid allocation IRQ read".to_string()))
+        }
+    }
+
+    fn write(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+        value: u64,
+    ) -> Result<(), MemoryFault> {
+        if offset == 0 && width == MmioAccessWidth::Word {
+            self.level = value != 0;
+            Ok(())
+        } else {
+            Err(MemoryFault::new("invalid allocation IRQ write".to_string()))
+        }
+    }
+}
 
 fn assert_steady_state_trap_entry_and_return_allocate_nothing() {
     let [vector_hi, vector_lo] = materialize(1, 0x2000);
@@ -416,6 +463,123 @@ fn assert_waiting_and_timer_wakeup_allocate_nothing() {
     }
 }
 
+fn assert_external_irq_wakeup_allocate_nothing() {
+    const IRQ_DEVICE_BASE: u32 = 0x1000_1000;
+    let [priority_hi, priority_lo] = materialize(1, PLIC_BASE + 4);
+    let [enable_hi, enable_lo] = materialize(1, PLIC_BASE + 0x2000);
+    let [threshold_hi, threshold_lo] = materialize(1, PLIC_BASE + 0x200000);
+    let [vector_hi, vector_lo] = materialize(3, 0x2000);
+    let [meie_hi, meie_lo] = materialize(4, 1 << 11);
+    let main = [
+        priority_hi,
+        priority_lo,
+        addi(2, 0, 1),
+        sw(1, 2, 0),
+        enable_hi,
+        enable_lo,
+        addi(2, 0, 1 << 1),
+        sw(1, 2, 0),
+        threshold_hi,
+        threshold_lo,
+        sw(1, 0, 0),
+        vector_hi,
+        vector_lo,
+        csrrw(0, CSR_MTVEC, 3),
+        meie_hi,
+        meie_lo,
+        csrrw(0, CSR_MIE, 4),
+        addi(5, 0, 1 << 3),
+        csrrw(0, CSR_MSTATUS, 5),
+        wfi(),
+        jal(0, -4),
+    ];
+    let [claim_hi, claim_lo] = materialize(8, PLIC_BASE + 0x200004);
+    let [device_hi, device_lo] = materialize(6, IRQ_DEVICE_BASE);
+    let handler = [
+        claim_hi,
+        claim_lo,
+        lw(9, 8, 0),
+        device_hi,
+        device_lo,
+        sw(6, 0, 0),
+        sw(8, 9, 0),
+        mret(),
+    ];
+    let words = |words: &[u32]| {
+        words
+            .iter()
+            .copied()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, words(&main)))
+        .load(LoadSegment::rx(0x2000, words(&handler)))
+        .load(LoadSegment::rw_with_mem_size(0x3000, [], 0x1000))
+        .finish();
+
+    for execution in [
+        Rv32ExecutionBackendConfig::Cached { sets: 64 },
+        Rv32ExecutionBackendConfig::Predecoded,
+        Rv32ExecutionBackendConfig::BlockCached {
+            sets: 32,
+            max_instructions: 8,
+        },
+        Rv32ExecutionBackendConfig::DirectDbt {
+            max_instructions: 8,
+            scratch_bytes: 4096,
+        },
+        Rv32ExecutionBackendConfig::CachedDbt {
+            sets: 32,
+            max_instructions: 8,
+            scratch_bytes: 4096,
+            cache_bytes: 4096,
+            code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+            register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
+        },
+    ] {
+        let mut builder = Rv32MachineBuilder::from_elf(
+            &elf,
+            Rv32MachineConfig {
+                ram_size: 0x10_000,
+                debug_limit: 0,
+                execution,
+            },
+        )
+        .unwrap();
+        let (device, _) =
+            builder.add_mmio_device_with_irq(IRQ_DEVICE_BASE, AllocationIrqDevice { level: false });
+        let mut machine = builder.build().unwrap();
+        assert!(matches!(
+            machine.run(20).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt { .. }
+        ));
+        machine.device_mut(device).unwrap().level = true;
+        assert!(matches!(
+            machine.run(64).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt { .. }
+        ));
+
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        for _ in 0..32 {
+            machine.device_mut(device).unwrap().level = true;
+            assert!(matches!(
+                machine.run(64).unwrap(),
+                Rv32MachineOutcome::WaitingForInterrupt { .. }
+            ));
+        }
+        let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+        let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+
+        assert_eq!(allocations, 0, "{execution:?} allocated around PLIC/WFI");
+        assert_eq!(
+            allocated_bytes, 0,
+            "{execution:?} allocated bytes around PLIC/WFI"
+        );
+    }
+}
+
 #[cfg(feature = "dbt-execution-profile")]
 fn assert_profiled_cached_dbt_steady_state_allocates_nothing() {
     let words = [addi(1, 1, 1), jal(0, -4)];
@@ -479,6 +643,7 @@ fn steady_state_machine_paths_allocate_nothing() {
     assert_block_cache_evictions_allocate_nothing();
     assert_cached_dbt_zbb_loop_allocates_nothing();
     assert_waiting_and_timer_wakeup_allocate_nothing();
+    assert_external_irq_wakeup_allocate_nothing();
     #[cfg(feature = "dbt-execution-profile")]
     assert_profiled_cached_dbt_steady_state_allocates_nothing();
 }
