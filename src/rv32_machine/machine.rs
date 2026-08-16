@@ -24,8 +24,9 @@ use super::platform::{self, ControlDevice, DebugDevice, TimerDevice};
 use super::{
     builder::{PendingMmioDevice, Rv32DeviceHandle},
     plic::{PlicDevice, MAX_SOURCES},
-    Rv32AddressSpace, Rv32AddressSpaceError, Rv32DbtStats, Rv32ElfError, Rv32LoadedImage,
-    Rv32MachineBuilder, Rv32PlicSource, PLIC_BASE,
+    Rv32AddressSpace, Rv32AddressSpaceError, Rv32DbtStats, Rv32ElfError, Rv32IrqRouteInspection,
+    Rv32LoadedImage, Rv32MachineBuilder, Rv32MachineInspection, Rv32PlicSource, PLIC_BASE,
+    RV32_PLIC_MAX_SOURCES,
 };
 #[cfg(feature = "dbt-code-audit")]
 use super::{Rv32DbtCodeSnapshot, Rv32DbtCodeSnapshotError};
@@ -1060,6 +1061,34 @@ impl Rv32Machine {
         self.hart.pc()
     }
 
+    /// Copies the current host-visible machine state without mutating it.
+    ///
+    /// This inspection is intended for trusted host tooling between calls to
+    /// [`Self::run`]. It is not a persistence snapshot or a guest-visible ABI.
+    pub fn inspection_snapshot(&self) -> Rv32MachineInspection {
+        let mut irq_routes = [Rv32IrqRouteInspection::default(); RV32_PLIC_MAX_SOURCES];
+        for (target, route) in irq_routes.iter_mut().zip(&self.irq_routes) {
+            *target = Rv32IrqRouteInspection {
+                source: route.source.get(),
+                level: self
+                    .address_space
+                    .bus()
+                    .interrupt_level(route.device_id)
+                    .unwrap_or(false),
+            };
+        }
+        Rv32MachineInspection {
+            hart: self.hart.inspection(),
+            timer: self.timer().inspection(),
+            plic: self.plic().inspection(),
+            irq_route_count: self.irq_routes.len(),
+            irq_routes,
+            control_status: self.control_status(),
+            translation_stats: self.translation_stats(),
+            dbt_stats: self.dbt_stats(),
+        }
+    }
+
     pub fn cache_stats(&self) -> Option<Rv32imCacheStats> {
         match &self.execution {
             Rv32ExecutionBackend::Cached(cache) => Some(cache.stats()),
@@ -1212,6 +1241,13 @@ impl Rv32Machine {
             .bus()
             .device::<TimerDevice>(self.timer_device)
             .expect("RV32 machine timer device invariant")
+    }
+
+    fn plic(&self) -> &PlicDevice {
+        self.address_space
+            .bus()
+            .device::<PlicDevice>(self.plic_device)
+            .expect("RV32 machine PLIC device invariant")
     }
 
     fn execution_error(&self, pc: u32, message: String) -> Rv32MachineExecutionError {
