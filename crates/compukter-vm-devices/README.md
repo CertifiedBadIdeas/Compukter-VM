@@ -30,7 +30,14 @@ use compukter_vm::rv32_machine::{Rv32MachineBuilder, Rv32MachineConfig};
 use compukter_vm_devices::Uart16550;
 
 # fn build(elf: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-let mut builder = Rv32MachineBuilder::from_elf(elf, Rv32MachineConfig::default())?;
+let mut builder = Rv32MachineBuilder::from_elf(
+    elf,
+    Rv32MachineConfig {
+        ram_size: 64 * 1024,
+        debug_limit: 0,
+        execution: Default::default(),
+    },
+)?;
 let (uart, source) =
     builder.add_mmio_device_with_irq(0x1000_1000, Uart16550::new());
 let mut machine = builder.build()?;

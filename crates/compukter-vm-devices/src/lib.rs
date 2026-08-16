@@ -9,6 +9,8 @@
  * (at your option) any later version.
  */
 
+#![doc = include_str!("../README.md")]
+
 mod uart16550;
 
 pub use uart16550::{Uart16550, Uart16550Diagnostics, UartTransferResult};
