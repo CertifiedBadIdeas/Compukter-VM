@@ -1,5 +1,5 @@
 [workspace]
-members = ["tools/compukter-vm-benchmarks"]
+members = ["crates/compukter-vm-devices", "tools/compukter-vm-benchmarks"]
 default-members = ["."]
 resolver = "2"
 
