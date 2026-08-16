@@ -33,7 +33,7 @@ use compukter_vm::{
     bus::{MmioAccessWidth, MmioContext, MmioDevice},
     memory::MemoryFault,
 };
-use rv32_elf_support::{Elf32Builder, LoadSegment};
+use rv32_elf_support::{machine_program_elf, Elf32Builder, LoadSegment};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -644,6 +644,36 @@ fn steady_state_machine_paths_allocate_nothing() {
     assert_cached_dbt_zbb_loop_allocates_nothing();
     assert_waiting_and_timer_wakeup_allocate_nothing();
     assert_external_irq_wakeup_allocate_nothing();
+    assert_repeated_machine_inspection_allocates_nothing();
     #[cfg(feature = "dbt-execution-profile")]
     assert_profiled_cached_dbt_steady_state_allocates_nothing();
+}
+
+fn assert_repeated_machine_inspection_allocates_nothing() {
+    let elf = machine_program_elf(&[jal(0, 0)]);
+    let machine = Rv32Machine::from_elf(
+        &elf,
+        Rv32MachineConfig {
+            ram_size: 0x10_000,
+            debug_limit: 0,
+            execution: Rv32ExecutionBackendConfig::CachedDbt {
+                sets: 32,
+                max_instructions: 8,
+                scratch_bytes: 4096,
+                cache_bytes: 4096,
+                code_alignment: compukter_vm::rv32_machine::DEFAULT_DBT_CODE_ALIGNMENT,
+                register_profile: compukter_vm::rv32_machine::DEFAULT_DBT_REGISTER_PROFILE,
+            },
+        },
+    )
+    .unwrap();
+
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    for _ in 0..1_000 {
+        std::hint::black_box(machine.inspection_snapshot());
+    }
+
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(ALLOCATED_BYTES.load(Ordering::Relaxed), 0);
 }
