@@ -19,7 +19,7 @@
 
 use super::{
     machine::validate_config, Rv32ElfLoader, Rv32LoadedImage, Rv32Machine, Rv32MachineBuildError,
-    Rv32MachineConfig,
+    Rv32MachineConfig, Rv32PlicSource,
 };
 use crate::bus::MmioDevice;
 use std::fmt::{Debug, Formatter};
@@ -78,12 +78,14 @@ impl<T> Hash for Rv32DeviceHandle<T> {
 pub(super) struct PendingMmioDevice {
     pub(super) base: u32,
     pub(super) device: Box<dyn MmioDevice>,
+    pub(super) plic_source: Option<Rv32PlicSource>,
 }
 
 pub struct Rv32MachineBuilder {
     image: Rv32LoadedImage,
     config: Rv32MachineConfig,
     devices: Vec<PendingMmioDevice>,
+    next_plic_source: u32,
 }
 
 impl Rv32MachineBuilder {
@@ -94,14 +96,36 @@ impl Rv32MachineBuilder {
             image,
             config,
             devices: Vec::new(),
+            next_plic_source: 1,
         })
     }
 
     pub fn add_mmio_device<T: MmioDevice>(&mut self, base: u32, device: T) -> Rv32DeviceHandle<T> {
+        self.push_device(base, device, None)
+    }
+
+    pub fn add_mmio_device_with_irq<T: MmioDevice>(
+        &mut self,
+        base: u32,
+        device: T,
+    ) -> (Rv32DeviceHandle<T>, Rv32PlicSource) {
+        let source = Rv32PlicSource::provisional(self.next_plic_source);
+        self.next_plic_source = self.next_plic_source.saturating_add(1);
+        let handle = self.push_device(base, device, Some(source));
+        (handle, source)
+    }
+
+    fn push_device<T: MmioDevice>(
+        &mut self,
+        base: u32,
+        device: T,
+        plic_source: Option<Rv32PlicSource>,
+    ) -> Rv32DeviceHandle<T> {
         let handle = Rv32DeviceHandle::new(self.devices.len());
         self.devices.push(PendingMmioDevice {
             base,
             device: Box::new(device),
+            plic_source,
         });
         handle
     }

@@ -44,6 +44,10 @@ impl Rv32PlicSource {
     pub(crate) fn new(id: u32) -> Option<Self> {
         (1..=MAX_SOURCES).contains(&id).then_some(Self(id))
     }
+
+    pub(super) fn provisional(id: u32) -> Self {
+        Self(id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

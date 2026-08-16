@@ -53,6 +53,48 @@ const MIE_MTIE: i32 = 1 << 7;
 
 struct TestRegister(i32);
 
+struct TestIrqDevice {
+    level: bool,
+}
+
+impl MmioDevice for TestIrqDevice {
+    fn size(&self) -> u32 {
+        4
+    }
+
+    fn interrupt_level(&self) -> bool {
+        self.level
+    }
+
+    fn read(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+    ) -> Result<u64, MemoryFault> {
+        if offset == 0 && width == MmioAccessWidth::Word {
+            Ok(u64::from(self.level))
+        } else {
+            Err(MemoryFault::new("invalid test IRQ read".to_string()))
+        }
+    }
+
+    fn write(
+        &mut self,
+        _context: &mut MmioContext<'_>,
+        offset: u32,
+        width: MmioAccessWidth,
+        value: u64,
+    ) -> Result<(), MemoryFault> {
+        if offset == 0 && width == MmioAccessWidth::Word {
+            self.level = value != 0;
+            Ok(())
+        } else {
+            Err(MemoryFault::new("invalid test IRQ write".to_string()))
+        }
+    }
+}
+
 impl MmioDevice for TestRegister {
     fn size(&self) -> u32 {
         4
@@ -102,6 +144,27 @@ fn builder_installs_a_device_with_a_typed_host_handle() {
     assert_eq!(machine.device(register).unwrap().0, 7);
     machine.device_mut(register).unwrap().0 = 11;
     assert_eq!(machine.device(register).unwrap().0, 11);
+}
+
+#[test]
+fn builder_assigns_dense_irq_sources_without_changing_plain_devices() {
+    let elf = halting_machine_elf(b'I');
+    let mut builder = Rv32MachineBuilder::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+    )
+    .unwrap();
+    let plain = builder.add_mmio_device(0x1000_1000, TestRegister(0));
+    let (first_device, first_source) =
+        builder.add_mmio_device_with_irq(0x1000_1100, TestIrqDevice { level: false });
+    let (_, second_source) =
+        builder.add_mmio_device_with_irq(0x1000_1200, TestIrqDevice { level: false });
+
+    assert_eq!(first_source.get(), 1);
+    assert_eq!(second_source.get(), 2);
+    let machine = builder.build().unwrap();
+    assert!(machine.device(plain).is_some());
+    assert!(machine.device(first_device).is_some());
 }
 
 #[test]
