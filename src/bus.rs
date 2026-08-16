@@ -98,6 +98,10 @@ impl MachineBusTrafficCounters {
 pub trait MmioDevice: Any {
     fn size(&self) -> u32;
 
+    fn interrupt_level(&self) -> bool {
+        false
+    }
+
     fn take_yield_signal(&mut self) -> bool {
         false
     }
@@ -159,6 +163,7 @@ impl MmioRegion {
 pub struct MachineBus {
     memory: MachineMemory,
     regions: Vec<MmioRegion>,
+    mmio_epoch: u64,
     ram_traffic: MachineBusTrafficCounters,
     mmio_traffic: MachineBusTrafficCounters,
 }
@@ -168,6 +173,7 @@ impl MachineBus {
         Ok(Self {
             memory: MachineMemory::zeroed(memory_size)?,
             regions: Vec::new(),
+            mmio_epoch: 0,
             ram_traffic: MachineBusTrafficCounters::default(),
             mmio_traffic: MachineBusTrafficCounters::default(),
         })
@@ -235,6 +241,16 @@ impl MachineBus {
         self.regions
             .get(id)
             .map(|region| (region.base, region.size))
+    }
+
+    pub fn interrupt_level(&self, id: MmioDeviceId) -> Option<bool> {
+        self.regions
+            .get(id)
+            .map(|region| region.device.interrupt_level())
+    }
+
+    pub fn mmio_epoch(&self) -> u64 {
+        self.mmio_epoch
     }
 
     pub fn load_i32(&mut self, address: u32) -> Result<i32, MemoryFault> {
@@ -315,6 +331,7 @@ impl MemoryBus for MachineBus {
                     .read(&mut context, offset, MmioAccessWidth::Word)?;
                 region.traffic.record_load(4);
                 self.mmio_traffic.record_load(4);
+                self.mmio_epoch = self.mmio_epoch.wrapping_add(1);
                 return Ok(value as u32 as i32);
             }
         }
@@ -335,6 +352,7 @@ impl MemoryBus for MachineBus {
                 )?;
                 region.traffic.record_store(4);
                 self.mmio_traffic.record_store(4);
+                self.mmio_epoch = self.mmio_epoch.wrapping_add(1);
                 return Ok(());
             }
         }
@@ -396,6 +414,7 @@ impl MemoryBus for MachineBus {
                     .read(&mut context, offset, MmioAccessWidth::Byte)?;
                 region.traffic.record_load(1);
                 self.mmio_traffic.record_load(1);
+                self.mmio_epoch = self.mmio_epoch.wrapping_add(1);
                 return Ok(value as u8);
             }
         }
@@ -416,6 +435,7 @@ impl MemoryBus for MachineBus {
                 )?;
                 region.traffic.record_store(1);
                 self.mmio_traffic.record_store(1);
+                self.mmio_epoch = self.mmio_epoch.wrapping_add(1);
                 return Ok(());
             }
         }
@@ -433,6 +453,7 @@ impl MemoryBus for MachineBus {
                     .read(&mut context, offset, MmioAccessWidth::Halfword)?;
                 region.traffic.record_load(2);
                 self.mmio_traffic.record_load(2);
+                self.mmio_epoch = self.mmio_epoch.wrapping_add(1);
                 return Ok(value as u16);
             }
         }
@@ -453,6 +474,7 @@ impl MemoryBus for MachineBus {
                 )?;
                 region.traffic.record_store(2);
                 self.mmio_traffic.record_store(2);
+                self.mmio_epoch = self.mmio_epoch.wrapping_add(1);
                 return Ok(());
             }
         }
@@ -471,6 +493,7 @@ impl MemoryBus for MachineBus {
                         .read(&mut context, offset, MmioAccessWidth::Doubleword)?;
                 region.traffic.record_load(8);
                 self.mmio_traffic.record_load(8);
+                self.mmio_epoch = self.mmio_epoch.wrapping_add(1);
                 return Ok(value);
             }
         }
@@ -488,6 +511,7 @@ impl MemoryBus for MachineBus {
                     .write(&mut context, offset, MmioAccessWidth::Doubleword, value)?;
                 region.traffic.record_store(8);
                 self.mmio_traffic.record_store(8);
+                self.mmio_epoch = self.mmio_epoch.wrapping_add(1);
                 return Ok(());
             }
         }
@@ -505,6 +529,40 @@ mod tests {
     struct RegisterDevice {
         value: i32,
         read_only: bool,
+    }
+
+    struct InterruptRegister {
+        level: bool,
+    }
+
+    impl MmioDevice for InterruptRegister {
+        fn size(&self) -> u32 {
+            4
+        }
+
+        fn interrupt_level(&self) -> bool {
+            self.level
+        }
+
+        fn read(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            _offset: u32,
+            _width: MmioAccessWidth,
+        ) -> Result<u64, MemoryFault> {
+            Ok(u64::from(self.level))
+        }
+
+        fn write(
+            &mut self,
+            _context: &mut MmioContext<'_>,
+            _offset: u32,
+            _width: MmioAccessWidth,
+            value: u64,
+        ) -> Result<(), MemoryFault> {
+            self.level = value != 0;
+            Ok(())
+        }
     }
 
     impl MmioDevice for RegisterDevice {
@@ -675,6 +733,7 @@ mod tests {
         bus.store_u16(0x1000, 2).unwrap();
         bus.store_i32(0x1000, 3).unwrap();
         bus.store_u64(0x1000, 4).unwrap();
+        assert_eq!(bus.mmio_epoch(), 8);
         assert_eq!(
             bus.device::<CountingDevice>(device_id)
                 .unwrap()
@@ -691,6 +750,26 @@ mod tests {
                 MmioAccessWidth::Doubleword,
             ]
         );
+    }
+
+    #[test]
+    fn mmio_epoch_and_interrupt_level_track_device_boundary_activity() {
+        let mut bus = MachineBus::new(16).unwrap();
+        let device = bus
+            .map_mmio(0x1000, Box::new(InterruptRegister { level: false }))
+            .unwrap();
+
+        assert_eq!(bus.mmio_epoch(), 0);
+        bus.store_i32(0, 7).unwrap();
+        assert_eq!(bus.mmio_epoch(), 0);
+        assert_eq!(bus.interrupt_level(device), Some(false));
+
+        assert_eq!(bus.load_i32(0x1000).unwrap(), 0);
+        assert_eq!(bus.mmio_epoch(), 1);
+        bus.store_i32(0x1000, 1).unwrap();
+        assert_eq!(bus.mmio_epoch(), 2);
+        assert_eq!(bus.interrupt_level(device), Some(true));
+        assert_eq!(bus.interrupt_level(device + 1), None);
     }
 
     #[test]

@@ -388,7 +388,13 @@ impl Rv32Machine {
         let custom_device_count = custom_devices.len();
         let mut first_custom_device = 0;
         for (index, pending) in custom_devices.into_iter().enumerate() {
-            let device_id = bus.map_mmio(pending.base, pending.device)?;
+            let PendingMmioDevice {
+                base,
+                device,
+                plic_source,
+            } = pending;
+            let _ = plic_source;
+            let device_id = bus.map_mmio(base, device)?;
             if index == 0 {
                 first_custom_device = device_id;
             }
