@@ -115,3 +115,16 @@ It is installed with `add_mmio_device_with_irq` at a host-selected free address;
 address `0x1000_0000` is unavailable because the Compukter control device
 already owns it. UART register, FIFO, attachment, and interrupt behavior is
 specified in `crates/compukter-vm-devices/README.md`.
+
+## Host inspection
+
+Trusted embedding tools may call `Rv32Machine::inspection_snapshot()` between
+`run()` calls. The returned fixed-size value copies the hart registers and
+machine CSRs, timer, PLIC sources, immutable IRQ routes and sampled line levels,
+control status, and backend statistics. Repeated inspection performs no heap
+allocation and does not acknowledge, claim, clear, synchronize, or otherwise
+mutate guest-visible state.
+
+Inspection is deliberately absent from the guest ABI. It is also not a
+versioned persistence snapshot and cannot be restored. Guest platform discovery
+and future machine save states remain separate contracts.
