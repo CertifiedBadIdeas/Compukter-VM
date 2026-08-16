@@ -25,7 +25,7 @@ use compukter_vm::rv32_machine::{
     Rv32MachineBuilder, Rv32MachineConfig, Rv32MachineOutcome, CONTROL_BASE, DEBUG_BASE,
     DEFAULT_DBT_CACHE_SETS, DEFAULT_DBT_CODE_ALIGNMENT, DEFAULT_DBT_CODE_BYTES,
     DEFAULT_DBT_MAX_INSTRUCTIONS, DEFAULT_DBT_REGISTER_PROFILE, DEFAULT_DBT_SCRATCH_BYTES,
-    STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC, TIMER_BASE,
+    PLIC_BASE, STATUS_BOOTING, STATUS_HALTED, STATUS_PANIC, TIMER_BASE,
 };
 #[cfg(feature = "dbt-execution-profile")]
 use compukter_vm::rv32_machine::{Rv32DbtExecutionProfile, Rv32DbtProfileEdgeKind};
@@ -50,6 +50,7 @@ const CSR_MCAUSE: u16 = 0x342;
 const CSR_MTVAL: u16 = 0x343;
 const MSTATUS_MIE: i32 = 1 << 3;
 const MIE_MTIE: i32 = 1 << 7;
+const MIE_MEIE: i32 = 1 << 11;
 
 struct TestRegister(i32);
 
@@ -168,6 +169,26 @@ fn builder_assigns_dense_irq_sources_without_changing_plain_devices() {
 }
 
 #[test]
+fn builder_rejects_more_than_1023_irq_sources() {
+    let elf = halting_machine_elf(b'L');
+    let mut builder = Rv32MachineBuilder::from_elf(
+        &elf,
+        config(Rv32ExecutionBackendConfig::Cached { sets: 8 }, 0),
+    )
+    .unwrap();
+    for index in 0..1024_u32 {
+        let _ = builder
+            .add_mmio_device_with_irq(0x1100_0000 + index * 4, TestIrqDevice { level: false });
+    }
+
+    let error = match builder.build() {
+        Ok(_) => panic!("source 1024 must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("at most 1023"));
+}
+
+#[test]
 fn builder_device_is_visible_to_guest_mmio() {
     const REGISTER_BASE: u32 = 0x1000_1000;
     let [base_hi, base_lo] = materialize(1, REGISTER_BASE);
@@ -282,6 +303,164 @@ fn all_backends_stop_at_wfi_without_spending_later_budgets() {
             }
         );
         assert_eq!(machine.pc(), 0x1004);
+    }
+}
+
+#[test]
+fn all_backends_deliver_machine_external_interrupt() {
+    const IRQ_DEVICE_BASE: u32 = 0x1000_1000;
+    const VECTOR_BASE: u32 = 0x2000;
+    const HANDLER: u32 = VECTOR_BASE + 4 * 11;
+    const PLIC_PRIORITY_1: u32 = PLIC_BASE + 4;
+    const PLIC_ENABLE_0: u32 = PLIC_BASE + 0x2000;
+    const PLIC_THRESHOLD_0: u32 = PLIC_BASE + 0x200000;
+    const PLIC_CLAIM_0: u32 = PLIC_BASE + 0x200004;
+
+    let [priority_hi, priority_lo] = materialize(1, PLIC_PRIORITY_1);
+    let [enable_hi, enable_lo] = materialize(1, PLIC_ENABLE_0);
+    let [threshold_hi, threshold_lo] = materialize(1, PLIC_THRESHOLD_0);
+    let [handler_hi, handler_lo] = materialize(3, VECTOR_BASE | 1);
+    let [meie_hi, meie_lo] = materialize(4, MIE_MEIE as u32);
+    let main = [
+        priority_hi,
+        priority_lo,
+        addi(2, 0, 3),
+        sw(1, 2, 0),
+        enable_hi,
+        enable_lo,
+        addi(2, 0, 1 << 1),
+        sw(1, 2, 0),
+        threshold_hi,
+        threshold_lo,
+        sw(1, 0, 0),
+        handler_hi,
+        handler_lo,
+        csrrw(0, CSR_MTVEC, 3),
+        meie_hi,
+        meie_lo,
+        csrrw(0, CSR_MIE, 4),
+        addi(5, 0, MSTATUS_MIE),
+        csrrw(0, CSR_MSTATUS, 5),
+        wfi(),
+        lui(10, 0x10000),
+        addi(11, 0, STATUS_HALTED),
+        sw(10, 11, 0),
+    ];
+    let [claim_hi, claim_lo] = materialize(8, PLIC_CLAIM_0);
+    let [device_hi, device_lo] = materialize(6, IRQ_DEVICE_BASE);
+    let [debug_hi, debug_lo] = materialize(6, DEBUG_BASE);
+    let handler = [
+        csrrs(7, CSR_MCAUSE, 0),
+        claim_hi,
+        claim_lo,
+        lw(9, 8, 0),
+        device_hi,
+        device_lo,
+        sw(6, 0, 0),
+        sw(8, 9, 0),
+        debug_hi,
+        debug_lo,
+        sw(6, 7, 0),
+        sw(6, 9, 0),
+        csrrw(0, CSR_MIE, 0),
+        mret(),
+    ];
+    let words = |words: &[u32]| {
+        words
+            .iter()
+            .copied()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, words(&main)))
+        .load(LoadSegment::rx(HANDLER, words(&handler)))
+        .load(LoadSegment::rw_with_mem_size(0x3000, [], 0x1000))
+        .finish();
+
+    for execution in configs() {
+        let mut builder = Rv32MachineBuilder::from_elf(&elf, config(execution, 2)).unwrap();
+        let (device, source) =
+            builder.add_mmio_device_with_irq(IRQ_DEVICE_BASE, TestIrqDevice { level: false });
+        assert_eq!(source.get(), 1);
+        let mut machine = builder.build().unwrap();
+
+        assert_eq!(
+            machine.run(20).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 20,
+                retired_total: 20,
+            }
+        );
+        machine.device_mut(device).unwrap().level = true;
+        let outcome = machine.run(32).unwrap();
+        assert_eq!(
+            outcome,
+            Rv32MachineOutcome::Halted {
+                exit_code: 0,
+                retired_delta: 17,
+                retired_total: 37,
+            },
+            "backend {execution:?}: pc={:#010x}, debug={:?}, irq_level={}",
+            machine.pc(),
+            machine.debug_bytes(),
+            machine.device(device).unwrap().level,
+        );
+        assert_eq!(machine.debug_bytes(), &[11, 1]);
+        assert!(!machine.device(device).unwrap().level);
+    }
+}
+
+#[test]
+fn all_backends_wake_wfi_for_external_interrupt_without_global_mie() {
+    const IRQ_DEVICE_BASE: u32 = 0x1000_1000;
+    let [priority_hi, priority_lo] = materialize(1, PLIC_BASE + 4);
+    let [enable_hi, enable_lo] = materialize(1, PLIC_BASE + 0x2000);
+    let [threshold_hi, threshold_lo] = materialize(1, PLIC_BASE + 0x200000);
+    let [meie_hi, meie_lo] = materialize(4, MIE_MEIE as u32);
+    let elf = machine_program_elf(&[
+        priority_hi,
+        priority_lo,
+        addi(2, 0, 1),
+        sw(1, 2, 0),
+        enable_hi,
+        enable_lo,
+        addi(2, 0, 1 << 1),
+        sw(1, 2, 0),
+        threshold_hi,
+        threshold_lo,
+        sw(1, 0, 0),
+        meie_hi,
+        meie_lo,
+        csrrw(0, CSR_MIE, 4),
+        wfi(),
+        lui(10, 0x10000),
+        addi(11, 0, STATUS_HALTED),
+        sw(10, 11, 0),
+    ]);
+
+    for execution in configs() {
+        let mut builder = Rv32MachineBuilder::from_elf(&elf, config(execution, 0)).unwrap();
+        let (device, _) =
+            builder.add_mmio_device_with_irq(IRQ_DEVICE_BASE, TestIrqDevice { level: false });
+        let mut machine = builder.build().unwrap();
+
+        assert_eq!(
+            machine.run(15).unwrap(),
+            Rv32MachineOutcome::WaitingForInterrupt {
+                retired_delta: 15,
+                retired_total: 15,
+            }
+        );
+        machine.device_mut(device).unwrap().level = true;
+        assert_eq!(
+            machine.run(3).unwrap(),
+            Rv32MachineOutcome::Halted {
+                exit_code: 0,
+                retired_delta: 3,
+                retired_total: 18,
+            }
+        );
     }
 }
 

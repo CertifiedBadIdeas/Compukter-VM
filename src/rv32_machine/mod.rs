@@ -26,7 +26,6 @@ mod elf;
 mod hart;
 mod machine;
 mod platform;
-#[allow(dead_code)] // Removed when the PLIC is installed by the machine integration slice.
 mod plic;
 
 pub use address_space::{Rv32AddressSpace, Rv32AddressSpaceError};
