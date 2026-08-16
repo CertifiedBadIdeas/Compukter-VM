@@ -31,6 +31,7 @@ const PT_NULL: u32 = 0;
 const PT_LOAD: u32 = 1;
 const PT_PHDR: u32 = 6;
 const PT_GNU_STACK: u32 = 0x6474_e551;
+const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -184,7 +185,7 @@ impl Rv32ElfLoader {
             let header = program_offset + index * program_entry_size;
             let program_type = read_u32(bytes, header, Rv32ElfErrorKind::ProgramHeader)?;
             match program_type {
-                PT_NULL | PT_PHDR | PT_GNU_STACK => continue,
+                PT_NULL | PT_PHDR | PT_GNU_STACK | PT_RISCV_ATTRIBUTES => continue,
                 PT_LOAD => {}
                 unsupported => {
                     return Err(Rv32ElfError::new(

@@ -48,6 +48,20 @@ fn valid_elf_loads_segments_zero_fills_bss_and_records_exact_permissions() {
 }
 
 #[test]
+fn standard_riscv_attributes_program_header_is_ignored() {
+    let mut elf = Elf32Builder::new(0x1000)
+        .load(LoadSegment::rx(0x1000, [0x13, 0, 0, 0]))
+        .finish();
+    put_u16(&mut elf, 44, 2);
+    put_u32(&mut elf, 52 + 32, 0x7000_0003);
+
+    let image = Rv32ElfLoader::load(&elf, 0x5000).unwrap();
+
+    assert_eq!(image.entry_point(), 0x1000);
+    assert_eq!(&image.ram()[0x1000..0x1004], &[0x13, 0, 0, 0]);
+}
+
+#[test]
 fn malformed_or_unsupported_elf_is_rejected_before_an_image_is_returned() {
     for case in invalid_cases() {
         let error = Rv32ElfLoader::load(&case.bytes, case.ram_size)
