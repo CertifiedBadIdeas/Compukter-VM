@@ -152,6 +152,76 @@ fn block_flush_completes_without_changing_media() {
     );
 }
 
+#[test]
+fn block_reports_standard_statuses_without_partial_rejected_writes() {
+    let original = vec![0x11; 1024];
+    let (mut bus, device_id) = block_bus(original.clone(), true);
+    bus.memory_mut()
+        .write_bytes(DATA_ADDRESS, &[0x77; 512])
+        .unwrap();
+    write_request_header(&mut bus, 1, 0);
+    write_descriptor(&mut bus, 0, HEADER_ADDRESS, 16, VIRTQ_DESC_F_NEXT, 1);
+    write_descriptor(&mut bus, 1, DATA_ADDRESS, 512, VIRTQ_DESC_F_NEXT, 2);
+    write_descriptor(&mut bus, 2, STATUS_ADDRESS, 1, VIRTQ_DESC_F_WRITE, 0);
+
+    submit(&mut bus, 0, 1);
+
+    assert_eq!(bus.memory().load_u8(STATUS_ADDRESS).unwrap(), 1);
+    assert_eq!(bus.memory().load_i32(USED_ADDRESS + 8).unwrap(), 1);
+    assert_eq!(
+        bus.device::<VirtioMmioDevice<VirtioBlockDevice>>(device_id)
+            .unwrap()
+            .device()
+            .bytes(),
+        original
+    );
+
+    write_request_header(&mut bus, 0xffff, 0);
+    submit(&mut bus, 0, 2);
+    assert_eq!(bus.memory().load_u8(STATUS_ADDRESS).unwrap(), 2);
+    assert_eq!(bus.memory().load_i32(USED_ADDRESS + 16).unwrap(), 1);
+}
+
+#[test]
+fn block_out_of_range_write_is_rejected_before_media_mutation() {
+    let original = vec![0x22; 1024];
+    let (mut bus, device_id) = block_bus(original.clone(), false);
+    bus.memory_mut()
+        .write_bytes(DATA_ADDRESS, &[0x88; 512])
+        .unwrap();
+    write_request_header(&mut bus, 1, 2);
+    write_descriptor(&mut bus, 0, HEADER_ADDRESS, 16, VIRTQ_DESC_F_NEXT, 1);
+    write_descriptor(&mut bus, 1, DATA_ADDRESS, 512, VIRTQ_DESC_F_NEXT, 2);
+    write_descriptor(&mut bus, 2, STATUS_ADDRESS, 1, VIRTQ_DESC_F_WRITE, 0);
+
+    submit(&mut bus, 0, 1);
+
+    assert_eq!(bus.memory().load_u8(STATUS_ADDRESS).unwrap(), 1);
+    assert_eq!(
+        bus.device::<VirtioMmioDevice<VirtioBlockDevice>>(device_id)
+            .unwrap()
+            .device()
+            .bytes(),
+        original
+    );
+}
+
+#[test]
+fn malformed_block_layout_requires_transport_reset_without_completion() {
+    let (mut bus, _) = block_bus(vec![0; 512], false);
+    bus.memory_mut().store_u8(STATUS_ADDRESS, 0xff).unwrap();
+    write_request_header(&mut bus, 0, 0);
+    write_descriptor(&mut bus, 0, HEADER_ADDRESS, 16, VIRTQ_DESC_F_NEXT, 1);
+    write_descriptor(&mut bus, 1, DATA_ADDRESS, 512, VIRTQ_DESC_F_NEXT, 2);
+    write_descriptor(&mut bus, 2, STATUS_ADDRESS, 1, VIRTQ_DESC_F_WRITE, 0);
+
+    submit(&mut bus, 0, 1);
+
+    assert_eq!(bus.memory().load_u8(STATUS_ADDRESS).unwrap(), 0xff);
+    assert_eq!(bus.memory().load_u16(USED_ADDRESS + 2).unwrap(), 0);
+    assert_ne!(bus.load_i32(VIRTIO_BASE + 0x070).unwrap() & 64, 0);
+}
+
 fn block_bus(bytes: Vec<u8>, read_only: bool) -> (MachineBus, MmioDeviceId) {
     let mut bus = MachineBus::new(0x1_0000).unwrap();
     let device = VirtioBlockDevice::from_bytes(bytes, read_only).unwrap();
