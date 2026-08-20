@@ -159,7 +159,12 @@ impl VirtioDevice for VirtioBlockDevice {
             }
             VIRTIO_BLK_T_FLUSH => Err(VirtioDeviceError::InvalidRequest),
             _ => {
-                write_stream_byte(context.memory_mut(), writable, 0, VIRTIO_BLK_S_UNSUPP)?;
+                write_stream_byte(
+                    context.memory_mut(),
+                    writable,
+                    writable_length - 1,
+                    VIRTIO_BLK_S_UNSUPP,
+                )?;
                 Ok(1)
             }
         }

@@ -279,6 +279,26 @@ fn block_read_accepts_data_and_status_in_one_writable_descriptor() {
     assert_eq!(bus.memory().load_i32(USED_ADDRESS + 8).unwrap(), 513);
 }
 
+#[test]
+fn unsupported_get_id_writes_status_after_its_response_buffer() {
+    let (mut bus, _) = block_bus(vec![0; 512], false);
+    bus.memory_mut()
+        .write_bytes(DATA_ADDRESS, &[0xa9; 21])
+        .unwrap();
+    write_request_header(&mut bus, 8, 0);
+    write_descriptor(&mut bus, 0, HEADER_ADDRESS, 16, VIRTQ_DESC_F_NEXT, 1);
+    write_descriptor(&mut bus, 1, DATA_ADDRESS, 21, VIRTQ_DESC_F_WRITE, 0);
+
+    submit(&mut bus, 0, 1);
+
+    assert_eq!(
+        &bus.memory().bytes()[DATA_ADDRESS as usize..DATA_ADDRESS as usize + 20],
+        &[0xa9; 20]
+    );
+    assert_eq!(bus.memory().load_u8(DATA_ADDRESS + 20).unwrap(), 2);
+    assert_eq!(bus.memory().load_i32(USED_ADDRESS + 8).unwrap(), 1);
+}
+
 fn block_bus(bytes: Vec<u8>, read_only: bool) -> (MachineBus, MmioDeviceId) {
     let mut bus = MachineBus::new(0x1_0000).unwrap();
     let device = VirtioBlockDevice::from_bytes(bytes, read_only).unwrap();
