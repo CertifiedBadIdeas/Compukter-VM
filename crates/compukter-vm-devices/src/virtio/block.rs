@@ -10,6 +10,12 @@ const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 const CONFIG_SIZE: usize = 24;
+const VIRTIO_BLK_T_IN: u32 = 0;
+const VIRTIO_BLK_T_OUT: u32 = 1;
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const VIRTIO_BLK_S_OK: u8 = 0;
+const VIRTIO_BLK_S_IOERR: u8 = 1;
+const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioBlockError {
@@ -21,9 +27,8 @@ pub enum VirtioBlockError {
 impl Display for VirtioBlockError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidCapacity => formatter.write_str(
-                "VirtIO block capacity must be a positive multiple of 512 bytes",
-            ),
+            Self::InvalidCapacity => formatter
+                .write_str("VirtIO block capacity must be a positive multiple of 512 bytes"),
             Self::CapacityTooLarge => {
                 formatter.write_str("VirtIO block capacity does not fit host address space")
             }
@@ -124,10 +129,127 @@ impl VirtioDevice for VirtioBlockDevice {
 
     fn process_chain(
         &mut self,
-        _context: &mut MmioContext<'_>,
-        _chain: VirtioDescriptorChain<'_>,
+        context: &mut MmioContext<'_>,
+        chain: VirtioDescriptorChain<'_>,
     ) -> Result<u32, VirtioDeviceError> {
-        Err(VirtioDeviceError::InvalidRequest)
+        let descriptors = chain.descriptors();
+        if descriptors.len() < 2 {
+            return Err(VirtioDeviceError::InvalidRequest);
+        }
+        let header = descriptors[0];
+        let status = descriptors[descriptors.len() - 1];
+        if header.writable || header.length < 16 || !status.writable || status.length < 1 {
+            return Err(VirtioDeviceError::InvalidRequest);
+        }
+
+        let mut request = [0_u8; 16];
+        context
+            .memory()
+            .read_bytes(header.address, &mut request)
+            .map_err(|_| VirtioDeviceError::InvalidRequest)?;
+        let request_type = u32::from_le_bytes(request[0..4].try_into().unwrap());
+        let sector = u64::from_le_bytes(request[8..16].try_into().unwrap());
+        let data = &descriptors[1..descriptors.len() - 1];
+
+        match request_type {
+            VIRTIO_BLK_T_IN => self.read_request(context, data, status.address, sector),
+            VIRTIO_BLK_T_OUT => self.write_request(context, data, status.address, sector),
+            VIRTIO_BLK_T_FLUSH if data.is_empty() => {
+                write_status(context, status.address, VIRTIO_BLK_S_OK)?;
+                Ok(1)
+            }
+            VIRTIO_BLK_T_FLUSH => Err(VirtioDeviceError::InvalidRequest),
+            _ => {
+                write_status(context, status.address, VIRTIO_BLK_S_UNSUPP)?;
+                Ok(1)
+            }
+        }
     }
 }
 
+impl VirtioBlockDevice {
+    fn read_request(
+        &self,
+        context: &mut MmioContext<'_>,
+        data: &[super::VirtioDescriptor],
+        status_address: u32,
+        sector: u64,
+    ) -> Result<u32, VirtioDeviceError> {
+        if data.is_empty() || data.iter().any(|descriptor| !descriptor.writable) {
+            return Err(VirtioDeviceError::InvalidRequest);
+        }
+        let Some((start, length)) = self.data_range(data, sector) else {
+            write_status(context, status_address, VIRTIO_BLK_S_IOERR)?;
+            return Ok(1);
+        };
+
+        let mut storage_offset = start;
+        for descriptor in data {
+            let end = storage_offset + descriptor.length as usize;
+            context
+                .memory_mut()
+                .write_bytes(descriptor.address, &self.storage[storage_offset..end])
+                .map_err(|_| VirtioDeviceError::InvalidRequest)?;
+            storage_offset = end;
+        }
+        write_status(context, status_address, VIRTIO_BLK_S_OK)?;
+        u32::try_from(length + 1).map_err(|_| VirtioDeviceError::InvalidRequest)
+    }
+
+    fn write_request(
+        &mut self,
+        context: &mut MmioContext<'_>,
+        data: &[super::VirtioDescriptor],
+        status_address: u32,
+        sector: u64,
+    ) -> Result<u32, VirtioDeviceError> {
+        if data.is_empty() || data.iter().any(|descriptor| descriptor.writable) {
+            return Err(VirtioDeviceError::InvalidRequest);
+        }
+        let Some((start, _length)) = self.data_range(data, sector) else {
+            write_status(context, status_address, VIRTIO_BLK_S_IOERR)?;
+            return Ok(1);
+        };
+        if self.read_only {
+            write_status(context, status_address, VIRTIO_BLK_S_IOERR)?;
+            return Ok(1);
+        }
+
+        let mut storage_offset = start;
+        for descriptor in data {
+            let end = storage_offset + descriptor.length as usize;
+            context
+                .memory()
+                .read_bytes(descriptor.address, &mut self.storage[storage_offset..end])
+                .map_err(|_| VirtioDeviceError::InvalidRequest)?;
+            storage_offset = end;
+        }
+        write_status(context, status_address, VIRTIO_BLK_S_OK)?;
+        Ok(1)
+    }
+
+    fn data_range(&self, data: &[super::VirtioDescriptor], sector: u64) -> Option<(usize, usize)> {
+        let length = data.iter().try_fold(0_usize, |total, descriptor| {
+            total.checked_add(descriptor.length as usize)
+        })?;
+        if length == 0 || !length.is_multiple_of(VIRTIO_BLOCK_SECTOR_SIZE) {
+            return None;
+        }
+        let start = sector
+            .checked_mul(VIRTIO_BLOCK_SECTOR_SIZE as u64)
+            .and_then(|value| usize::try_from(value).ok())?;
+        let end = start.checked_add(length)?;
+        (end <= self.storage.len()).then_some((start, length))
+    }
+}
+
+fn write_status(
+    context: &mut MmioContext<'_>,
+    address: u32,
+    status: u8,
+) -> Result<(), VirtioDeviceError> {
+    context
+        .memory_mut()
+        .store_u8(address, status)
+        .map_err(|_| VirtioDeviceError::InvalidRequest)
+}
