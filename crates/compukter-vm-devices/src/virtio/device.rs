@@ -18,10 +18,6 @@ pub struct VirtioDescriptorChain<'a> {
 }
 
 impl<'a> VirtioDescriptorChain<'a> {
-    #[allow(
-        dead_code,
-        reason = "validated descriptor parsing is connected to MMIO notifications in the next slice"
-    )]
     pub(crate) fn new(head: u16, descriptors: &'a [VirtioDescriptor]) -> Self {
         Self { head, descriptors }
     }

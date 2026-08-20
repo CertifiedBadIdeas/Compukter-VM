@@ -1,7 +1,3 @@
-#[allow(
-    dead_code,
-    reason = "descriptor parsing is connected to MMIO notifications in the next slice"
-)]
 mod descriptor;
 mod device;
 mod mmio;
