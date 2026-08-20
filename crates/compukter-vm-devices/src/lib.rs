@@ -12,5 +12,6 @@
 #![doc = include_str!("../README.md")]
 
 mod uart16550;
+pub mod virtio;
 
 pub use uart16550::{Uart16550, Uart16550Diagnostics, UartTransferResult};
