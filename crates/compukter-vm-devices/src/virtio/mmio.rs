@@ -15,6 +15,8 @@ const VERSION: u32 = 2;
 const VENDOR_ID: u32 = u32::from_le_bytes(*b"COMP");
 const CONFIG_SPACE_OFFSET: u32 = 0x100;
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+const DEVICE_FEATURE_MASK: u64 =
+    ((1_u64 << 24) - 1) | (1_u64 << 41) | (1_u64 << 42) | (u64::MAX << 50);
 
 pub const STATUS_ACKNOWLEDGE: u32 = 1;
 pub const STATUS_DRIVER: u32 = 2;
@@ -26,12 +28,17 @@ pub const STATUS_FAILED: u32 = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioTransportError {
     ReservedDeviceId,
+    UnsupportedTransportFeatures(u64),
 }
 
 impl Display for VirtioTransportError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReservedDeviceId => formatter.write_str("VirtIO device id zero is reserved"),
+            Self::UnsupportedTransportFeatures(features) => write!(
+                formatter,
+                "concrete VirtIO device advertised transport-owned feature bits {features:#018x}"
+            ),
         }
     }
 }
@@ -55,6 +62,12 @@ impl<D: VirtioDevice> VirtioMmioDevice<D> {
     pub fn new(device: D) -> Result<Self, VirtioTransportError> {
         if device.device_id() == 0 {
             return Err(VirtioTransportError::ReservedDeviceId);
+        }
+        let unsupported_features = device.features() & !(DEVICE_FEATURE_MASK | VIRTIO_F_VERSION_1);
+        if unsupported_features != 0 {
+            return Err(VirtioTransportError::UnsupportedTransportFeatures(
+                unsupported_features,
+            ));
         }
         Ok(Self {
             device,
@@ -270,6 +283,7 @@ impl<D: VirtioDevice> MmioDevice for VirtioMmioDevice<D> {
             {
                 self.queue.try_enable(context.memory());
             }
+            0x044 if self.queue_selector == 0 && value == 0 => self.queue.disable(),
             0x050 if value == 0 && self.driver_ready() && self.queue.ready() => {
                 self.process_queue(context);
             }
@@ -417,7 +431,7 @@ mod tests {
     #[test]
     fn feature_banks_offer_device_features_and_required_modern_bit() {
         let mut bus = MachineBus::new(0x1000).unwrap();
-        let (device, _) = IdentityDevice::new((1 << 5) | (1_u64 << 47));
+        let (device, _) = IdentityDevice::new((1 << 5) | (1_u64 << 55));
         bus.map_mmio(MMIO_BASE, Box::new(VirtioMmioDevice::new(device).unwrap()))
             .unwrap();
 
@@ -425,10 +439,21 @@ mod tests {
         bus.store_i32(MMIO_BASE + 0x014, 1).unwrap();
         assert_eq!(
             bus.load_i32(MMIO_BASE + 0x010).unwrap() as u32,
-            (1 << 15) | 1
+            (1 << 23) | 1
         );
         bus.store_i32(MMIO_BASE + 0x014, 2).unwrap();
         assert_eq!(bus.load_i32(MMIO_BASE + 0x010).unwrap(), 0);
+    }
+
+    #[test]
+    fn concrete_device_cannot_advertise_transport_owned_features() {
+        let (device, _) = IdentityDevice::new(1 << 28);
+
+        assert!(matches!(
+            VirtioMmioDevice::new(device),
+            Err(VirtioTransportError::UnsupportedTransportFeatures(features))
+                if features == 1 << 28
+        ));
     }
 
     #[test]
@@ -637,6 +662,21 @@ mod tests {
         bus.memory_mut().store_u16(0x2004, 0).unwrap();
         bus.memory_mut().store_u16(0x2002, 1).unwrap();
 
+        bus.store_i32(QUEUE_MMIO_BASE + 0x050, 0).unwrap();
+
+        assert_eq!(bus.memory().load_u16(0x3002).unwrap(), 0);
+        assert_eq!(bus.interrupt_level(id), Some(false));
+    }
+
+    #[test]
+    fn zero_queue_ready_quiesces_the_queue_before_readback() {
+        let (mut bus, id) = configured_echo_queue(true);
+        bus.store_i32(QUEUE_MMIO_BASE + 0x044, 0).unwrap();
+        submit_echo_chain(&mut bus, 0, b"stopped");
+        bus.memory_mut().store_u16(0x2004, 0).unwrap();
+        bus.memory_mut().store_u16(0x2002, 1).unwrap();
+
+        assert_eq!(bus.load_i32(QUEUE_MMIO_BASE + 0x044).unwrap(), 0);
         bus.store_i32(QUEUE_MMIO_BASE + 0x050, 0).unwrap();
 
         assert_eq!(bus.memory().load_u16(0x3002).unwrap(), 0);

@@ -170,6 +170,8 @@ output.
 The transport deliberately has a small, bounded contract:
 
 - `VIRTIO_F_VERSION_1` is mandatory and legacy mode is rejected;
+- concrete devices may advertise only device-specific feature bits; unsupported
+  transport-owned bits are rejected during construction;
 - exactly one queue (index 0), with a maximum of 128 descriptors;
 - queue size must be a non-zero power of two;
 - direct descriptors only: no indirect tables, packed rings, `EVENT_IDX`,
@@ -220,8 +222,9 @@ when delegated to `VirtioDevice`.
 | `0x080..0x0a4` | Queue addresses | low/high descriptor, available, and used addresses |
 | `0x0fc` | ConfigGeneration | currently zero |
 
-Without `EVENT_IDX`, queue metadata occupies exactly `16 * n` descriptor
-bytes, `4 + 2 * n` available-ring bytes, and `4 + 8 * n` used-ring bytes.
+Queue metadata occupies exactly `16 * n` descriptor bytes, `6 + 2 * n`
+available-ring bytes, and `6 + 8 * n` used-ring bytes. Without `EVENT_IDX`,
+the trailing event fields remain part of the standard layout but are ignored.
 The required alignments are 16, 2, and 4 bytes respectively.
 
 ## Deliberate omissions

@@ -86,6 +86,10 @@ impl SplitVirtqueue {
         *self = Self::default();
     }
 
+    pub(crate) fn disable(&mut self) {
+        self.ready = false;
+    }
+
     pub(crate) fn available_index(&self, memory: &MachineMemory) -> Result<u16, MemoryFault> {
         memory.load_u16(guest_address(self.available_address, 2)?)
     }
@@ -129,11 +133,11 @@ impl SplitVirtqueue {
             return false;
         };
         let Some(available) =
-            GuestRange::new(self.available_address, 4 + 2 * size, 2, memory.len())
+            GuestRange::new(self.available_address, 6 + 2 * size, 2, memory.len())
         else {
             return false;
         };
-        let Some(used) = GuestRange::new(self.used_address, 4 + 8 * size, 4, memory.len()) else {
+        let Some(used) = GuestRange::new(self.used_address, 6 + 8 * size, 4, memory.len()) else {
             return false;
         };
 
