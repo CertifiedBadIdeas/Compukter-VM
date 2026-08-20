@@ -159,8 +159,74 @@ The guest services the UART before completing its PLIC claim. If any enabled
 condition is still true after completion, the level remains asserted and the
 PLIC re-pends the source.
 
+## VirtIO-MMIO transport
+
+`virtio::VirtioMmioDevice<D>` provides a reusable modern VirtIO-MMIO v2
+transport for deterministic in-tree devices. `D` implements `VirtioDevice`;
+the transport owns feature negotiation, one split virtqueue, descriptor
+validation, used-ring publication, reset state, and an active-high interrupt
+output.
+
+The transport deliberately has a small, bounded contract:
+
+- `VIRTIO_F_VERSION_1` is mandatory and legacy mode is rejected;
+- exactly one queue (index 0), with a maximum of 128 descriptors;
+- queue size must be a non-zero power of two;
+- direct descriptors only: no indirect tables, packed rings, `EVENT_IDX`,
+  notification data, or multiple queues;
+- descriptor parsing uses fixed transport-owned scratch storage;
+- the steady-state notify/completion path performs no heap allocation;
+- all queue metadata and data buffers must be wholly inside RV32 RAM and must
+  not overlap each other.
+
+Malformed runtime queue state sets `DEVICE_NEEDS_RESET`, raises the
+configuration interrupt, and leaves the failing request unpublished. Earlier
+requests completed by the same notification remain visible in the used ring.
+Writing zero to `Status` resets both transport and concrete-device state.
+
+The host installs the transport like any other interrupt-capable device:
+
+```rust,ignore
+let (disk, source) = builder.add_mmio_device_with_irq(
+    0x1000_2000,
+    VirtioMmioDevice::new(MyVirtioDevice::new())?,
+);
+```
+
+The address is selected by the embedding platform. The current acceptance
+fixture uses `0x1000_2000`; it is not hard-coded by the transport.
+
+### VirtIO-MMIO header
+
+Header registers require aligned 32-bit accesses. Device-specific
+configuration begins at offset `0x100` and preserves the guest access width
+when delegated to `VirtioDevice`.
+
+| Offset | Register | Behavior |
+|---:|---|---|
+| `0x000` | MagicValue | `0x74726976` |
+| `0x004` | Version | modern transport version 2 |
+| `0x008` | DeviceID | supplied by `VirtioDevice` |
+| `0x00c` | VendorID | `COMP` |
+| `0x010` / `0x014` | DeviceFeatures / Sel | two 32-bit feature banks |
+| `0x020` / `0x024` | DriverFeatures / Sel | accepted driver feature banks |
+| `0x030` | QueueSel | only queue 0 exists |
+| `0x034` | QueueNumMax | 128 for queue 0, otherwise 0 |
+| `0x038` | QueueNum | bounded power-of-two queue size |
+| `0x044` | QueueReady | validates and freezes queue configuration |
+| `0x050` | QueueNotify | processes queue 0 when the driver is ready |
+| `0x060` / `0x064` | InterruptStatus / ACK | bit 0 used-ring, bit 1 configuration |
+| `0x070` | Status | cumulative VirtIO device status; zero resets |
+| `0x080..0x0a4` | Queue addresses | low/high descriptor, available, and used addresses |
+| `0x0fc` | ConfigGeneration | currently zero |
+
+Without `EVENT_IDX`, queue metadata occupies exactly `16 * n` descriptor
+bytes, `4 + 2 * n` available-ring bytes, and `4 + 8 * n` used-ring bytes.
+The required alignments are 16, 2, and 4 bytes respectively.
+
 ## Deliberate omissions
 
 This version does not emulate serialized waveforms, baud time, parity/framing
 errors, break timing, RX timeout interrupts, modem delta state, RTS/CTS flow
-control, loopback, DMA, snapshots, or hot controller installation.
+control, loopback, DMA, snapshots, hot controller installation, legacy VirtIO,
+packed queues, or transport-level multi-queue operation.

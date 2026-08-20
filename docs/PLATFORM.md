@@ -116,6 +116,15 @@ address `0x1000_0000` is unavailable because the Compukter control device
 already owns it. UART register, FIFO, attachment, and interrupt behavior is
 specified in `crates/compukter-vm-devices/README.md`.
 
+The devices crate also provides a modern VirtIO-MMIO v2 transport. It is not a
+fixed standard-platform device: the embedding application chooses its address,
+concrete `VirtioDevice`, and PLIC source by installing it with
+`add_mmio_device_with_irq`. The current transport exposes one bounded split
+queue of at most 128 descriptors, requires `VIRTIO_F_VERSION_1`, and performs
+no heap allocation while processing warmed steady-state notifications. Its
+register and queue-validation ABI is specified in
+`crates/compukter-vm-devices/README.md`.
+
 ## Host inspection
 
 Trusted embedding tools may call `Rv32Machine::inspection_snapshot()` between
