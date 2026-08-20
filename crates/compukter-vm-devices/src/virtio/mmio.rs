@@ -1,4 +1,4 @@
-use super::VirtioDevice;
+use super::{queue::SplitVirtqueue, VirtioDevice, MAX_QUEUE_SIZE};
 use compukter_vm::bus::{MmioAccessWidth, MmioContext, MmioDevice};
 use compukter_vm::memory::MemoryFault;
 use std::error::Error;
@@ -42,6 +42,8 @@ pub struct VirtioMmioDevice<D: VirtioDevice> {
     status: u32,
     interrupt_status: u32,
     config_generation: u32,
+    queue_selector: u32,
+    queue: SplitVirtqueue,
 }
 
 impl<D: VirtioDevice> VirtioMmioDevice<D> {
@@ -57,6 +59,8 @@ impl<D: VirtioDevice> VirtioMmioDevice<D> {
             status: 0,
             interrupt_status: 0,
             config_generation: 0,
+            queue_selector: 0,
+            queue: SplitVirtqueue::default(),
         })
     }
 
@@ -83,6 +87,10 @@ impl<D: VirtioDevice> VirtioMmioDevice<D> {
             && self.status & (STATUS_DEVICE_NEEDS_RESET | STATUS_FAILED) == 0
     }
 
+    pub fn queue_ready(&self) -> bool {
+        self.queue.ready()
+    }
+
     fn offered_features(&self) -> u64 {
         self.device.features() | VIRTIO_F_VERSION_1
     }
@@ -94,6 +102,8 @@ impl<D: VirtioDevice> VirtioMmioDevice<D> {
         self.status = 0;
         self.interrupt_status = 0;
         self.config_generation = 0;
+        self.queue_selector = 0;
+        self.queue.reset();
         self.device.reset();
     }
 
@@ -140,6 +150,8 @@ impl<D: VirtioDevice> MmioDevice for VirtioMmioDevice<D> {
             0x008 => self.device.device_id(),
             0x00c => VENDOR_ID,
             0x010 => feature_bank(self.offered_features(), self.device_features_selector),
+            0x034 if self.queue_selector == 0 => u32::from(MAX_QUEUE_SIZE),
+            0x044 if self.queue_selector == 0 => u32::from(self.queue.ready()),
             0x060 => self.interrupt_status,
             0x070 => self.status,
             0x0fc => self.config_generation,
@@ -149,7 +161,7 @@ impl<D: VirtioDevice> MmioDevice for VirtioMmioDevice<D> {
 
     fn write(
         &mut self,
-        _context: &mut MmioContext<'_>,
+        context: &mut MmioContext<'_>,
         offset: u32,
         width: MmioAccessWidth,
         value: u64,
@@ -174,6 +186,21 @@ impl<D: VirtioDevice> MmioDevice for VirtioMmioDevice<D> {
             0x024 if self.status & STATUS_FEATURES_OK == 0 => {
                 self.driver_features_selector = value;
             }
+            0x030 => self.queue_selector = value,
+            0x038 if self.queue_selector == 0 => self.queue.set_size(value),
+            0x044
+                if self.queue_selector == 0
+                    && value == 1
+                    && self.status & STATUS_FEATURES_OK != 0 =>
+            {
+                self.queue.try_enable(context.memory());
+            }
+            0x080 if self.queue_selector == 0 => self.queue.set_descriptor_low(value),
+            0x084 if self.queue_selector == 0 => self.queue.set_descriptor_high(value),
+            0x090 if self.queue_selector == 0 => self.queue.set_available_low(value),
+            0x094 if self.queue_selector == 0 => self.queue.set_available_high(value),
+            0x0a0 if self.queue_selector == 0 => self.queue.set_used_low(value),
+            0x0a4 if self.queue_selector == 0 => self.queue.set_used_high(value),
             0x070 => self.write_status(value),
             _ => {}
         }
@@ -223,6 +250,7 @@ mod tests {
     };
 
     const MMIO_BASE: u32 = 0x2000;
+    const QUEUE_MMIO_BASE: u32 = 0x1_0000;
 
     struct IdentityDevice {
         features: u64,
@@ -357,5 +385,83 @@ mod tests {
         assert_eq!(bus.load_i32(MMIO_BASE + 0x070).unwrap(), 0);
         assert_eq!(bus.load_i32(MMIO_BASE + 0x010).unwrap(), 1 << 5);
         assert_eq!(reset_count.load(Ordering::Relaxed), 1);
+    }
+
+    fn mapped_queue_transport() -> (MachineBus, usize) {
+        let mut bus = MachineBus::new(0x1_0000).unwrap();
+        let (device, _) = IdentityDevice::new(0);
+        let id = bus
+            .map_mmio(
+                QUEUE_MMIO_BASE,
+                Box::new(VirtioMmioDevice::new(device).unwrap()),
+            )
+            .unwrap();
+        bus.store_i32(QUEUE_MMIO_BASE + 0x024, 1).unwrap();
+        bus.store_i32(QUEUE_MMIO_BASE + 0x020, 1).unwrap();
+        bus.store_i32(QUEUE_MMIO_BASE + 0x070, 1 | 2 | 8).unwrap();
+        (bus, id)
+    }
+
+    fn write_address(bus: &mut MachineBus, offset: u32, address: u64) {
+        bus.store_i32(QUEUE_MMIO_BASE + offset, address as i32)
+            .unwrap();
+        bus.store_i32(QUEUE_MMIO_BASE + offset + 4, (address >> 32) as i32)
+            .unwrap();
+    }
+
+    fn configure_queue(
+        bus: &mut MachineBus,
+        size: u32,
+        descriptor: u64,
+        available: u64,
+        used: u64,
+    ) {
+        bus.store_i32(QUEUE_MMIO_BASE + 0x038, size as i32).unwrap();
+        write_address(bus, 0x080, descriptor);
+        write_address(bus, 0x090, available);
+        write_address(bus, 0x0a0, used);
+        bus.store_i32(QUEUE_MMIO_BASE + 0x044, 1).unwrap();
+    }
+
+    #[test]
+    fn queue_zero_accepts_a_bounded_power_of_two_configuration() {
+        let (mut bus, id) = mapped_queue_transport();
+
+        assert_eq!(
+            bus.load_i32(QUEUE_MMIO_BASE + 0x034).unwrap(),
+            i32::from(crate::virtio::MAX_QUEUE_SIZE)
+        );
+        configure_queue(&mut bus, 64, 0x1000, 0x2000, 0x3000);
+
+        assert!(bus
+            .device::<VirtioMmioDevice<IdentityDevice>>(id)
+            .unwrap()
+            .queue_ready());
+    }
+
+    #[test]
+    fn invalid_queue_configuration_never_becomes_ready() {
+        let invalid = [
+            (0, 0x1000, 0x2000, 0x3000),
+            (3, 0x1000, 0x2000, 0x3000),
+            (256, 0x1000, 0x2000, 0x3000),
+            (64, 0x1008, 0x2000, 0x3000),
+            (64, 0x1000, 0x2001, 0x3000),
+            (64, 0x1000, 0x2000, 0x3002),
+            (64, 0x1000, 0x1100, 0x3000),
+            (64, 0x1000, 0x2000, 0xff00),
+            (64, 0x1_0000_1000, 0x2000, 0x3000),
+        ];
+
+        for (size, descriptor, available, used) in invalid {
+            let (mut bus, id) = mapped_queue_transport();
+            configure_queue(&mut bus, size, descriptor, available, used);
+            assert!(
+                !bus.device::<VirtioMmioDevice<IdentityDevice>>(id)
+                    .unwrap()
+                    .queue_ready(),
+                "invalid queue became ready: size={size}, desc={descriptor:#x}, avail={available:#x}, used={used:#x}"
+            );
+        }
     }
 }
