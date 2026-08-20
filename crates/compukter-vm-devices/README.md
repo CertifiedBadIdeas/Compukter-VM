@@ -227,9 +227,52 @@ available-ring bytes, and `6 + 8 * n` used-ring bytes. Without `EVENT_IDX`,
 the trailing event fields remain part of the standard layout but are ignored.
 The required alignments are 16, 2, and 4 bytes respectively.
 
+## VirtIO block device
+
+`virtio::VirtioBlockDevice` is the standard modern VirtIO device ID 2 on top of
+the transport above. `from_bytes` takes ownership of an existing raw image;
+`zeroed` creates a new disk by sector count. Capacity must be positive and an
+exact multiple of the fixed 512-byte logical sector size. `bytes` and
+`bytes_mut` let an embedding load or persist the image outside VM execution.
+
+The device advertises `VIRTIO_BLK_F_BLK_SIZE` and `VIRTIO_BLK_F_FLUSH`;
+read-only instances additionally advertise `VIRTIO_BLK_F_RO`. Its read-only
+configuration prefix exposes 64-bit capacity in 512-byte sectors at bytes
+`0..8` and `blk_size = 512` at bytes `20..24`.
+
+One request uses direct descriptors in this order:
+
+1. a device-readable 16-byte-or-larger header containing little-endian
+   `{ type: u32, reserved: u32, sector: u64 }`;
+2. zero or more data descriptors;
+3. a final device-writable status descriptor of at least one byte.
+
+The supported types are `VIRTIO_BLK_T_IN`, `VIRTIO_BLK_T_OUT`, and
+`VIRTIO_BLK_T_FLUSH`. IN data descriptors are device-writable, OUT data
+descriptors are device-readable, and each data transfer must be a non-zero
+multiple of 512 bytes wholly inside the disk. FLUSH has no data descriptors and
+is a deterministic successful no-op for the memory backend.
+
+The device writes standard `OK`, `IOERR`, or `UNSUPP` status values. The used
+length counts bytes written by the device: transferred data plus one status byte
+for IN, and one status byte for OUT, FLUSH, or an ordinary error. Structural
+requests that cannot be completed safely use the transport's
+`DEVICE_NEEDS_RESET` path instead. Complete request validation happens before a
+write can change the backing image, and device reset never erases media.
+
+Backing storage allocates only during construction. Queue processing uses
+fixed transport scratch state and copies directly between validated guest ranges
+and the preallocated image, so the steady-state request path performs no host
+allocation. Host file access is deliberately not part of this device and must
+happen outside tick execution in the embedding application.
+
 ## Deliberate omissions
 
 This version does not emulate serialized waveforms, baud time, parity/framing
 errors, break timing, RX timeout interrupts, modem delta state, RTS/CTS flow
 control, loopback, DMA, snapshots, hot controller installation, legacy VirtIO,
 packed queues, or transport-level multi-queue operation.
+
+The block device additionally omits discard, write-zeroes, secure erase, zoned
+storage, asynchronous host file I/O, runtime media hotplug, and multiple request
+queues.
