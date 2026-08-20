@@ -168,6 +168,16 @@ impl MachineMemory {
         &self.bytes
     }
 
+    pub fn read_bytes(&self, address: u32, output: &mut [u8]) -> Result<(), MemoryFault> {
+        output.copy_from_slice(self.range(address, output.len())?);
+        Ok(())
+    }
+
+    pub fn write_bytes(&mut self, address: u32, input: &[u8]) -> Result<(), MemoryFault> {
+        self.range_mut(address, input.len())?.copy_from_slice(input);
+        Ok(())
+    }
+
     #[allow(
         dead_code,
         reason = "the RV32 JIT dispatcher consumes the direct RAM pointer in a later slice"
@@ -441,5 +451,27 @@ mod tests {
         let error = memory.load_i32(6).unwrap_err();
 
         assert_eq!(error.to_string(), "memory access 6..10 is outside 8 bytes");
+    }
+
+    #[test]
+    fn bulk_copy_validates_the_complete_range_before_mutation() {
+        let mut memory = MachineMemory::zeroed(8).unwrap();
+        memory.write_bytes(2, &[1, 2, 3, 4]).unwrap();
+
+        let mut output = [0_u8; 4];
+        memory.read_bytes(2, &mut output).unwrap();
+        assert_eq!(output, [1, 2, 3, 4]);
+
+        let before = memory.bytes().to_vec();
+        assert!(memory.write_bytes(6, &[9, 9, 9]).is_err());
+        assert_eq!(memory.bytes(), before);
+    }
+
+    #[test]
+    fn zero_length_bulk_copy_accepts_the_ram_end() {
+        let mut memory = MachineMemory::zeroed(8).unwrap();
+
+        memory.write_bytes(8, &[]).unwrap();
+        memory.read_bytes(8, &mut []).unwrap();
     }
 }
