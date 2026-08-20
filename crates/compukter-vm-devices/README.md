@@ -240,12 +240,19 @@ read-only instances additionally advertise `VIRTIO_BLK_F_RO`. Its read-only
 configuration prefix exposes 64-bit capacity in 512-byte sectors at bytes
 `0..8` and `blk_size = 512` at bytes `20..24`.
 
-One request uses direct descriptors in this order:
+One request is a byte stream spread across direct descriptors. Descriptor
+boundaries do not define field boundaries: the 16-byte header may be split,
+OUT data may share a descriptor with the end of the header, and IN data may
+share its final descriptor with status. The stream contains:
 
-1. a device-readable 16-byte-or-larger header containing little-endian
+1. a device-readable 16-byte header containing little-endian
    `{ type: u32, reserved: u32, sector: u64 }`;
-2. zero or more data descriptors;
-3. a final device-writable status descriptor of at least one byte.
+2. request data, with direction selected by the operation;
+3. one final device-writable status byte.
+
+As required by VirtIO framing, all device-readable descriptors precede all
+device-writable descriptors. The device treats each direction group as one
+scatter/gather stream and does not otherwise depend on descriptor arrangement.
 
 The supported types are `VIRTIO_BLK_T_IN`, `VIRTIO_BLK_T_OUT`, and
 `VIRTIO_BLK_T_FLUSH`. IN data descriptors are device-writable, OUT data
