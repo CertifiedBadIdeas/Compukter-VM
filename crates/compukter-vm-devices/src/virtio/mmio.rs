@@ -1,4 +1,8 @@
-use super::{queue::SplitVirtqueue, VirtioDevice, MAX_QUEUE_SIZE};
+use super::{
+    descriptor::{parse_chain, DescriptorScratch},
+    queue::SplitVirtqueue,
+    VirtioDevice, MAX_QUEUE_SIZE,
+};
 use compukter_vm::bus::{MmioAccessWidth, MmioContext, MmioDevice};
 use compukter_vm::memory::MemoryFault;
 use std::error::Error;
@@ -44,6 +48,7 @@ pub struct VirtioMmioDevice<D: VirtioDevice> {
     config_generation: u32,
     queue_selector: u32,
     queue: SplitVirtqueue,
+    descriptor_scratch: DescriptorScratch,
 }
 
 impl<D: VirtioDevice> VirtioMmioDevice<D> {
@@ -61,6 +66,7 @@ impl<D: VirtioDevice> VirtioMmioDevice<D> {
             config_generation: 0,
             queue_selector: 0,
             queue: SplitVirtqueue::default(),
+            descriptor_scratch: DescriptorScratch::default(),
         })
     }
 
@@ -78,6 +84,10 @@ impl<D: VirtioDevice> VirtioMmioDevice<D> {
 
     pub fn interrupt_status(&self) -> u32 {
         self.interrupt_status
+    }
+
+    pub fn interrupt_pending(&self) -> bool {
+        self.interrupt_status != 0
     }
 
     pub fn driver_ready(&self) -> bool {
@@ -104,6 +114,7 @@ impl<D: VirtioDevice> VirtioMmioDevice<D> {
         self.config_generation = 0;
         self.queue_selector = 0;
         self.queue.reset();
+        self.descriptor_scratch = DescriptorScratch::default();
         self.device.reset();
     }
 
@@ -124,11 +135,75 @@ impl<D: VirtioDevice> VirtioMmioDevice<D> {
             self.status &= !STATUS_FEATURES_OK;
         }
     }
+
+    fn process_queue(&mut self, context: &mut MmioContext<'_>) {
+        let available_index = match self.queue.available_index(context.memory()) {
+            Ok(index) => index,
+            Err(_) => {
+                self.needs_reset();
+                return;
+            }
+        };
+        let pending = available_index.wrapping_sub(self.queue.last_available_index);
+        if pending > self.queue.size() {
+            self.needs_reset();
+            return;
+        }
+
+        for _ in 0..pending {
+            let current = self.queue.last_available_index;
+            let head = match self.queue.available_head(context.memory(), current) {
+                Ok(head) => head,
+                Err(_) => {
+                    self.needs_reset();
+                    return;
+                }
+            };
+            let chain = match parse_chain(
+                context.memory(),
+                &self.queue,
+                head,
+                &mut self.descriptor_scratch,
+            ) {
+                Ok(chain) => chain,
+                Err(_) => {
+                    self.needs_reset();
+                    return;
+                }
+            };
+            let written = match self.device.process_chain(context, chain) {
+                Ok(written) => written,
+                Err(_) => {
+                    self.needs_reset();
+                    return;
+                }
+            };
+            if self
+                .queue
+                .publish_used(context.memory_mut(), head, written)
+                .is_err()
+            {
+                self.needs_reset();
+                return;
+            }
+            self.queue.last_available_index = current.wrapping_add(1);
+            self.interrupt_status |= 1;
+        }
+    }
+
+    fn needs_reset(&mut self) {
+        self.status |= STATUS_DEVICE_NEEDS_RESET;
+        self.interrupt_status |= 2;
+    }
 }
 
 impl<D: VirtioDevice> MmioDevice for VirtioMmioDevice<D> {
     fn size(&self) -> u32 {
         VIRTIO_MMIO_REGION_SIZE
+    }
+
+    fn interrupt_level(&self) -> bool {
+        self.interrupt_pending()
     }
 
     fn read(
@@ -195,6 +270,10 @@ impl<D: VirtioDevice> MmioDevice for VirtioMmioDevice<D> {
             {
                 self.queue.try_enable(context.memory());
             }
+            0x050 if value == 0 && self.driver_ready() && self.queue.ready() => {
+                self.process_queue(context);
+            }
+            0x064 => self.interrupt_status &= !value,
             0x080 if self.queue_selector == 0 => self.queue.set_descriptor_low(value),
             0x084 if self.queue_selector == 0 => self.queue.set_descriptor_high(value),
             0x090 if self.queue_selector == 0 => self.queue.set_available_low(value),
@@ -285,10 +364,26 @@ mod tests {
 
         fn process_chain(
             &mut self,
-            _context: &mut MmioContext<'_>,
-            _chain: VirtioDescriptorChain<'_>,
+            context: &mut MmioContext<'_>,
+            chain: VirtioDescriptorChain<'_>,
         ) -> Result<u32, VirtioDeviceError> {
-            Ok(0)
+            let [input, output] = chain.descriptors() else {
+                return Err(VirtioDeviceError::InvalidRequest);
+            };
+            if input.writable || !output.writable {
+                return Err(VirtioDeviceError::InvalidRequest);
+            }
+            let written = input.length.min(output.length).min(128);
+            let mut bytes = [0_u8; 128];
+            context
+                .memory()
+                .read_bytes(input.address, &mut bytes[..written as usize])
+                .map_err(|_| VirtioDeviceError::InvalidRequest)?;
+            context
+                .memory_mut()
+                .write_bytes(output.address, &bytes[..written as usize])
+                .map_err(|_| VirtioDeviceError::InvalidRequest)?;
+            Ok(written)
         }
     }
 
@@ -463,5 +558,124 @@ mod tests {
                 "invalid queue became ready: size={size}, desc={descriptor:#x}, avail={available:#x}, used={used:#x}"
             );
         }
+    }
+
+    fn configured_echo_queue(driver_ok: bool) -> (MachineBus, usize) {
+        let (mut bus, id) = mapped_queue_transport();
+        configure_queue(&mut bus, 8, 0x1000, 0x2000, 0x3000);
+        if driver_ok {
+            bus.store_i32(QUEUE_MMIO_BASE + 0x070, 1 | 2 | 8 | 4)
+                .unwrap();
+        }
+        (bus, id)
+    }
+
+    fn write_queue_descriptor(
+        bus: &mut MachineBus,
+        index: u16,
+        address: u64,
+        length: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let base = 0x1000 + u32::from(index) * 16;
+        bus.memory_mut().store_u64(base, address).unwrap();
+        bus.memory_mut().store_i32(base + 8, length as i32).unwrap();
+        bus.memory_mut().store_u16(base + 12, flags).unwrap();
+        bus.memory_mut().store_u16(base + 14, next).unwrap();
+    }
+
+    fn submit_echo_chain(bus: &mut MachineBus, head: u16, input: &[u8]) {
+        let input_address = 0x4000 + u32::from(head) * 0x100;
+        let output_address = 0x5000 + u32::from(head) * 0x100;
+        write_queue_descriptor(
+            bus,
+            head,
+            input_address.into(),
+            input.len() as u32,
+            1,
+            head + 1,
+        );
+        write_queue_descriptor(
+            bus,
+            head + 1,
+            output_address.into(),
+            input.len() as u32,
+            2,
+            0,
+        );
+        bus.memory_mut().write_bytes(input_address, input).unwrap();
+    }
+
+    #[test]
+    fn notify_processes_available_entries_and_raises_used_interrupt() {
+        let (mut bus, id) = configured_echo_queue(true);
+        submit_echo_chain(&mut bus, 0, b"virtio");
+        bus.memory_mut().store_u16(0x2004, 0).unwrap();
+        bus.memory_mut().store_u16(0x2002, 1).unwrap();
+
+        bus.store_i32(QUEUE_MMIO_BASE + 0x050, 0).unwrap();
+
+        assert_eq!(bus.memory().load_u16(0x3002).unwrap(), 1);
+        assert_eq!(bus.memory().load_i32(0x3004).unwrap(), 0);
+        assert_eq!(bus.memory().load_i32(0x3008).unwrap(), 6);
+        let mut output = [0_u8; 6];
+        bus.memory().read_bytes(0x5000, &mut output).unwrap();
+        assert_eq!(&output, b"virtio");
+        assert_eq!(bus.load_i32(QUEUE_MMIO_BASE + 0x060).unwrap(), 1);
+        assert_eq!(bus.interrupt_level(id), Some(true));
+
+        bus.store_i32(QUEUE_MMIO_BASE + 0x064, 1).unwrap();
+        assert_eq!(bus.load_i32(QUEUE_MMIO_BASE + 0x060).unwrap(), 0);
+        assert_eq!(bus.interrupt_level(id), Some(false));
+    }
+
+    #[test]
+    fn notify_before_driver_ok_does_nothing() {
+        let (mut bus, id) = configured_echo_queue(false);
+        submit_echo_chain(&mut bus, 0, b"early");
+        bus.memory_mut().store_u16(0x2004, 0).unwrap();
+        bus.memory_mut().store_u16(0x2002, 1).unwrap();
+
+        bus.store_i32(QUEUE_MMIO_BASE + 0x050, 0).unwrap();
+
+        assert_eq!(bus.memory().load_u16(0x3002).unwrap(), 0);
+        assert_eq!(bus.interrupt_level(id), Some(false));
+    }
+
+    #[test]
+    fn excessive_available_delta_requires_reset_and_raises_config_interrupt() {
+        let (mut bus, id) = configured_echo_queue(true);
+        bus.memory_mut().store_u16(0x2002, 9).unwrap();
+
+        bus.store_i32(QUEUE_MMIO_BASE + 0x050, 0).unwrap();
+
+        assert_ne!(
+            bus.load_i32(QUEUE_MMIO_BASE + 0x070).unwrap() as u32 & STATUS_DEVICE_NEEDS_RESET,
+            0
+        );
+        assert_eq!(bus.load_i32(QUEUE_MMIO_BASE + 0x060).unwrap(), 2);
+        assert_eq!(bus.interrupt_level(id), Some(true));
+    }
+
+    #[test]
+    fn malformed_later_entry_preserves_an_earlier_completion() {
+        let (mut bus, _) = configured_echo_queue(true);
+        submit_echo_chain(&mut bus, 0, b"first");
+        write_queue_descriptor(&mut bus, 2, 0x6000, 4, 4, 0);
+        bus.memory_mut().store_u16(0x2004, 0).unwrap();
+        bus.memory_mut().store_u16(0x2006, 2).unwrap();
+        bus.memory_mut().store_u16(0x2002, 2).unwrap();
+
+        bus.store_i32(QUEUE_MMIO_BASE + 0x050, 0).unwrap();
+
+        assert_eq!(bus.memory().load_u16(0x3002).unwrap(), 1);
+        assert_eq!(bus.memory().load_i32(0x3004).unwrap(), 0);
+        assert_eq!(bus.memory().load_i32(0x3008).unwrap(), 5);
+        assert_eq!(bus.load_i32(QUEUE_MMIO_BASE + 0x060).unwrap(), 3);
+        assert_ne!(
+            bus.load_i32(QUEUE_MMIO_BASE + 0x070).unwrap() as u32 & STATUS_DEVICE_NEEDS_RESET,
+            0
+        );
     }
 }

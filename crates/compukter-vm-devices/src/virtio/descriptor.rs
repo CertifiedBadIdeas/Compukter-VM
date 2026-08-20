@@ -139,9 +139,9 @@ fn queue_metadata_ranges(
     Ok([
         GuestRange::new(queue.descriptor_address(), 16 * size, 16, memory_len)
             .ok_or(DescriptorError::InvalidChain)?,
-        GuestRange::new(queue.available_address(), 6 + 2 * size, 2, memory_len)
+        GuestRange::new(queue.available_address(), 4 + 2 * size, 2, memory_len)
             .ok_or(DescriptorError::InvalidChain)?,
-        GuestRange::new(queue.used_address(), 6 + 8 * size, 4, memory_len)
+        GuestRange::new(queue.used_address(), 4 + 8 * size, 4, memory_len)
             .ok_or(DescriptorError::InvalidChain)?,
     ])
 }

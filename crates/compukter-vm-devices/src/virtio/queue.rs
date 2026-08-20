@@ -1,4 +1,4 @@
-use compukter_vm::memory::MachineMemory;
+use compukter_vm::memory::{MachineMemory, MemoryFault};
 
 use super::MAX_QUEUE_SIZE;
 
@@ -13,10 +13,6 @@ pub(crate) struct SplitVirtqueue {
 }
 
 impl SplitVirtqueue {
-    #[allow(
-        dead_code,
-        reason = "descriptor parsing is connected to MMIO notifications in the next slice"
-    )]
     pub(crate) fn size(&self) -> u16 {
         self.size
     }
@@ -25,26 +21,14 @@ impl SplitVirtqueue {
         self.ready
     }
 
-    #[allow(
-        dead_code,
-        reason = "descriptor parsing is connected to MMIO notifications in the next slice"
-    )]
     pub(crate) fn descriptor_address(&self) -> u64 {
         self.descriptor_address
     }
 
-    #[allow(
-        dead_code,
-        reason = "descriptor parsing is connected to MMIO notifications in the next slice"
-    )]
     pub(crate) fn available_address(&self) -> u64 {
         self.available_address
     }
 
-    #[allow(
-        dead_code,
-        reason = "descriptor parsing is connected to MMIO notifications in the next slice"
-    )]
     pub(crate) fn used_address(&self) -> u64 {
         self.used_address
     }
@@ -102,6 +86,37 @@ impl SplitVirtqueue {
         *self = Self::default();
     }
 
+    pub(crate) fn available_index(&self, memory: &MachineMemory) -> Result<u16, MemoryFault> {
+        memory.load_u16(guest_address(self.available_address, 2)?)
+    }
+
+    pub(crate) fn available_head(
+        &self,
+        memory: &MachineMemory,
+        available_index: u16,
+    ) -> Result<u16, MemoryFault> {
+        let slot = available_index & (self.size - 1);
+        memory.load_u16(guest_address(
+            self.available_address,
+            4 + u64::from(slot) * 2,
+        )?)
+    }
+
+    pub(crate) fn publish_used(
+        &self,
+        memory: &mut MachineMemory,
+        head: u16,
+        written: u32,
+    ) -> Result<(), MemoryFault> {
+        let used_index_address = guest_address(self.used_address, 2)?;
+        let used_index = memory.load_u16(used_index_address)?;
+        let slot = used_index & (self.size - 1);
+        let element = guest_address(self.used_address, 4 + u64::from(slot) * 8)?;
+        memory.store_i32(element, i32::from(head))?;
+        memory.store_i32(element + 4, written as i32)?;
+        memory.store_u16(used_index_address, used_index.wrapping_add(1))
+    }
+
     fn validate(&self, memory: &MachineMemory) -> bool {
         if self.size == 0 || self.size > MAX_QUEUE_SIZE || !self.size.is_power_of_two() {
             return false;
@@ -114,11 +129,11 @@ impl SplitVirtqueue {
             return false;
         };
         let Some(available) =
-            GuestRange::new(self.available_address, 6 + 2 * size, 2, memory.len())
+            GuestRange::new(self.available_address, 4 + 2 * size, 2, memory.len())
         else {
             return false;
         };
-        let Some(used) = GuestRange::new(self.used_address, 6 + 8 * size, 4, memory.len()) else {
+        let Some(used) = GuestRange::new(self.used_address, 4 + 8 * size, 4, memory.len()) else {
             return false;
         };
 
@@ -158,4 +173,10 @@ fn set_low(address: &mut u64, value: u32) {
 
 fn set_high(address: &mut u64, value: u32) {
     *address = (*address & u64::from(u32::MAX)) | (u64::from(value) << 32);
+}
+
+fn guest_address(base: u64, offset: u64) -> Result<u32, MemoryFault> {
+    base.checked_add(offset)
+        .and_then(|address| u32::try_from(address).ok())
+        .ok_or_else(|| MemoryFault::new("VirtIO queue address is outside RV32".to_string()))
 }
