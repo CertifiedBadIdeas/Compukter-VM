@@ -1,5 +1,6 @@
-use super::{VirtioDescriptorChain, VirtioDevice, VirtioDeviceError};
+use super::{VirtioDescriptor, VirtioDescriptorChain, VirtioDevice, VirtioDeviceError};
 use compukter_vm::bus::{MmioAccessWidth, MmioContext};
+use compukter_vm::memory::MachineMemory;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -132,35 +133,33 @@ impl VirtioDevice for VirtioBlockDevice {
         context: &mut MmioContext<'_>,
         chain: VirtioDescriptorChain<'_>,
     ) -> Result<u32, VirtioDeviceError> {
-        let descriptors = chain.descriptors();
-        if descriptors.len() < 2 {
-            return Err(VirtioDeviceError::InvalidRequest);
-        }
-        let header = descriptors[0];
-        let status = descriptors[descriptors.len() - 1];
-        if header.writable || header.length < 16 || !status.writable || status.length < 1 {
+        let (readable, writable) = split_directional_streams(chain.descriptors())?;
+        let readable_length = stream_length(readable)?;
+        let writable_length = stream_length(writable)?;
+        if readable_length < 16 || writable_length < 1 {
             return Err(VirtioDeviceError::InvalidRequest);
         }
 
         let mut request = [0_u8; 16];
-        context
-            .memory()
-            .read_bytes(header.address, &mut request)
-            .map_err(|_| VirtioDeviceError::InvalidRequest)?;
+        read_stream(context.memory(), readable, 0, &mut request)?;
         let request_type = u32::from_le_bytes(request[0..4].try_into().unwrap());
         let sector = u64::from_le_bytes(request[8..16].try_into().unwrap());
-        let data = &descriptors[1..descriptors.len() - 1];
 
         match request_type {
-            VIRTIO_BLK_T_IN => self.read_request(context, data, status.address, sector),
-            VIRTIO_BLK_T_OUT => self.write_request(context, data, status.address, sector),
-            VIRTIO_BLK_T_FLUSH if data.is_empty() => {
-                write_status(context, status.address, VIRTIO_BLK_S_OK)?;
+            VIRTIO_BLK_T_IN if readable_length == 16 => {
+                self.read_request(context, writable, writable_length, sector)
+            }
+            VIRTIO_BLK_T_IN => Err(VirtioDeviceError::InvalidRequest),
+            VIRTIO_BLK_T_OUT => {
+                self.write_request(context, readable, writable, readable_length, sector)
+            }
+            VIRTIO_BLK_T_FLUSH if readable_length == 16 => {
+                write_stream_byte(context.memory_mut(), writable, 0, VIRTIO_BLK_S_OK)?;
                 Ok(1)
             }
             VIRTIO_BLK_T_FLUSH => Err(VirtioDeviceError::InvalidRequest),
             _ => {
-                write_status(context, status.address, VIRTIO_BLK_S_UNSUPP)?;
+                write_stream_byte(context.memory_mut(), writable, 0, VIRTIO_BLK_S_UNSUPP)?;
                 Ok(1)
             }
         }
@@ -171,67 +170,55 @@ impl VirtioBlockDevice {
     fn read_request(
         &self,
         context: &mut MmioContext<'_>,
-        data: &[super::VirtioDescriptor],
-        status_address: u32,
+        writable: &[VirtioDescriptor],
+        writable_length: usize,
         sector: u64,
     ) -> Result<u32, VirtioDeviceError> {
-        if data.is_empty() || data.iter().any(|descriptor| !descriptor.writable) {
-            return Err(VirtioDeviceError::InvalidRequest);
-        }
-        let Some((start, length)) = self.data_range(data, sector) else {
-            write_status(context, status_address, VIRTIO_BLK_S_IOERR)?;
+        let length = writable_length - 1;
+        let used_length = length
+            .checked_add(1)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(VirtioDeviceError::InvalidRequest)?;
+        let Some(start) = self.data_start(length, sector) else {
+            write_stream_byte(context.memory_mut(), writable, length, VIRTIO_BLK_S_IOERR)?;
             return Ok(1);
         };
-
-        let mut storage_offset = start;
-        for descriptor in data {
-            let end = storage_offset + descriptor.length as usize;
-            context
-                .memory_mut()
-                .write_bytes(descriptor.address, &self.storage[storage_offset..end])
-                .map_err(|_| VirtioDeviceError::InvalidRequest)?;
-            storage_offset = end;
-        }
-        write_status(context, status_address, VIRTIO_BLK_S_OK)?;
-        u32::try_from(length + 1).map_err(|_| VirtioDeviceError::InvalidRequest)
+        let end = start + length;
+        write_stream(context.memory_mut(), writable, 0, &self.storage[start..end])?;
+        write_stream_byte(context.memory_mut(), writable, length, VIRTIO_BLK_S_OK)?;
+        Ok(used_length)
     }
 
     fn write_request(
         &mut self,
         context: &mut MmioContext<'_>,
-        data: &[super::VirtioDescriptor],
-        status_address: u32,
+        readable: &[VirtioDescriptor],
+        writable: &[VirtioDescriptor],
+        readable_length: usize,
         sector: u64,
     ) -> Result<u32, VirtioDeviceError> {
-        if data.is_empty() || data.iter().any(|descriptor| descriptor.writable) {
-            return Err(VirtioDeviceError::InvalidRequest);
-        }
-        let Some((start, _length)) = self.data_range(data, sector) else {
-            write_status(context, status_address, VIRTIO_BLK_S_IOERR)?;
+        let length = readable_length - 16;
+        let Some(start) = self.data_start(length, sector) else {
+            write_stream_byte(context.memory_mut(), writable, 0, VIRTIO_BLK_S_IOERR)?;
             return Ok(1);
         };
         if self.read_only {
-            write_status(context, status_address, VIRTIO_BLK_S_IOERR)?;
+            write_stream_byte(context.memory_mut(), writable, 0, VIRTIO_BLK_S_IOERR)?;
             return Ok(1);
         }
 
-        let mut storage_offset = start;
-        for descriptor in data {
-            let end = storage_offset + descriptor.length as usize;
-            context
-                .memory()
-                .read_bytes(descriptor.address, &mut self.storage[storage_offset..end])
-                .map_err(|_| VirtioDeviceError::InvalidRequest)?;
-            storage_offset = end;
-        }
-        write_status(context, status_address, VIRTIO_BLK_S_OK)?;
+        let end = start + length;
+        read_stream(
+            context.memory(),
+            readable,
+            16,
+            &mut self.storage[start..end],
+        )?;
+        write_stream_byte(context.memory_mut(), writable, 0, VIRTIO_BLK_S_OK)?;
         Ok(1)
     }
 
-    fn data_range(&self, data: &[super::VirtioDescriptor], sector: u64) -> Option<(usize, usize)> {
-        let length = data.iter().try_fold(0_usize, |total, descriptor| {
-            total.checked_add(descriptor.length as usize)
-        })?;
+    fn data_start(&self, length: usize, sector: u64) -> Option<usize> {
         if length == 0 || !length.is_multiple_of(VIRTIO_BLOCK_SECTOR_SIZE) {
             return None;
         }
@@ -239,17 +226,123 @@ impl VirtioBlockDevice {
             .checked_mul(VIRTIO_BLOCK_SECTOR_SIZE as u64)
             .and_then(|value| usize::try_from(value).ok())?;
         let end = start.checked_add(length)?;
-        (end <= self.storage.len()).then_some((start, length))
+        (end <= self.storage.len()).then_some(start)
     }
 }
 
-fn write_status(
-    context: &mut MmioContext<'_>,
-    address: u32,
-    status: u8,
+fn split_directional_streams(
+    descriptors: &[VirtioDescriptor],
+) -> Result<(&[VirtioDescriptor], &[VirtioDescriptor]), VirtioDeviceError> {
+    let first_writable = descriptors
+        .iter()
+        .position(|descriptor| descriptor.writable)
+        .ok_or(VirtioDeviceError::InvalidRequest)?;
+    let (readable, writable) = descriptors.split_at(first_writable);
+    if readable.is_empty() || writable.iter().any(|descriptor| !descriptor.writable) {
+        return Err(VirtioDeviceError::InvalidRequest);
+    }
+    Ok((readable, writable))
+}
+
+fn stream_length(descriptors: &[VirtioDescriptor]) -> Result<usize, VirtioDeviceError> {
+    descriptors.iter().try_fold(0_usize, |length, descriptor| {
+        length
+            .checked_add(descriptor.length as usize)
+            .ok_or(VirtioDeviceError::InvalidRequest)
+    })
+}
+
+fn read_stream(
+    memory: &MachineMemory,
+    descriptors: &[VirtioDescriptor],
+    skip: usize,
+    output: &mut [u8],
 ) -> Result<(), VirtioDeviceError> {
-    context
-        .memory_mut()
-        .store_u8(address, status)
+    let mut skip = skip;
+    let mut written = 0;
+    for descriptor in descriptors {
+        let descriptor_length = descriptor.length as usize;
+        if skip >= descriptor_length {
+            skip -= descriptor_length;
+            continue;
+        }
+        let offset = skip;
+        skip = 0;
+        let count = (descriptor_length - offset).min(output.len() - written);
+        let address = descriptor_address(*descriptor, offset)?;
+        memory
+            .read_bytes(address, &mut output[written..written + count])
+            .map_err(|_| VirtioDeviceError::InvalidRequest)?;
+        written += count;
+        if written == output.len() {
+            return Ok(());
+        }
+    }
+    Err(VirtioDeviceError::InvalidRequest)
+}
+
+fn write_stream(
+    memory: &mut MachineMemory,
+    descriptors: &[VirtioDescriptor],
+    skip: usize,
+    input: &[u8],
+) -> Result<(), VirtioDeviceError> {
+    let mut skip = skip;
+    let mut read = 0;
+    for descriptor in descriptors {
+        let descriptor_length = descriptor.length as usize;
+        if skip >= descriptor_length {
+            skip -= descriptor_length;
+            continue;
+        }
+        let offset = skip;
+        skip = 0;
+        let count = (descriptor_length - offset).min(input.len() - read);
+        let address = descriptor_address(*descriptor, offset)?;
+        memory
+            .write_bytes(address, &input[read..read + count])
+            .map_err(|_| VirtioDeviceError::InvalidRequest)?;
+        read += count;
+        if read == input.len() {
+            return Ok(());
+        }
+    }
+    Err(VirtioDeviceError::InvalidRequest)
+}
+
+fn write_stream_byte(
+    memory: &mut MachineMemory,
+    descriptors: &[VirtioDescriptor],
+    offset: usize,
+    value: u8,
+) -> Result<(), VirtioDeviceError> {
+    let address = stream_address(descriptors, offset)?;
+    memory
+        .store_u8(address, value)
         .map_err(|_| VirtioDeviceError::InvalidRequest)
+}
+
+fn stream_address(
+    descriptors: &[VirtioDescriptor],
+    mut offset: usize,
+) -> Result<u32, VirtioDeviceError> {
+    for descriptor in descriptors {
+        let length = descriptor.length as usize;
+        if offset < length {
+            return descriptor_address(*descriptor, offset);
+        }
+        offset -= length;
+    }
+    Err(VirtioDeviceError::InvalidRequest)
+}
+
+fn descriptor_address(
+    descriptor: VirtioDescriptor,
+    offset: usize,
+) -> Result<u32, VirtioDeviceError> {
+    let offset = u32::try_from(offset).map_err(|_| VirtioDeviceError::InvalidRequest)?;
+    descriptor
+        .address
+        .checked_add(offset)
+        .ok_or(VirtioDeviceError::InvalidRequest)
 }

@@ -20,6 +20,7 @@ const HEADER_ADDRESS: u32 = 0x4300;
 const DATA_ADDRESS: u32 = 0x4400;
 const SECOND_DATA_ADDRESS: u32 = 0x4600;
 const STATUS_ADDRESS: u32 = 0x4800;
+const COALESCED_ADDRESS: u32 = 0x5000;
 const QUEUE_SIZE: u16 = 8;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
@@ -64,6 +65,7 @@ fn block_device_rejects_invalid_capacity_and_checks_zeroed_size() {
 #[test]
 fn block_read_copies_multiple_data_descriptors_and_completes() {
     let bytes: Vec<u8> = (0..1024).map(|index| index as u8).collect();
+    let expected = bytes[512..].to_vec();
     let (mut bus, _) = block_bus(bytes, false);
     write_request_header(&mut bus, 0, 1);
     write_descriptor(&mut bus, 0, HEADER_ADDRESS, 16, VIRTQ_DESC_F_NEXT, 1);
@@ -89,7 +91,11 @@ fn block_read_copies_multiple_data_descriptors_and_completes() {
 
     assert_eq!(
         &bus.memory().bytes()[DATA_ADDRESS as usize..DATA_ADDRESS as usize + 256],
-        &bus.memory().bytes()[SECOND_DATA_ADDRESS as usize..SECOND_DATA_ADDRESS as usize + 256]
+        &expected[..256]
+    );
+    assert_eq!(
+        &bus.memory().bytes()[SECOND_DATA_ADDRESS as usize..SECOND_DATA_ADDRESS as usize + 256],
+        &expected[256..]
     );
     assert_eq!(bus.memory().load_u8(STATUS_ADDRESS).unwrap(), 0);
     assert_eq!(bus.memory().load_i32(USED_ADDRESS + 8).unwrap(), 513);
@@ -220,6 +226,57 @@ fn malformed_block_layout_requires_transport_reset_without_completion() {
     assert_eq!(bus.memory().load_u8(STATUS_ADDRESS).unwrap(), 0xff);
     assert_eq!(bus.memory().load_u16(USED_ADDRESS + 2).unwrap(), 0);
     assert_ne!(bus.load_i32(VIRTIO_BASE + 0x070).unwrap() & 64, 0);
+}
+
+#[test]
+fn block_write_accepts_a_split_header_coalesced_with_data() {
+    let (mut bus, device_id) = block_bus(vec![0; 512], false);
+    let mut tail = vec![0_u8; 8 + 512];
+    tail[..8].copy_from_slice(&0_u64.to_le_bytes());
+    tail[8..].fill(0x6d);
+    bus.memory_mut().store_i32(HEADER_ADDRESS, 1).unwrap();
+    bus.memory_mut().store_i32(HEADER_ADDRESS + 4, 0).unwrap();
+    bus.memory_mut()
+        .write_bytes(COALESCED_ADDRESS, &tail)
+        .unwrap();
+    write_descriptor(&mut bus, 0, HEADER_ADDRESS, 8, VIRTQ_DESC_F_NEXT, 1);
+    write_descriptor(
+        &mut bus,
+        1,
+        COALESCED_ADDRESS,
+        tail.len() as u32,
+        VIRTQ_DESC_F_NEXT,
+        2,
+    );
+    write_descriptor(&mut bus, 2, STATUS_ADDRESS, 1, VIRTQ_DESC_F_WRITE, 0);
+
+    submit(&mut bus, 0, 1);
+
+    assert_eq!(bus.memory().load_u8(STATUS_ADDRESS).unwrap(), 0);
+    assert_eq!(
+        bus.device::<VirtioMmioDevice<VirtioBlockDevice>>(device_id)
+            .unwrap()
+            .device()
+            .bytes(),
+        &[0x6d; 512]
+    );
+}
+
+#[test]
+fn block_read_accepts_data_and_status_in_one_writable_descriptor() {
+    let (mut bus, _) = block_bus(vec![0x7e; 512], false);
+    write_request_header(&mut bus, 0, 0);
+    write_descriptor(&mut bus, 0, HEADER_ADDRESS, 16, VIRTQ_DESC_F_NEXT, 1);
+    write_descriptor(&mut bus, 1, DATA_ADDRESS, 513, VIRTQ_DESC_F_WRITE, 0);
+
+    submit(&mut bus, 0, 1);
+
+    assert_eq!(
+        &bus.memory().bytes()[DATA_ADDRESS as usize..DATA_ADDRESS as usize + 512],
+        &[0x7e; 512]
+    );
+    assert_eq!(bus.memory().load_u8(DATA_ADDRESS + 512).unwrap(), 0);
+    assert_eq!(bus.memory().load_i32(USED_ADDRESS + 8).unwrap(), 513);
 }
 
 fn block_bus(bytes: Vec<u8>, read_only: bool) -> (MachineBus, MmioDeviceId) {
