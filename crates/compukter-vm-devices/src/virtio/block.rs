@@ -113,7 +113,7 @@ impl VirtioDevice for VirtioBlockDevice {
         let end = offset
             .checked_add(width)
             .ok_or(VirtioDeviceError::InvalidRequest)?;
-        if offset % width != 0 || end > CONFIG_SIZE {
+        if !offset.is_multiple_of(width) || end > CONFIG_SIZE {
             return Err(VirtioDeviceError::InvalidRequest);
         }
         let config = self.config();
