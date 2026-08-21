@@ -47,6 +47,180 @@ pub(crate) fn minimal_vector_with_string_records(records: &[&[u8]]) -> Vec<u8> {
     vector_with_strings(records)
 }
 
+pub(crate) fn two_module_vector() -> Vec<u8> {
+    let library_sections = minimal_module_sections(&[b"lib", b"work"], 1, &[], &[export_record(1)]);
+    let library_hash = semantic_hash(&library_sections);
+    let application_import = import_record(1, 1, 1, 0, library_hash);
+    let application_sections =
+        minimal_module_sections(&[b"app", b"entry"], 1, &[application_import], &[]);
+    let application_hash = semantic_hash(&application_sections);
+
+    let manifest = manifest();
+    let application = module_record(0, 1, application_hash, 1, 0);
+    let library = module_record(0, 2, library_hash, 0, 1);
+    let modules = indexed(&[&application, &library]);
+    let empty = indexed(&[]);
+    let mut sections = vec![
+        (0x0001_u16, 0_u32, manifest, 1),
+        (0x0002, 0, modules, 2),
+        (0x0003, 0, empty, 0),
+    ];
+    for (scope, module) in [(1, application_sections), (2, library_sections)] {
+        for (kind, payload, count) in module {
+            sections.push((kind, scope, payload, count));
+        }
+    }
+    assemble(sections, 1 << 3)
+}
+
+fn minimal_module_sections(
+    strings: &[&[u8]],
+    function_name: u32,
+    imports: &[Vec<u8>],
+    exports: &[Vec<u8>],
+) -> Vec<(u16, Vec<u8>, u32)> {
+    let strings_payload = indexed(strings);
+    let mut function_type = vec![3, 0];
+    push_u16(&mut function_type, 0);
+    push_u32(&mut function_type, function_name);
+    push_u16(&mut function_type, 0);
+    push_u16(&mut function_type, 0);
+    function_type.extend_from_slice(&[0, 0, 0, 0]);
+    push_u32(&mut function_type, u32::MAX);
+    let types = indexed(&[&function_type]);
+    let empty = indexed(&[]);
+
+    let mut function = Vec::new();
+    push_u32(&mut function, u32::MAX);
+    push_u32(&mut function, function_name);
+    push_u32(&mut function, 0);
+    push_u32(&mut function, 2);
+    push_u16(&mut function, 0);
+    push_u16(&mut function, 0);
+    push_u32(&mut function, 0);
+    push_u32(&mut function, 1);
+    push_u32(&mut function, 0);
+    push_u32(&mut function, 0);
+    let functions = indexed(&[&function]);
+
+    let mut block = Vec::new();
+    for value in [0, 0, 1, 1, 0, 0] {
+        push_u32(&mut block, value);
+    }
+    let blocks = indexed(&[&block]);
+    let return_unit = [0xe3, 0, 6, 0, 0xff, 0xff];
+    let code = indexed(&[&return_unit]);
+    let import_refs: Vec<_> = imports.iter().map(Vec::as_slice).collect();
+    let export_refs: Vec<_> = exports.iter().map(Vec::as_slice).collect();
+    vec![
+        (0x0100, strings_payload, strings.len() as u32),
+        (0x0101, types, 1),
+        (0x0102, empty.clone(), 0),
+        (0x0103, indexed(&import_refs), imports.len() as u32),
+        (0x0104, indexed(&export_refs), exports.len() as u32),
+        (0x0105, empty.clone(), 0),
+        (0x0106, functions, 1),
+        (0x0107, blocks, 1),
+        (0x0108, code, 1),
+        (0x0109, empty, 0),
+    ]
+}
+
+fn semantic_hash(sections: &[(u16, Vec<u8>, u32)]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"Compukter module v1\0");
+    for (kind, payload, _) in sections {
+        hasher.update(kind.to_le_bytes());
+        hasher.update((payload.len() as u64).to_le_bytes());
+        hasher.update(payload);
+    }
+    hasher.finalize().into()
+}
+
+fn import_record(
+    kind: u8,
+    target_module: u32,
+    target_name: u32,
+    signature: u32,
+    hash: [u8; 32],
+) -> Vec<u8> {
+    let mut record = vec![kind, 0, 0, 0];
+    push_u32(&mut record, target_module);
+    push_u32(&mut record, target_name);
+    push_u32(&mut record, signature);
+    record.extend(hash);
+    record
+}
+
+fn export_record(name: u32) -> Vec<u8> {
+    let mut record = vec![1, 1];
+    push_u16(&mut record, 0);
+    push_u32(&mut record, name);
+    push_u32(&mut record, 0);
+    push_u32(&mut record, 0);
+    record
+}
+
+fn module_record(name: u32, flags: u32, hash: [u8; 32], imports: u32, exports: u32) -> Vec<u8> {
+    let mut record = Vec::new();
+    push_u32(&mut record, name);
+    push_u32(&mut record, flags);
+    record.extend(hash);
+    for value in [imports, exports, 1, 1, 0] {
+        push_u32(&mut record, value);
+    }
+    record
+}
+
+fn manifest() -> Vec<u8> {
+    let mut manifest = Vec::new();
+    for value in [0, 0, 1, 1, 0, 0, 1, 1, 0, 0] {
+        push_u32(&mut manifest, value);
+    }
+    manifest.resize(112, 0);
+    manifest
+}
+
+fn assemble(sections: Vec<(u16, u32, Vec<u8>, u32)>, semantic_features: u32) -> Vec<u8> {
+    let first_payload = align8(HEADER_SIZE + sections.len() * DIRECTORY_ENTRY_SIZE);
+    let mut cursor = first_payload;
+    let mut entries = Vec::new();
+    for (kind, scope, payload, count) in &sections {
+        entries.push((*kind, *scope, cursor, payload.len(), *count));
+        cursor = align8(cursor + payload.len());
+    }
+    let payload_end = entries.last().unwrap().2 + entries.last().unwrap().3;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CPKT");
+    for value in [1_u16, 0, 1, 0, 64, 32] {
+        push_u16(&mut bytes, value);
+    }
+    push_u32(&mut bytes, sections.len() as u32);
+    push_u32(&mut bytes, semantic_features);
+    push_u64(&mut bytes, 64);
+    push_u64(&mut bytes, payload_end as u64);
+    push_u32(&mut bytes, 0);
+    push_u32(&mut bytes, 0);
+    bytes.resize(HEADER_SIZE, 0);
+    for (kind, scope, offset, length, count) in &entries {
+        push_u16(&mut bytes, *kind);
+        push_u16(&mut bytes, 3);
+        push_u32(&mut bytes, *scope);
+        push_u64(&mut bytes, *offset as u64);
+        push_u64(&mut bytes, *length as u64);
+        push_u32(&mut bytes, *count);
+        push_u32(&mut bytes, 0);
+    }
+    bytes.resize(first_payload, 0);
+    for ((_, _, offset, _, _), (_, _, payload, _)) in entries.iter().zip(&sections) {
+        bytes.resize(*offset, 0);
+        bytes.extend_from_slice(payload);
+    }
+    bytes.resize(payload_end + DIGEST_SIZE, 0);
+    rehash(&mut bytes);
+    bytes
+}
+
 fn vector_with_strings(string_records: &[&[u8]]) -> Vec<u8> {
     let strings = indexed(string_records);
     let mut function_type = vec![3, 0];

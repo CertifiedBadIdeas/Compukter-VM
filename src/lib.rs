@@ -28,5 +28,11 @@ mod decode;
 pub mod diagnostic;
 pub mod limits;
 
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+#[cfg_attr(not(test), allow(dead_code))]
+mod verify;
+
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use limits::ArtifactLimits;
