@@ -40,7 +40,15 @@ fn indexed(records: &[&[u8]]) -> Vec<u8> {
 }
 
 pub(crate) fn minimal_vector() -> Vec<u8> {
-    let strings = indexed(&[b"app", b"entry"]);
+    vector_with_strings(&[b"app", b"entry"])
+}
+
+pub(crate) fn minimal_vector_with_string_records(records: &[&[u8]]) -> Vec<u8> {
+    vector_with_strings(records)
+}
+
+fn vector_with_strings(string_records: &[&[u8]]) -> Vec<u8> {
+    let strings = indexed(string_records);
     let mut function_type = vec![3, 0];
     push_u16(&mut function_type, 0);
     push_u32(&mut function_type, 1);
