@@ -3,6 +3,17 @@ use std::sync::Arc;
 
 use crate::test_support as support;
 
+fn decoded_fixture(name: &str) -> crate::artifact::DecodedArtifact {
+    assert!(matches!(name, "language-runtime.cpkt" | "debug.cpkt"));
+    let bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name),
+    )
+    .unwrap();
+    super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap()
+}
+
 fn error_code(bytes: Vec<u8>) -> Code {
     super::container::decode_container(&bytes, &ArtifactLimits::default())
         .unwrap_err()
@@ -573,4 +584,48 @@ fn instruction_computes_variable_fixed_costs() {
     let decoded =
         super::code::decode_code_record(&asynchronous, 1, &ArtifactLimits::default()).unwrap();
     assert_eq!(decoded[0].fixed_cost().unwrap(), 8);
+}
+
+#[test]
+fn records_decode_language_runtime_golden_features() {
+    let artifact = decoded_fixture("language-runtime.cpkt");
+    let module = &artifact.modules[0];
+    assert!(module
+        .types
+        .iter()
+        .any(|value| matches!(value, crate::artifact::NominalType::Class { .. })));
+    assert!(module
+        .types
+        .iter()
+        .any(|value| matches!(value, crate::artifact::NominalType::Array { .. })));
+    assert!(module.functions[0]
+        .registers
+        .iter()
+        .any(|value| value.kind == 7 && value.flags == 1));
+    let mut instructions = module.code.iter().flat_map(|code| code.instructions.iter());
+    assert!(instructions
+        .clone()
+        .any(|value| matches!(value, crate::artifact::Instruction::NewObject { .. })));
+    assert!(instructions
+        .clone()
+        .any(|value| matches!(value, crate::artifact::Instruction::NewArray { .. })));
+    assert!(instructions.clone().any(|value| matches!(
+        value,
+        crate::artifact::Instruction::ArrayLoad { .. }
+            | crate::artifact::Instruction::ArrayStore { .. }
+    )));
+    assert!(instructions.any(|value| matches!(value, crate::artifact::Instruction::Branch { .. })));
+    assert!(module.blocks.iter().any(|block| block.flags & 1 != 0));
+    assert_eq!(module.exceptions.len(), 1);
+}
+
+#[test]
+fn records_decode_debug_golden_inline_ancestry() {
+    let artifact = decoded_fixture("debug.cpkt");
+    let debug = &artifact.modules[0].debug;
+    assert_eq!(debug.len(), 2);
+    assert_eq!(debug[0].inline_parent, u32::MAX);
+    assert_eq!(debug[1].inline_parent, 0);
+    assert!(debug[0].end_utf16 > debug[0].start_utf16);
+    assert!(debug[1].end_utf16 > debug[1].start_utf16);
 }

@@ -149,6 +149,223 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
 }
 
 #[allow(dead_code)]
+pub(crate) fn language_runtime_vector() -> Vec<u8> {
+    let strings = indexed(&[b"Box", b"app", b"array", b"entry"]);
+    let empty = indexed(&[]);
+
+    let mut class_type = vec![0, 0];
+    push_u16(&mut class_type, 0);
+    for value in [0, u32::MAX, 0, 0, 0, 0, 0] {
+        push_u32(&mut class_type, value);
+    }
+    let mut array_type = vec![2, 0];
+    push_u16(&mut array_type, 0);
+    push_u32(&mut array_type, 2);
+    array_type.extend(value_type(1, 0, u32::MAX));
+    let mut function_type = vec![3, 0];
+    push_u16(&mut function_type, 0);
+    push_u32(&mut function_type, 3);
+    push_u16(&mut function_type, 0);
+    push_u16(&mut function_type, 0);
+    function_type.extend(value_type(0, 0, u32::MAX));
+    let types = indexed(&[&class_type, &array_type, &function_type]);
+
+    let zero = [0, 0, 0, 0, 0];
+    let one = [0, 1, 0, 0, 0];
+    let constants = indexed(&[&zero, &one]);
+
+    let registers = [
+        value_type(7, 0, 0),
+        value_type(7, 1, 0),
+        value_type(5, 0, u32::MAX),
+        value_type(1, 0, u32::MAX),
+        value_type(7, 0, 1),
+        value_type(1, 0, u32::MAX),
+        value_type(7, 0, 0),
+        value_type(1, 0, u32::MAX),
+    ];
+    let mut function = Vec::new();
+    for value in [u32::MAX, 3, 2, 2] {
+        push_u32(&mut function, value);
+    }
+    push_u16(&mut function, registers.len() as u16);
+    push_u16(&mut function, 0);
+    for value in [0, 5, 0, 1] {
+        push_u32(&mut function, value);
+    }
+    for register in registers {
+        function.extend(register);
+    }
+    let functions = indexed(&[&function]);
+
+    let block_values = [
+        [0, 0, 4, 8, 0, 0],
+        [0, 1, 6, 11, 0, 0],
+        [0, 2, 2, 6, 0, 0],
+        [0, 3, 1, 1, 1, 0],
+        [0, 4, 1, 1, 0, 0],
+    ];
+    let block_records: Vec<Vec<u8>> = block_values
+        .into_iter()
+        .map(|values| {
+            let mut record = Vec::new();
+            for value in values {
+                push_u32(&mut record, value);
+            }
+            record
+        })
+        .collect();
+    let block_refs: Vec<&[u8]> = block_records.iter().map(Vec::as_slice).collect();
+    let blocks = indexed(&block_refs);
+
+    let block_zero = concat_frames(&[
+        frame(0x30, 0, &[0, 0, 0]),
+        frame(0x03, 0, &[1, 0]),
+        frame(0x39, 0, &[2, 0, 1, 0, 0]),
+        frame(0xe1, 0, &[2, 0, 1, 2]),
+    ]);
+    let block_one = concat_frames(&[
+        frame(0x02, 0, &[3, 0, 1]),
+        frame(0x02, 0, &[7, 0, 0]),
+        frame(0x31, 0, &[4, 0, 1, 3, 0]),
+        frame(0x34, 0, &[4, 0, 7, 0, 3, 0]),
+        frame(0x33, 0, &[5, 0, 4, 0, 7, 0]),
+        frame(0xe0, 0, &[3]),
+    ]);
+    let block_two = concat_frames(&[frame(0x30, 0, &[6, 0, 0]), frame(0xe4, 0, &[6, 0])]);
+    let block_three = frame(0xe0, 0, &[3]);
+    let block_four = frame(0xe3, 0, &[0xff, 0xff]);
+    let code = indexed(&[
+        &block_zero,
+        &block_one,
+        &block_two,
+        &block_three,
+        &block_four,
+    ]);
+
+    let mut exception = Vec::new();
+    for value in [0, 2, 1, 0, 4] {
+        push_u32(&mut exception, value);
+    }
+    push_u16(&mut exception, 6);
+    push_u16(&mut exception, 0);
+    let exceptions = indexed(&[&exception]);
+
+    let semantic_sections = vec![
+        (0x0100_u16, strings, 4),
+        (0x0101, types, 3),
+        (0x0102, constants, 2),
+        (0x0103, empty.clone(), 0),
+        (0x0104, empty.clone(), 0),
+        (0x0105, empty.clone(), 0),
+        (0x0106, functions, 1),
+        (0x0107, blocks, 5),
+        (0x0108, code, 5),
+        (0x0109, exceptions, 1),
+    ];
+    single_module_artifact(semantic_sections, None, 1 << 0, 1, 3, 11)
+}
+
+#[allow(dead_code)]
+pub(crate) fn debug_vector() -> Vec<u8> {
+    let strings = indexed(&[b"app", b"entry"]);
+    let empty = indexed(&[]);
+    let mut function_type = vec![3, 0];
+    push_u16(&mut function_type, 0);
+    push_u32(&mut function_type, 1);
+    push_u16(&mut function_type, 0);
+    push_u16(&mut function_type, 0);
+    function_type.extend(value_type(0, 0, u32::MAX));
+    let types = indexed(&[&function_type]);
+
+    let mut function = Vec::new();
+    for value in [u32::MAX, 1, 0, 2] {
+        push_u32(&mut function, value);
+    }
+    push_u16(&mut function, 0);
+    push_u16(&mut function, 0);
+    for value in [0, 1, 0, 0] {
+        push_u32(&mut function, value);
+    }
+    let functions = indexed(&[&function]);
+    let mut block = Vec::new();
+    for value in [0, 0, 2, 2, 0, 0] {
+        push_u32(&mut block, value);
+    }
+    let blocks = indexed(&[&block]);
+    let code_record = concat_frames(&[frame(0x00, 0, &[]), frame(0xe3, 0, &[0xff, 0xff])]);
+    let code = indexed(&[&code_record]);
+    let semantic_sections = vec![
+        (0x0100_u16, strings, 2),
+        (0x0101, types, 1),
+        (0x0102, empty.clone(), 0),
+        (0x0103, empty.clone(), 0),
+        (0x0104, empty.clone(), 0),
+        (0x0105, empty.clone(), 0),
+        (0x0106, functions, 1),
+        (0x0107, blocks, 1),
+        (0x0108, code, 1),
+        (0x0109, empty, 0),
+    ];
+
+    let path = b"src/main.kts";
+    let mut first = Vec::new();
+    for value in [0, 0, 0, 0, 5, u32::MAX, path.len() as u32] {
+        push_u32(&mut first, value);
+    }
+    first.extend_from_slice(path);
+    let mut second = Vec::new();
+    for value in [0, 0, 1, 6, 12, 0, path.len() as u32] {
+        push_u32(&mut second, value);
+    }
+    second.extend_from_slice(path);
+    let debug = indexed(&[&first, &second]);
+    single_module_artifact(semantic_sections, Some((debug, 2)), 0, 0, 1, 2)
+}
+
+fn single_module_artifact(
+    semantic_sections: Vec<(u16, Vec<u8>, u32)>,
+    debug: Option<(Vec<u8>, u32)>,
+    semantic_features: u32,
+    module_name: u32,
+    type_count: u32,
+    maximum_block_cost: u32,
+) -> Vec<u8> {
+    let module_hash = semantic_hash(&semantic_sections);
+    let mut manifest = manifest();
+    manifest[24..28].copy_from_slice(&maximum_block_cost.to_le_bytes());
+    manifest[28..32].copy_from_slice(&maximum_block_cost.to_le_bytes());
+    let module = module_record_full(module_name, 1, module_hash, 0, 0, type_count, 1);
+    let modules = indexed(&[&module]);
+    let empty = indexed(&[]);
+    let mut sections = vec![
+        (0x0001_u16, 0_u32, manifest, 1),
+        (0x0002, 0, modules, 1),
+        (0x0003, 0, empty, 0),
+    ];
+    sections.extend(
+        semantic_sections
+            .into_iter()
+            .map(|(kind, payload, count)| (kind, 1, payload, count)),
+    );
+    if let Some((payload, count)) = debug {
+        sections.push((0x0110, 1, payload, count));
+    }
+    assemble(sections, semantic_features)
+}
+
+fn frame(opcode: u8, form: u8, operands: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![opcode, form];
+    push_u16(&mut bytes, (operands.len() + 4) as u16);
+    bytes.extend_from_slice(operands);
+    bytes
+}
+
+fn concat_frames(frames: &[Vec<u8>]) -> Vec<u8> {
+    frames.iter().flatten().copied().collect()
+}
+
+#[allow(dead_code)]
 fn value_type(kind: u8, flags: u8, nominal_type: u32) -> Vec<u8> {
     let mut bytes = vec![kind, flags];
     push_u16(&mut bytes, 0);
@@ -296,6 +513,25 @@ fn module_record_with_counts(
     let mut record = Vec::new();
     push_u32(&mut record, 0);
     push_u32(&mut record, 1);
+    record.extend(hash);
+    for value in [imports, exports, types, functions, 0] {
+        push_u32(&mut record, value);
+    }
+    record
+}
+
+fn module_record_full(
+    name: u32,
+    flags: u32,
+    hash: [u8; 32],
+    imports: u32,
+    exports: u32,
+    types: u32,
+    functions: u32,
+) -> Vec<u8> {
+    let mut record = Vec::new();
+    push_u32(&mut record, name);
+    push_u32(&mut record, flags);
     record.extend(hash);
     for value in [imports, exports, types, functions, 0] {
         push_u32(&mut record, value);
