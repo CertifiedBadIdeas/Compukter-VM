@@ -74,7 +74,7 @@ pub(crate) struct DecodedModule {
     pub fields: Vec<Field>,
     pub functions: Vec<Function>,
     pub blocks: Vec<Block>,
-    pub code: Vec<ByteRange>,
+    pub code: Vec<DecodedCode>,
     pub exceptions: Vec<ExceptionEntry>,
     pub debug: Vec<DebugEntry>,
 }
@@ -211,4 +211,276 @@ pub(crate) struct DebugEntry {
     pub end_utf16: u32,
     pub inline_parent: u32,
     pub source_path: ByteRange,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct DecodedCode {
+    pub bytes: ByteRange,
+    pub instructions: Box<[Instruction]>,
+    pub fixed_cost: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SwitchCase {
+    pub value: i32,
+    pub target: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Instruction {
+    Nop,
+    Move {
+        dst: u16,
+        src: u16,
+    },
+    Const {
+        dst: u16,
+        constant: u32,
+    },
+    Null {
+        dst: u16,
+    },
+    Convert {
+        dst: u16,
+        src: u16,
+    },
+    Add {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Sub {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Mul {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Div {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Rem {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Neg {
+        form: u8,
+        dst: u16,
+        src: u16,
+    },
+    BitAnd {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    BitOr {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    BitXor {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    ShiftLeft {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    ShiftRight {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    ShiftUnsigned {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Equal {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    NotEqual {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Less {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    LessEqual {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Greater {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    GreaterEqual {
+        form: u8,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    RefEqual {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    RefNotEqual {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    NewObject {
+        dst: u16,
+        type_ref: u32,
+    },
+    NewArray {
+        dst: u16,
+        type_ref: u32,
+        length: u16,
+    },
+    ArrayLength {
+        dst: u16,
+        array: u16,
+    },
+    ArrayLoad {
+        dst: u16,
+        array: u16,
+        index: u16,
+    },
+    ArrayStore {
+        array: u16,
+        index: u16,
+        value: u16,
+    },
+    FieldGet {
+        dst: u16,
+        receiver: u16,
+        field_ref: u32,
+    },
+    FieldSet {
+        receiver: u16,
+        field_ref: u32,
+        value: u16,
+    },
+    StaticGet {
+        dst: u16,
+        field_ref: u32,
+    },
+    StaticSet {
+        field_ref: u32,
+        value: u16,
+    },
+    IsType {
+        dst: u16,
+        value: u16,
+        type_ref: u32,
+    },
+    CheckedCast {
+        dst: u16,
+        value: u16,
+        type_ref: u32,
+    },
+    CallDirect {
+        dst: u16,
+        function_ref: u32,
+        args: Box<[u16]>,
+    },
+    CallVirtual {
+        dst: u16,
+        function_ref: u32,
+        args: Box<[u16]>,
+    },
+    CallInterface {
+        dst: u16,
+        function_ref: u32,
+        args: Box<[u16]>,
+    },
+    CoroutineSpawn {
+        dst: u16,
+        function_ref: u32,
+        args: Box<[u16]>,
+    },
+    CapabilityCallSync {
+        dst: u16,
+        capability: u32,
+        operation: u32,
+        args: Box<[u16]>,
+    },
+    Jump {
+        target: u32,
+    },
+    Branch {
+        condition: u16,
+        true_block: u32,
+        false_block: u32,
+    },
+    SwitchI32 {
+        key: u16,
+        default_block: u32,
+        cases: Box<[SwitchCase]>,
+    },
+    Return {
+        value: u16,
+    },
+    Throw {
+        exception: u16,
+    },
+    CallSuspend {
+        dst: u16,
+        function_ref: u32,
+        args: Box<[u16]>,
+        resume_block: u32,
+    },
+    Yield {
+        resume_block: u32,
+    },
+    Sleep {
+        duration: u16,
+        resume_block: u32,
+    },
+    CoroutineJoin {
+        dst: u16,
+        coroutine: u16,
+        resume_block: u32,
+    },
+    CapabilityCallAsync {
+        dst: u16,
+        capability: u32,
+        operation: u32,
+        args: Box<[u16]>,
+        resume_block: u32,
+    },
+    Unreachable,
 }
