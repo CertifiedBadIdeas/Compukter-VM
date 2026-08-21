@@ -1,8 +1,7 @@
 use crate::{diagnostic::Code, limits::ArtifactLimits};
 use std::sync::Arc;
 
-#[path = "../../tests/support/mod.rs"]
-mod support;
+use crate::test_support as support;
 
 fn error_code(bytes: Vec<u8>) -> Code {
     super::container::decode_container(&bytes, &ArtifactLimits::default())
