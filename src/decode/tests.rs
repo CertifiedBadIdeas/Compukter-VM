@@ -311,33 +311,46 @@ fn records_decode_spec_vector_a() {
 }
 
 #[test]
-fn records_reencode_vector_a_byte_for_byte() {
-    let original = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/vector-a.cpkt"
-    ));
-    let decoded =
-        super::records::decode_artifact(Arc::from(original.as_slice()), &ArtifactLimits::default())
-            .unwrap();
-    assert_eq!(
-        crate::test_encode::encode_artifact(&decoded).unwrap(),
-        original
-    );
-}
+fn committed_artifacts_reencode_byte_for_byte() {
+    let fixtures: [(&str, &[u8]); 4] = [
+        (
+            "vector-a.cpkt",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/vector-a.cpkt"
+            )),
+        ),
+        (
+            "two-module.cpkt",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/two-module.cpkt"
+            )),
+        ),
+        (
+            "language-runtime.cpkt",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/language-runtime.cpkt"
+            )),
+        ),
+        (
+            "debug.cpkt",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/debug.cpkt"
+            )),
+        ),
+    ];
 
-#[test]
-fn records_reencode_two_module_golden_byte_for_byte() {
-    let original = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/two-module.cpkt"
-    ));
-    let decoded =
-        super::records::decode_artifact(Arc::from(original.as_slice()), &ArtifactLimits::default())
-            .unwrap();
-    assert_eq!(
-        crate::test_encode::encode_artifact(&decoded).unwrap(),
-        original
-    );
+    for (name, original) in fixtures {
+        let decoded =
+            super::records::decode_artifact(Arc::from(original), &ArtifactLimits::default())
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let encoded = crate::test_encode::encode_artifact(&decoded)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert_eq!(encoded, original, "{name}");
+    }
 }
 
 #[test]
@@ -516,8 +529,7 @@ fn instruction_requires_one_final_terminator_and_exact_count() {
     );
 }
 
-#[test]
-fn instruction_decodes_every_v1_opcode() {
+fn for_each_v1_opcode_case(mut check: impl FnMut(u8, u8, &[u8], bool)) {
     let r2 = &[0, 0, 1, 0][..];
     let r3 = &[0, 0, 1, 0, 2, 0][..];
     let cases: &[(u8, u8, &[u8], bool)] = &[
@@ -576,6 +588,13 @@ fn instruction_decodes_every_v1_opcode() {
     ];
 
     for &(opcode, form, operands, terminator) in cases {
+        check(opcode, form, operands, terminator);
+    }
+}
+
+#[test]
+fn instruction_decodes_every_v1_opcode() {
+    for_each_v1_opcode_case(|opcode, form, operands, terminator| {
         let mut bytes = vec![opcode, form, (operands.len() + 4) as u8, 0];
         bytes.extend_from_slice(operands);
         let count = if terminator {
@@ -586,7 +605,26 @@ fn instruction_decodes_every_v1_opcode() {
         };
         super::code::decode_code_record(&bytes, count, &ArtifactLimits::default())
             .unwrap_or_else(|error| panic!("opcode {opcode:#04x}: {error:?}"));
-    }
+    });
+}
+
+#[test]
+fn instruction_reencodes_every_v1_opcode() {
+    for_each_v1_opcode_case(|opcode, form, operands, terminator| {
+        let mut original = vec![opcode, form, (operands.len() + 4) as u8, 0];
+        original.extend_from_slice(operands);
+        let count = if terminator {
+            1
+        } else {
+            original.extend_from_slice(&[0xe3, 0, 6, 0, 0xff, 0xff]);
+            2
+        };
+        let decoded =
+            super::code::decode_code_record(&original, count, &ArtifactLimits::default()).unwrap();
+        let encoded = crate::test_encode::encode_instruction_record(&decoded)
+            .unwrap_or_else(|error| panic!("opcode {opcode:#04x}: {error:?}"));
+        assert_eq!(encoded, original, "opcode {opcode:#04x}");
+    });
 }
 
 #[test]
