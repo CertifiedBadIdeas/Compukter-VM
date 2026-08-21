@@ -19,7 +19,12 @@
 
 #![doc = "The standalone managed runtime for Compukter bytecode."]
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod artifact;
+#[cfg_attr(not(test), allow(dead_code))]
 mod bytes;
+#[cfg_attr(not(test), allow(dead_code))]
+mod decode;
 pub mod diagnostic;
 pub mod limits;
 
