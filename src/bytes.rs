@@ -1,12 +1,10 @@
 use crate::diagnostic::{Code, Diagnostic, Family};
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Cursor<'a> {
     bytes: &'a [u8],
     position: usize,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<'a> Cursor<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
