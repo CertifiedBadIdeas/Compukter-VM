@@ -110,7 +110,7 @@ fn encode_module(
     let code = module
         .code
         .iter()
-        .map(|record| encode_instructions(&record.instructions))
+        .map(|record| encode_instruction_record(&record.instructions))
         .collect::<Result<Vec<_>, _>>()?;
     let exceptions = module
         .exceptions
@@ -432,15 +432,424 @@ fn encode_value_type(bytes: &mut Vec<u8>, value: ValueType) {
     u32le(bytes, value.nominal_type.0);
 }
 
-fn encode_instructions(values: &[Instruction]) -> Result<Vec<u8>, EncodeError> {
+pub(crate) fn encode_instruction_record(values: &[Instruction]) -> Result<Vec<u8>, EncodeError> {
     let mut bytes = Vec::new();
     for value in values {
-        match value {
-            Instruction::Return { value } => frame(&mut bytes, 0xe3, 0, &value.to_le_bytes())?,
-            _ => return Err(EncodeError("instruction encoder is incomplete")),
-        }
+        let (opcode, form, operands) = encode_instruction(value)?;
+        frame(&mut bytes, opcode, form, &operands)?;
     }
     Ok(bytes)
+}
+
+fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeError> {
+    let mut operands = Vec::new();
+    let (opcode, form) = match value {
+        Instruction::Nop => (0x00, 0),
+        Instruction::Move { dst, src } => {
+            regs(&mut operands, &[*dst, *src]);
+            (0x01, 0)
+        }
+        Instruction::Const { dst, constant } => {
+            reg(&mut operands, *dst);
+            id(&mut operands, *constant);
+            (0x02, 0)
+        }
+        Instruction::Null { dst } => {
+            reg(&mut operands, *dst);
+            (0x03, 0)
+        }
+        Instruction::Convert { dst, src } => {
+            regs(&mut operands, &[*dst, *src]);
+            (0x04, 0)
+        }
+        Instruction::Add {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x10, *form, *dst, *lhs, *rhs),
+        Instruction::Sub {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x11, *form, *dst, *lhs, *rhs),
+        Instruction::Mul {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x12, *form, *dst, *lhs, *rhs),
+        Instruction::Div {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x13, *form, *dst, *lhs, *rhs),
+        Instruction::Rem {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x14, *form, *dst, *lhs, *rhs),
+        Instruction::Neg { form, dst, src } => {
+            regs(&mut operands, &[*dst, *src]);
+            (0x15, *form)
+        }
+        Instruction::BitAnd {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x16, *form, *dst, *lhs, *rhs),
+        Instruction::BitOr {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x17, *form, *dst, *lhs, *rhs),
+        Instruction::BitXor {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x18, *form, *dst, *lhs, *rhs),
+        Instruction::ShiftLeft {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x19, *form, *dst, *lhs, *rhs),
+        Instruction::ShiftRight {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x1a, *form, *dst, *lhs, *rhs),
+        Instruction::ShiftUnsigned {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x1b, *form, *dst, *lhs, *rhs),
+        Instruction::Equal {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x20, *form, *dst, *lhs, *rhs),
+        Instruction::NotEqual {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x21, *form, *dst, *lhs, *rhs),
+        Instruction::Less {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x22, *form, *dst, *lhs, *rhs),
+        Instruction::LessEqual {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x23, *form, *dst, *lhs, *rhs),
+        Instruction::Greater {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x24, *form, *dst, *lhs, *rhs),
+        Instruction::GreaterEqual {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => arithmetic_operands(&mut operands, 0x25, *form, *dst, *lhs, *rhs),
+        Instruction::RefEqual { dst, lhs, rhs } => {
+            regs(&mut operands, &[*dst, *lhs, *rhs]);
+            (0x26, 7)
+        }
+        Instruction::RefNotEqual { dst, lhs, rhs } => {
+            regs(&mut operands, &[*dst, *lhs, *rhs]);
+            (0x27, 7)
+        }
+        Instruction::NewObject { dst, type_ref } => {
+            reg(&mut operands, *dst);
+            id(&mut operands, *type_ref);
+            (0x30, 0)
+        }
+        Instruction::NewArray {
+            dst,
+            type_ref,
+            length,
+        } => {
+            reg(&mut operands, *dst);
+            id(&mut operands, *type_ref);
+            reg(&mut operands, *length);
+            (0x31, 0)
+        }
+        Instruction::ArrayLength { dst, array } => {
+            regs(&mut operands, &[*dst, *array]);
+            (0x32, 0)
+        }
+        Instruction::ArrayLoad { dst, array, index } => {
+            regs(&mut operands, &[*dst, *array, *index]);
+            (0x33, 0)
+        }
+        Instruction::ArrayStore {
+            array,
+            index,
+            value,
+        } => {
+            regs(&mut operands, &[*array, *index, *value]);
+            (0x34, 0)
+        }
+        Instruction::FieldGet {
+            dst,
+            receiver,
+            field_ref,
+        } => {
+            regs(&mut operands, &[*dst, *receiver]);
+            id(&mut operands, *field_ref);
+            (0x35, 0)
+        }
+        Instruction::FieldSet {
+            receiver,
+            field_ref,
+            value,
+        } => {
+            reg(&mut operands, *receiver);
+            id(&mut operands, *field_ref);
+            reg(&mut operands, *value);
+            (0x36, 0)
+        }
+        Instruction::StaticGet { dst, field_ref } => {
+            reg(&mut operands, *dst);
+            id(&mut operands, *field_ref);
+            (0x37, 0)
+        }
+        Instruction::StaticSet { field_ref, value } => {
+            id(&mut operands, *field_ref);
+            reg(&mut operands, *value);
+            (0x38, 0)
+        }
+        Instruction::IsType {
+            dst,
+            value,
+            type_ref,
+        } => {
+            regs(&mut operands, &[*dst, *value]);
+            id(&mut operands, *type_ref);
+            (0x39, 0)
+        }
+        Instruction::CheckedCast {
+            dst,
+            value,
+            type_ref,
+        } => {
+            regs(&mut operands, &[*dst, *value]);
+            id(&mut operands, *type_ref);
+            (0x3a, 0)
+        }
+        Instruction::CallDirect {
+            dst,
+            function_ref,
+            args,
+        } => {
+            call_operands(&mut operands, *dst, *function_ref, args)?;
+            (0x40, 0)
+        }
+        Instruction::CallVirtual {
+            dst,
+            function_ref,
+            args,
+        } => {
+            call_operands(&mut operands, *dst, *function_ref, args)?;
+            (0x41, 0)
+        }
+        Instruction::CallInterface {
+            dst,
+            function_ref,
+            args,
+        } => {
+            call_operands(&mut operands, *dst, *function_ref, args)?;
+            (0x42, 0)
+        }
+        Instruction::CoroutineSpawn {
+            dst,
+            function_ref,
+            args,
+        } => {
+            reg(&mut operands, *dst);
+            id(&mut operands, *function_ref);
+            encode_args(&mut operands, args)?;
+            (0x50, 0)
+        }
+        Instruction::CapabilityCallSync {
+            dst,
+            capability,
+            operation,
+            args,
+        } => {
+            capability_operands(&mut operands, *dst, *capability, *operation, args)?;
+            (0x51, 0)
+        }
+        Instruction::Jump { target } => {
+            id(&mut operands, *target);
+            (0xe0, 0)
+        }
+        Instruction::Branch {
+            condition,
+            true_block,
+            false_block,
+        } => {
+            reg(&mut operands, *condition);
+            id(&mut operands, *true_block);
+            id(&mut operands, *false_block);
+            (0xe1, 0)
+        }
+        Instruction::SwitchI32 {
+            key,
+            default_block,
+            cases,
+        } => {
+            reg(&mut operands, *key);
+            id(&mut operands, *default_block);
+            id(
+                &mut operands,
+                to_u32(cases.len(), "switch case count exceeds u32")?,
+            );
+            for case in cases {
+                operands.extend(case.value.to_le_bytes());
+                id(&mut operands, case.target);
+            }
+            (0xe2, 0)
+        }
+        Instruction::Return { value } => {
+            reg(&mut operands, *value);
+            (0xe3, 0)
+        }
+        Instruction::Throw { exception } => {
+            reg(&mut operands, *exception);
+            (0xe4, 0)
+        }
+        Instruction::CallSuspend {
+            dst,
+            function_ref,
+            args,
+            resume_block,
+        } => {
+            call_operands(&mut operands, *dst, *function_ref, args)?;
+            id(&mut operands, *resume_block);
+            (0xe5, 0)
+        }
+        Instruction::Yield { resume_block } => {
+            id(&mut operands, *resume_block);
+            (0xe6, 0)
+        }
+        Instruction::Sleep {
+            duration,
+            resume_block,
+        } => {
+            reg(&mut operands, *duration);
+            id(&mut operands, *resume_block);
+            (0xe7, 0)
+        }
+        Instruction::CoroutineJoin {
+            dst,
+            coroutine,
+            resume_block,
+        } => {
+            regs(&mut operands, &[*dst, *coroutine]);
+            id(&mut operands, *resume_block);
+            (0xe8, 0)
+        }
+        Instruction::CapabilityCallAsync {
+            dst,
+            capability,
+            operation,
+            args,
+            resume_block,
+        } => {
+            capability_operands(&mut operands, *dst, *capability, *operation, args)?;
+            id(&mut operands, *resume_block);
+            (0xe9, 0)
+        }
+        Instruction::Unreachable => (0xff, 0),
+    };
+    Ok((opcode, form, operands))
+}
+
+fn arithmetic_operands(
+    operands: &mut Vec<u8>,
+    opcode: u8,
+    form: u8,
+    dst: u16,
+    lhs: u16,
+    rhs: u16,
+) -> (u8, u8) {
+    regs(operands, &[dst, lhs, rhs]);
+    (opcode, form)
+}
+
+fn call_operands(
+    operands: &mut Vec<u8>,
+    dst: u16,
+    function_ref: u32,
+    args: &[u16],
+) -> Result<(), EncodeError> {
+    reg(operands, dst);
+    id(operands, function_ref);
+    encode_args(operands, args)
+}
+
+fn capability_operands(
+    operands: &mut Vec<u8>,
+    dst: u16,
+    capability: u32,
+    operation: u32,
+    args: &[u16],
+) -> Result<(), EncodeError> {
+    reg(operands, dst);
+    id(operands, capability);
+    id(operands, operation);
+    encode_args(operands, args)
+}
+
+fn encode_args(operands: &mut Vec<u8>, args: &[u16]) -> Result<(), EncodeError> {
+    id(
+        operands,
+        to_u32(args.len(), "instruction argument count exceeds u32")?,
+    );
+    regs(operands, args);
+    Ok(())
+}
+
+fn regs(bytes: &mut Vec<u8>, values: &[u16]) {
+    for value in values {
+        reg(bytes, *value);
+    }
+}
+
+fn reg(bytes: &mut Vec<u8>, value: u16) {
+    u16le(bytes, value);
+}
+
+fn id(bytes: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
 }
 
 fn frame(bytes: &mut Vec<u8>, opcode: u8, form: u8, operands: &[u8]) -> Result<(), EncodeError> {
