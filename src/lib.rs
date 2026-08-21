@@ -34,5 +34,14 @@ mod test_support;
 #[cfg_attr(not(test), allow(dead_code))]
 mod verify;
 
+pub use artifact::{EntryPoint, VerifiedArtifact};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use limits::ArtifactLimits;
+
+/// Decodes and verifies an untrusted Compukter artifact before publishing it.
+pub fn verify_artifact(
+    bytes: std::sync::Arc<[u8]>,
+    limits: ArtifactLimits,
+) -> Result<VerifiedArtifact, DiagnosticSet> {
+    verify::verify_artifact(bytes, limits)
+}

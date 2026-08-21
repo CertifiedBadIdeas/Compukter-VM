@@ -42,6 +42,63 @@ pub(crate) struct DecodedArtifact {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryPoint {
+    pub module: u32,
+    pub function: u32,
+}
+
+/// A fully decoded and verified artifact.
+///
+/// It cannot be constructed without passing [`crate::verify_artifact`].
+///
+/// ```compile_fail
+/// let artifact = compukter_vm::VerifiedArtifact {};
+/// ```
+#[derive(Clone)]
+pub struct VerifiedArtifact {
+    inner: Arc<VerifiedArtifactInner>,
+}
+
+impl std::fmt::Debug for VerifiedArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedArtifact")
+            .field("content_hash", &self.content_hash())
+            .field("entry", &self.entry())
+            .field("module_count", &self.module_count())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct VerifiedArtifactInner {
+    decoded: DecodedArtifact,
+}
+
+impl VerifiedArtifact {
+    pub(crate) fn new(decoded: DecodedArtifact) -> Self {
+        Self {
+            inner: Arc::new(VerifiedArtifactInner { decoded }),
+        }
+    }
+
+    pub fn content_hash(&self) -> [u8; 32] {
+        self.inner.decoded.content_hash
+    }
+
+    pub fn entry(&self) -> EntryPoint {
+        EntryPoint {
+            module: self.inner.decoded.header.entry_module,
+            function: self.inner.decoded.header.entry_function,
+        }
+    }
+
+    pub fn module_count(&self) -> usize {
+        self.inner.decoded.modules.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Manifest {
     pub required_heap_bytes: u32,
     pub required_stack_bytes: u32,
