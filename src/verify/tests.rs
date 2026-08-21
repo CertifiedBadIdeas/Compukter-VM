@@ -149,3 +149,480 @@ fn module_rejects_field_owned_by_function_type() {
     let error = super::modules::verify_modules(&artifact, &ArtifactLimits::default()).unwrap_err();
     assert_eq!(error.first().unwrap().code, Code::BadType);
 }
+
+fn verify_cfg(artifact: &crate::artifact::DecodedArtifact) -> Result<(), crate::DiagnosticSet> {
+    super::functions::verify_functions(artifact, &ArtifactLimits::default())
+}
+
+fn unit_return() -> crate::artifact::DecodedCode {
+    crate::artifact::DecodedCode {
+        bytes: crate::artifact::ByteRange { start: 0, end: 0 },
+        instructions: vec![crate::artifact::Instruction::Return { value: u16::MAX }]
+            .into_boxed_slice(),
+        fixed_cost: 1,
+    }
+}
+
+#[test]
+fn cfg_accepts_vector_a() {
+    verify_cfg(&decoded(support::minimal_vector())).unwrap();
+}
+
+#[test]
+fn cfg_rejects_bad_entry_function() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.header.entry_function = 1;
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadControlFlow);
+}
+
+#[test]
+fn cfg_rejects_uninitialized_register_read() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.manifest.maximum_block_cost = 2;
+    let function = &mut artifact.modules[0].functions[0];
+    function.register_count = 2;
+    function.registers = vec![
+        crate::artifact::ValueType {
+            kind: 1,
+            flags: 0,
+            nominal_type: crate::artifact::TypeId(u32::MAX),
+        },
+        crate::artifact::ValueType {
+            kind: 1,
+            flags: 0,
+            nominal_type: crate::artifact::TypeId(u32::MAX),
+        },
+    ];
+    artifact.modules[0].blocks[0].instruction_count = 2;
+    artifact.modules[0].blocks[0].declared_fixed_cost = 2;
+    artifact.modules[0].code[0].instructions = vec![
+        crate::artifact::Instruction::Move { dst: 0, src: 1 },
+        crate::artifact::Instruction::Return { value: u16::MAX },
+    ]
+    .into_boxed_slice();
+    artifact.modules[0].code[0].fixed_cost = 2;
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::UninitializedRegister);
+}
+
+#[test]
+fn cfg_rejects_wrong_destination_type() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.manifest.maximum_block_cost = 2;
+    let bool_type = crate::artifact::ValueType {
+        kind: 5,
+        flags: 0,
+        nominal_type: crate::artifact::TypeId(u32::MAX),
+    };
+    let i32_type = crate::artifact::ValueType {
+        kind: 1,
+        flags: 0,
+        nominal_type: crate::artifact::TypeId(u32::MAX),
+    };
+    artifact.modules[0].types[0] = crate::artifact::NominalType::Function {
+        name: 1,
+        flags: 0,
+        result: crate::artifact::ValueType {
+            kind: 0,
+            flags: 0,
+            nominal_type: crate::artifact::TypeId(u32::MAX),
+        },
+        parameters: vec![bool_type, i32_type],
+    };
+    let function = &mut artifact.modules[0].functions[0];
+    function.register_count = 2;
+    function.parameter_count = 2;
+    function.registers = vec![bool_type, i32_type];
+    artifact.modules[0].blocks[0].instruction_count = 2;
+    artifact.modules[0].blocks[0].declared_fixed_cost = 2;
+    artifact.modules[0].code[0].instructions = vec![
+        crate::artifact::Instruction::Move { dst: 0, src: 1 },
+        crate::artifact::Instruction::Return { value: u16::MAX },
+    ]
+    .into_boxed_slice();
+    artifact.modules[0].code[0].fixed_cost = 2;
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn cfg_rejects_unreachable_block() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].functions[0].block_count = 2;
+    artifact.modules[0].blocks.push(crate::artifact::Block {
+        owner_function: crate::artifact::FunctionId(0),
+        code_record: crate::artifact::BlockId(1),
+        instruction_count: 1,
+        declared_fixed_cost: 1,
+        flags: 0,
+    });
+    artifact.modules[0].code.push(unit_return());
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadControlFlow);
+}
+
+#[test]
+fn cfg_rejects_backedge_to_non_safepoint() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].code[0].instructions =
+        vec![crate::artifact::Instruction::Jump { target: 0 }].into_boxed_slice();
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadControlFlow);
+}
+
+#[test]
+fn cfg_rejects_incorrect_block_cost() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].blocks[0].declared_fixed_cost = 2;
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadCost);
+}
+
+fn primitive(kind: u8) -> crate::artifact::ValueType {
+    crate::artifact::ValueType {
+        kind,
+        flags: 0,
+        nominal_type: crate::artifact::TypeId(u32::MAX),
+    }
+}
+
+fn reference(type_id: u32, nullable: bool) -> crate::artifact::ValueType {
+    crate::artifact::ValueType {
+        kind: 7,
+        flags: u8::from(nullable),
+        nominal_type: crate::artifact::TypeId(type_id),
+    }
+}
+
+fn configure_entry(
+    artifact: &mut crate::artifact::DecodedArtifact,
+    registers: Vec<crate::artifact::ValueType>,
+    parameter_count: u16,
+    instructions: Vec<crate::artifact::Instruction>,
+) {
+    let parameters = registers[..parameter_count as usize].to_vec();
+    artifact.modules[0].types[0] = crate::artifact::NominalType::Function {
+        name: 1,
+        flags: 0,
+        result: primitive(0),
+        parameters,
+    };
+    let function = &mut artifact.modules[0].functions[0];
+    function.register_count = registers.len() as u16;
+    function.parameter_count = parameter_count;
+    function.registers = registers;
+    let fixed_cost = instructions
+        .iter()
+        .map(|instruction| instruction.fixed_cost().unwrap())
+        .sum();
+    artifact.manifest.maximum_block_cost = fixed_cost;
+    artifact.modules[0].blocks[0].instruction_count = instructions.len() as u32;
+    artifact.modules[0].blocks[0].declared_fixed_cost = fixed_cost;
+    artifact.modules[0].code[0].instructions = instructions.into_boxed_slice();
+    artifact.modules[0].code[0].fixed_cost = fixed_cost;
+}
+
+#[test]
+fn cfg_accepts_imported_direct_call() {
+    let mut artifact = decoded(support::two_module_vector());
+    configure_entry(
+        &mut artifact,
+        Vec::new(),
+        0,
+        vec![
+            crate::artifact::Instruction::CallDirect {
+                dst: u16::MAX,
+                function_ref: 0x8000_0000,
+                args: Vec::new().into_boxed_slice(),
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
+fn cfg_rejects_wrong_call_argument_count() {
+    let mut artifact = decoded(support::two_module_vector());
+    configure_entry(
+        &mut artifact,
+        vec![primitive(1)],
+        1,
+        vec![
+            crate::artifact::Instruction::CallDirect {
+                dst: u16::MAX,
+                function_ref: 0x8000_0000,
+                args: vec![0].into_boxed_slice(),
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn cfg_rejects_direct_call_to_abstract_function() {
+    let mut artifact = decoded(support::two_module_vector());
+    artifact.modules[1].functions[0].flags |= 1 << 3;
+    artifact.modules[1].functions[0].block_count = 0;
+    configure_entry(
+        &mut artifact,
+        Vec::new(),
+        0,
+        vec![
+            crate::artifact::Instruction::CallDirect {
+                dst: u16::MAX,
+                function_ref: 0x8000_0000,
+                args: Vec::new().into_boxed_slice(),
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn cfg_rejects_forged_import_kind_reference() {
+    let mut artifact = decoded(support::two_module_vector());
+    configure_entry(
+        &mut artifact,
+        vec![reference(0, false)],
+        0,
+        vec![
+            crate::artifact::Instruction::NewObject {
+                dst: 0,
+                type_ref: 0x8000_0000,
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+fn field_artifact(nullable_receiver: bool, mutable: bool) -> crate::artifact::DecodedArtifact {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].types.push(class(0, 0, u32::MAX));
+    artifact.modules[0].fields.push(crate::artifact::Field {
+        owner: crate::artifact::TypeId(1),
+        name: 1,
+        value_type: primitive(1),
+        flags: u32::from(mutable),
+    });
+    configure_entry(
+        &mut artifact,
+        vec![reference(1, nullable_receiver), primitive(1)],
+        2,
+        vec![
+            crate::artifact::Instruction::FieldSet {
+                receiver: 0,
+                field_ref: 0,
+                value: 1,
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    artifact
+}
+
+#[test]
+fn cfg_accepts_mutable_field_write() {
+    verify_cfg(&field_artifact(false, true)).unwrap();
+}
+
+#[test]
+fn cfg_accepts_base_field_through_subclass_receiver() {
+    let mut artifact = field_artifact(false, true);
+    artifact.modules[0].types.push(class(0, 0, 1));
+    configure_entry(
+        &mut artifact,
+        vec![reference(2, false), primitive(1)],
+        2,
+        vec![
+            crate::artifact::Instruction::FieldSet {
+                receiver: 0,
+                field_ref: 0,
+                value: 1,
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
+fn cfg_rejects_immutable_field_write() {
+    let error = verify_cfg(&field_artifact(false, false)).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn cfg_rejects_nullable_field_receiver() {
+    let error = verify_cfg(&field_artifact(true, true)).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn cfg_rejects_target_outside_function() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].code[0].instructions =
+        vec![crate::artifact::Instruction::Jump { target: 1 }].into_boxed_slice();
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadControlFlow);
+}
+
+#[test]
+fn cfg_rejects_missing_terminator() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].code[0].instructions =
+        vec![crate::artifact::Instruction::Nop].into_boxed_slice();
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadControlFlow);
+}
+
+#[test]
+fn cfg_rejects_noncontiguous_function_blocks() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].blocks[0].owner_function = crate::artifact::FunctionId(1);
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadControlFlow);
+}
+
+#[test]
+fn cfg_rejects_value_initialized_on_only_one_join_path() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0]
+        .constants
+        .push(crate::artifact::Constant::I32(7));
+    artifact.modules[0].types[0] = crate::artifact::NominalType::Function {
+        name: 1,
+        flags: 0,
+        result: primitive(0),
+        parameters: vec![primitive(5)],
+    };
+    let function = &mut artifact.modules[0].functions[0];
+    function.register_count = 3;
+    function.parameter_count = 1;
+    function.registers = vec![primitive(5), primitive(1), primitive(1)];
+    function.block_count = 3;
+    artifact.manifest.maximum_block_cost = 2;
+    artifact.modules[0].blocks = vec![
+        crate::artifact::Block {
+            owner_function: crate::artifact::FunctionId(0),
+            code_record: crate::artifact::BlockId(0),
+            instruction_count: 1,
+            declared_fixed_cost: 1,
+            flags: 0,
+        },
+        crate::artifact::Block {
+            owner_function: crate::artifact::FunctionId(0),
+            code_record: crate::artifact::BlockId(1),
+            instruction_count: 2,
+            declared_fixed_cost: 2,
+            flags: 0,
+        },
+        crate::artifact::Block {
+            owner_function: crate::artifact::FunctionId(0),
+            code_record: crate::artifact::BlockId(2),
+            instruction_count: 2,
+            declared_fixed_cost: 2,
+            flags: 0,
+        },
+    ];
+    artifact.modules[0].code = vec![
+        crate::artifact::DecodedCode {
+            bytes: crate::artifact::ByteRange { start: 0, end: 0 },
+            instructions: vec![crate::artifact::Instruction::Branch {
+                condition: 0,
+                true_block: 1,
+                false_block: 2,
+            }]
+            .into_boxed_slice(),
+            fixed_cost: 1,
+        },
+        crate::artifact::DecodedCode {
+            bytes: crate::artifact::ByteRange { start: 0, end: 0 },
+            instructions: vec![
+                crate::artifact::Instruction::Const {
+                    dst: 1,
+                    constant: 0,
+                },
+                crate::artifact::Instruction::Jump { target: 2 },
+            ]
+            .into_boxed_slice(),
+            fixed_cost: 2,
+        },
+        crate::artifact::DecodedCode {
+            bytes: crate::artifact::ByteRange { start: 0, end: 0 },
+            instructions: vec![
+                crate::artifact::Instruction::Move { dst: 2, src: 1 },
+                crate::artifact::Instruction::Return { value: u16::MAX },
+            ]
+            .into_boxed_slice(),
+            fixed_cost: 2,
+        },
+    ];
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::UninitializedRegister);
+}
+
+#[test]
+fn cfg_rejects_wrong_call_argument_type() {
+    let mut artifact = decoded(support::two_module_vector());
+    artifact.modules[1].types[0] = crate::artifact::NominalType::Function {
+        name: 1,
+        flags: 0,
+        result: primitive(0),
+        parameters: vec![primitive(1)],
+    };
+    artifact.modules[1].functions[0].register_count = 1;
+    artifact.modules[1].functions[0].parameter_count = 1;
+    artifact.modules[1].functions[0].registers = vec![primitive(1)];
+    configure_entry(
+        &mut artifact,
+        vec![primitive(5)],
+        1,
+        vec![
+            crate::artifact::Instruction::CallDirect {
+                dst: u16::MAX,
+                function_ref: 0x8000_0000,
+                args: vec![0].into_boxed_slice(),
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn cfg_rejects_invalid_field_receiver_kind() {
+    let mut artifact = field_artifact(false, true);
+    configure_entry(
+        &mut artifact,
+        vec![primitive(1), primitive(1)],
+        2,
+        vec![
+            crate::artifact::Instruction::FieldSet {
+                receiver: 0,
+                field_ref: 0,
+                value: 1,
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn cfg_accepts_while_true_at_loop_header_safepoint() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].blocks[0].flags = 1;
+    artifact.modules[0].code[0].instructions =
+        vec![crate::artifact::Instruction::Jump { target: 0 }].into_boxed_slice();
+    verify_cfg(&artifact).unwrap();
+}
