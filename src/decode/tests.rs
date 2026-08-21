@@ -1,4 +1,5 @@
 use crate::{diagnostic::Code, limits::ArtifactLimits};
+use std::sync::Arc;
 
 #[path = "../../tests/support/mod.rs"]
 mod support;
@@ -234,4 +235,135 @@ fn indexed_rejects_record_id_outside_table() {
         .unwrap();
     let section = super::indexed::IndexedSection::decode(&container, entry, &limits).unwrap();
     assert_eq!(section.record(2).unwrap_err().code, Code::BadRecord);
+}
+
+#[test]
+fn records_decode_spec_vector_a() {
+    let bytes = support::minimal_vector();
+    assert_eq!(bytes.len(), 1088);
+    assert_eq!(
+        support::artifact_hash(&bytes),
+        support::hex32("88803a07260a3b0123ef230b482a682400e6cae03e90f3be0a117419406509d3")
+    );
+    let artifact =
+        super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap();
+
+    assert_eq!(artifact.modules.len(), 1);
+    assert_eq!(artifact.header.entry_module, 0);
+    assert_eq!(artifact.header.entry_function, 0);
+    let module = &artifact.modules[0];
+    assert_eq!(module.name_string, 0);
+    assert_eq!(module.flags, 1);
+    assert_eq!(module.declared_imports, 0);
+    assert_eq!(module.declared_exports, 0);
+    assert_eq!(module.declared_types, 1);
+    assert_eq!(module.declared_functions, 1);
+    let strings: Vec<_> = module
+        .strings
+        .iter()
+        .map(|range| std::str::from_utf8(range.slice(&artifact.bytes)).unwrap())
+        .collect();
+    assert_eq!(strings, ["app", "entry"]);
+    assert_eq!(
+        artifact.content_hash,
+        support::artifact_hash(&artifact.bytes)
+    );
+    assert_eq!(artifact.manifest.maximum_coroutines, 1);
+    assert_eq!(artifact.manifest.maximum_call_depth, 1);
+    assert_eq!(artifact.manifest.maximum_block_cost, 1);
+    assert_eq!(artifact.manifest.minimum_slice_cost, 1);
+    assert_eq!(artifact.capabilities.len(), 0);
+    assert_eq!(artifact.modules[0].types.len(), 1);
+    assert!(matches!(
+        artifact.modules[0].types[0],
+        crate::artifact::NominalType::Function { ref parameters, .. } if parameters.is_empty()
+    ));
+    assert!(artifact.modules[0].constants.is_empty());
+    assert!(artifact.modules[0].imports.is_empty());
+    assert!(artifact.modules[0].exports.is_empty());
+    assert!(artifact.modules[0].fields.is_empty());
+    assert_eq!(artifact.modules[0].functions.len(), 1);
+    assert_eq!(artifact.modules[0].functions[0].block_count, 1);
+    assert_eq!(artifact.modules[0].blocks.len(), 1);
+    assert_eq!(artifact.modules[0].blocks[0].declared_fixed_cost, 1);
+    assert_eq!(
+        artifact.modules[0].code[0].slice(&artifact.bytes),
+        [0xe3, 0, 6, 0, 0xff, 0xff]
+    );
+    assert!(artifact.modules[0].exceptions.is_empty());
+    assert!(artifact.modules[0].debug.is_empty());
+    assert_eq!(
+        artifact.modules[0].semantic_hash,
+        support::hex32("f73d8f8699e060aac0df1079d820a9fd778a649dd391980c23ee2a4e3c17c2cc")
+    );
+}
+
+#[test]
+fn records_reject_module_count_disagreement() {
+    let mut bytes = support::minimal_vector();
+    support::write_u32(&mut bytes, 664, 0);
+    support::rehash(&mut bytes);
+    let error =
+        super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadRecord);
+}
+
+#[test]
+fn records_reject_out_of_range_local_ids() {
+    let mut bytes = support::minimal_vector();
+    let module = support::indexed_record_offset(&bytes, crate::artifact::format::MODULES, 0, 0);
+    support::write_u32(&mut bytes, module, 99);
+    support::rehash(&mut bytes);
+    let error =
+        super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadRecord);
+}
+
+#[test]
+fn records_reject_function_parameter_count_above_register_count() {
+    let mut bytes = support::minimal_vector();
+    let function = support::indexed_record_offset(&bytes, crate::artifact::format::FUNCTIONS, 1, 0);
+    support::write_u16(&mut bytes, function + 18, 1);
+    support::rehash(&mut bytes);
+    let error =
+        super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadRecord);
+}
+
+#[test]
+fn records_reject_block_code_id_disagreement() {
+    let mut bytes = support::minimal_vector();
+    let block = support::indexed_record_offset(&bytes, crate::artifact::format::BLOCKS, 1, 0);
+    support::write_u32(&mut bytes, block + 4, 1);
+    support::rehash(&mut bytes);
+    let error =
+        super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadRecord);
+}
+
+#[test]
+fn records_enforce_artifact_wide_table_limits() {
+    let limits = [
+        ArtifactLimits {
+            strings_bytes: 7,
+            ..ArtifactLimits::default()
+        },
+        ArtifactLimits {
+            code_bytes: 5,
+            ..ArtifactLimits::default()
+        },
+        ArtifactLimits {
+            functions: 0,
+            ..ArtifactLimits::default()
+        },
+        ArtifactLimits {
+            blocks: 0,
+            ..ArtifactLimits::default()
+        },
+    ];
+    for limits in limits {
+        let error = super::records::decode_artifact(Arc::from(support::minimal_vector()), &limits)
+            .unwrap_err();
+        assert_eq!(error.first().unwrap().code, Code::LimitExceeded);
+    }
 }

@@ -178,6 +178,21 @@ pub(crate) fn rehash(bytes: &mut [u8]) {
     bytes[payload_end..].copy_from_slice(&digest);
 }
 
+pub(crate) fn artifact_hash(bytes: &[u8]) -> [u8; 32] {
+    let payload_end = bytes.len() - DIGEST_SIZE;
+    Sha256::digest(&bytes[..payload_end]).into()
+}
+
+pub(crate) fn hex32(value: &str) -> [u8; 32] {
+    assert_eq!(value.len(), 64);
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).unwrap();
+        bytes[index] = u8::from_str_radix(text, 16).unwrap();
+    }
+    bytes
+}
+
 pub(crate) fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -188,6 +203,27 @@ pub(crate) fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
 
 pub(crate) fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+pub(crate) fn indexed_record_offset(bytes: &[u8], kind: u16, scope: u32, id: usize) -> usize {
+    let section_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let entry = (0..section_count)
+        .map(|index| HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE)
+        .find(|offset| {
+            u16::from_le_bytes(bytes[*offset..*offset + 2].try_into().unwrap()) == kind
+                && u32::from_le_bytes(bytes[*offset + 4..*offset + 8].try_into().unwrap()) == scope
+        })
+        .unwrap();
+    let section = u64::from_le_bytes(bytes[entry + 8..entry + 16].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(bytes[section..section + 4].try_into().unwrap()) as usize;
+    assert!(id < count);
+    let prefix = align8(16 + 4 * (count + 1));
+    let relative = u32::from_le_bytes(
+        bytes[section + 16 + id * 4..section + 20 + id * 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    section + prefix + relative
 }
 
 pub(crate) fn minimal_vector_with_overlapping_sections() -> Vec<u8> {
