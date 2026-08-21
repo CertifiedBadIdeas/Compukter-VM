@@ -6,12 +6,27 @@ use crate::{
     limits::ArtifactLimits,
 };
 
-use super::{cfg::verify_control_flow, modules};
+use super::{
+    cfg::verify_control_flow,
+    exceptions::{ExceptionModel, Handler},
+    modules,
+};
 
 pub(crate) fn verify_functions(
     artifact: &DecodedArtifact,
+    exceptions: &ExceptionModel,
     limits: &ArtifactLimits,
 ) -> Result<(), DiagnosticSet> {
+    if artifact.manifest.minimum_slice_cost < artifact.manifest.maximum_block_cost {
+        return Err(failure(
+            limits,
+            Family::Cost,
+            Code::BadCost,
+            0,
+            0,
+            "minimum slice cost is below maximum block cost",
+        ));
+    }
     let entry_module = artifact.header.entry_module as usize;
     let entry_function = artifact.header.entry_function as usize;
     if artifact
@@ -48,7 +63,13 @@ pub(crate) fn verify_functions(
                 }
                 continue;
             }
-            let control = verify_control_flow(module, module_id, function_id, limits)?;
+            let handlers = &exceptions.functions[module_id][function_id];
+            let handler_blocks: Vec<_> = handlers
+                .iter()
+                .map(|handler| handler.handler_block)
+                .collect();
+            let control =
+                verify_control_flow(module, module_id, function_id, &handler_blocks, limits)?;
             verify_dataflow(
                 artifact,
                 module_id,
@@ -56,6 +77,7 @@ pub(crate) fn verify_functions(
                 function,
                 signature,
                 &control.successors,
+                handlers,
                 limits,
             )?;
         }
@@ -134,6 +156,7 @@ fn verify_dataflow(
     function: &Function,
     signature: (usize, &ValueType, &[ValueType]),
     successors: &[Vec<usize>],
+    handlers: &[Handler],
     limits: &ArtifactLimits,
 ) -> Result<(), DiagnosticSet> {
     let words = (function.register_count as usize).div_ceil(64);
@@ -194,6 +217,19 @@ fn verify_dataflow(
             ));
         }
         for instruction in &code.instructions {
+            if may_throw(instruction) {
+                for handler in handlers.iter().filter(|handler| {
+                    block_id >= handler.protected_start && block_id < handler.protected_end
+                }) {
+                    let mut incoming = state.clone();
+                    for parameter in 0..function.parameter_count as usize {
+                        set(&mut incoming, parameter);
+                    }
+                    set(&mut incoming, handler.exception_register as usize);
+                    let local_handler = handler.handler_block - block_start;
+                    merge_state(&mut states, &mut queue, local_handler, &incoming);
+                }
+            }
             verify_instruction(
                 artifact,
                 module_id,
@@ -206,26 +242,74 @@ fn verify_dataflow(
             )?;
         }
         for target in &successors[local_block] {
-            match &mut states[*target] {
-                None => {
-                    states[*target] = Some(state.clone());
-                    queue.push_back(*target);
-                }
-                Some(existing) => {
-                    let mut changed = false;
-                    for (word, incoming) in existing.iter_mut().zip(&state) {
-                        let intersection = *word & *incoming;
-                        changed |= intersection != *word;
-                        *word = intersection;
-                    }
-                    if changed {
-                        queue.push_back(*target);
-                    }
-                }
+            merge_state(&mut states, &mut queue, *target, &state);
+        }
+    }
+    if states.iter().any(Option::is_none) {
+        return Err(failure(
+            limits,
+            Family::Cfg,
+            Code::BadControlFlow,
+            module_id,
+            function_id,
+            "exception handler has no potentially throwing predecessor",
+        ));
+    }
+    Ok(())
+}
+
+fn merge_state(
+    states: &mut [Option<Vec<u64>>],
+    queue: &mut VecDeque<usize>,
+    target: usize,
+    incoming: &[u64],
+) {
+    match &mut states[target] {
+        None => {
+            states[target] = Some(incoming.to_vec());
+            queue.push_back(target);
+        }
+        Some(existing) => {
+            let mut changed = false;
+            for (word, incoming) in existing.iter_mut().zip(incoming) {
+                let intersection = *word & *incoming;
+                changed |= intersection != *word;
+                *word = intersection;
+            }
+            if changed {
+                queue.push_back(target);
             }
         }
     }
-    Ok(())
+}
+
+fn may_throw(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::Convert { .. }
+            | Instruction::Div { .. }
+            | Instruction::Rem { .. }
+            | Instruction::NewObject { .. }
+            | Instruction::NewArray { .. }
+            | Instruction::ArrayLength { .. }
+            | Instruction::ArrayLoad { .. }
+            | Instruction::ArrayStore { .. }
+            | Instruction::FieldGet { .. }
+            | Instruction::FieldSet { .. }
+            | Instruction::StaticGet { .. }
+            | Instruction::StaticSet { .. }
+            | Instruction::CheckedCast { .. }
+            | Instruction::CallDirect { .. }
+            | Instruction::CallVirtual { .. }
+            | Instruction::CallInterface { .. }
+            | Instruction::CoroutineSpawn { .. }
+            | Instruction::CapabilityCallSync { .. }
+            | Instruction::Throw { .. }
+            | Instruction::CallSuspend { .. }
+            | Instruction::Sleep { .. }
+            | Instruction::CoroutineJoin { .. }
+            | Instruction::CapabilityCallAsync { .. }
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -239,6 +323,25 @@ fn verify_instruction(
     state: &mut [u64],
     limits: &ArtifactLimits,
 ) -> Result<(), DiagnosticSet> {
+    if function.flags & 1 == 0
+        && matches!(
+            instruction,
+            Instruction::CallSuspend { .. }
+                | Instruction::Yield { .. }
+                | Instruction::Sleep { .. }
+                | Instruction::CoroutineJoin { .. }
+                | Instruction::CapabilityCallAsync { .. }
+        )
+    {
+        return Err(failure(
+            limits,
+            Family::Cfg,
+            Code::BadControlFlow,
+            module_id,
+            function_id,
+            "suspending terminator appears in a non-suspending function",
+        ));
+    }
     match instruction {
         Instruction::Nop | Instruction::Jump { .. } | Instruction::Unreachable => {}
         Instruction::Move { dst, src } => {
@@ -815,7 +918,20 @@ fn verify_instruction(
             require_kind(function, *dst, 7, module_id, function_id, limits)?;
             write(state, *dst, function, module_id, function_id, limits)?;
         }
-        Instruction::CapabilityCallSync { dst, args, .. } => {
+        Instruction::CapabilityCallSync {
+            dst,
+            capability,
+            operation,
+            args,
+        } => {
+            verify_capability(
+                artifact,
+                module_id,
+                function_id,
+                *capability,
+                *operation,
+                limits,
+            )?;
             for argument in args.iter() {
                 read(function, state, *argument, module_id, function_id, limits)?;
             }
@@ -903,7 +1019,21 @@ fn verify_instruction(
                 write(state, *dst, function, module_id, function_id, limits)?;
             }
         }
-        Instruction::CapabilityCallAsync { dst, args, .. } => {
+        Instruction::CapabilityCallAsync {
+            dst,
+            capability,
+            operation,
+            args,
+            ..
+        } => {
+            verify_capability(
+                artifact,
+                module_id,
+                function_id,
+                *capability,
+                *operation,
+                limits,
+            )?;
             for argument in args.iter() {
                 read(function, state, *argument, module_id, function_id, limits)?;
             }
@@ -1258,7 +1388,7 @@ fn require_kind(
     }
 }
 
-fn value_assignable(
+pub(super) fn value_assignable(
     artifact: &DecodedArtifact,
     source_module: usize,
     source: ValueType,
@@ -1440,6 +1570,48 @@ fn code_failure(
         limits,
         Family::Code,
         Code::BadInstruction,
+        module,
+        function,
+        detail,
+    )
+}
+
+fn verify_capability(
+    artifact: &DecodedArtifact,
+    module: usize,
+    function: usize,
+    capability: u32,
+    operation: u32,
+    limits: &ArtifactLimits,
+) -> Result<(), DiagnosticSet> {
+    let descriptor = artifact
+        .capabilities
+        .get(capability as usize)
+        .ok_or_else(|| {
+            capability_failure(limits, module, function, "capability id is out of range")
+        })?;
+    if operation >= descriptor.operation_count {
+        Err(capability_failure(
+            limits,
+            module,
+            function,
+            "capability operation id is out of range",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn capability_failure(
+    limits: &ArtifactLimits,
+    module: usize,
+    function: usize,
+    detail: &'static str,
+) -> DiagnosticSet {
+    failure(
+        limits,
+        Family::Capability,
+        Code::BadCapability,
         module,
         function,
         detail,

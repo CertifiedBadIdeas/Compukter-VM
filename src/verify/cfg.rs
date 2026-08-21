@@ -14,6 +14,7 @@ pub(super) fn verify_control_flow(
     module: &DecodedModule,
     module_id: usize,
     function_id: usize,
+    handler_blocks: &[usize],
     limits: &ArtifactLimits,
 ) -> Result<ControlFlow, DiagnosticSet> {
     let function = &module.functions[function_id];
@@ -91,6 +92,14 @@ pub(super) fn verify_control_flow(
                     "backedge target is not a loop-header safepoint",
                 ));
             }
+            if handler_blocks.contains(&target) {
+                return Err(failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "ordinary control flow targets an exception handler",
+                ));
+            }
             local.push(target - start);
         }
         successors.push(local);
@@ -108,7 +117,11 @@ pub(super) fn verify_control_flow(
             }
         }
     }
-    if reachable.iter().any(|value| !value) {
+    if reachable
+        .iter()
+        .enumerate()
+        .any(|(local, value)| !value && !handler_blocks.contains(&(start + local)))
+    {
         return Err(failure(
             limits,
             module_id,
