@@ -17,7 +17,23 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#![doc = "The standalone managed runtime for Compukter bytecode."]
+//! The standalone managed runtime for Compukter bytecode.
+//!
+//! Artifact loading accepts immutable bytes and caller-selected resource
+//! limits. It publishes only a fully verified artifact:
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use compukter_vm::{verify_artifact, ArtifactLimits, DiagnosticSet, VerifiedArtifact};
+//!
+//! fn load(bytes: Arc<[u8]>) -> Result<VerifiedArtifact, DiagnosticSet> {
+//!     verify_artifact(bytes, ArtifactLimits::default())
+//! }
+//! ```
+//!
+//! The artifact digest proves integrity, not publisher authenticity. Host trust
+//! policy, device admission, and execution remain separate from verification.
 
 #[cfg_attr(not(test), allow(dead_code))]
 mod artifact;
@@ -39,6 +55,9 @@ pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use limits::ArtifactLimits;
 
 /// Decodes and verifies an untrusted Compukter artifact before publishing it.
+///
+/// `limits` bounds parsing and verification work. Successful verification does
+/// not authenticate, admit, reserve resources for, or execute the artifact.
 pub fn verify_artifact(
     bytes: std::sync::Arc<[u8]>,
     limits: ArtifactLimits,
