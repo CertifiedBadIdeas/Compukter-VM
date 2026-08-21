@@ -1,74 +1,32 @@
 # Compukter VM
 
-Compukter VM is the standalone deterministic RV32 virtual machine used by
-[Compukter Kraft](https://github.com/CertifiedBadIdeas/Compukter-Kraft). It
-implements the product RV32IMA_Zicsr_Zifencei ISA plus the complete ratified
-RV32 Zbb 1.0 subset, ELF32/ILP32 execution model, bounded translation caches,
-and the VM-owned performance suite. Because Zba and Zbs are not implemented
-yet, `misa.B` remains zero and the VM does not claim the complete B extension.
+Compukter VM is the standalone managed Rust runtime used by
+[Compukter Kraft](https://github.com/CertifiedBadIdeas/Compukter-Kraft).
+
+The project is in an intentional clean-break interval. The retired RISC-V
+machine, ELF runtime, and native-code backends have been removed. The new
+platform compiles Kotlin scripts through a pinned K2/Kotlin IR target into a
+versioned Compukter bytecode executed only inside this resource-bounded VM.
+
+The accepted architecture is tracked by
+[Compukter-Kraft issue #500](https://github.com/CertifiedBadIdeas/Compukter-Kraft/issues/500).
+Artifact, verifier, interpreter, heap, scheduler, snapshot, and optimization
+contracts will be introduced through independently verified roadmap slices.
 
 ## Local verification
 
 ```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked --offline
 ```
 
-The stock-toolchain ELF contracts additionally require Clang and LLD:
-
-```bash
-bash scripts/tests/rv32-elf-boot-contract.sh
-bash scripts/tests/rv32-elf-trap-contract.sh
-bash scripts/tests/rv32-elf-atomic-contract.sh
-bash scripts/tests/rv32-elf-zbb-contract.sh
-```
-
-## Benchmarks
-
-The complete-machine benchmark has no external tool dependency:
-
-```bash
-cargo run -p compukter-vm-benchmarks --release --locked --offline \
-    --bin rv32_machine_benchmarks -- 1000 21 7
-```
-
-The shared native, QEMU, and product comparison is intentionally strict. It
-requires `clang`, `ld.lld`, LLVM inspection tools, and `qemu-system-riscv32`:
-
-```bash
-bash scripts/tests/rv32-c-qemu-comparison.sh
-```
-
-To measure the effect of compiler-generated Zbb instructions against the same
-current Cached DBT configuration:
-
-```bash
-bash scripts/tests/rv32-c-zbb-self-ab.sh
-```
-
-For focused measurements of only the current product-default Cached DBT:
-
-```bash
-cargo run -p compukter-vm-benchmarks --release --locked --offline \
-    --bin rv32_c_comparison -- product-default target/rv32-c-comparison 21
-```
-
-Its C kernel, linker scripts, and startup code live in
-`tools/compukter-vm-benchmarks/assets/rv32-c-comparison`. Generated benchmark artifacts are local to
-`target/` and are not committed.
-
 ## Compukter Kraft integration
 
-Compukter Kraft consumes this repository as the pinned
-`host/compukter-vm` submodule. In the mod repository, initialize it with:
+Compukter Kraft consumes this repository as its pinned
+`host/compukter-vm` submodule. Runtime changes are committed in the submodule
+repository first; the consuming repository then records the selected submodule
+commit.
 
-```bash
-git submodule update --init --recursive
-```
-
-The VM does not read sources, assets, scripts, or build outputs from the parent
-repository.
-
-## Platform ABI
-
-The built-in MMIO layout, deterministic machine timer, and `WFI` host contract
-are documented in [docs/PLATFORM.md](docs/PLATFORM.md).
+The VM must remain independent of Minecraft, NeoForge, Kotlin compiler
+internals, and files outside its repository checkout.

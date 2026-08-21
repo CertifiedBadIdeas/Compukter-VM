@@ -1,37 +1,10 @@
-[workspace]
-members = ["crates/compukter-vm-devices", "tools/compukter-vm-benchmarks"]
-default-members = ["."]
-resolver = "2"
-
 [package]
 name = "compukter-vm"
 version = "0.1.0"
 edition = "2021"
-include = [
-    "src/**",
-    "docs/PLATFORM.md",
-    "Cargo.toml",
-    "Cargo.lock",
-    "README.md",
-]
 
 [lib]
 crate-type = ["rlib"]
-
-[features]
-default = []
-unstable-benchmark-support = []
-dbt-chain-stats = []
-dbt-code-audit = []
-dbt-execution-profile = []
-dbt-translation-timing = []
-dbt-tier1-prototype = []
-
-[dependencies]
-rvsim = { version = "=0.2.2", default-features = false }
-thiserror = "1.0"
-memmap2 = "=0.9.9"
-libc = "=0.2.189"
 
 [profile.release]
 codegen-units = 1
