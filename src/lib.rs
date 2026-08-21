@@ -18,3 +18,10 @@
  */
 
 #![doc = "The standalone managed runtime for Compukter bytecode."]
+
+mod bytes;
+pub mod diagnostic;
+pub mod limits;
+
+pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
+pub use limits::ArtifactLimits;
