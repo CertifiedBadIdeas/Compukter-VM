@@ -292,7 +292,7 @@ fn verify_owned_range(
     Ok(())
 }
 
-fn resolved_type(
+pub(super) fn resolved_type(
     artifact: &DecodedArtifact,
     module_id: usize,
     reference: TypeId,
@@ -518,7 +518,7 @@ fn signatures_match(
     }
 }
 
-fn value_types_match(
+pub(super) fn value_types_match(
     artifact: &DecodedArtifact,
     left_module: usize,
     left: crate::artifact::ValueType,
