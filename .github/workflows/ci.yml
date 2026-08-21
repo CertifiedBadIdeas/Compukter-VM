@@ -19,5 +19,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features --locked --offline -- -D warnings
       - run: cargo test --locked --offline
+      - run: cargo test --test golden_fixtures --locked --offline
       - run: cargo test --release --test bounded_failures --locked --offline
       - run: cargo doc --no-deps --document-private-items --locked --offline
