@@ -488,6 +488,81 @@ pub(crate) fn artifact_hash(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(&bytes[..payload_end]).into()
 }
 
+#[allow(dead_code)]
+pub(crate) fn artifact_manifest(name: &str, bytes: &[u8]) -> String {
+    let section_count = read_u32(bytes, 16) as usize;
+    let semantic_features = read_u32(bytes, 20);
+    let payload_end = read_u64(bytes, 32) as usize;
+    assert_eq!(payload_end + DIGEST_SIZE, bytes.len());
+    let digest = Sha256::digest(&bytes[..payload_end]);
+    assert_eq!(digest.as_slice(), &bytes[payload_end..]);
+
+    let mut manifest = format!(
+        "# {name}\n\n- file length: {}\n- payload end: {payload_end}\n- semantic features: 0x{semantic_features:08x}\n- artifact sha256: `{}`\n\n| Kind | Scope | Offset | Length | Count | Record offsets |\n|---:|---:|---:|---:|---:|---|\n",
+        bytes.len(),
+        hex(&digest),
+    );
+    let mut module_hashes = Vec::new();
+    for id in 0..section_count {
+        let directory = HEADER_SIZE + id * DIRECTORY_ENTRY_SIZE;
+        let kind = read_u16(bytes, directory);
+        let scope = read_u32(bytes, directory + 4);
+        let offset = read_u64(bytes, directory + 8) as usize;
+        let length = read_u64(bytes, directory + 16) as usize;
+        let count = read_u32(bytes, directory + 24) as usize;
+        let records = if kind == 0x0001 {
+            "fixed".to_owned()
+        } else {
+            indexed_record_ranges(bytes, offset, count)
+                .into_iter()
+                .map(|(start, length)| format!("`{start}:{length}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        manifest.push_str(&format!(
+            "| `0x{kind:04x}` | {scope} | {offset} | {length} | {count} | {records} |\n"
+        ));
+        if kind == 0x0002 {
+            for (start, _) in indexed_record_ranges(bytes, offset, count) {
+                module_hashes.push(bytes[start + 8..start + 40].to_vec());
+            }
+        }
+    }
+    manifest.push_str("\n## Module semantic hashes\n\n");
+    for (id, hash) in module_hashes.iter().enumerate() {
+        manifest.push_str(&format!("- module {id}: `{}`\n", hex(hash)));
+    }
+    manifest
+}
+
+fn indexed_record_ranges(bytes: &[u8], section: usize, count: usize) -> Vec<(usize, usize)> {
+    assert_eq!(read_u32(bytes, section) as usize, count);
+    let records = section + align8(16 + 4 * (count + 1));
+    (0..count)
+        .map(|id| {
+            let start = read_u32(bytes, section + 16 + id * 4) as usize;
+            let end = read_u32(bytes, section + 20 + id * 4) as usize;
+            (records + start, end - start)
+        })
+        .collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
 pub(crate) fn hex32(value: &str) -> [u8; 32] {
     assert_eq!(value.len(), 64);
     let mut bytes = [0_u8; 32];
