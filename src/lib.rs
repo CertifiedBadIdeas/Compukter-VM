@@ -17,11 +17,4 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#[cfg(feature = "unstable-benchmark-support")]
-#[doc(hidden)]
-pub mod benchmark_support;
-pub mod bus;
-pub mod memory;
-mod rv32_dbt;
-pub mod rv32_machine;
-pub mod rv32im;
+#![doc = "The standalone managed runtime for Compukter bytecode."]
