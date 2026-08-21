@@ -100,3 +100,138 @@ fn container_rejects_truncated_trailer() {
     bytes.pop();
     assert_eq!(error_code(bytes), Code::BadLength);
 }
+
+fn strings_error(bytes: Vec<u8>) -> Code {
+    let limits = ArtifactLimits::default();
+    let container = super::container::decode_container(&bytes, &limits).unwrap();
+    let entry = container
+        .directory
+        .iter()
+        .find(|entry| entry.kind == crate::artifact::format::STRINGS)
+        .unwrap();
+    super::indexed::decode_string_table(&container, entry, &limits)
+        .unwrap_err()
+        .code
+}
+
+#[test]
+fn indexed_accepts_canonical_string_table() {
+    let bytes = support::minimal_vector();
+    let limits = ArtifactLimits::default();
+    let container = super::container::decode_container(&bytes, &limits).unwrap();
+    let entry = container
+        .directory
+        .iter()
+        .find(|entry| entry.kind == crate::artifact::format::STRINGS)
+        .unwrap();
+
+    let strings = super::indexed::decode_string_table(&container, entry, &limits).unwrap();
+    assert_eq!(strings, ["app", "entry"]);
+}
+
+#[test]
+fn indexed_rejects_non_zero_first_offset() {
+    let mut bytes = support::minimal_vector();
+    support::write_u32(&mut bytes, 720, 1);
+    support::rehash(&mut bytes);
+    assert_eq!(strings_error(bytes), Code::BadRecord);
+}
+
+#[test]
+fn indexed_rejects_decreasing_offsets() {
+    let mut bytes = support::minimal_vector();
+    support::write_u32(&mut bytes, 724, 6);
+    support::write_u32(&mut bytes, 728, 5);
+    support::rehash(&mut bytes);
+    assert_eq!(strings_error(bytes), Code::BadRecord);
+}
+
+#[test]
+fn indexed_rejects_last_offset_mismatch() {
+    let mut bytes = support::minimal_vector();
+    support::write_u32(&mut bytes, 728, 7);
+    support::rehash(&mut bytes);
+    assert_eq!(strings_error(bytes), Code::BadRecord);
+}
+
+#[test]
+fn indexed_rejects_non_zero_envelope_padding() {
+    let mut bytes = support::minimal_vector();
+    bytes[732] = 1;
+    support::rehash(&mut bytes);
+    assert_eq!(strings_error(bytes), Code::BadRecord);
+}
+
+#[test]
+fn indexed_rejects_directory_count_disagreement() {
+    let mut bytes = support::minimal_vector();
+    support::write_u32(&mut bytes, 704, 1);
+    support::rehash(&mut bytes);
+    assert_eq!(strings_error(bytes), Code::BadRecord);
+}
+
+#[test]
+fn indexed_rejects_invalid_utf8() {
+    let bytes = support::minimal_vector_with_string_records(&[b"app", &[0xff]]);
+    assert_eq!(strings_error(bytes), Code::InvalidUtf8);
+}
+
+#[test]
+fn indexed_rejects_unsorted_strings() {
+    let bytes = support::minimal_vector_with_string_records(&[b"z", b"a"]);
+    assert_eq!(strings_error(bytes), Code::BadRecord);
+}
+
+#[test]
+fn indexed_rejects_duplicate_strings() {
+    let bytes = support::minimal_vector_with_string_records(&[b"same", b"same"]);
+    assert_eq!(strings_error(bytes), Code::BadRecord);
+}
+
+#[test]
+fn indexed_rejects_empty_string_after_index_zero() {
+    let bytes = support::minimal_vector_with_string_records(&[b"app", b""]);
+    assert_eq!(strings_error(bytes), Code::BadRecord);
+}
+
+#[test]
+fn indexed_checks_record_limit_before_offset_allocation() {
+    let bytes = support::minimal_vector();
+    let limits = ArtifactLimits {
+        records_per_section: 1,
+        ..ArtifactLimits::default()
+    };
+    let error = super::container::decode_container(&bytes, &limits).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::LimitExceeded);
+}
+
+#[test]
+fn indexed_checks_total_string_byte_limit() {
+    let bytes = support::minimal_vector();
+    let limits = ArtifactLimits {
+        strings_bytes: 7,
+        ..ArtifactLimits::default()
+    };
+    let container = super::container::decode_container(&bytes, &limits).unwrap();
+    let entry = container
+        .directory
+        .iter()
+        .find(|entry| entry.kind == crate::artifact::format::STRINGS)
+        .unwrap();
+    let error = super::indexed::decode_string_table(&container, entry, &limits).unwrap_err();
+    assert_eq!(error.code, Code::LimitExceeded);
+}
+
+#[test]
+fn indexed_rejects_record_id_outside_table() {
+    let bytes = support::minimal_vector();
+    let limits = ArtifactLimits::default();
+    let container = super::container::decode_container(&bytes, &limits).unwrap();
+    let entry = container
+        .directory
+        .iter()
+        .find(|entry| entry.kind == crate::artifact::format::STRINGS)
+        .unwrap();
+    let section = super::indexed::IndexedSection::decode(&container, entry, &limits).unwrap();
+    assert_eq!(section.record(2).unwrap_err().code, Code::BadRecord);
+}
