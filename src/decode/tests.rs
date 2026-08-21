@@ -629,3 +629,56 @@ fn records_decode_debug_golden_inline_ancestry() {
     assert!(debug[0].end_utf16 > debug[0].start_utf16);
     assert!(debug[1].end_utf16 > debug[1].start_utf16);
 }
+
+#[test]
+fn instruction_decodes_host_runtime_golden() {
+    let bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host-runtime.code"),
+    )
+    .unwrap();
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    assert_eq!(count, 5);
+    let records_start = (16 + 4 * (count + 1) + 7) & !7;
+    let expected_counts = [2, 1, 1, 2, 1];
+    let expected_costs = [7, 3, 4, 6, 6];
+    let mut decoded = Vec::new();
+    for id in 0..count {
+        let start =
+            u32::from_le_bytes(bytes[16 + id * 4..20 + id * 4].try_into().unwrap()) as usize;
+        let end = u32::from_le_bytes(bytes[20 + id * 4..24 + id * 4].try_into().unwrap()) as usize;
+        let instructions = super::code::decode_code_record(
+            &bytes[records_start + start..records_start + end],
+            expected_counts[id],
+            &ArtifactLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum::<u32>(),
+            expected_costs[id]
+        );
+        decoded.push(instructions);
+    }
+    assert!(matches!(
+        decoded[0][0],
+        crate::artifact::Instruction::CoroutineSpawn { .. }
+    ));
+    assert!(matches!(
+        decoded[1][0],
+        crate::artifact::Instruction::Sleep { .. }
+    ));
+    assert!(matches!(
+        decoded[2][0],
+        crate::artifact::Instruction::CoroutineJoin { .. }
+    ));
+    assert!(matches!(
+        decoded[3][0],
+        crate::artifact::Instruction::CapabilityCallSync { .. }
+    ));
+    assert!(matches!(
+        decoded[4][0],
+        crate::artifact::Instruction::CapabilityCallAsync { .. }
+    ));
+}

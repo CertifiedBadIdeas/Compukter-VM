@@ -323,6 +323,19 @@ pub(crate) fn debug_vector() -> Vec<u8> {
     single_module_artifact(semantic_sections, Some((debug, 2)), 0, 0, 1, 2)
 }
 
+#[allow(dead_code)]
+pub(crate) fn host_runtime_code() -> Vec<u8> {
+    let spawn = concat_frames(&[frame(0x50, 0, &[0, 0, 0, 0]), frame(0xe3, 0, &[0xff, 0xff])]);
+    let sleep = frame(0xe7, 0, &[0, 0, 0]);
+    let join = frame(0xe8, 0, &[0xff, 0xff, 0, 0, 0]);
+    let synchronous = concat_frames(&[
+        frame(0x51, 0, &[0xff, 0xff, 0, 0, 0]),
+        frame(0xe3, 0, &[0xff, 0xff]),
+    ]);
+    let asynchronous = frame(0xe9, 0, &[0xff, 0xff, 0, 1, 0, 0]);
+    indexed(&[&spawn, &sleep, &join, &synchronous, &asynchronous])
+}
+
 fn single_module_artifact(
     semantic_sections: Vec<(u16, Vec<u8>, u32)>,
     debug: Option<(Vec<u8>, u32)>,
@@ -769,6 +782,49 @@ pub(crate) fn artifact_manifest(name: &str, bytes: &[u8]) -> String {
         manifest.push_str(&format!("- module {id}: `{}`\n", hex(hash)));
     }
     manifest
+}
+
+#[allow(dead_code)]
+pub(crate) fn code_manifest(name: &str, bytes: &[u8]) -> String {
+    let count = read_u32(bytes, 0) as usize;
+    let records = align8(16 + 4 * (count + 1));
+    let mut manifest = format!(
+        "# {name}\n\n- envelope length: {}\n- record count: {count}\n\n| Record | Instruction | Offset | Opcode | Form | Length | Fixed cost |\n|---:|---:|---:|---:|---:|---:|---:|\n",
+        bytes.len()
+    );
+    for record in 0..count {
+        let relative_start = read_u32(bytes, 16 + record * 4) as usize;
+        let relative_end = read_u32(bytes, 20 + record * 4) as usize;
+        let start = records + relative_start;
+        let end = records + relative_end;
+        let mut cursor = start;
+        let mut instruction = 0;
+        while cursor < end {
+            let opcode = bytes[cursor];
+            let form = bytes[cursor + 1];
+            let length = read_u16(bytes, cursor + 2) as usize;
+            let cost = fixture_instruction_cost(opcode, &bytes[cursor + 4..cursor + length]);
+            manifest.push_str(&format!(
+                "| {record} | {instruction} | {cursor} | `0x{opcode:02x}` | {form} | {length} | {cost} |\n"
+            ));
+            cursor += length;
+            instruction += 1;
+        }
+        assert_eq!(cursor, end);
+    }
+    manifest
+}
+
+fn fixture_instruction_cost(opcode: u8, operands: &[u8]) -> u32 {
+    match opcode {
+        0x50 => 6 + u32::from(operands[3]),
+        0x51 => 5 + u32::from(operands[4]),
+        0xe7 => 3,
+        0xe8 => 4,
+        0xe9 => 6 + u32::from(operands[4]),
+        0xe3 => 1,
+        _ => panic!("opcode {opcode:#04x} is not part of the host-runtime fixture"),
+    }
 }
 
 fn indexed_record_ranges(bytes: &[u8], section: usize, count: usize) -> Vec<(usize, usize)> {
