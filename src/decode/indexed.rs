@@ -14,6 +14,16 @@ pub(crate) struct IndexedSection<'a> {
 }
 
 impl<'a> IndexedSection<'a> {
+    #[cfg(test)]
+    pub(crate) fn from_test_records(kind: u16, records: &'a [u8], offsets: Vec<u32>) -> Self {
+        Self {
+            kind,
+            offsets,
+            records,
+            records_offset: 0,
+        }
+    }
+
     pub(crate) fn decode(
         container: &Container<'a>,
         entry: &DirectoryEntry,
@@ -167,6 +177,25 @@ impl<'a> IndexedSection<'a> {
         self.records.get(start..end).ok_or_else(|| {
             self.record_error(start, Code::BadRecord, "record range is outside section")
         })
+    }
+
+    pub(crate) fn record_range(&self, id: u32) -> Result<std::ops::Range<usize>, Diagnostic> {
+        let id = usize::try_from(id)
+            .map_err(|_| self.record_error(0, Code::BadRecord, "record id does not fit usize"))?;
+        let start = *self
+            .offsets
+            .get(id)
+            .ok_or_else(|| self.record_error(0, Code::BadRecord, "record id is out of range"))?
+            as usize;
+        let end =
+            *self.offsets.get(id + 1).ok_or_else(|| {
+                self.record_error(0, Code::BadRecord, "record end is out of range")
+            })? as usize;
+        Ok(self.records_offset + start..self.records_offset + end)
+    }
+
+    pub(crate) fn record_bytes_len(&self) -> usize {
+        self.records.len()
     }
 
     fn record_error(&self, relative: usize, code: Code, detail: &'static str) -> Diagnostic {
