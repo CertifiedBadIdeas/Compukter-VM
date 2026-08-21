@@ -286,8 +286,10 @@ fn records_decode_spec_vector_a() {
     assert_eq!(artifact.modules[0].functions[0].block_count, 1);
     assert_eq!(artifact.modules[0].blocks.len(), 1);
     assert_eq!(artifact.modules[0].blocks[0].declared_fixed_cost, 1);
+    assert_eq!(artifact.modules[0].code[0].instructions.len(), 1);
+    assert_eq!(artifact.modules[0].code[0].fixed_cost, 1);
     assert_eq!(
-        artifact.modules[0].code[0].slice(&artifact.bytes),
+        artifact.modules[0].code[0].bytes.slice(&artifact.bytes),
         [0xe3, 0, 6, 0, 0xff, 0xff]
     );
     assert!(artifact.modules[0].exceptions.is_empty());
@@ -366,4 +368,210 @@ fn records_enforce_artifact_wide_table_limits() {
             .unwrap_err();
         assert_eq!(error.first().unwrap().code, Code::LimitExceeded);
     }
+}
+
+fn instruction_error(bytes: &[u8], count: u32, limits: &ArtifactLimits) -> Code {
+    super::code::decode_code_record(bytes, count, limits)
+        .unwrap_err()
+        .first()
+        .unwrap()
+        .code
+}
+
+#[test]
+fn instruction_decodes_unit_return_and_arithmetic_block() {
+    let unit_return = [0xe3, 0, 6, 0, 0xff, 0xff];
+    let instructions =
+        super::code::decode_code_record(&unit_return, 1, &ArtifactLimits::default()).unwrap();
+    assert_eq!(instructions.len(), 1);
+    assert_eq!(instructions[0].fixed_cost().unwrap(), 1);
+
+    let arithmetic = [0x10, 1, 10, 0, 0, 0, 1, 0, 2, 0, 0xe3, 0, 6, 0, 0, 0];
+    let instructions =
+        super::code::decode_code_record(&arithmetic, 2, &ArtifactLimits::default()).unwrap();
+    assert_eq!(instructions.len(), 2);
+    assert_eq!(
+        instructions
+            .iter()
+            .map(|value| value.fixed_cost().unwrap())
+            .sum::<u32>(),
+        2
+    );
+}
+
+#[test]
+fn instruction_rejects_unknown_opcode_form_and_bad_lengths() {
+    let limits = ArtifactLimits::default();
+    assert_eq!(
+        instruction_error(&[0x05, 0, 4, 0], 1, &limits),
+        Code::BadInstruction
+    );
+    assert_eq!(
+        instruction_error(&[0x00, 1, 4, 0], 1, &limits),
+        Code::BadInstruction
+    );
+    assert_eq!(
+        instruction_error(&[0x00, 0, 3, 0], 1, &limits),
+        Code::BadInstruction
+    );
+    assert_eq!(
+        instruction_error(&[0x01, 0, 8, 0, 0, 0], 1, &limits),
+        Code::BadInstruction
+    );
+    assert_eq!(
+        instruction_error(&[0x01, 0, 10, 0, 0, 0, 1, 0, 0, 0], 1, &limits),
+        Code::BadInstruction
+    );
+}
+
+#[test]
+fn instruction_rejects_noncanonical_ids_and_excessive_lists() {
+    let limits = ArtifactLimits::default();
+    assert_eq!(
+        instruction_error(&[0x02, 0, 8, 0, 0, 0, 0x80, 0], 1, &limits),
+        Code::NonCanonicalUleb128
+    );
+
+    let strict = ArtifactLimits {
+        registers_per_function: 1,
+        ..ArtifactLimits::default()
+    };
+    let call = [0x40, 0, 12, 0, 0xff, 0xff, 0, 2, 0, 0, 1, 0];
+    assert_eq!(instruction_error(&call, 1, &strict), Code::LimitExceeded);
+
+    let switch = [0xe2, 0, 10, 0, 0, 0, 0, 2, 0, 0];
+    assert_eq!(instruction_error(&switch, 1, &strict), Code::LimitExceeded);
+}
+
+#[test]
+fn instruction_allows_absent_register_only_for_optional_operands() {
+    let limits = ArtifactLimits::default();
+    let invalid_move = [0x01, 0, 8, 0, 0xff, 0xff, 0, 0];
+    assert_eq!(
+        instruction_error(&invalid_move, 1, &limits),
+        Code::BadInstruction
+    );
+    let invalid_spawn = [0x50, 0, 8, 0, 0xff, 0xff, 0, 0];
+    assert_eq!(
+        instruction_error(&invalid_spawn, 1, &limits),
+        Code::BadInstruction
+    );
+    super::code::decode_code_record(&[0xe3, 0, 6, 0, 0xff, 0xff], 1, &limits).unwrap();
+}
+
+#[test]
+fn instruction_requires_one_final_terminator_and_exact_count() {
+    let limits = ArtifactLimits::default();
+    assert_eq!(
+        instruction_error(&[0, 0, 4, 0], 1, &limits),
+        Code::BadInstruction
+    );
+    assert_eq!(
+        instruction_error(&[0xe3, 0, 6, 0, 0xff, 0xff, 0, 0, 4, 0], 2, &limits),
+        Code::BadInstruction
+    );
+    assert_eq!(
+        instruction_error(&[0xe3, 0, 6, 0, 0xff, 0xff], 2, &limits),
+        Code::BadInstruction
+    );
+}
+
+#[test]
+fn instruction_decodes_every_v1_opcode() {
+    let r2 = &[0, 0, 1, 0][..];
+    let r3 = &[0, 0, 1, 0, 2, 0][..];
+    let cases: &[(u8, u8, &[u8], bool)] = &[
+        (0x00, 0, &[], false),
+        (0x01, 0, r2, false),
+        (0x02, 0, &[0, 0, 0], false),
+        (0x03, 0, &[0, 0], false),
+        (0x04, 0, r2, false),
+        (0x10, 1, r3, false),
+        (0x11, 2, r3, false),
+        (0x12, 3, r3, false),
+        (0x13, 4, r3, false),
+        (0x14, 1, r3, false),
+        (0x15, 2, r2, false),
+        (0x16, 1, r3, false),
+        (0x17, 2, r3, false),
+        (0x18, 1, r3, false),
+        (0x19, 2, r3, false),
+        (0x1a, 1, r3, false),
+        (0x1b, 2, r3, false),
+        (0x20, 5, r3, false),
+        (0x21, 6, r3, false),
+        (0x22, 6, r3, false),
+        (0x23, 1, r3, false),
+        (0x24, 2, r3, false),
+        (0x25, 3, r3, false),
+        (0x26, 7, r3, false),
+        (0x27, 7, r3, false),
+        (0x30, 0, &[0, 0, 0], false),
+        (0x31, 0, &[0, 0, 0, 1, 0], false),
+        (0x32, 0, r2, false),
+        (0x33, 0, r3, false),
+        (0x34, 0, r3, false),
+        (0x35, 0, &[0, 0, 1, 0, 0], false),
+        (0x36, 0, &[0, 0, 0, 1, 0], false),
+        (0x37, 0, &[0, 0, 0], false),
+        (0x38, 0, &[0, 1, 0], false),
+        (0x39, 0, &[0, 0, 1, 0, 0], false),
+        (0x3a, 0, &[0, 0, 1, 0, 0], false),
+        (0x40, 0, &[0xff, 0xff, 0, 0], false),
+        (0x41, 0, &[0xff, 0xff, 0, 0], false),
+        (0x42, 0, &[0xff, 0xff, 0, 0], false),
+        (0x50, 0, &[0, 0, 0, 0], false),
+        (0x51, 0, &[0xff, 0xff, 0, 0, 0], false),
+        (0xe0, 0, &[0], true),
+        (0xe1, 0, &[0, 0, 0, 0], true),
+        (0xe2, 0, &[0, 0, 0, 0], true),
+        (0xe3, 0, &[0xff, 0xff], true),
+        (0xe4, 0, &[0, 0], true),
+        (0xe5, 0, &[0xff, 0xff, 0, 0, 0], true),
+        (0xe6, 0, &[0], true),
+        (0xe7, 0, &[0, 0, 0], true),
+        (0xe8, 0, &[0xff, 0xff, 0, 0, 0], true),
+        (0xe9, 0, &[0xff, 0xff, 0, 0, 0, 0], true),
+        (0xff, 0, &[], true),
+    ];
+
+    for &(opcode, form, operands, terminator) in cases {
+        let mut bytes = vec![opcode, form, (operands.len() + 4) as u8, 0];
+        bytes.extend_from_slice(operands);
+        let count = if terminator {
+            1
+        } else {
+            bytes.extend_from_slice(&[0xe3, 0, 6, 0, 0xff, 0xff]);
+            2
+        };
+        super::code::decode_code_record(&bytes, count, &ArtifactLimits::default())
+            .unwrap_or_else(|error| panic!("opcode {opcode:#04x}: {error:?}"));
+    }
+}
+
+#[test]
+fn instruction_rejects_unsorted_switch_cases() {
+    let bytes = [0xe2, 0, 18, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        instruction_error(&bytes, 1, &ArtifactLimits::default()),
+        Code::BadInstruction
+    );
+}
+
+#[test]
+fn instruction_computes_variable_fixed_costs() {
+    let call = [
+        0x40, 0, 12, 0, 0xff, 0xff, 0, 2, 0, 0, 1, 0, 0xe3, 0, 6, 0, 0xff, 0xff,
+    ];
+    let decoded = super::code::decode_code_record(&call, 2, &ArtifactLimits::default()).unwrap();
+    assert_eq!(decoded[0].fixed_cost().unwrap(), 6);
+
+    let switch = [0xe2, 0, 18, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1];
+    let decoded = super::code::decode_code_record(&switch, 1, &ArtifactLimits::default()).unwrap();
+    assert_eq!(decoded[0].fixed_cost().unwrap(), 3);
+
+    let asynchronous = [0xe9, 0, 14, 0, 0xff, 0xff, 0, 0, 2, 0, 0, 1, 0, 0];
+    let decoded =
+        super::code::decode_code_record(&asynchronous, 1, &ArtifactLimits::default()).unwrap();
+    assert_eq!(decoded[0].fixed_cost().unwrap(), 8);
 }

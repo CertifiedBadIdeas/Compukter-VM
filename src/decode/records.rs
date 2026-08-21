@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     artifact::{
         format, Block, BlockId, ByteRange, Capability, Constant, DebugEntry, DecodedArtifact,
-        DecodedModule, ExceptionEntry, Export, Field, Function, FunctionId, Import, Manifest,
-        ModuleId, NominalType, TypeId, ValueType,
+        DecodedCode, DecodedModule, ExceptionEntry, Export, Field, Function, FunctionId, Import,
+        Manifest, ModuleId, NominalType, TypeId, ValueType,
     },
     bytes::Cursor,
     decode::{container::decode_container, indexed::IndexedSection},
@@ -221,7 +221,7 @@ pub(crate) fn decode_artifact(
         let fields = parse_fields(&fields_section, limits)?;
         let functions = parse_functions(&functions_section, limits)?;
         let blocks = parse_blocks(&blocks_section, limits)?;
-        let code = collect_ranges(&code_section, limits)?;
+        let code = parse_code(&code_section, &blocks, limits)?;
         let exceptions = parse_exceptions(&exceptions_section, limits)?;
         let debug = match optional(&container, scope, format::DEBUG) {
             Some(entry) => {
@@ -676,6 +676,43 @@ fn collect_ranges(
         });
     }
     Ok(ranges)
+}
+
+fn parse_code(
+    section: &IndexedSection<'_>,
+    blocks: &[Block],
+    limits: &ArtifactLimits,
+) -> Result<Vec<DecodedCode>, DiagnosticSet> {
+    if section.len() != blocks.len() {
+        return Err(record_error(
+            limits,
+            format::CODE,
+            "block and code record counts disagree",
+        ));
+    }
+    let mut code = Vec::new();
+    code.try_reserve_exact(section.len())
+        .map_err(|_| raw(Code::LimitExceeded, "cannot reserve decoded code"))?;
+    for (id, block) in blocks.iter().enumerate() {
+        let record = section.record(id as u32).map_err(single_raw)?;
+        let range = section.record_range(id as u32).map_err(single_raw)?;
+        let instructions =
+            super::code::decode_code_record(record, block.instruction_count, limits)?;
+        let fixed_cost = instructions.iter().try_fold(0_u32, |total, instruction| {
+            total
+                .checked_add(instruction.fixed_cost().map_err(single_raw)?)
+                .ok_or_else(|| raw(Code::BadCost, "block fixed cost overflows u32"))
+        })?;
+        code.push(DecodedCode {
+            bytes: ByteRange {
+                start: range.start,
+                end: range.end,
+            },
+            instructions,
+            fixed_cost,
+        });
+    }
+    Ok(code)
 }
 
 fn parse_each<T, F>(
