@@ -45,6 +45,8 @@ pub mod diagnostic;
 pub mod limits;
 
 #[cfg(test)]
+mod test_encode;
+#[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 #[cfg_attr(not(test), allow(dead_code))]

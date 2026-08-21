@@ -311,6 +311,36 @@ fn records_decode_spec_vector_a() {
 }
 
 #[test]
+fn records_reencode_vector_a_byte_for_byte() {
+    let original = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/vector-a.cpkt"
+    ));
+    let decoded =
+        super::records::decode_artifact(Arc::from(original.as_slice()), &ArtifactLimits::default())
+            .unwrap();
+    assert_eq!(
+        crate::test_encode::encode_artifact(&decoded).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn records_reencode_two_module_golden_byte_for_byte() {
+    let original = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/two-module.cpkt"
+    ));
+    let decoded =
+        super::records::decode_artifact(Arc::from(original.as_slice()), &ArtifactLimits::default())
+            .unwrap();
+    assert_eq!(
+        crate::test_encode::encode_artifact(&decoded).unwrap(),
+        original
+    );
+}
+
+#[test]
 fn records_reject_module_count_disagreement() {
     let mut bytes = support::minimal_vector();
     support::write_u32(&mut bytes, 664, 0);
