@@ -40,6 +40,13 @@ fn regenerate_committed_fixtures() {
         )
         .unwrap();
     }
+    let code = support::host_runtime_code();
+    fs::write(fixture("host-runtime.code"), &code).unwrap();
+    fs::write(
+        fixture("host-runtime.manifest.md"),
+        support::code_manifest("host-runtime", &code),
+    )
+    .unwrap();
 }
 
 fn artifact_cases() -> [(&'static str, Vec<u8>, usize); 4] {
@@ -49,4 +56,15 @@ fn artifact_cases() -> [(&'static str, Vec<u8>, usize); 4] {
         ("language-runtime", support::language_runtime_vector(), 1),
         ("debug", support::debug_vector(), 1),
     ]
+}
+
+#[test]
+fn host_runtime_code_golden_is_committed_and_reproducible() {
+    let committed = fs::read(fixture("host-runtime.code")).unwrap();
+    assert_eq!(committed, support::host_runtime_code());
+    let committed_manifest = fs::read_to_string(fixture("host-runtime.manifest.md")).unwrap();
+    assert_eq!(
+        committed_manifest,
+        support::code_manifest("host-runtime", &committed)
+    );
 }
