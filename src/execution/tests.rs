@@ -7,6 +7,69 @@ use super::{
 };
 use sha2::{Digest, Sha256};
 
+mod allocation_counter {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) struct CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count();
+            // SAFETY: the request is delegated unchanged to the system allocator.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            count();
+            // SAFETY: the request is delegated unchanged to the system allocator.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: the pointer and layout came from the delegated allocator.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if new_size > layout.size() {
+                count();
+            }
+            // SAFETY: the request is delegated unchanged to the system allocator.
+            unsafe { System.realloc(pointer, layout, new_size) }
+        }
+    }
+
+    fn count() {
+        ENABLED.with(|enabled| {
+            if enabled.get() {
+                ALLOCATIONS.with(|allocations| allocations.set(allocations.get() + 1));
+            }
+        });
+    }
+
+    pub(super) fn reset_and_enable() {
+        ALLOCATIONS.with(|allocations| allocations.set(0));
+        ENABLED.with(|enabled| enabled.set(true));
+    }
+
+    pub(super) fn disable_and_read() -> u64 {
+        ENABLED.with(|enabled| enabled.set(false));
+        ALLOCATIONS.with(Cell::get)
+    }
+}
+
+#[global_allocator]
+static TEST_ALLOCATOR: allocation_counter::CountingAllocator =
+    allocation_counter::CountingAllocator;
+
 #[test]
 fn direct_calls_copy_arguments_and_publish_results_on_return() {
     let mut machine = fixtures::started_zero_arg(fixtures::nested_call_artifact());
@@ -97,6 +160,82 @@ fn straight_line_trace_digest_matches_documented_field_encoding() {
         ],
         <[u8; 32]>::from(trace.finalize())
     );
+}
+
+#[test]
+fn scalar_control_steady_state_allocates_nothing() {
+    for artifact in fixtures::allocation_workloads() {
+        let mut machine = fixtures::started_zero_arg(artifact);
+        allocation_counter::reset_and_enable();
+        for _ in 0..1_000 {
+            assert!(matches!(
+                machine.run_slice(4_096).unwrap(),
+                Outcome::SliceExhausted
+            ));
+        }
+        let allocations = allocation_counter::disable_and_read();
+        assert_eq!(0, allocations);
+    }
+}
+
+#[test]
+#[ignore = "records a hardware-specific release performance baseline"]
+fn tier0_performance_baseline() {
+    use std::{fmt::Write, process::Command, time::Instant};
+
+    const WARMUP_SLICES: usize = 100;
+    const MEASURED_SLICES: usize = 1_000;
+    const BUDGET: u32 = 4_096;
+
+    let rustc = Command::new("rustc").arg("-Vv").output().unwrap();
+    let rustc = String::from_utf8_lossy(&rustc.stdout);
+    let release = rustc
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .unwrap_or("unknown");
+    let host = rustc
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap_or("unknown");
+    let cpu = std::env::var("COMPUKTER_BENCH_CPU").unwrap_or_else(|_| "unspecified".into());
+    println!("artifact\tworkload\tblocks\tinstructions\telapsed_ns\tblocks_per_s\tinstructions_per_s\trustc\thost\tcpu");
+
+    for workload in fixtures::performance_workloads() {
+        let hash = workload.artifact.content_hash();
+        let mut machine = fixtures::started_zero_arg(workload.artifact);
+        for _ in 0..WARMUP_SLICES {
+            assert_eq!(Outcome::SliceExhausted, machine.run_slice(BUDGET).unwrap());
+        }
+        let blocks_before = machine.entered_blocks();
+        let instructions_before = machine.executed_instructions();
+        let started = Instant::now();
+        for _ in 0..MEASURED_SLICES {
+            assert_eq!(Outcome::SliceExhausted, machine.run_slice(BUDGET).unwrap());
+        }
+        let elapsed = started.elapsed();
+        let blocks = machine.entered_blocks() - blocks_before;
+        let instructions = machine.executed_instructions() - instructions_before;
+        let elapsed_ns = elapsed.as_nanos();
+        assert!(elapsed_ns > 0 && blocks > 0 && instructions > 0);
+        let seconds = elapsed.as_secs_f64();
+        let mut hash_text = String::with_capacity(64);
+        for byte in hash {
+            write!(&mut hash_text, "{byte:02x}").unwrap();
+        }
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}\t{}\t{}\t{}",
+            hash_text,
+            workload.name,
+            blocks,
+            instructions,
+            elapsed_ns,
+            blocks as f64 / seconds,
+            instructions as f64 / seconds,
+            release,
+            host,
+            cpu
+        );
+    }
 }
 
 #[test]
