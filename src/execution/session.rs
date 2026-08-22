@@ -27,6 +27,8 @@ pub struct Session {
     next_request_id: u64,
     preparing_request: Option<PreparingRequest>,
     maximum_slice_budget: u32,
+    inbound_length: usize,
+    resuming_host_string: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -126,6 +128,8 @@ impl Session {
             next_request_id: 1,
             preparing_request: None,
             maximum_slice_budget,
+            inbound_length: 0,
+            resuming_host_string: false,
         })
     }
 
@@ -169,7 +173,24 @@ impl Session {
         if self.preparing_request.is_some() {
             return self.advance_request_preparation(guest_budget, maintenance_budget);
         }
-        match self.machine.run_slice(guest_budget, maintenance_budget)? {
+        if self.resuming_host_string {
+            let outcome = self.machine.run_capability_string_slice(
+                &self.inbound_utf16[..self.inbound_length],
+                guest_budget,
+                maintenance_budget,
+            )?;
+            self.resuming_host_string = self.machine.capability_string_response_pending();
+            return self.map_machine_outcome(outcome);
+        }
+        let outcome = self.machine.run_slice(guest_budget, maintenance_budget)?;
+        self.map_machine_outcome(outcome)
+    }
+
+    fn map_machine_outcome(
+        &mut self,
+        outcome: super::error::Outcome,
+    ) -> Result<AdvanceOutcome<'_>, RunError> {
+        match outcome {
             super::error::Outcome::SliceExhausted => Ok(AdvanceOutcome::SliceExhausted),
             super::error::Outcome::HostRequest => self.begin_request(),
             super::error::Outcome::AllocationExhausted(exhaustion) => Ok(
@@ -228,7 +249,24 @@ impl Session {
             HostValueInput::F64(value) => Some(RuntimeValue::F64(value)),
             HostValueInput::Bool(value) => Some(RuntimeValue::Bool(value)),
             HostValueInput::Char(value) => Some(RuntimeValue::Char(value)),
-            HostValueInput::String(_) => return Err(ResumeError::ResponseTooLarge),
+            HostValueInput::String(units) => {
+                if units.len() > self.inbound_utf16.len() {
+                    return Err(ResumeError::ResponseTooLarge);
+                }
+                if let Err(fault) = self
+                    .machine
+                    .begin_capability_string_response(units.is_empty())
+                {
+                    self.pending_request = None;
+                    self.terminal = Some(SessionTerminal::Faulted(fault));
+                    return Ok(());
+                }
+                self.inbound_utf16[..units.len()].copy_from_slice(units);
+                self.inbound_length = units.len();
+                self.resuming_host_string = self.machine.capability_string_response_pending();
+                self.pending_request = None;
+                return Ok(());
+            }
         };
         self.machine
             .complete_capability(value)

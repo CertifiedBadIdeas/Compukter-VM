@@ -70,7 +70,9 @@ pub(super) struct Machine {
     pending_text: Option<text::PendingText>,
     pending_concat: Option<text::PendingConcat>,
     pending_concat_source: Option<AllocationSource>,
-    string_collection_pending: bool,
+    pending_host_string: Option<text::PendingHostString>,
+    pending_host_string_source: Option<AllocationSource>,
+    string_collection_pending: Option<StringCollectionTarget>,
     emergency_oom: Option<super::value::ReferenceValue>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
@@ -104,6 +106,12 @@ struct AllocationRetry {
     logical_bytes: u32,
     shape: AllocationShape,
     source: AllocationSource,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StringCollectionTarget {
+    Concat,
+    HostResponse,
 }
 
 impl AllocationRetry {
@@ -177,7 +185,9 @@ impl Machine {
             pending_text: None,
             pending_concat: None,
             pending_concat_source: None,
-            string_collection_pending: false,
+            pending_host_string: None,
+            pending_host_string_source: None,
+            string_collection_pending: None,
             emergency_oom: Some(super::value::ReferenceValue::emergency()),
             frame_depth: 0,
             consumed_fixed_cost: 0,
@@ -1134,6 +1144,7 @@ impl Machine {
     fn fault(&mut self, fault: VmFault) -> Outcome {
         self.cancel_pending_allocation();
         self.cancel_pending_concat();
+        self.cancel_pending_host_string();
         let outcome = Outcome::Faulted(fault);
         self.lifecycle = Lifecycle::Terminal(outcome);
         outcome
@@ -1177,7 +1188,7 @@ impl Machine {
     ) -> Result<Outcome, RunError> {
         if self.collector.is_active()
             || self.allocation_retry.is_some()
-            || self.string_collection_pending
+            || self.string_collection_pending.is_some()
         {
             return Ok(self.fault(VmFault::CorruptLifecycle));
         }
@@ -1208,12 +1219,21 @@ impl Machine {
             }
         }
         if !self.collector.is_active() {
-            if self.string_collection_pending {
-                self.string_collection_pending = false;
-                let Some(pending) = self.pending_concat.as_mut() else {
-                    return Ok(self.fault(VmFault::CorruptLifecycle));
-                };
-                pending.mark_collection_attempted();
+            if let Some(target) = self.string_collection_pending.take() {
+                match target {
+                    StringCollectionTarget::Concat => {
+                        let Some(pending) = self.pending_concat.as_mut() else {
+                            return Ok(self.fault(VmFault::CorruptLifecycle));
+                        };
+                        pending.mark_collection_attempted();
+                    }
+                    StringCollectionTarget::HostResponse => {
+                        let Some(pending) = self.pending_host_string.as_mut() else {
+                            return Ok(self.fault(VmFault::CorruptLifecycle));
+                        };
+                        pending.mark_collection_attempted();
+                    }
+                }
                 return Ok(Outcome::SliceExhausted);
             }
             let Some(retry) = self.allocation_retry.take() else {
@@ -1352,13 +1372,13 @@ impl Machine {
                 }
                 if self.collector.is_active()
                     || self.allocation_retry.is_some()
-                    || self.string_collection_pending
+                    || self.string_collection_pending.is_some()
                 {
                     let _ = pending.abort(&mut self.heap);
                     return Some(self.fault(VmFault::CorruptLifecycle));
                 }
                 self.pending_concat = Some(pending);
-                self.string_collection_pending = true;
+                self.string_collection_pending = Some(StringCollectionTarget::Concat);
                 self.collector.start();
                 return Some(Outcome::SliceExhausted);
             }
@@ -1413,7 +1433,20 @@ impl Machine {
             let _ = pending.abort(&mut self.heap);
         }
         self.pending_concat_source = None;
-        self.string_collection_pending = false;
+        self.string_collection_pending = None;
+    }
+
+    fn cancel_pending_host_string(&mut self) {
+        if let Some(pending) = self.pending_host_string.take() {
+            let _ = pending.abort(&mut self.heap);
+        }
+        self.pending_host_string_source = None;
+        if matches!(
+            self.string_collection_pending,
+            Some(StringCollectionTarget::HostResponse)
+        ) {
+            self.string_collection_pending = None;
+        }
     }
 
     fn reference_type(
@@ -1609,6 +1642,139 @@ impl Machine {
         frame.block = resume_block;
         frame.instruction = 0;
         Ok(())
+    }
+
+    pub(super) fn begin_capability_string_response(&mut self, empty: bool) -> Result<(), VmFault> {
+        let frame_index = self
+            .frame_depth
+            .checked_sub(1)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let frame = *self
+            .frames
+            .get(frame_index)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let destination = match self
+            .image
+            .block(frame.block)
+            .and_then(|block| block.instructions.get(frame.instruction))
+        {
+            Some(ResolvedInstruction::CapabilityCallAsync { dst, .. }) if *dst != u16::MAX => *dst,
+            _ => return Err(VmFault::CorruptLifecycle),
+        };
+        if empty {
+            let value = self
+                .image
+                .empty_string()
+                .ok_or(VmFault::InvalidResolvedId)?;
+            return self.complete_capability(Some(value));
+        }
+        if self.pending_host_string.is_some() || self.string_collection_pending.is_some() {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        self.pending_host_string = Some(text::PendingHostString::new(destination));
+        self.pending_host_string_source = Some(self.allocation_source(frame_index));
+        Ok(())
+    }
+
+    pub(super) fn run_capability_string_slice(
+        &mut self,
+        source: &[u16],
+        guest_budget: u32,
+        maintenance_budget: u32,
+    ) -> Result<Outcome, RunError> {
+        match self.lifecycle {
+            Lifecycle::Terminal(outcome) => return Ok(outcome),
+            Lifecycle::Pristine => return Err(RunError::NotStarted),
+            Lifecycle::Runnable => {}
+        }
+        if guest_budget == 0 || guest_budget > self.image.maximum_slice_budget() {
+            return Err(RunError::InvalidSliceBudget {
+                minimum: 1,
+                maximum: self.image.maximum_slice_budget(),
+                supplied: guest_budget,
+            });
+        }
+        if maintenance_budget > self.image.maximum_slice_budget() {
+            return Err(RunError::InvalidSliceBudget {
+                minimum: 0,
+                maximum: self.image.maximum_slice_budget(),
+                supplied: maintenance_budget,
+            });
+        }
+        if self.collector.is_active() {
+            return self.run_maintenance(maintenance_budget);
+        }
+        let Some(mut pending) = self.pending_host_string.take() else {
+            return Ok(self.fault(VmFault::CorruptLifecycle));
+        };
+        let (used, result) = match pending.resume(&self.image, &mut self.heap, source, guest_budget)
+        {
+            Ok(result) => result,
+            Err(text::TextError::Exhausted {
+                used,
+                block_bytes,
+                requested,
+                collection_attempted,
+            }) => {
+                let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used)) else {
+                    let _ = pending.abort(&mut self.heap);
+                    return Ok(self.fault(VmFault::AccountingOverflow));
+                };
+                self.consumed_dynamic_cost = consumed;
+                let Some(source) = self.pending_host_string_source else {
+                    let _ = pending.abort(&mut self.heap);
+                    return Ok(self.fault(VmFault::CorruptLifecycle));
+                };
+                if block_bytes > self.image.storage_plan().heap_bytes || collection_attempted {
+                    let _ = pending.abort(&mut self.heap);
+                    self.pending_host_string_source = None;
+                    return Ok(self.allocation_exhausted(
+                        AllocationRequestKind::String,
+                        requested,
+                        collection_attempted,
+                        source,
+                    ));
+                }
+                if self.collector.is_active()
+                    || self.allocation_retry.is_some()
+                    || self.string_collection_pending.is_some()
+                {
+                    let _ = pending.abort(&mut self.heap);
+                    return Ok(self.fault(VmFault::CorruptLifecycle));
+                }
+                self.pending_host_string = Some(pending);
+                self.string_collection_pending = Some(StringCollectionTarget::HostResponse);
+                self.collector.start();
+                return Ok(Outcome::SliceExhausted);
+            }
+            Err(error) => {
+                let _ = pending.abort(&mut self.heap);
+                self.pending_host_string_source = None;
+                return Ok(self.text_outcome(error));
+            }
+        };
+        let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used)) else {
+            let _ = pending.abort(&mut self.heap);
+            return Ok(self.fault(VmFault::AccountingOverflow));
+        };
+        self.consumed_dynamic_cost = consumed;
+        let Some((_destination, value)) = result else {
+            self.pending_host_string = Some(pending);
+            return Ok(Outcome::SliceExhausted);
+        };
+        self.pending_host_string_source = None;
+        if let Err(fault) = self.complete_capability(Some(value)) {
+            return Ok(self.fault(fault));
+        }
+        Ok(Outcome::SliceExhausted)
+    }
+
+    pub(super) fn capability_string_response_pending(&self) -> bool {
+        self.pending_host_string.is_some()
+            || matches!(
+                self.string_collection_pending,
+                Some(StringCollectionTarget::HostResponse)
+            )
     }
 
     pub(super) fn consumed_dynamic_cost(&self) -> u64 {

@@ -396,6 +396,142 @@ impl PendingConcat {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingHostString {
+    destination: u16,
+    scan: u32,
+    latin1: bool,
+    reservation: Option<ReservedAllocation>,
+    layout: Option<StringLayout>,
+    written: u32,
+    collection_attempted: bool,
+}
+
+impl PendingHostString {
+    pub(super) const fn new(destination: u16) -> Self {
+        Self {
+            destination,
+            scan: 0,
+            latin1: true,
+            reservation: None,
+            layout: None,
+            written: 0,
+            collection_attempted: false,
+        }
+    }
+
+    pub(super) fn resume(
+        &mut self,
+        image: &ExecutionImage,
+        heap: &mut Heap,
+        source: &[u16],
+        budget: u32,
+    ) -> Result<(u32, Option<(u16, RuntimeValue)>), TextError> {
+        let length = u32::try_from(source.len())
+            .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?;
+        let mut used = 0;
+        while self.scan < length && used < budget {
+            let end = self.scan.saturating_add(8).min(length);
+            while self.scan < end {
+                self.latin1 &= source[self.scan as usize] <= 0xff;
+                self.scan += 1;
+            }
+            used += 1;
+        }
+        if self.scan < length {
+            return Ok((used, None));
+        }
+        if self.reservation.is_none() {
+            let encoding = if self.latin1 {
+                StringEncoding::Latin1
+            } else {
+                StringEncoding::Utf16
+            };
+            let layout = string_layout(encoding, length)
+                .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?;
+            let ty = image
+                .string_type()
+                .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?;
+            self.reservation = match heap.reserve(AllocationRequest {
+                block_bytes: layout.block_bytes,
+                ty,
+            }) {
+                Ok(reservation) => reservation,
+                Err(VmFault::HandleExhausted) => None,
+                Err(fault) => return Err(TextError::Fault(fault)),
+            };
+            if self.reservation.is_none() {
+                return Err(TextError::Exhausted {
+                    used,
+                    block_bytes: layout.block_bytes,
+                    requested: layout.payload_bytes,
+                    collection_attempted: self.collection_attempted,
+                });
+            }
+            self.layout = Some(layout);
+        }
+        let layout = self
+            .layout
+            .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
+        let reservation = self
+            .reservation
+            .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
+        let initialized_bytes = layout.block_bytes - 16;
+        while self.written < initialized_bytes && used < budget {
+            let end = self.written.saturating_add(16).min(initialized_bytes);
+            let mut chunk = [0_u8; 16];
+            for offset in self.written..end {
+                chunk[(offset - self.written) as usize] = if offset >= layout.payload_bytes {
+                    0
+                } else if offset < 4 {
+                    length.to_le_bytes()[offset as usize]
+                } else if offset == 4 {
+                    u8::from(layout.encoding == StringEncoding::Utf16)
+                } else if offset < 8 {
+                    0
+                } else {
+                    let data = offset - 8;
+                    match layout.encoding {
+                        StringEncoding::Latin1 => source[data as usize] as u8,
+                        StringEncoding::Utf16 => {
+                            let unit = source[(data / 2) as usize].to_le_bytes();
+                            unit[(data % 2) as usize]
+                        }
+                    }
+                };
+            }
+            heap.write_reserved(
+                reservation,
+                self.written,
+                &chunk[..(end - self.written) as usize],
+            )
+            .map_err(TextError::Fault)?;
+            self.written = end;
+            used += 1;
+        }
+        if self.written < initialized_bytes {
+            return Ok((used, None));
+        }
+        let reference = heap.commit(reservation).map_err(TextError::Fault)?;
+        self.reservation = None;
+        Ok((
+            used,
+            Some((self.destination, RuntimeValue::Reference(reference))),
+        ))
+    }
+
+    pub(super) fn abort(self, heap: &mut Heap) -> Result<(), VmFault> {
+        if let Some(reservation) = self.reservation {
+            heap.abort(reservation)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn mark_collection_attempted(&mut self) {
+        self.collection_attempted = true;
+    }
+}
+
 pub(super) enum SubstringPlan {
     Identity(RuntimeValue),
     Empty,

@@ -1576,6 +1576,121 @@ pub(super) fn string_capability_artifact(
     )
 }
 
+pub(super) fn string_response_capability_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![string, primitive(1)],
+        Vec::new(),
+        &[],
+        vec![
+            vec![Instruction::CapabilityCallAsync {
+                dst: 0,
+                capability: 0,
+                operation: 0,
+                args: Box::new([]),
+                resume_block: 1,
+            }],
+            vec![
+                Instruction::StringHash { dst: 1, string: 0 },
+                Instruction::Return { value: 1 },
+            ],
+        ],
+        |artifact| {
+            artifact.header.semantic_features = 0b1110;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 1,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+            let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+                unreachable!();
+            };
+            *flags = 1;
+            artifact.modules[0].functions[0].flags = 1;
+        },
+    )
+}
+
+pub(super) fn string_response_gc_retry_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![string, string, string, string, primitive(1)],
+        Vec::new(),
+        &[0x0100; 8],
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: 0,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::StringConcat {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Instruction::Jump { target: 2 },
+            ],
+            vec![
+                Instruction::Const {
+                    dst: 2,
+                    constant: 0,
+                },
+                Instruction::CapabilityCallAsync {
+                    dst: 3,
+                    capability: 0,
+                    operation: 0,
+                    args: Box::new([]),
+                    resume_block: 3,
+                },
+            ],
+            vec![
+                Instruction::StringHash { dst: 4, string: 3 },
+                Instruction::Return { value: 4 },
+            ],
+        ],
+        |artifact| {
+            artifact.header.semantic_features = 0b1110;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 1,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+            let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+                unreachable!();
+            };
+            *flags = 1;
+            artifact.modules[0].functions[0].flags = 1;
+        },
+    )
+}
+
 pub(super) fn portable_layout_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let base_reference = ValueType {
