@@ -277,6 +277,120 @@ pub(super) struct ScalarCase {
     pub expected_fixed_cost: u64,
 }
 
+pub(super) struct TraceCase {
+    pub name: &'static str,
+    pub artifact: VerifiedArtifact,
+    pub args: Box<[EntryArgument]>,
+    pub budget: u32,
+    pub outcome: super::error::Outcome,
+    pub digest: [u8; 32],
+    pub fixed_cost: u64,
+}
+
+pub(super) fn trace_cases() -> Vec<TraceCase> {
+    let scalar = scalar_cases().remove(0);
+    let (branch, branch_args) = branch_switch_artifact(0);
+    let (switch, switch_args) = branch_switch_artifact(1);
+    vec![
+        TraceCase {
+            name: "straight_line",
+            artifact: scalar.artifact,
+            args: scalar.args,
+            budget: 2,
+            outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(7))),
+            digest: [
+                166, 84, 34, 161, 100, 88, 173, 25, 105, 181, 10, 183, 116, 180, 193, 205, 85, 40,
+                175, 96, 101, 147, 151, 218, 69, 87, 171, 59, 106, 147, 61, 44,
+            ],
+            fixed_cost: 2,
+        },
+        TraceCase {
+            name: "branch",
+            artifact: branch,
+            args: branch_args,
+            budget: 64,
+            outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(10))),
+            digest: [
+                172, 177, 184, 35, 78, 58, 68, 53, 75, 168, 170, 148, 208, 224, 98, 38, 46, 123,
+                193, 19, 116, 124, 75, 219, 171, 58, 227, 215, 133, 55, 36, 147,
+            ],
+            fixed_cost: 3,
+        },
+        TraceCase {
+            name: "switch",
+            artifact: switch,
+            args: switch_args,
+            budget: 64,
+            outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(20))),
+            digest: [
+                158, 20, 181, 111, 155, 172, 189, 72, 253, 154, 121, 182, 128, 246, 244, 47, 106,
+                78, 245, 87, 198, 49, 17, 199, 168, 102, 154, 217, 245, 118, 44, 1,
+            ],
+            fixed_cost: 5,
+        },
+        TraceCase {
+            name: "nested_call",
+            artifact: nested_call_artifact(),
+            args: Box::new([]),
+            budget: 128,
+            outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(42))),
+            digest: [
+                202, 247, 15, 74, 82, 69, 0, 127, 155, 56, 229, 155, 56, 220, 134, 34, 208, 84, 34,
+                165, 24, 106, 30, 112, 49, 52, 209, 183, 224, 14, 221, 147,
+            ],
+            fixed_cost: 17,
+        },
+        TraceCase {
+            name: "trap",
+            artifact: trap_after_write_artifact(7),
+            args: Box::new([]),
+            budget: 7,
+            outcome: super::error::Outcome::Crashed(super::error::GuestTrap::DivisionByZero),
+            digest: [
+                105, 237, 23, 177, 137, 66, 195, 156, 18, 75, 55, 255, 194, 9, 48, 7, 74, 26, 210,
+                125, 152, 194, 149, 199, 44, 88, 177, 128, 54, 199, 205, 48,
+            ],
+            fixed_cost: 7,
+        },
+        TraceCase {
+            name: "exact_fit",
+            artifact: two_block_artifact(3, 5),
+            args: Box::new([]),
+            budget: 8,
+            outcome: super::error::Outcome::Halted(None),
+            digest: [
+                26, 4, 113, 135, 27, 23, 254, 52, 42, 10, 81, 236, 202, 247, 54, 211, 75, 251, 117,
+                40, 139, 21, 195, 158, 137, 160, 93, 117, 6, 22, 172, 78,
+            ],
+            fixed_cost: 8,
+        },
+        TraceCase {
+            name: "discarded_remainder",
+            artifact: two_block_artifact(3, 5),
+            args: Box::new([]),
+            budget: 7,
+            outcome: super::error::Outcome::SliceExhausted,
+            digest: [
+                76, 219, 106, 116, 17, 37, 160, 129, 145, 182, 101, 200, 118, 224, 228, 252, 24,
+                221, 129, 236, 252, 89, 83, 215, 187, 104, 118, 53, 120, 241, 157, 206,
+            ],
+            fixed_cost: 3,
+        },
+        TraceCase {
+            name: "infinite_loop",
+            artifact: empty_loop_artifact(3),
+            args: Box::new([]),
+            budget: 10,
+            outcome: super::error::Outcome::SliceExhausted,
+            digest: [
+                160, 22, 191, 190, 189, 165, 225, 226, 226, 121, 222, 145, 44, 1, 76, 170, 57, 118,
+                61, 83, 10, 64, 160, 248, 9, 184, 71, 57, 71, 225, 71, 173,
+            ],
+            fixed_cost: 9,
+        },
+    ]
+}
+
 pub(super) fn scalar_cases() -> Vec<ScalarCase> {
     let case = |name, registers: Vec<ValueType>, args: Vec<RuntimeValue>, instruction, expected| {
         let instructions = vec![

@@ -33,6 +33,29 @@ impl RuntimeValue {
             Self::Reference(value) => value.handle as u64,
         }
     }
+
+    pub(super) fn trace_tag(self) -> u8 {
+        match self {
+            Self::I32(_) => 1,
+            Self::I64(_) => 2,
+            Self::F32(_) => 3,
+            Self::F64(_) => 4,
+            Self::Bool(_) => 5,
+            Self::Char(_) => 6,
+            Self::Null => 7,
+            Self::Reference(_) => 8,
+        }
+    }
+
+    pub(super) fn trace_payload_len(self) -> u32 {
+        match self {
+            Self::I32(_) | Self::F32(_) | Self::Char(_) => 4,
+            Self::I64(_) | Self::F64(_) => 8,
+            Self::Bool(_) => 1,
+            Self::Null => 0,
+            Self::Reference(_) => 16,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
