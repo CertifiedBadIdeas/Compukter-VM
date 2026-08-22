@@ -38,6 +38,7 @@ pub(super) struct Machine {
     registers: Box<[RegisterValue]>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
+    entered_blocks: u64,
 }
 
 impl Machine {
@@ -63,6 +64,7 @@ impl Machine {
             registers: registers.into_boxed_slice(),
             frame_depth: 0,
             consumed_fixed_cost: 0,
+            entered_blocks: 0,
         })
     }
 
@@ -127,64 +129,116 @@ impl Machine {
                 supplied: budget,
             });
         }
-        let remaining = budget;
-        let frame_index = self
-            .frame_depth
-            .checked_sub(1)
-            .ok_or(RunError::NotRunnable)?;
-        let block_index = self.frames[frame_index].block;
-        let block = self.image.block(block_index).ok_or(RunError::NotRunnable)?;
-        if block.fixed_cost > remaining {
-            return Ok(Outcome::SliceExhausted);
-        }
-        let _remaining_after_charge = remaining - block.fixed_cost;
-        let Some(consumed) = self
-            .consumed_fixed_cost
-            .checked_add(u64::from(block.fixed_cost))
-        else {
-            return Ok(self.fault(VmFault::AccountingOverflow));
-        };
-        self.consumed_fixed_cost = consumed;
+        let mut remaining = budget;
+        loop {
+            let frame_index = self
+                .frame_depth
+                .checked_sub(1)
+                .ok_or(RunError::NotRunnable)?;
+            let block_index = self.frames[frame_index].block;
+            let block = self.image.block(block_index).ok_or(RunError::NotRunnable)?;
+            if block.fixed_cost > remaining {
+                return Ok(Outcome::SliceExhausted);
+            }
+            remaining -= block.fixed_cost;
+            let Some(consumed) = self
+                .consumed_fixed_cost
+                .checked_add(u64::from(block.fixed_cost))
+            else {
+                return Ok(self.fault(VmFault::AccountingOverflow));
+            };
+            let Some(entered_blocks) = self.entered_blocks.checked_add(1) else {
+                return Ok(self.fault(VmFault::AccountingOverflow));
+            };
+            self.consumed_fixed_cost = consumed;
+            self.entered_blocks = entered_blocks;
 
-        while self.frames[frame_index].instruction < block.instructions.len() {
-            let instruction_index = self.frames[frame_index].instruction;
-            let instruction = &block.instructions[instruction_index];
-            if let ResolvedInstruction::Return { value } = instruction {
-                let returned = if *value == u16::MAX {
-                    None
-                } else {
-                    match self.read_register(frame_index, *value) {
-                        Ok(value) => Some(value),
-                        Err(fault) => return Ok(self.fault(fault)),
+            while self.frames[frame_index].instruction < block.instructions.len() {
+                let instruction_index = self.frames[frame_index].instruction;
+                let instruction = &block.instructions[instruction_index];
+                match instruction {
+                    ResolvedInstruction::Return { value } => {
+                        let returned = if *value == u16::MAX {
+                            None
+                        } else {
+                            match self.read_register(frame_index, *value) {
+                                Ok(value) => Some(value),
+                                Err(fault) => return Ok(self.fault(fault)),
+                            }
+                        };
+                        let outcome = Outcome::Halted(returned);
+                        self.lifecycle = Lifecycle::Terminal(outcome);
+                        self.frame_depth = 0;
+                        return Ok(outcome);
                     }
-                };
-                let outcome = Outcome::Halted(returned);
-                self.lifecycle = Lifecycle::Terminal(outcome);
-                self.frame_depth = 0;
-                return Ok(outcome);
+                    ResolvedInstruction::Jump { target } => {
+                        self.frames[frame_index].block = *target;
+                        self.frames[frame_index].instruction = 0;
+                        break;
+                    }
+                    ResolvedInstruction::Branch {
+                        condition,
+                        true_block,
+                        false_block,
+                    } => {
+                        let target = match self.read_register(frame_index, *condition) {
+                            Ok(RuntimeValue::Bool(true)) => *true_block,
+                            Ok(RuntimeValue::Bool(false)) => *false_block,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        self.frames[frame_index].block = target;
+                        self.frames[frame_index].instruction = 0;
+                        break;
+                    }
+                    ResolvedInstruction::SwitchI32 {
+                        key,
+                        default_block,
+                        cases,
+                    } => {
+                        let key = match self.read_register(frame_index, *key) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let target = cases
+                            .binary_search_by_key(&key, |case| case.value)
+                            .map(|index| cases[index].target)
+                            .unwrap_or(*default_block);
+                        self.frames[frame_index].block = target;
+                        self.frames[frame_index].instruction = 0;
+                        break;
+                    }
+                    ResolvedInstruction::Unreachable => {
+                        return Ok(self.fault(VmFault::ReachedUnreachable));
+                    }
+                    _ => {
+                        let width = self.image.registers_per_frame();
+                        let base = frame_index * width;
+                        let registers = &mut self.registers[base..base + width];
+                        let register_types = &self
+                            .image
+                            .function(self.frames[frame_index].function)
+                            .ok_or(RunError::NotRunnable)?
+                            .registers;
+                        match execute_scalar(instruction, registers, register_types, &self.image) {
+                            Ok(()) => self.frames[frame_index].instruction += 1,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => {
+                                return Ok(self.fault(fault));
+                            }
+                        }
+                    }
+                }
             }
-            let width = self.image.registers_per_frame();
-            let base = frame_index * width;
-            let registers = &mut self.registers[base..base + width];
-            let register_types = &self
-                .image
-                .function(self.frames[frame_index].function)
-                .ok_or(RunError::NotRunnable)?
-                .registers;
-            match execute_scalar(instruction, registers, register_types, &self.image) {
-                Ok(()) => self.frames[frame_index].instruction += 1,
-                Err(InstructionFailure::Trap(trap)) => {
-                    let outcome = Outcome::Crashed(trap);
-                    self.lifecycle = Lifecycle::Terminal(outcome);
-                    return Ok(outcome);
-                }
-                Err(InstructionFailure::Fault(fault)) => {
-                    let outcome = self.fault(fault);
-                    return Ok(outcome);
-                }
+            if self.frames[frame_index].instruction == block.instructions.len() {
+                return Ok(self.fault(VmFault::CorruptLifecycle));
             }
         }
-        Ok(self.fault(VmFault::CorruptLifecycle))
     }
 
     fn read_register(&self, frame: usize, register: u16) -> Result<RuntimeValue, VmFault> {
@@ -206,6 +260,10 @@ impl Machine {
 
     pub(super) fn consumed_fixed_cost(&self) -> u64 {
         self.consumed_fixed_cost
+    }
+
+    pub(super) fn entered_blocks(&self) -> u64 {
+        self.entered_blocks
     }
 
     fn validate_argument(
@@ -273,6 +331,13 @@ impl Machine {
             self.frame_depth,
             self.registers.clone(),
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_active_registers(&self) -> Box<[RegisterValue]> {
+        let width = self.image.registers_per_frame();
+        let base = self.frame_depth.saturating_sub(1) * width;
+        self.registers[base..base + width].into()
     }
 }
 

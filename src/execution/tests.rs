@@ -29,6 +29,56 @@ fn scalar_vectors_match_kotlin_jvm_semantics() {
 }
 
 #[test]
+fn block_cost_is_atomic_and_slice_remainder_is_discarded() {
+    let mut exact = fixtures::started_zero_arg(fixtures::two_block_artifact(3, 5));
+    assert_eq!(Outcome::Halted(None), exact.run_slice(8).unwrap());
+    assert_eq!(8, exact.consumed_fixed_cost());
+
+    let mut short = fixtures::started_zero_arg(fixtures::two_block_artifact(3, 5));
+    assert_eq!(Outcome::SliceExhausted, short.run_slice(7).unwrap());
+    assert_eq!(3, short.consumed_fixed_cost());
+    assert_eq!(Outcome::Halted(None), short.run_slice(5).unwrap());
+    assert_eq!(8, short.consumed_fixed_cost());
+}
+
+#[test]
+fn while_true_executes_floor_budget_over_block_cost_iterations() {
+    let mut machine = fixtures::started_zero_arg(fixtures::empty_loop_artifact(3));
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(10).unwrap());
+    assert_eq!(9, machine.consumed_fixed_cost());
+    assert_eq!(3, machine.entered_blocks());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(4).unwrap());
+    assert_eq!(12, machine.consumed_fixed_cost());
+    assert_eq!(4, machine.entered_blocks());
+}
+
+#[test]
+fn trap_keeps_the_full_containing_block_charge() {
+    let mut machine = fixtures::started_zero_arg(fixtures::trap_after_write_artifact(7));
+    assert_eq!(
+        Outcome::Crashed(super::error::GuestTrap::DivisionByZero),
+        machine.run_slice(7).unwrap()
+    );
+    assert_eq!(7, machine.consumed_fixed_cost());
+    assert_eq!(
+        fixtures::pre_trap_registers(),
+        machine.test_active_registers()
+    );
+}
+
+#[test]
+fn branch_and_switch_select_only_the_verified_target() {
+    for (key, expected) in [(0, 10), (1, 20), (7, 30)] {
+        let (artifact, args) = fixtures::branch_switch_artifact(key);
+        let mut machine = fixtures::started(artifact, &args);
+        assert_eq!(
+            Outcome::Halted(Some(RuntimeValue::I32(expected))),
+            machine.run_slice(64).unwrap()
+        );
+    }
+}
+
+#[test]
 fn start_validates_all_arguments_before_mutation() {
     let image =
         ExecutionImage::admit(fixtures::typed_entry_artifact(), fixtures::profile()).unwrap();

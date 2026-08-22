@@ -1,15 +1,173 @@
 use std::sync::Arc;
 
 use crate::{
-    artifact::{Constant, Instruction, NominalType, TypeId, ValueType},
+    artifact::{
+        Block, BlockId, ByteRange, Constant, DecodedCode, FunctionId, Instruction, NominalType,
+        SwitchCase, TypeId, ValueType,
+    },
     verify_artifact, ArtifactLimits, VerifiedArtifact,
 };
 
 use super::{
     image::{AdmittedReference, ExecutionImage, ExecutionProfile},
-    value::{EntryArgument, ReferenceValue, RuntimeValue},
+    machine::Machine,
+    value::{EntryArgument, ReferenceValue, RegisterValue, RuntimeValue},
     TypeKey,
 };
+
+pub(super) fn started(artifact: VerifiedArtifact, args: &[EntryArgument]) -> Machine {
+    let image = ExecutionImage::admit(artifact, profile()).unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(args).unwrap();
+    machine
+}
+
+pub(super) fn started_zero_arg(artifact: VerifiedArtifact) -> Machine {
+    started(artifact, &[])
+}
+
+pub(super) fn two_block_artifact(first_cost: u32, second_cost: u32) -> VerifiedArtifact {
+    let mut first = (0..first_cost - 1)
+        .map(|_| Instruction::Nop)
+        .collect::<Vec<_>>();
+    first.push(Instruction::Jump { target: 1 });
+    let mut second = (0..second_cost - 1)
+        .map(|_| Instruction::Nop)
+        .collect::<Vec<_>>();
+    second.push(Instruction::Return { value: u16::MAX });
+    verified_blocks(
+        primitive(0),
+        0,
+        Vec::new(),
+        Vec::new(),
+        vec![(0, first), (0, second)],
+        1,
+    )
+}
+
+pub(super) fn empty_loop_artifact(cost: u32) -> VerifiedArtifact {
+    let mut instructions = (0..cost - 1).map(|_| Instruction::Nop).collect::<Vec<_>>();
+    instructions.push(Instruction::Jump { target: 0 });
+    verified_blocks(
+        primitive(0),
+        0,
+        Vec::new(),
+        Vec::new(),
+        vec![(1, instructions)],
+        1,
+    )
+}
+
+pub(super) fn trap_after_write_artifact(cost: u32) -> VerifiedArtifact {
+    let instructions = vec![
+        Instruction::Const {
+            dst: 0,
+            constant: 1,
+        },
+        Instruction::Const {
+            dst: 1,
+            constant: 0,
+        },
+        Instruction::Div {
+            form: 1,
+            dst: 2,
+            lhs: 0,
+            rhs: 1,
+        },
+        Instruction::Return { value: u16::MAX },
+    ];
+    assert_eq!(
+        cost,
+        instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum()
+    );
+    verified_blocks(
+        primitive(0),
+        0,
+        vec![primitive(1), primitive(1), primitive(1)],
+        vec![Constant::I32(0), Constant::I32(1)],
+        vec![(0, instructions)],
+        1,
+    )
+}
+
+pub(super) fn pre_trap_registers() -> Box<[RegisterValue]> {
+    Box::new([
+        RegisterValue::Initialized(RuntimeValue::I32(1)),
+        RegisterValue::Initialized(RuntimeValue::I32(0)),
+        RegisterValue::Uninitialized,
+    ])
+}
+
+pub(super) fn branch_switch_artifact(key: i32) -> (VerifiedArtifact, Box<[EntryArgument]>) {
+    let artifact = verified_blocks(
+        primitive(1),
+        2,
+        vec![primitive(5), primitive(1), primitive(1)],
+        vec![Constant::I32(10), Constant::I32(20), Constant::I32(30)],
+        vec![
+            (
+                0,
+                vec![Instruction::Branch {
+                    condition: 0,
+                    true_block: 1,
+                    false_block: 2,
+                }],
+            ),
+            (
+                0,
+                vec![
+                    Instruction::Const {
+                        dst: 2,
+                        constant: 0,
+                    },
+                    Instruction::Return { value: 2 },
+                ],
+            ),
+            (
+                0,
+                vec![Instruction::SwitchI32 {
+                    key: 1,
+                    default_block: 4,
+                    cases: Box::new([SwitchCase {
+                        value: 1,
+                        target: 3,
+                    }]),
+                }],
+            ),
+            (
+                0,
+                vec![
+                    Instruction::Const {
+                        dst: 2,
+                        constant: 1,
+                    },
+                    Instruction::Return { value: 2 },
+                ],
+            ),
+            (
+                0,
+                vec![
+                    Instruction::Const {
+                        dst: 2,
+                        constant: 2,
+                    },
+                    Instruction::Return { value: 2 },
+                ],
+            ),
+        ],
+        1,
+    );
+    (
+        artifact,
+        Box::new([
+            EntryArgument(RuntimeValue::Bool(key == 0)),
+            EntryArgument(RuntimeValue::I32(key)),
+        ]),
+    )
+}
 
 pub(super) struct ScalarCase {
     pub name: &'static str,
@@ -327,6 +485,62 @@ fn verified_program(
         artifact.manifest.minimum_slice_cost = fixed_cost;
         artifact.manifest.required_stack_bytes =
             super::image::frame_charge(register_count.into()).unwrap() as u32;
+    })
+}
+
+fn verified_blocks(
+    result: ValueType,
+    parameter_count: usize,
+    registers: Vec<ValueType>,
+    constants: Vec<Constant>,
+    blocks: Vec<(u32, Vec<Instruction>)>,
+    maximum_call_depth: u32,
+) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result,
+            parameters: registers[..parameter_count].to_vec(),
+        };
+        artifact.modules[0].constants = constants;
+        let register_count = registers.len() as u16;
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = register_count;
+        function.parameter_count = parameter_count as u16;
+        function.registers = registers;
+        function.first_block = BlockId(0);
+        function.block_count = blocks.len() as u32;
+        let mut block_records = Vec::new();
+        let mut code_records = Vec::new();
+        let mut maximum_block_cost = 0;
+        for (block_id, (flags, instructions)) in blocks.into_iter().enumerate() {
+            let fixed_cost = instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum();
+            maximum_block_cost = maximum_block_cost.max(fixed_cost);
+            block_records.push(Block {
+                owner_function: FunctionId(0),
+                code_record: BlockId(block_id as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: fixed_cost,
+                flags,
+            });
+            code_records.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: instructions.into_boxed_slice(),
+                fixed_cost,
+            });
+        }
+        artifact.modules[0].blocks = block_records;
+        artifact.modules[0].code = code_records;
+        artifact.manifest.maximum_block_cost = maximum_block_cost;
+        artifact.manifest.minimum_slice_cost = maximum_block_cost;
+        artifact.manifest.maximum_call_depth = maximum_call_depth;
+        artifact.manifest.required_stack_bytes =
+            (super::image::frame_charge(register_count.into()).unwrap()
+                * u64::from(maximum_call_depth)) as u32;
     })
 }
 
