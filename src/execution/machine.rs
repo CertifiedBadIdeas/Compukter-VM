@@ -1,5 +1,6 @@
 use super::{
     error::{AdmissionError, AllocationExhaustion, GuestTrap, Outcome, RunError, VmFault},
+    gc::Collector,
     heap::{AllocationRequest, Heap},
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
     image::{ExecutionImage, ResolvedInstruction, ResolvedValueType},
@@ -17,12 +18,12 @@ enum Lifecycle {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Frame {
-    function: usize,
-    block: usize,
-    instruction: usize,
-    caller_instruction: usize,
-    destination: u16,
+pub(super) struct Frame {
+    pub(super) function: usize,
+    pub(super) block: usize,
+    pub(super) instruction: usize,
+    pub(super) caller_instruction: usize,
+    pub(super) destination: u16,
 }
 
 impl Frame {
@@ -33,6 +34,17 @@ impl Frame {
         caller_instruction: 0,
         destination: u16::MAX,
     };
+
+    #[cfg(test)]
+    pub(super) const fn test_entry(function: usize) -> Self {
+        Self {
+            function,
+            block: 0,
+            instruction: 0,
+            caller_instruction: 0,
+            destination: u16::MAX,
+        }
+    }
 }
 
 pub(super) struct Machine {
@@ -42,14 +54,52 @@ pub(super) struct Machine {
     registers: Box<[RegisterValue]>,
     static_slots: Box<[RuntimeValue]>,
     heap: Heap,
+    collector: Collector,
+    allocation_retry: Option<AllocationRetry>,
     pending_allocation: Option<PendingAllocation>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
     consumed_dynamic_cost: u64,
+    consumed_maintenance_cost: u64,
     entered_blocks: u64,
     executed_instructions: u64,
     maximum_observed_frame_depth: usize,
     trace: Sha256,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AllocationShape {
+    Object,
+    Array { length: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AllocationRetry {
+    request: AllocationRequest,
+    destination: u16,
+    logical_bytes: u32,
+    shape: AllocationShape,
+}
+
+impl AllocationRetry {
+    fn reserve(self, heap: &mut Heap) -> Result<Option<PendingAllocation>, VmFault> {
+        let Some(reservation) = heap.reserve(self.request)? else {
+            return Ok(None);
+        };
+        let state = PendingState {
+            request: self.request,
+            reservation,
+            destination: self.destination,
+            logical_bytes: self.logical_bytes,
+            initialized_bytes: 0,
+            fixed_cost_paid: true,
+            collection_attempted: true,
+        };
+        Ok(Some(match self.shape {
+            AllocationShape::Object => PendingAllocation::Object(state),
+            AllocationShape::Array { length } => PendingAllocation::Array { state, length },
+        }))
+    }
 }
 
 impl Machine {
@@ -91,10 +141,13 @@ impl Machine {
             registers: registers.into_boxed_slice(),
             static_slots: static_slots.into_boxed_slice(),
             heap,
+            collector: Collector::new(),
+            allocation_retry: None,
             pending_allocation: None,
             frame_depth: 0,
             consumed_fixed_cost: 0,
             consumed_dynamic_cost: 0,
+            consumed_maintenance_cost: 0,
             entered_blocks: 0,
             executed_instructions: 0,
             maximum_observed_frame_depth: 0,
@@ -148,7 +201,11 @@ impl Machine {
         Ok(())
     }
 
-    pub(super) fn run_slice(&mut self, budget: u32) -> Result<Outcome, RunError> {
+    pub(super) fn run_slice(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+    ) -> Result<Outcome, RunError> {
         match self.lifecycle {
             Lifecycle::Terminal(outcome) => return Ok(outcome),
             Lifecycle::Pristine => return Err(RunError::NotStarted),
@@ -159,14 +216,27 @@ impl Machine {
         } else {
             self.image.minimum_slice_cost()
         };
-        if budget == 0 || budget < minimum || budget > self.image.maximum_slice_budget() {
+        if guest_budget == 0
+            || guest_budget < minimum
+            || guest_budget > self.image.maximum_slice_budget()
+        {
             return Err(RunError::InvalidSliceBudget {
                 minimum,
                 maximum: self.image.maximum_slice_budget(),
-                supplied: budget,
+                supplied: guest_budget,
             });
         }
-        let mut remaining = budget;
+        if maintenance_budget > self.image.maximum_slice_budget() {
+            return Err(RunError::InvalidSliceBudget {
+                minimum: 0,
+                maximum: self.image.maximum_slice_budget(),
+                supplied: maintenance_budget,
+            });
+        }
+        if self.collector.is_active() {
+            return self.run_maintenance(maintenance_budget);
+        }
+        let mut remaining = guest_budget;
         loop {
             let frame_index = self
                 .frame_depth
@@ -372,7 +442,13 @@ impl Machine {
                         let reservation = match self.heap.reserve(request) {
                             Ok(Some(reservation)) => reservation,
                             Ok(None) => {
-                                return Ok(self.allocation_exhausted(request.block_bytes, false))
+                                let retry = AllocationRetry {
+                                    request,
+                                    destination: *dst,
+                                    logical_bytes,
+                                    shape: AllocationShape::Object,
+                                };
+                                return self.start_collection(retry, maintenance_budget);
                             }
                             Err(fault) => return Ok(self.fault(fault)),
                         };
@@ -421,7 +497,15 @@ impl Machine {
                         let reservation = match self.heap.reserve(request) {
                             Ok(Some(reservation)) => reservation,
                             Ok(None) => {
-                                return Ok(self.allocation_exhausted(request.block_bytes, false))
+                                let retry = AllocationRetry {
+                                    request,
+                                    destination: *dst,
+                                    logical_bytes: layout.payload_bytes,
+                                    shape: AllocationShape::Array {
+                                        length: layout.length,
+                                    },
+                                };
+                                return self.start_collection(retry, maintenance_budget);
                             }
                             Err(fault) => return Ok(self.fault(fault)),
                         };
@@ -814,6 +898,55 @@ impl Machine {
         outcome
     }
 
+    fn start_collection(
+        &mut self,
+        retry: AllocationRetry,
+        maintenance_budget: u32,
+    ) -> Result<Outcome, RunError> {
+        if self.collector.is_active() || self.allocation_retry.is_some() {
+            return Ok(self.fault(VmFault::CorruptLifecycle));
+        }
+        self.allocation_retry = Some(retry);
+        self.collector.start();
+        self.run_maintenance(maintenance_budget)
+    }
+
+    fn run_maintenance(&mut self, budget: u32) -> Result<Outcome, RunError> {
+        let mut remaining = budget;
+        while remaining != 0 && self.collector.is_active() {
+            let Some(consumed) = self.consumed_maintenance_cost.checked_add(1) else {
+                return Ok(self.fault(VmFault::AccountingOverflow));
+            };
+            remaining -= 1;
+            self.consumed_maintenance_cost = consumed;
+            match self.collector.step(
+                &mut self.heap,
+                &self.image,
+                &self.static_slots,
+                &self.frames,
+                &self.registers,
+                self.frame_depth,
+            ) {
+                Ok(1) => {}
+                Ok(_) => return Ok(self.fault(VmFault::CorruptLifecycle)),
+                Err(fault) => return Ok(self.fault(fault)),
+            }
+        }
+        if !self.collector.is_active() {
+            let Some(retry) = self.allocation_retry.take() else {
+                return Ok(self.fault(VmFault::CorruptLifecycle));
+            };
+            match retry.reserve(&mut self.heap) {
+                Ok(Some(pending)) => self.pending_allocation = Some(pending),
+                Ok(None) => {
+                    return Ok(self.allocation_exhausted(retry.request.block_bytes, true));
+                }
+                Err(fault) => return Ok(self.fault(fault)),
+            }
+        }
+        Ok(Outcome::SliceExhausted)
+    }
+
     fn resume_pending_allocation(
         &mut self,
         frame_index: usize,
@@ -1062,6 +1195,10 @@ impl Machine {
         self.frame_depth
     }
 
+    pub(super) fn consumed_maintenance_cost(&self) -> u64 {
+        self.consumed_maintenance_cost
+    }
+
     #[cfg(test)]
     pub(super) fn test_register(&self, register: usize) -> Option<RuntimeValue> {
         match self.registers.get(register) {
@@ -1095,6 +1232,11 @@ impl Machine {
             return Ok(());
         };
         pending.abort(&mut self.heap)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_collector_active(&self) -> bool {
+        self.collector.is_active()
     }
 
     #[cfg(test)]

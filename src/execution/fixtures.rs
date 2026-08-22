@@ -828,6 +828,146 @@ pub(super) fn object_allocation_artifact(field_count: u32) -> VerifiedArtifact {
     })
 }
 
+pub(super) fn gc_retry_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let reference = ValueType {
+            kind: 7,
+            flags: 1,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: reference,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0]
+            .types
+            .push(plain_class(TypeId(u32::MAX), 0, 0));
+        artifact.modules[0].declared_types = 2;
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 1;
+        function.registers = vec![reference];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::NewObject {
+                        dst: 0,
+                        type_ref: 1,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::Null { dst: 0 },
+                    Instruction::Jump { target: 2 },
+                ],
+                vec![
+                    Instruction::NewObject {
+                        dst: 0,
+                        type_ref: 1,
+                    },
+                    Instruction::Jump { target: 3 },
+                ],
+                vec![Instruction::Return { value: 0 }],
+            ],
+        );
+        configure_stack(artifact, 1, 1);
+    })
+}
+
+pub(super) fn gc_failed_retry_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let reference = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: reference,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0]
+            .types
+            .push(plain_class(TypeId(u32::MAX), 0, 0));
+        artifact.modules[0].declared_types = 2;
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 2;
+        function.registers = vec![reference, reference];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::NewObject {
+                        dst: 0,
+                        type_ref: 1,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::NewObject {
+                        dst: 1,
+                        type_ref: 1,
+                    },
+                    Instruction::Jump { target: 2 },
+                ],
+                vec![Instruction::Return { value: 1 }],
+            ],
+        );
+        configure_stack(artifact, 2, 1);
+    })
+}
+
+pub(super) fn gc_graph_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let reference = ValueType {
+            kind: 7,
+            flags: 1,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: Vec::new(),
+        };
+        artifact.modules[0]
+            .types
+            .push(plain_class(TypeId(u32::MAX), 0, 3));
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].fields = vec![
+            Field {
+                owner: TypeId(1),
+                name: 0,
+                value_type: reference,
+                flags: 0,
+            },
+            Field {
+                owner: TypeId(1),
+                name: 0,
+                value_type: reference,
+                flags: 0,
+            },
+            Field {
+                owner: TypeId(1),
+                name: 0,
+                value_type: reference,
+                flags: 2,
+            },
+        ];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 1;
+        function.registers = vec![reference];
+        install_entry_blocks(
+            artifact,
+            vec![vec![Instruction::Return { value: u16::MAX }]],
+        );
+        configure_stack(artifact, 1, 2);
+    })
+}
+
 pub(super) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
     let reference = ValueType {
         kind: 7,

@@ -203,6 +203,7 @@ impl Heap {
             block_size
         };
         self.write_header(block, allocated_size, previous_size, true)?;
+        self.write_word(block, NEXT_FREE, slot)?;
         self.total_free = self
             .total_free
             .checked_sub(allocated_size)
@@ -517,6 +518,120 @@ impl Heap {
             live_handles: self.live_handles,
             retired_handles: self.retired_handles,
         }
+    }
+
+    pub(super) fn enqueue_gray(
+        &mut self,
+        reference: ReferenceValue,
+        epoch: u32,
+        head: &mut Option<u32>,
+        tail: &mut Option<u32>,
+    ) -> Result<(), VmFault> {
+        if reference.domain() != ReferenceDomain::Managed {
+            return Ok(());
+        }
+        let slot = reference.slot();
+        let entry = self
+            .handles
+            .get_mut(slot as usize)
+            .ok_or(VmFault::InvalidReference)?;
+        if entry.state != HandleState::Live || entry.generation != reference.generation() {
+            return Err(VmFault::InvalidReference);
+        }
+        if entry.mark_epoch == epoch {
+            return Ok(());
+        }
+        entry.mark_epoch = epoch;
+        entry.gray_next = NULL_OFFSET;
+        if let Some(previous) = *tail {
+            self.handles
+                .get_mut(previous as usize)
+                .ok_or(VmFault::CorruptHeap)?
+                .gray_next = slot;
+        } else {
+            *head = Some(slot);
+        }
+        *tail = Some(slot);
+        Ok(())
+    }
+
+    pub(super) fn dequeue_gray(
+        &mut self,
+        head: &mut Option<u32>,
+        tail: &mut Option<u32>,
+    ) -> Result<Option<(ReferenceValue, TypeKey)>, VmFault> {
+        let Some(slot) = *head else {
+            return Ok(None);
+        };
+        let entry = self
+            .handles
+            .get_mut(slot as usize)
+            .ok_or(VmFault::CorruptHeap)?;
+        if entry.state != HandleState::Live {
+            return Err(VmFault::CorruptHeap);
+        }
+        let next = entry.gray_next;
+        entry.gray_next = NULL_OFFSET;
+        *head = (next != NULL_OFFSET).then_some(next);
+        if head.is_none() {
+            *tail = None;
+        }
+        let reference =
+            ReferenceValue::managed(slot, entry.generation).ok_or(VmFault::CorruptHeap)?;
+        Ok(Some((reference, entry.ty)))
+    }
+
+    pub(super) fn arena_bytes(&self) -> u32 {
+        self.arena_bytes
+    }
+
+    pub(super) fn sweep_block(&mut self, offset: u32, epoch: u32) -> Result<u32, VmFault> {
+        if offset >= self.arena_bytes {
+            return Err(VmFault::CorruptHeap);
+        }
+        let block = BlockOffset(offset);
+        let size = self.block_size(block)?;
+        if !self.block_allocated(block)? {
+            return offset.checked_add(size).ok_or(VmFault::CorruptHeap);
+        }
+        let slot = self.read_word(block, NEXT_FREE)?;
+        let entry = self
+            .handles
+            .get(slot as usize)
+            .copied()
+            .ok_or(VmFault::CorruptHeap)?;
+        if entry.state != HandleState::Live || entry.block != block {
+            return Err(VmFault::CorruptHeap);
+        }
+        if entry.mark_epoch == epoch {
+            self.handles[slot as usize].gray_next = NULL_OFFSET;
+            return offset.checked_add(size).ok_or(VmFault::CorruptHeap);
+        }
+
+        let previous_size = self.read_word(block, PREVIOUS_SIZE)?;
+        let merged = if offset != 0 {
+            let previous = BlockOffset(
+                offset
+                    .checked_sub(previous_size)
+                    .ok_or(VmFault::CorruptHeap)?,
+            );
+            if self.block_allocated(previous)? {
+                block
+            } else {
+                previous
+            }
+        } else {
+            block
+        };
+        let reference =
+            ReferenceValue::managed(slot, entry.generation).ok_or(VmFault::CorruptHeap)?;
+        if !self.free(reference)? {
+            return Err(VmFault::CorruptHeap);
+        }
+        merged
+            .0
+            .checked_add(self.block_size(merged)?)
+            .ok_or(VmFault::CorruptHeap)
     }
 
     #[cfg(test)]
