@@ -1,5 +1,8 @@
 # Tier 0 interpreter baseline
 
+Managed heap, compact-string, GC, fragmentation, and idle-instance measurements
+are recorded separately in [the managed heap baseline](managed-heap-baseline.md).
+
 Recorded on 2026-08-22 with the release profile (`codegen-units = 1`, thin
 LTO), Rust 1.95.0, host `x86_64-unknown-linux-gnu`, and CPU label
 `x86_64 local`.

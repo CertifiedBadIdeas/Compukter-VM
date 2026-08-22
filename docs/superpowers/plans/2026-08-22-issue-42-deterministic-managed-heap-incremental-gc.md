@@ -503,7 +503,7 @@ git commit -m "feat(vm): guarantee bounded managed OOM delivery (#42)"
 - Modify: `docs/performance/tier0-baseline.md`
 - Create: `docs/performance/managed-heap-baseline.md`
 
-- [ ] **Step 1: Add end-to-end golden and ignored release workloads**
+- [x] **Step 1: Add end-to-end golden and ignored release workloads**
 
 Add one representative artifact that allocates inherited objects and reference
 arrays, creates a cycle, retains through a static, drops it, performs one-unit
@@ -513,13 +513,13 @@ digest, heap statistics, and debug/release equality. Add ignored workloads for
 allocation sizes, field/array/text operations, root/edge/leaf/sweep units,
 fragmentation, and 10,000 idle instances.
 
-- [ ] **Step 2: Run focused golden tests in both profiles**
+- [x] **Step 2: Run focused golden tests in both profiles**
 
 Run: `cargo test --locked --offline execution::tests::managed_heap_vertical -- --nocapture && cargo test --release --locked --offline execution::tests::managed_heap_vertical -- --nocapture`
 
 Expected: both profiles PASS with identical semantic digests and totals.
 
-- [ ] **Step 3: Run release workloads and write the observed baseline**
+- [x] **Step 3: Run release workloads and write the observed baseline**
 
 Run: `cargo test --release --locked --offline managed_heap_performance -- --ignored --nocapture --test-threads=1`
 
@@ -528,13 +528,13 @@ GC unit/pause distributions, live/free/largest-block/slack bytes, metadata and
 resident totals, and idle zero-work result in
 `docs/performance/managed-heap-baseline.md`. Link it from the Tier 0 baseline.
 
-- [ ] **Step 4: Run the complete verification matrix**
+- [x] **Step 4: Run the complete verification matrix**
 
 Run: `cargo fmt --all -- --check && cargo test --locked --offline && cargo test --release --locked --offline && cargo clippy --all-targets --all-features --locked --offline -- -D warnings && git diff --check`
 
 Expected: every command exits zero; non-ignored tests report zero failures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/execution/tests.rs src/execution/heap_tests.rs src/execution/gc_tests.rs src/execution/text_tests.rs docs/performance/tier0-baseline.md docs/performance/managed-heap-baseline.md

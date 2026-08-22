@@ -188,6 +188,56 @@ fn allocator_steady_state_allocates_nothing() -> Result<(), AdmissionError> {
 }
 
 #[test]
+#[ignore = "records a hardware-specific managed-heap performance baseline"]
+fn managed_heap_performance_allocator_and_fragmentation() {
+    use std::time::Instant;
+
+    const ITERATIONS: u32 = 100_000;
+    println!("workload\titerations\telapsed_ns\toperations_per_s\ttotal_free\tlargest_free");
+    for block_bytes in [32, 64, 256] {
+        let mut heap = Heap::new(&allocator_plan(4_096)).unwrap();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            let reservation = heap
+                .reserve(allocator_request(block_bytes))
+                .unwrap()
+                .unwrap();
+            let reference = heap.commit(reservation).unwrap();
+            assert!(heap.free(reference).unwrap());
+        }
+        let elapsed = started.elapsed();
+        let diagnostic = heap.diagnostic();
+        println!(
+            "allocate_free_{block_bytes}\t{ITERATIONS}\t{}\t{:.0}\t{}\t{}",
+            elapsed.as_nanos(),
+            f64::from(ITERATIONS) / elapsed.as_secs_f64(),
+            diagnostic.total_free,
+            diagnostic.largest_free_block,
+        );
+    }
+
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        let mut heap = Heap::new(&allocator_plan(128)).unwrap();
+        let values = [
+            heap.reserve(allocator_request(32)).unwrap().unwrap(),
+            heap.reserve(allocator_request(32)).unwrap().unwrap(),
+            heap.reserve(allocator_request(32)).unwrap().unwrap(),
+            heap.reserve(allocator_request(32)).unwrap().unwrap(),
+        ];
+        for reservation in values {
+            heap.abort(reservation).unwrap();
+        }
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "fragment_coalesce\t{ITERATIONS}\t{}\t{:.0}\t128\t128",
+        elapsed.as_nanos(),
+        f64::from(ITERATIONS) / elapsed.as_secs_f64(),
+    );
+}
+
+#[test]
 fn portable_minimum_and_representative_layouts() -> Result<(), AdmissionError> {
     assert_eq!(32, empty_object_layout()?.block_bytes);
     assert_eq!(48, array_layout(ValueWidth::Char, 9)?.block_bytes);
