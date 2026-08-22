@@ -17,7 +17,7 @@ pub use error::{AdmissionError, GuestTrap, RunError, VmFault};
 pub use host::{
     AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, HostArguments, HostFailure,
     HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView,
-    ManagedAllocationFailure, OperationSchema, RequestId, ResumeError,
+    ManagedAllocationFailure, OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError,
 };
 pub use session::Session;
 

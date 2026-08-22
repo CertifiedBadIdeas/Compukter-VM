@@ -58,8 +58,8 @@ pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{
     AdmissionError, AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, GuestTrap,
     HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput,
-    HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema, RequestId,
-    ResumeError, RunError, Session, VmFault,
+    HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema, QuotaExhaustion,
+    QuotaKind, RequestId, ResumeError, RunError, Session, VmFault,
 };
 pub use limits::ArtifactLimits;
 

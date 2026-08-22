@@ -312,11 +312,26 @@ pub struct ManagedAllocationFailure {
     pub collection_attempted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaKind {
+    HostRequestCodeUnits,
+    HostRequests,
+    AcceptedResponses,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotaExhaustion {
+    pub kind: QuotaKind,
+    pub limit: u64,
+    pub consumed: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AdvanceOutcome<'a> {
     SliceExhausted,
     HostRequest(HostRequestView<'a>),
     AllocationExhausted(ManagedAllocationFailure),
+    QuotaExhausted(QuotaExhaustion),
     Halted(Option<HostValueView<'a>>),
     Crashed(super::error::GuestTrap),
     Faulted(super::error::VmFault),

@@ -5,7 +5,8 @@ use super::{
     host::{
         AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, HostArguments,
         HostFailure, HostRequestView, HostResponse, HostValueInput, HostValueSlot, HostValueView,
-        ManagedAllocationFailure, RequestId, ResolvedCapability, ResolvedOperation, ResumeError,
+        ManagedAllocationFailure, QuotaExhaustion, QuotaKind, RequestId, ResolvedCapability,
+        ResolvedOperation, ResumeError,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::Machine,
@@ -24,6 +25,8 @@ pub struct Session {
     pending_request: Option<PendingRequest>,
     terminal: Option<SessionTerminal>,
     next_request_id: u64,
+    preparing_request: Option<PreparingRequest>,
+    maximum_slice_budget: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -34,9 +37,18 @@ struct PendingRequest {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PreparingRequest {
+    capability: u32,
+    operation: u32,
+    argument: usize,
+    string_offset: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum SessionTerminal {
     HostFailed(HostFailure),
     Faulted(super::error::VmFault),
+    QuotaExhausted(QuotaExhaustion),
 }
 
 struct CapabilityResolution {
@@ -76,6 +88,7 @@ impl Session {
         let outbound_capacity = checked_usize(profile.maximum_outbound_utf16_code_units)?;
         let inbound_capacity = checked_usize(profile.maximum_inbound_utf16_code_units)?;
         let maximum_accepted_responses = profile.maximum_accepted_responses;
+        let maximum_slice_budget = profile.maximum_slice_budget;
         let image_profile = ImageProfile {
             heap_bytes: profile.heap_bytes,
             frame_storage_bytes: profile.frame_storage_bytes,
@@ -111,6 +124,8 @@ impl Session {
             pending_request: None,
             terminal: None,
             next_request_id: 1,
+            preparing_request: None,
+            maximum_slice_budget,
         })
     }
 
@@ -143,14 +158,20 @@ impl Session {
             return Ok(match terminal {
                 SessionTerminal::HostFailed(failure) => AdvanceOutcome::HostFailed(failure),
                 SessionTerminal::Faulted(fault) => AdvanceOutcome::Faulted(fault),
+                SessionTerminal::QuotaExhausted(exhaustion) => {
+                    AdvanceOutcome::QuotaExhausted(exhaustion)
+                }
             });
         }
         if self.pending_request.is_some() {
             return self.request_outcome().map_err(|_| RunError::NotRunnable);
         }
+        if self.preparing_request.is_some() {
+            return self.advance_request_preparation(guest_budget, maintenance_budget);
+        }
         match self.machine.run_slice(guest_budget, maintenance_budget)? {
             super::error::Outcome::SliceExhausted => Ok(AdvanceOutcome::SliceExhausted),
-            super::error::Outcome::HostRequest => self.publish_scalar_request(),
+            super::error::Outcome::HostRequest => self.begin_request(),
             super::error::Outcome::AllocationExhausted(exhaustion) => Ok(
                 AdvanceOutcome::AllocationExhausted(ManagedAllocationFailure {
                     diagnostic: exhaustion.diagnostic,
@@ -216,41 +237,157 @@ impl Session {
         Ok(())
     }
 
-    fn publish_scalar_request(&mut self) -> Result<AdvanceOutcome<'_>, RunError> {
+    fn begin_request(&mut self) -> Result<AdvanceOutcome<'_>, RunError> {
         let prepared = (|| {
             let suspension = self.machine.capability_suspension()?;
             if suspension.arguments.len() > self.argument_slots.len() {
                 return Err(super::error::VmFault::InvalidStoragePlan);
             }
+            let schema = self
+                .capabilities
+                .get(suspension.capability as usize)
+                .and_then(Option::as_ref)
+                .and_then(|capability| capability.operations.get(suspension.operation as usize))
+                .ok_or(super::error::VmFault::InvalidResolvedId)?;
+            let mut outbound_used = 0_u32;
+            let mut contains_string = false;
             for (index, register) in suspension.arguments.iter().copied().enumerate() {
-                let value = self.machine.capability_argument(register)?;
-                let slot =
-                    runtime_slot(value).ok_or(super::error::VmFault::UnsupportedInstruction)?;
-                self.argument_slots[index] = slot;
+                if schema.arguments.get(index) == Some(&super::host::HostValueType::String) {
+                    contains_string = true;
+                    let length = self.machine.capability_string_length(register)?;
+                    self.argument_slots[index] = HostValueSlot::String {
+                        start: outbound_used,
+                        length,
+                    };
+                    outbound_used = outbound_used
+                        .checked_add(length)
+                        .ok_or(super::error::VmFault::AccountingOverflow)?;
+                } else {
+                    let value = self.machine.capability_argument(register)?;
+                    let slot =
+                        runtime_slot(value).ok_or(super::error::VmFault::UnsupportedInstruction)?;
+                    self.argument_slots[index] = slot;
+                }
             }
             Ok((
                 suspension.capability,
                 suspension.operation,
                 suspension.arguments.len(),
+                outbound_used,
+                contains_string,
             ))
         })();
-        let (capability, operation, argument_count) = match prepared {
+        let (capability, operation, argument_count, outbound_used, contains_string) = match prepared
+        {
             Ok(prepared) => prepared,
             Err(fault) => return self.establish_fault(fault),
         };
-        let next = self.next_request_id.checked_add(1);
-        let Some(next) = next else {
+        self.argument_count = argument_count;
+        let outbound_limit = u64::try_from(self.outbound_utf16.len()).unwrap_or(u64::MAX);
+        if u64::from(outbound_used) > outbound_limit {
+            return self.establish_quota(QuotaExhaustion {
+                kind: QuotaKind::HostRequestCodeUnits,
+                limit: outbound_limit,
+                consumed: u64::from(outbound_used),
+            });
+        }
+        if contains_string && outbound_used != 0 {
+            self.preparing_request = Some(PreparingRequest {
+                capability,
+                operation,
+                argument: 0,
+                string_offset: 0,
+            });
+            return Ok(AdvanceOutcome::SliceExhausted);
+        }
+        self.publish_prepared_request(capability, operation)
+    }
+
+    fn publish_prepared_request(
+        &mut self,
+        capability: u32,
+        operation: u32,
+    ) -> Result<AdvanceOutcome<'_>, RunError> {
+        let Some(next) = self.next_request_id.checked_add(1) else {
             return self.establish_fault(super::error::VmFault::AccountingOverflow);
         };
         let id = RequestId::new(self.next_request_id).ok_or(RunError::NotRunnable)?;
         self.next_request_id = next;
-        self.argument_count = argument_count;
         self.pending_request = Some(PendingRequest {
             id,
             capability,
             operation,
         });
         self.request_outcome().map_err(|_| RunError::NotRunnable)
+    }
+
+    fn advance_request_preparation(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+    ) -> Result<AdvanceOutcome<'_>, RunError> {
+        if guest_budget == 0 || guest_budget > self.maximum_slice_budget {
+            return Err(RunError::InvalidSliceBudget {
+                minimum: 1,
+                maximum: self.maximum_slice_budget,
+                supplied: guest_budget,
+            });
+        }
+        if maintenance_budget > self.maximum_slice_budget {
+            return Err(RunError::InvalidSliceBudget {
+                minimum: 0,
+                maximum: self.maximum_slice_budget,
+                supplied: maintenance_budget,
+            });
+        }
+        let mut state = self.preparing_request.ok_or(RunError::NotRunnable)?;
+        let mut remaining = guest_budget;
+        while state.argument < self.argument_count {
+            let HostValueSlot::String { start, length } = self.argument_slots[state.argument]
+            else {
+                state.argument += 1;
+                state.string_offset = 0;
+                continue;
+            };
+            while state.string_offset < length && remaining != 0 {
+                let end = state.string_offset.saturating_add(8).min(length);
+                let register = self
+                    .machine
+                    .capability_suspension()
+                    .map_err(|_| RunError::NotRunnable)?
+                    .arguments
+                    .get(state.argument)
+                    .copied()
+                    .ok_or(RunError::NotRunnable)?;
+                while state.string_offset < end {
+                    let unit = self
+                        .machine
+                        .capability_string_code_unit(register, state.string_offset)
+                        .map_err(|_| RunError::NotRunnable)?;
+                    let destination = start
+                        .checked_add(state.string_offset)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .ok_or(RunError::NotRunnable)?;
+                    *self
+                        .outbound_utf16
+                        .get_mut(destination)
+                        .ok_or(RunError::NotRunnable)? = unit;
+                    state.string_offset += 1;
+                }
+                if let Err(fault) = self.machine.charge_capability_dynamic(1) {
+                    return self.establish_fault(fault);
+                }
+                remaining -= 1;
+            }
+            if state.string_offset != length {
+                self.preparing_request = Some(state);
+                return Ok(AdvanceOutcome::SliceExhausted);
+            }
+            state.argument += 1;
+            state.string_offset = 0;
+        }
+        self.preparing_request = None;
+        self.publish_prepared_request(state.capability, state.operation)
     }
 
     fn request_outcome(&self) -> Result<AdvanceOutcome<'_>, super::error::VmFault> {
@@ -279,6 +416,14 @@ impl Session {
     ) -> Result<AdvanceOutcome<'_>, RunError> {
         self.terminal = Some(SessionTerminal::Faulted(fault));
         Ok(AdvanceOutcome::Faulted(fault))
+    }
+
+    fn establish_quota(
+        &mut self,
+        exhaustion: QuotaExhaustion,
+    ) -> Result<AdvanceOutcome<'_>, RunError> {
+        self.terminal = Some(SessionTerminal::QuotaExhausted(exhaustion));
+        Ok(AdvanceOutcome::QuotaExhausted(exhaustion))
     }
 
     #[cfg(test)]
