@@ -1,11 +1,67 @@
-use super::TypeKey;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ReferenceValue {
-    pub image: [u8; 32],
-    pub ty: TypeKey,
-    pub handle: u32,
-    pub generation: u32,
+    tagged_slot: u32,
+    generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub(super) enum ReferenceDomain {
+    Managed = 0,
+    Literal = 1,
+    Emergency = 2,
+    Host = 3,
+}
+
+impl ReferenceValue {
+    const DOMAIN_SHIFT: u32 = 30;
+    pub(super) const MAX_SLOT: u32 = (1 << Self::DOMAIN_SHIFT) - 1;
+
+    pub(super) const fn new(domain: ReferenceDomain, slot: u32, generation: u32) -> Option<Self> {
+        if slot > Self::MAX_SLOT {
+            return None;
+        }
+        Some(Self {
+            tagged_slot: ((domain as u32) << Self::DOMAIN_SHIFT) | slot,
+            generation,
+        })
+    }
+
+    pub(super) const fn managed(slot: u32, generation: u32) -> Option<Self> {
+        Self::new(ReferenceDomain::Managed, slot, generation)
+    }
+
+    pub(super) const fn literal(slot: u32) -> Option<Self> {
+        Self::new(ReferenceDomain::Literal, slot, 0)
+    }
+
+    pub(super) const fn emergency() -> Self {
+        Self {
+            tagged_slot: (ReferenceDomain::Emergency as u32) << Self::DOMAIN_SHIFT,
+            generation: 0,
+        }
+    }
+
+    pub(super) const fn host(slot: u32, generation: u32) -> Option<Self> {
+        Self::new(ReferenceDomain::Host, slot, generation)
+    }
+
+    pub(super) const fn domain(self) -> ReferenceDomain {
+        match self.tagged_slot >> Self::DOMAIN_SHIFT {
+            0 => ReferenceDomain::Managed,
+            1 => ReferenceDomain::Literal,
+            2 => ReferenceDomain::Emergency,
+            _ => ReferenceDomain::Host,
+        }
+    }
+
+    pub(super) const fn slot(self) -> u32 {
+        self.tagged_slot & Self::MAX_SLOT
+    }
+
+    pub(super) const fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,7 +86,7 @@ impl RuntimeValue {
             Self::Bool(value) => u64::from(value),
             Self::Char(value) => u64::from(value),
             Self::Null => 0,
-            Self::Reference(value) => value.handle as u64,
+            Self::Reference(value) => value.slot() as u64,
         }
     }
 
@@ -60,7 +116,23 @@ impl RuntimeValue {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct EntryArgument(pub RuntimeValue);
+pub(super) struct EntryArgument {
+    pub owner: Option<[u8; 32]>,
+    pub value: RuntimeValue,
+}
+
+impl EntryArgument {
+    pub(super) const fn unowned(value: RuntimeValue) -> Self {
+        Self { owner: None, value }
+    }
+
+    pub(super) const fn owned(owner: [u8; 32], value: RuntimeValue) -> Self {
+        Self {
+            owner: Some(owner),
+            value,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum RegisterValue {

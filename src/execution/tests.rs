@@ -3,7 +3,7 @@ use super::{
     fixtures,
     image::ExecutionImage,
     machine::Machine,
-    value::{EntryArgument, RuntimeValue},
+    value::{EntryArgument, ReferenceDomain, ReferenceValue, RuntimeValue},
 };
 use sha2::{Digest, Sha256};
 
@@ -69,6 +69,27 @@ mod allocation_counter {
 #[global_allocator]
 static TEST_ALLOCATOR: allocation_counter::CountingAllocator =
     allocation_counter::CountingAllocator;
+
+#[test]
+fn compact_reference_token_is_eight_bytes() {
+    assert_eq!(8, core::mem::size_of::<ReferenceValue>());
+
+    let managed = ReferenceValue::managed(1, 7).unwrap();
+    let literal = ReferenceValue::literal(1).unwrap();
+    let emergency = ReferenceValue::emergency();
+    let host = ReferenceValue::host(1, 7).unwrap();
+    assert_eq!(ReferenceDomain::Managed, managed.domain());
+    assert_eq!(ReferenceDomain::Literal, literal.domain());
+    assert_eq!(ReferenceDomain::Emergency, emergency.domain());
+    assert_eq!(ReferenceDomain::Host, host.domain());
+    assert_ne!(managed, literal);
+    assert_ne!(managed, host);
+    assert_ne!(managed, ReferenceValue::managed(1, 8).unwrap());
+    assert_eq!(1, managed.slot());
+    assert_eq!(7, managed.generation());
+    assert!(ReferenceValue::managed(ReferenceValue::MAX_SLOT, 0).is_some());
+    assert!(ReferenceValue::managed(ReferenceValue::MAX_SLOT + 1, 0).is_none());
+}
 
 #[test]
 fn direct_calls_copy_arguments_and_publish_results_on_return() {
@@ -295,11 +316,11 @@ fn start_validates_all_arguments_before_mutation() {
     let mut machine = Machine::new(image).unwrap();
     let before = machine.test_snapshot();
     assert!(machine
-        .start(&[EntryArgument(RuntimeValue::I64(1))])
+        .start(&[EntryArgument::unowned(RuntimeValue::I64(1))])
         .is_err());
     assert_eq!(before, machine.test_snapshot());
     machine
-        .start(&[EntryArgument(RuntimeValue::I32(1))])
+        .start(&[EntryArgument::unowned(RuntimeValue::I32(1))])
         .unwrap();
     assert_eq!(1, machine.frame_depth());
     assert_eq!(RuntimeValue::I32(1), machine.test_register(0).unwrap());
@@ -308,22 +329,19 @@ fn start_validates_all_arguments_before_mutation() {
 #[test]
 fn references_require_matching_image_type_liveness_and_generation() {
     let (image, valid, foreign, dead, stale) = fixtures::reference_entry_case();
-    assert!(Machine::new(image.clone())
-        .unwrap()
-        .start(&[EntryArgument(valid)])
-        .is_ok());
-    assert!(Machine::new(image.clone())
-        .unwrap()
-        .start(&[EntryArgument(foreign)])
-        .is_err());
-    assert!(Machine::new(image.clone())
-        .unwrap()
-        .start(&[EntryArgument(dead)])
-        .is_err());
-    assert!(Machine::new(image)
-        .unwrap()
-        .start(&[EntryArgument(stale)])
-        .is_err());
+    assert!(Machine::new(image.clone()).unwrap().start(&[valid]).is_ok());
+    assert_eq!(
+        Err(RunError::ForeignReference { parameter: 0 }),
+        Machine::new(image.clone()).unwrap().start(&[foreign])
+    );
+    assert_eq!(
+        Err(RunError::DeadReference { parameter: 0 }),
+        Machine::new(image.clone()).unwrap().start(&[dead])
+    );
+    assert_eq!(
+        Err(RunError::DeadReference { parameter: 0 }),
+        Machine::new(image).unwrap().start(&[stale])
+    );
 }
 
 #[test]
@@ -333,10 +351,10 @@ fn failed_start_is_retryable_but_successful_start_is_one_shot() {
     let mut machine = Machine::new(image).unwrap();
     assert!(machine.start(&[]).is_err());
     machine
-        .start(&[EntryArgument(RuntimeValue::I32(7))])
+        .start(&[EntryArgument::unowned(RuntimeValue::I32(7))])
         .unwrap();
     assert_eq!(
         Err(RunError::AlreadyStarted),
-        machine.start(&[EntryArgument(RuntimeValue::I32(8))])
+        machine.start(&[EntryArgument::unowned(RuntimeValue::I32(8))])
     );
 }
