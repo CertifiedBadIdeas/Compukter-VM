@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     artifact::{
-        Block, BlockId, ByteRange, Constant, DecodedCode, FunctionId, Instruction, NominalType,
-        SwitchCase, TypeId, ValueType,
+        Block, BlockId, ByteRange, Constant, DecodedCode, Function, FunctionId, Instruction,
+        NominalType, SwitchCase, TypeId, ValueType,
     },
     verify_artifact, ArtifactLimits, VerifiedArtifact,
 };
@@ -16,7 +16,22 @@ use super::{
 };
 
 pub(super) fn started(artifact: VerifiedArtifact, args: &[EntryArgument]) -> Machine {
-    let image = ExecutionImage::admit(artifact, profile()).unwrap();
+    started_with_arguments_and_profile(artifact, profile(), args)
+}
+
+pub(super) fn started_with_profile(
+    artifact: VerifiedArtifact,
+    profile: ExecutionProfile,
+) -> Machine {
+    started_with_arguments_and_profile(artifact, profile, &[])
+}
+
+fn started_with_arguments_and_profile(
+    artifact: VerifiedArtifact,
+    profile: ExecutionProfile,
+    args: &[EntryArgument],
+) -> Machine {
+    let image = ExecutionImage::admit(artifact, profile).unwrap();
     let mut machine = Machine::new(image).unwrap();
     machine.start(args).unwrap();
     machine
@@ -24,6 +39,91 @@ pub(super) fn started(artifact: VerifiedArtifact, args: &[EntryArgument]) -> Mac
 
 pub(super) fn started_zero_arg(artifact: VerifiedArtifact) -> Machine {
     started(artifact, &[])
+}
+
+pub(super) fn nested_call_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let i32_type = primitive(1);
+        artifact.modules[0].types = vec![
+            function_type(i32_type, Vec::new()),
+            function_type(i32_type, vec![i32_type]),
+            function_type(i32_type, vec![i32_type, i32_type]),
+        ];
+        artifact.modules[0].declared_types = 3;
+        artifact.modules[0].constants = vec![Constant::I32(20), Constant::I32(22)];
+        artifact.modules[0].functions = vec![
+            function(0, 0, vec![i32_type], 0),
+            function(1, 1, vec![i32_type, i32_type], 1),
+            function(2, 2, vec![i32_type, i32_type], 2),
+        ];
+        artifact.modules[0].declared_functions = 3;
+        let programs = vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::CallDirect {
+                    dst: 0,
+                    function_ref: 1,
+                    args: Box::new([0]),
+                },
+                Instruction::Return { value: 0 },
+            ],
+            vec![
+                Instruction::Const {
+                    dst: 1,
+                    constant: 1,
+                },
+                Instruction::CallDirect {
+                    dst: 0,
+                    function_ref: 2,
+                    args: Box::new([0, 1]),
+                },
+                Instruction::Return { value: 0 },
+            ],
+            vec![
+                Instruction::Add {
+                    form: 1,
+                    dst: 0,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Instruction::Return { value: 0 },
+            ],
+        ];
+        install_function_blocks(artifact, programs);
+        configure_stack(artifact, 2, 3);
+    })
+}
+
+pub(super) fn recursive_artifact(maximum_call_depth: u32) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let i32_type = primitive(1);
+        artifact.modules[0].types[0] = function_type(primitive(0), Vec::new());
+        artifact.modules[0].constants = vec![Constant::I32(7)];
+        artifact.modules[0].functions[0] = function(0, 0, vec![i32_type], 0);
+        install_function_blocks(
+            artifact,
+            vec![vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::CallDirect {
+                    dst: u16::MAX,
+                    function_ref: 0,
+                    args: Box::new([]),
+                },
+                Instruction::Return { value: u16::MAX },
+            ]],
+        );
+        configure_stack(artifact, 1, maximum_call_depth);
+    })
+}
+
+pub(super) fn recursive_pre_call_state() -> Box<[RegisterValue]> {
+    Box::new([RegisterValue::Initialized(RuntimeValue::I32(7))])
 }
 
 pub(super) fn two_block_artifact(first_cost: u32, second_cost: u32) -> VerifiedArtifact {
@@ -542,6 +642,79 @@ fn verified_blocks(
             (super::image::frame_charge(register_count.into()).unwrap()
                 * u64::from(maximum_call_depth)) as u32;
     })
+}
+
+fn function_type(result: ValueType, parameters: Vec<ValueType>) -> NominalType {
+    NominalType::Function {
+        name: 1,
+        flags: 0,
+        result,
+        parameters,
+    }
+}
+
+fn function(
+    signature: u32,
+    parameter_count: u16,
+    registers: Vec<ValueType>,
+    first_block: u32,
+) -> Function {
+    Function {
+        owner: TypeId(u32::MAX),
+        name: 1,
+        signature: TypeId(signature),
+        flags: 0,
+        register_count: registers.len() as u16,
+        parameter_count,
+        first_block: BlockId(first_block),
+        block_count: 1,
+        first_exception: 0,
+        exception_count: 0,
+        registers,
+    }
+}
+
+fn install_function_blocks(
+    artifact: &mut crate::artifact::DecodedArtifact,
+    programs: Vec<Vec<Instruction>>,
+) {
+    let mut blocks = Vec::with_capacity(programs.len());
+    let mut code = Vec::with_capacity(programs.len());
+    let mut maximum_block_cost = 0;
+    for (function_id, instructions) in programs.into_iter().enumerate() {
+        let fixed_cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        maximum_block_cost = maximum_block_cost.max(fixed_cost);
+        blocks.push(Block {
+            owner_function: FunctionId(function_id as u32),
+            code_record: BlockId(function_id as u32),
+            instruction_count: instructions.len() as u32,
+            declared_fixed_cost: fixed_cost,
+            flags: 0,
+        });
+        code.push(DecodedCode {
+            bytes: ByteRange { start: 0, end: 0 },
+            instructions: instructions.into_boxed_slice(),
+            fixed_cost,
+        });
+    }
+    artifact.modules[0].blocks = blocks;
+    artifact.modules[0].code = code;
+    artifact.manifest.maximum_block_cost = maximum_block_cost;
+    artifact.manifest.minimum_slice_cost = maximum_block_cost;
+}
+
+fn configure_stack(
+    artifact: &mut crate::artifact::DecodedArtifact,
+    registers_per_frame: u64,
+    maximum_call_depth: u32,
+) {
+    artifact.manifest.maximum_call_depth = maximum_call_depth;
+    artifact.manifest.required_stack_bytes = (super::image::frame_charge(registers_per_frame)
+        .unwrap()
+        * u64::from(maximum_call_depth)) as u32;
 }
 
 fn primitive(kind: u8) -> ValueType {

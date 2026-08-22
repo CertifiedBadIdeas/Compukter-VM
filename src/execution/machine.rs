@@ -39,6 +39,7 @@ pub(super) struct Machine {
     frame_depth: usize,
     consumed_fixed_cost: u64,
     entered_blocks: u64,
+    maximum_observed_frame_depth: usize,
 }
 
 impl Machine {
@@ -65,6 +66,7 @@ impl Machine {
             frame_depth: 0,
             consumed_fixed_cost: 0,
             entered_blocks: 0,
+            maximum_observed_frame_depth: 0,
         })
     }
 
@@ -109,6 +111,7 @@ impl Machine {
             *slot = RegisterValue::Initialized(argument.0);
         }
         self.frame_depth = 1;
+        self.maximum_observed_frame_depth = 1;
         self.lifecycle = Lifecycle::Runnable;
         Ok(())
     }
@@ -137,21 +140,23 @@ impl Machine {
                 .ok_or(RunError::NotRunnable)?;
             let block_index = self.frames[frame_index].block;
             let block = self.image.block(block_index).ok_or(RunError::NotRunnable)?;
-            if block.fixed_cost > remaining {
-                return Ok(Outcome::SliceExhausted);
+            if self.frames[frame_index].instruction == 0 {
+                if block.fixed_cost > remaining {
+                    return Ok(Outcome::SliceExhausted);
+                }
+                remaining -= block.fixed_cost;
+                let Some(consumed) = self
+                    .consumed_fixed_cost
+                    .checked_add(u64::from(block.fixed_cost))
+                else {
+                    return Ok(self.fault(VmFault::AccountingOverflow));
+                };
+                let Some(entered_blocks) = self.entered_blocks.checked_add(1) else {
+                    return Ok(self.fault(VmFault::AccountingOverflow));
+                };
+                self.consumed_fixed_cost = consumed;
+                self.entered_blocks = entered_blocks;
             }
-            remaining -= block.fixed_cost;
-            let Some(consumed) = self
-                .consumed_fixed_cost
-                .checked_add(u64::from(block.fixed_cost))
-            else {
-                return Ok(self.fault(VmFault::AccountingOverflow));
-            };
-            let Some(entered_blocks) = self.entered_blocks.checked_add(1) else {
-                return Ok(self.fault(VmFault::AccountingOverflow));
-            };
-            self.consumed_fixed_cost = consumed;
-            self.entered_blocks = entered_blocks;
 
             while self.frames[frame_index].instruction < block.instructions.len() {
                 let instruction_index = self.frames[frame_index].instruction;
@@ -166,10 +171,98 @@ impl Machine {
                                 Err(fault) => return Ok(self.fault(fault)),
                             }
                         };
-                        let outcome = Outcome::Halted(returned);
-                        self.lifecycle = Lifecycle::Terminal(outcome);
-                        self.frame_depth = 0;
-                        return Ok(outcome);
+                        let function = self
+                            .image
+                            .function(self.frames[frame_index].function)
+                            .ok_or(RunError::NotRunnable)?;
+                        if (function.result.kind == 0) != returned.is_none() {
+                            return Ok(self.fault(VmFault::InvalidValueType));
+                        }
+                        if frame_index == 0 {
+                            let outcome = Outcome::Halted(returned);
+                            self.lifecycle = Lifecycle::Terminal(outcome);
+                            self.frame_depth = 0;
+                            return Ok(outcome);
+                        }
+
+                        let continuation = self.frames[frame_index].caller_instruction;
+                        let destination = self.frames[frame_index].destination;
+                        if (destination == u16::MAX) != returned.is_none() {
+                            return Ok(self.fault(VmFault::InvalidValueType));
+                        }
+                        let width = self.image.registers_per_frame();
+                        let callee_base = frame_index
+                            .checked_mul(width)
+                            .ok_or(RunError::NotRunnable)?;
+                        self.registers[callee_base..callee_base + width]
+                            .fill(RegisterValue::Uninitialized);
+                        self.frames[frame_index] = Frame::EMPTY;
+                        self.frame_depth = frame_index;
+                        let caller_index = frame_index - 1;
+                        self.frames[caller_index].instruction = continuation;
+                        if let Some(value) = returned {
+                            let destination_index = caller_index
+                                .checked_mul(width)
+                                .and_then(|base| base.checked_add(destination as usize))
+                                .ok_or(RunError::NotRunnable)?;
+                            let Some(slot) = self.registers.get_mut(destination_index) else {
+                                return Ok(self.fault(VmFault::InvalidStoragePlan));
+                            };
+                            *slot = RegisterValue::Initialized(value);
+                        }
+                        break;
+                    }
+                    ResolvedInstruction::CallDirect { dst, target, args } => {
+                        let Some(target_function) = self.image.function(*target) else {
+                            return Ok(self.fault(VmFault::InvalidResolvedId));
+                        };
+                        if target_function.parameter_count != args.len() {
+                            return Ok(self.fault(VmFault::InvalidValueType));
+                        }
+                        for source in args.iter() {
+                            if let Err(fault) = self.read_register(frame_index, *source) {
+                                return Ok(self.fault(fault));
+                            }
+                        }
+                        if self.frame_depth >= self.image.maximum_call_depth() {
+                            let outcome = Outcome::Crashed(GuestTrap::StackOverflow);
+                            self.lifecycle = Lifecycle::Terminal(outcome);
+                            return Ok(outcome);
+                        }
+                        let callee_index = self.frame_depth;
+                        if callee_index >= self.frames.len() {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        }
+                        let width = self.image.registers_per_frame();
+                        let callee_base = callee_index
+                            .checked_mul(width)
+                            .ok_or(RunError::NotRunnable)?;
+                        let Some(callee_registers) = self
+                            .registers
+                            .get_mut(callee_base..callee_base.saturating_add(width))
+                        else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        callee_registers.fill(RegisterValue::Uninitialized);
+                        for (parameter, source) in args.iter().enumerate() {
+                            let value = match self.read_register(frame_index, *source) {
+                                Ok(value) => value,
+                                Err(fault) => return Ok(self.fault(fault)),
+                            };
+                            self.registers[callee_base + parameter] =
+                                RegisterValue::Initialized(value);
+                        }
+                        self.frames[callee_index] = Frame {
+                            function: *target,
+                            block: target_function.first_block,
+                            instruction: 0,
+                            caller_instruction: instruction_index + 1,
+                            destination: *dst,
+                        };
+                        self.frame_depth += 1;
+                        self.maximum_observed_frame_depth =
+                            self.maximum_observed_frame_depth.max(self.frame_depth);
+                        break;
                     }
                     ResolvedInstruction::Jump { target } => {
                         self.frames[frame_index].block = *target;
@@ -338,6 +431,11 @@ impl Machine {
         let width = self.image.registers_per_frame();
         let base = self.frame_depth.saturating_sub(1) * width;
         self.registers[base..base + width].into()
+    }
+
+    #[cfg(test)]
+    pub(super) fn maximum_observed_frame_depth_for_test(&self) -> usize {
+        self.maximum_observed_frame_depth
     }
 }
 

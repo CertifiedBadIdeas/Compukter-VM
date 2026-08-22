@@ -1,10 +1,36 @@
 use super::{
-    error::{Outcome, RunError},
+    error::{GuestTrap, Outcome, RunError},
     fixtures,
     image::ExecutionImage,
     machine::Machine,
     value::{EntryArgument, RuntimeValue},
 };
+
+#[test]
+fn direct_calls_copy_arguments_and_publish_results_on_return() {
+    let mut machine = fixtures::started_zero_arg(fixtures::nested_call_artifact());
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::I32(42))),
+        machine.run_slice(128).unwrap()
+    );
+    assert_eq!(3, machine.maximum_observed_frame_depth_for_test());
+}
+
+#[test]
+fn stack_overflow_happens_before_a_new_frame_exists() {
+    let mut profile = fixtures::profile();
+    profile.maximum_call_depth = 3;
+    let mut machine = fixtures::started_with_profile(fixtures::recursive_artifact(3), profile);
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::StackOverflow),
+        machine.run_slice(128).unwrap()
+    );
+    assert_eq!(3, machine.frame_depth());
+    assert_eq!(
+        fixtures::recursive_pre_call_state(),
+        machine.test_active_registers()
+    );
+}
 
 #[test]
 fn scalar_vectors_match_kotlin_jvm_semantics() {
