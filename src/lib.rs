@@ -55,6 +55,10 @@ mod verify;
 
 pub use artifact::{EntryPoint, VerifiedArtifact};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
+pub use execution::{
+    AdmissionError, CapabilityBinding, EntryValue, ExecutionProfile, HostValueType,
+    OperationSchema, RunError, Session,
+};
 pub use limits::ArtifactLimits;
 
 /// Decodes and verifies an untrusted Compukter artifact before publishing it.

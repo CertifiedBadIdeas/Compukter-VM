@@ -7,6 +7,7 @@ use crate::VerifiedArtifact;
 
 use super::{
     error::AdmissionError,
+    host::{HostValueType, ResolvedCapability},
     layout::{object_layout, FieldSpec, RuntimeTypeLayout, StoragePlan, ValueWidth},
     value::{ReferenceValue, RuntimeValue},
     FunctionKey, TypeKey,
@@ -284,6 +285,13 @@ pub(super) enum ResolvedInstruction {
         target: usize,
         args: Box<[u16]>,
     },
+    CapabilityCallAsync {
+        dst: u16,
+        capability: u32,
+        operation: u32,
+        args: Box<[u16]>,
+        resume_block: usize,
+    },
     Jump {
         target: usize,
     },
@@ -365,6 +373,14 @@ impl ExecutionImage {
     pub(super) fn admit(
         artifact: VerifiedArtifact,
         profile: ExecutionProfile,
+    ) -> Result<Self, AdmissionError> {
+        Self::admit_with_capabilities(artifact, profile, &[])
+    }
+
+    pub(super) fn admit_with_capabilities(
+        artifact: VerifiedArtifact,
+        profile: ExecutionProfile,
+        capabilities: &[Option<ResolvedCapability>],
     ) -> Result<Self, AdmissionError> {
         let decoded = artifact.decoded();
         check_profile(decoded, &profile)?;
@@ -505,6 +521,9 @@ impl ExecutionImage {
             constant_offsets: &constant_offsets,
             field_offsets: &field_offsets,
             fields: &fields,
+            functions: &functions,
+            capabilities,
+            string_type,
         };
         for (module_id, module) in decoded.modules.iter().enumerate() {
             for (block_id, block) in module.blocks.iter().enumerate() {
@@ -520,6 +539,7 @@ impl ExecutionImage {
                     instructions.push(resolve_instruction(
                         decoded,
                         module_id,
+                        function,
                         &instruction_resolution,
                         instruction,
                     )?);
@@ -557,13 +577,6 @@ impl ExecutionImage {
             .and_then(|offset| offset.checked_add(entry_key.function as usize))
             .filter(|entry| *entry < functions.len())
             .ok_or(AdmissionError::InvalidEntry)?;
-        if decoded.modules[entry_key.module as usize].functions[entry_key.function as usize].flags
-            & 1
-            != 0
-        {
-            return Err(AdmissionError::InvalidEntry);
-        }
-
         Ok(Self(Arc::new(ExecutionImageInner {
             content_hash: artifact.content_hash(),
             artifact_bytes: decoded.bytes.clone(),
@@ -1353,11 +1366,15 @@ struct InstructionResolution<'a> {
     constant_offsets: &'a [usize],
     field_offsets: &'a [usize],
     fields: &'a [ResolvedField],
+    functions: &'a [ResolvedFunction],
+    capabilities: &'a [Option<ResolvedCapability>],
+    string_type: Option<TypeKey>,
 }
 
 fn resolve_instruction(
     artifact: &DecodedArtifact,
     module: usize,
+    function: usize,
     resolution: &InstructionResolution<'_>,
     instruction: &Instruction,
 ) -> Result<ResolvedInstruction, AdmissionError> {
@@ -1676,6 +1693,74 @@ fn resolve_instruction(
                 args: args.clone(),
             }
         }
+        Instruction::CapabilityCallSync { .. } => {
+            return Err(AdmissionError::SynchronousCapabilityUnsupported);
+        }
+        Instruction::CapabilityCallAsync {
+            dst,
+            capability,
+            operation,
+            args,
+            resume_block,
+        } => {
+            let resolved_capability = resolution
+                .capabilities
+                .get(*capability as usize)
+                .and_then(Option::as_ref)
+                .ok_or(AdmissionError::MissingCapability {
+                    index: u8::try_from(*capability).unwrap_or(u8::MAX),
+                })?;
+            let schema = resolved_capability
+                .operations
+                .get(*operation as usize)
+                .ok_or(AdmissionError::CapabilityOperationCount {
+                    capability: *capability,
+                    required: operation.saturating_add(1),
+                    available: u32::try_from(resolved_capability.operations.len())
+                        .unwrap_or(u32::MAX),
+                })?;
+            let resolved_function = resolution
+                .functions
+                .get(function)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let arguments_match = args.len() == schema.arguments.len()
+                && args
+                    .iter()
+                    .zip(schema.arguments.iter())
+                    .all(|(register, expected)| {
+                        resolved_function
+                            .registers
+                            .get(*register as usize)
+                            .is_some_and(|actual| {
+                                host_type_matches(*actual, *expected, resolution.string_type)
+                            })
+                    });
+            let result_matches = match schema.result {
+                HostValueType::Unit => *dst == u16::MAX,
+                expected => {
+                    *dst != u16::MAX
+                        && resolved_function
+                            .registers
+                            .get(*dst as usize)
+                            .is_some_and(|actual| {
+                                host_type_matches(*actual, expected, resolution.string_type)
+                            })
+                }
+            };
+            if !schema.asynchronous || !arguments_match || !result_matches {
+                return Err(AdmissionError::CapabilitySchema {
+                    capability: *capability,
+                    operation: *operation,
+                });
+            }
+            ResolvedInstruction::CapabilityCallAsync {
+                dst: *dst,
+                capability: *capability,
+                operation: *operation,
+                args: args.clone(),
+                resume_block: block(*resume_block)?,
+            }
+        }
         Instruction::Jump { target } => ResolvedInstruction::Jump {
             target: block(*target)?,
         },
@@ -1710,6 +1795,25 @@ fn resolve_instruction(
         Instruction::Unreachable => ResolvedInstruction::Unreachable,
         _ => return Err(AdmissionError::InvalidEntry),
     })
+}
+
+fn host_type_matches(
+    actual: ResolvedValueType,
+    expected: HostValueType,
+    string_type: Option<TypeKey>,
+) -> bool {
+    match expected {
+        HostValueType::Unit => false,
+        HostValueType::I32 => actual.kind == 1,
+        HostValueType::I64 => actual.kind == 2,
+        HostValueType::F32 => actual.kind == 3,
+        HostValueType::F64 => actual.kind == 4,
+        HostValueType::Bool => actual.kind == 5,
+        HostValueType::Char => actual.kind == 6,
+        HostValueType::String => {
+            actual.kind == 7 && !actual.nullable && actual.nominal == string_type
+        }
+    }
 }
 
 fn type_exists(artifact: &DecodedArtifact, key: TypeKey) -> bool {
