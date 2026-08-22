@@ -410,12 +410,28 @@ impl ExecutionImage {
         self.0.functions.get(index)
     }
 
+    pub(super) fn block(&self, index: usize) -> Option<&ResolvedBlock> {
+        self.0.blocks.get(index)
+    }
+
+    pub(super) fn constant(&self, index: usize) -> Option<RuntimeValue> {
+        self.0.constants.get(index).copied()
+    }
+
     pub(super) fn content_hash(&self) -> [u8; 32] {
         self.0.content_hash
     }
 
     pub(super) fn maximum_call_depth(&self) -> usize {
         self.0.maximum_call_depth
+    }
+
+    pub(super) fn minimum_slice_cost(&self) -> u32 {
+        self.0.minimum_slice_cost
+    }
+
+    pub(super) fn maximum_slice_budget(&self) -> u32 {
+        self.0.maximum_slice_budget
     }
 
     pub(super) fn host_reference(&self, value: ReferenceValue) -> Option<&ResolvedHostReference> {

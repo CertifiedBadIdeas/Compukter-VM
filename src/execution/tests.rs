@@ -1,10 +1,32 @@
 use super::{
-    error::RunError,
+    error::{Outcome, RunError},
     fixtures,
     image::ExecutionImage,
     machine::Machine,
     value::{EntryArgument, RuntimeValue},
 };
+
+#[test]
+fn scalar_vectors_match_kotlin_jvm_semantics() {
+    for case in fixtures::scalar_cases() {
+        let profile = fixtures::profile();
+        let budget = profile.maximum_slice_budget;
+        let image = ExecutionImage::admit(case.artifact, profile).unwrap();
+        let mut machine = Machine::new(image).unwrap();
+        machine.start(&case.args).unwrap();
+        let outcome = machine.run_slice(budget).unwrap();
+        match case.expected {
+            Ok(value) => assert_eq!(Outcome::Halted(Some(value)), outcome, "{}", case.name),
+            Err(trap) => assert_eq!(Outcome::Crashed(trap), outcome, "{}", case.name),
+        }
+        assert_eq!(
+            case.expected_fixed_cost,
+            machine.consumed_fixed_cost(),
+            "{}",
+            case.name
+        );
+    }
+}
 
 #[test]
 fn start_validates_all_arguments_before_mutation() {
