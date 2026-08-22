@@ -1,8 +1,15 @@
 use std::sync::Arc;
 
-use crate::{verify_artifact, ArtifactLimits, VerifiedArtifact};
+use crate::{
+    artifact::{NominalType, TypeId, ValueType},
+    verify_artifact, ArtifactLimits, VerifiedArtifact,
+};
 
-use super::{image::ExecutionProfile, TypeKey};
+use super::{
+    image::{AdmittedReference, ExecutionImage, ExecutionProfile},
+    value::{ReferenceValue, RuntimeValue},
+    TypeKey,
+};
 
 pub(super) fn scalar_artifact() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::minimal_vector(), 32)
@@ -10,6 +17,97 @@ pub(super) fn scalar_artifact() -> VerifiedArtifact {
 
 pub(super) fn artifact_with_new_object() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::language_runtime_vector(), 160)
+}
+
+pub(super) fn typed_entry_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: vec![primitive(1)],
+        };
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 1;
+        function.parameter_count = 1;
+        function.registers = vec![primitive(1)];
+        artifact.manifest.required_stack_bytes = 48;
+    })
+}
+
+pub(super) fn reference_entry_case() -> (
+    ExecutionImage,
+    RuntimeValue,
+    RuntimeValue,
+    RuntimeValue,
+    RuntimeValue,
+) {
+    let artifact = verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: vec![ValueType {
+                kind: 7,
+                flags: 0,
+                nominal_type: TypeId(1),
+            }],
+        };
+        artifact.modules[0].types.push(NominalType::Class {
+            flags: 0,
+            generic_arity: 0,
+            name: 0,
+            super_type: TypeId(u32::MAX),
+            interfaces: Vec::new(),
+            field_start: 0,
+            field_count: 0,
+            method_start: 0,
+            method_count: 0,
+        });
+        artifact.modules[0].declared_types = 2;
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 1;
+        function.parameter_count = 1;
+        function.registers = vec![ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        }];
+        artifact.manifest.required_stack_bytes = 48;
+    });
+    let hash = artifact.content_hash();
+    let ty = TypeKey { module: 0, ty: 1 };
+    let mut profile = profile();
+    profile.host_references = Box::new([
+        AdmittedReference {
+            ty,
+            handle: 1,
+            generation: 1,
+            live: true,
+        },
+        AdmittedReference {
+            ty,
+            handle: 2,
+            generation: 1,
+            live: false,
+        },
+    ]);
+    let image = ExecutionImage::admit(artifact, profile).unwrap();
+    let reference = |image, handle, generation| {
+        RuntimeValue::Reference(ReferenceValue {
+            image,
+            ty,
+            handle,
+            generation,
+        })
+    };
+    (
+        image,
+        reference(hash, 1, 1),
+        reference([0xff; 32], 1, 1),
+        reference(hash, 2, 1),
+        reference(hash, 1, 2),
+    )
 }
 
 pub(super) fn profile() -> ExecutionProfile {
@@ -56,6 +154,27 @@ fn verified_with_stack(mut bytes: Vec<u8>, required_stack_bytes: u32) -> Verifie
     bytes[manifest + 4..manifest + 8].copy_from_slice(&required_stack_bytes.to_le_bytes());
     crate::test_support::rehash(&mut bytes);
     verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+fn verified_mutated(
+    change: impl FnOnce(&mut crate::artifact::DecodedArtifact),
+) -> VerifiedArtifact {
+    let mut decoded = crate::decode::records::decode_artifact(
+        Arc::from(crate::test_support::minimal_vector()),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    change(&mut decoded);
+    let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
+    verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+fn primitive(kind: u8) -> ValueType {
+    ValueType {
+        kind,
+        flags: 0,
+        nominal_type: TypeId(u32::MAX),
+    }
 }
 
 fn section_offset(bytes: &[u8], kind: u16, scope: u32) -> usize {

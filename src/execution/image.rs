@@ -401,6 +401,28 @@ impl ExecutionImage {
     pub(super) fn registers_per_frame(&self) -> usize {
         self.0.registers_per_frame
     }
+
+    pub(super) fn entry_index(&self) -> usize {
+        self.0.entry
+    }
+
+    pub(super) fn function(&self, index: usize) -> Option<&ResolvedFunction> {
+        self.0.functions.get(index)
+    }
+
+    pub(super) fn content_hash(&self) -> [u8; 32] {
+        self.0.content_hash
+    }
+
+    pub(super) fn maximum_call_depth(&self) -> usize {
+        self.0.maximum_call_depth
+    }
+
+    pub(super) fn host_reference(&self, value: ReferenceValue) -> Option<&ResolvedHostReference> {
+        self.0.host_references.iter().find(|reference| {
+            reference.value.handle == value.handle && reference.value.generation == value.generation
+        })
+    }
 }
 
 pub(super) fn frame_charge(registers: u64) -> Result<u64, AdmissionError> {
