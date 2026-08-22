@@ -87,22 +87,31 @@ pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, Enc
 pub(crate) fn encode_artifact_rehashed(
     mut artifact: DecodedArtifact,
 ) -> Result<Vec<u8>, EncodeError> {
-    let hashes = artifact
-        .modules
-        .iter()
-        .map(|module| encode_module(&artifact, module).map(|(_, hash)| hash))
-        .collect::<Result<Vec<_>, _>>()?;
-    for (module, hash) in artifact.modules.iter_mut().zip(&hashes) {
-        module.semantic_hash = *hash;
-    }
-    for module in &mut artifact.modules {
-        for import in &mut module.imports {
-            import.target_hash = *hashes
-                .get(import.target_module.0 as usize)
-                .ok_or(EncodeError("import target module is out of range"))?;
+    for _ in 0..=artifact.modules.len() {
+        let hashes = artifact
+            .modules
+            .iter()
+            .map(|module| encode_module(&artifact, module).map(|(_, hash)| hash))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut changed = false;
+        for (module, hash) in artifact.modules.iter_mut().zip(&hashes) {
+            changed |= module.semantic_hash != *hash;
+            module.semantic_hash = *hash;
+        }
+        for module in &mut artifact.modules {
+            for import in &mut module.imports {
+                let target = *hashes
+                    .get(import.target_module.0 as usize)
+                    .ok_or(EncodeError("import target module is out of range"))?;
+                changed |= import.target_hash != target;
+                import.target_hash = target;
+            }
+        }
+        if !changed {
+            return encode_artifact(&artifact);
         }
     }
-    encode_artifact(&artifact)
+    Err(EncodeError("module hashes did not stabilize"))
 }
 
 fn encode_module(
@@ -724,6 +733,39 @@ fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeEr
         } => {
             capability_operands(&mut operands, *dst, *capability, *operation, args)?;
             (0x51, 0)
+        }
+        Instruction::StringLength { dst, string } => {
+            regs(&mut operands, &[*dst, *string]);
+            (0x60, 0)
+        }
+        Instruction::StringGet { dst, string, index } => {
+            regs(&mut operands, &[*dst, *string, *index]);
+            (0x61, 0)
+        }
+        Instruction::StringEquals { dst, lhs, rhs } => {
+            regs(&mut operands, &[*dst, *lhs, *rhs]);
+            (0x62, 0)
+        }
+        Instruction::StringCompare { dst, lhs, rhs } => {
+            regs(&mut operands, &[*dst, *lhs, *rhs]);
+            (0x63, 0)
+        }
+        Instruction::StringHash { dst, string } => {
+            regs(&mut operands, &[*dst, *string]);
+            (0x64, 0)
+        }
+        Instruction::StringConcat { dst, lhs, rhs } => {
+            regs(&mut operands, &[*dst, *lhs, *rhs]);
+            (0x65, 0)
+        }
+        Instruction::StringSubstring {
+            dst,
+            string,
+            start,
+            end,
+        } => {
+            regs(&mut operands, &[*dst, *string, *start, *end]);
+            (0x66, 0)
         }
         Instruction::Jump { target } => {
             id(&mut operands, *target);

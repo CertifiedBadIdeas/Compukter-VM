@@ -345,6 +345,214 @@ fn allocation_artifact(
     artifact
 }
 
+fn string_artifact(
+    registers: Vec<crate::artifact::ValueType>,
+    parameter_count: u16,
+    instructions: Vec<crate::artifact::Instruction>,
+) -> crate::artifact::DecodedArtifact {
+    let mut artifact = decoded(support::minimal_vector());
+    let mut bytes = artifact.bytes.to_vec();
+    let name_start = bytes.len();
+    bytes.extend_from_slice(b"kotlin.String");
+    let name_end = bytes.len();
+    artifact.bytes = Arc::from(bytes);
+
+    let module = &mut artifact.modules[0];
+    module.flags = 2;
+    let name = module.strings.len() as u32;
+    module.strings.push(crate::artifact::ByteRange {
+        start: name_start,
+        end: name_end,
+    });
+    module.types.push(class(name, 2, u32::MAX));
+    module.exports.push(crate::artifact::Export {
+        kind: 0,
+        visibility: 1,
+        name,
+        local_symbol: 1,
+        signature: crate::artifact::TypeId(1),
+    });
+    configure_entry(&mut artifact, registers, parameter_count, instructions);
+    artifact
+}
+
+#[test]
+fn cfg_accepts_typed_string_length() {
+    let artifact = string_artifact(
+        vec![reference(1, false), primitive(1)],
+        1,
+        vec![
+            crate::artifact::Instruction::StringLength { dst: 1, string: 0 },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
+fn cfg_requires_exact_standard_string_type_for_string_constants() {
+    let mut accepted = string_artifact(
+        vec![reference(1, false)],
+        0,
+        vec![
+            crate::artifact::Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    accepted.modules[0]
+        .utf16_literals
+        .push(crate::artifact::ByteRange { start: 0, end: 0 });
+    accepted.modules[0]
+        .constants
+        .push(crate::artifact::Constant::String(
+            crate::artifact::Utf16LiteralId(0),
+        ));
+    verify_cfg(&accepted).unwrap();
+
+    let mut rejected = allocation_artifact(vec![
+        crate::artifact::Instruction::Const {
+            dst: 0,
+            constant: 0,
+        },
+        crate::artifact::Instruction::Return { value: u16::MAX },
+    ]);
+    rejected.modules[0]
+        .utf16_literals
+        .push(crate::artifact::ByteRange { start: 0, end: 0 });
+    rejected.modules[0]
+        .constants
+        .push(crate::artifact::Constant::String(
+            crate::artifact::Utf16LiteralId(0),
+        ));
+    assert_eq!(
+        Code::BadType,
+        verify_cfg(&rejected).unwrap_err().first().unwrap().code
+    );
+}
+
+#[test]
+fn cfg_accepts_every_typed_string_instruction() {
+    let string = reference(1, false);
+    let cases = [
+        (
+            vec![string, primitive(1), primitive(6)],
+            2,
+            crate::artifact::Instruction::StringGet {
+                dst: 2,
+                string: 0,
+                index: 1,
+            },
+        ),
+        (
+            vec![string, string, primitive(5)],
+            2,
+            crate::artifact::Instruction::StringEquals {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+        ),
+        (
+            vec![string, string, primitive(1)],
+            2,
+            crate::artifact::Instruction::StringCompare {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+        ),
+        (
+            vec![string, primitive(1)],
+            1,
+            crate::artifact::Instruction::StringHash { dst: 1, string: 0 },
+        ),
+        (
+            vec![string, string, string],
+            2,
+            crate::artifact::Instruction::StringConcat {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+        ),
+        (
+            vec![string, primitive(1), primitive(1), string],
+            3,
+            crate::artifact::Instruction::StringSubstring {
+                dst: 3,
+                string: 0,
+                start: 1,
+                end: 2,
+            },
+        ),
+    ];
+
+    for (registers, parameter_count, instruction) in cases {
+        let artifact = string_artifact(
+            registers,
+            parameter_count,
+            vec![
+                instruction,
+                crate::artifact::Instruction::Return { value: u16::MAX },
+            ],
+        );
+        verify_cfg(&artifact).unwrap();
+    }
+}
+
+#[test]
+fn cfg_rejects_string_allocation_after_another_instruction() {
+    for instruction in [
+        crate::artifact::Instruction::StringConcat {
+            dst: 2,
+            lhs: 0,
+            rhs: 1,
+        },
+        crate::artifact::Instruction::StringSubstring {
+            dst: 3,
+            string: 0,
+            start: 1,
+            end: 2,
+        },
+    ] {
+        let is_concat = matches!(
+            &instruction,
+            crate::artifact::Instruction::StringConcat { .. }
+        );
+        let registers = match &instruction {
+            crate::artifact::Instruction::StringConcat { .. } => {
+                vec![
+                    reference(1, false),
+                    reference(1, false),
+                    reference(1, false),
+                ]
+            }
+            _ => vec![
+                reference(1, false),
+                primitive(1),
+                primitive(1),
+                reference(1, false),
+            ],
+        };
+        let artifact = string_artifact(
+            registers,
+            if is_concat { 2 } else { 3 },
+            vec![
+                crate::artifact::Instruction::Nop,
+                instruction,
+                crate::artifact::Instruction::Return { value: u16::MAX },
+            ],
+        );
+
+        let error = verify_cfg(&artifact).unwrap_err();
+        assert_eq!(error.first().unwrap().code, Code::BadInstruction);
+    }
+}
+
 #[test]
 fn cfg_rejects_allocation_after_another_instruction() {
     let artifact = allocation_artifact(vec![

@@ -331,6 +331,38 @@ impl Heap {
         Ok(())
     }
 
+    pub(super) fn write_reserved(
+        &mut self,
+        reservation: ReservedAllocation,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), VmFault> {
+        self.validate_reservation(reservation)?;
+        let capacity = self
+            .block_size(reservation.block)?
+            .checked_sub(16)
+            .ok_or(VmFault::CorruptHeap)?;
+        let length = u32::try_from(bytes.len()).map_err(|_| VmFault::CorruptHeap)?;
+        if offset.checked_add(length).ok_or(VmFault::CorruptHeap)? > capacity {
+            return Err(VmFault::CorruptHeap);
+        }
+        let start = reservation
+            .block
+            .0
+            .checked_add(16)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(VmFault::CorruptHeap)?;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            let position = start + index as u32;
+            let unit = self
+                .arena
+                .get_mut((position / 16) as usize)
+                .ok_or(VmFault::CorruptHeap)?;
+            unit.0[(position % 16) as usize] = byte;
+        }
+        Ok(())
+    }
+
     fn validate_reservation(&self, reservation: ReservedAllocation) -> Result<(), VmFault> {
         let entry = self
             .handles

@@ -8,6 +8,7 @@ mod image;
 mod layout;
 mod machine;
 mod numeric;
+mod text;
 mod value;
 
 #[cfg(test)]
@@ -18,6 +19,8 @@ mod gc_tests;
 mod heap_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod text_tests;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct FunctionKey {

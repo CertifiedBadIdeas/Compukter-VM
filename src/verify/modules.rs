@@ -515,7 +515,7 @@ fn signatures_match(
                         )
                     })
         }
-        _ => false,
+        _ => left_identity == right_identity,
     }
 }
 

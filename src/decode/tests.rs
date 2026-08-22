@@ -680,6 +680,7 @@ fn instruction_requires_one_final_terminator_and_exact_count() {
 fn for_each_v1_opcode_case(mut check: impl FnMut(u8, u8, &[u8], bool)) {
     let r2 = &[0, 0, 1, 0][..];
     let r3 = &[0, 0, 1, 0, 2, 0][..];
+    let r4 = &[0, 0, 1, 0, 2, 0, 3, 0][..];
     let cases: &[(u8, u8, &[u8], bool)] = &[
         (0x00, 0, &[], false),
         (0x01, 0, r2, false),
@@ -722,6 +723,13 @@ fn for_each_v1_opcode_case(mut check: impl FnMut(u8, u8, &[u8], bool)) {
         (0x42, 0, &[0xff, 0xff, 0, 0], false),
         (0x50, 0, &[0, 0, 0, 0], false),
         (0x51, 0, &[0xff, 0xff, 0, 0, 0], false),
+        (0x60, 0, r2, false),
+        (0x61, 0, r3, false),
+        (0x62, 0, r3, false),
+        (0x63, 0, r3, false),
+        (0x64, 0, r2, false),
+        (0x65, 0, r3, false),
+        (0x66, 0, r4, false),
         (0xe0, 0, &[0], true),
         (0xe1, 0, &[0, 0, 0, 0], true),
         (0xe2, 0, &[0, 0, 0, 0], true),
