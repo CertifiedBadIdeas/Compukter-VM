@@ -1,13 +1,15 @@
 use super::{
-    error::{AdmissionError, RunError},
-    image::{ExecutionImage, ResolvedValueType},
+    error::{AdmissionError, GuestTrap, Outcome, RunError, VmFault},
+    image::{ExecutionImage, ResolvedInstruction, ResolvedValueType},
+    numeric,
     value::{EntryArgument, RegisterValue, RuntimeValue},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Lifecycle {
     Pristine,
     Runnable,
+    Terminal(Outcome),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +37,7 @@ pub(super) struct Machine {
     frames: Box<[Frame]>,
     registers: Box<[RegisterValue]>,
     frame_depth: usize,
+    consumed_fixed_cost: u64,
 }
 
 impl Machine {
@@ -59,6 +62,7 @@ impl Machine {
             frames: frames.into_boxed_slice(),
             registers: registers.into_boxed_slice(),
             frame_depth: 0,
+            consumed_fixed_cost: 0,
         })
     }
 
@@ -105,6 +109,103 @@ impl Machine {
         self.frame_depth = 1;
         self.lifecycle = Lifecycle::Runnable;
         Ok(())
+    }
+
+    pub(super) fn run_slice(&mut self, budget: u32) -> Result<Outcome, RunError> {
+        match self.lifecycle {
+            Lifecycle::Terminal(outcome) => return Ok(outcome),
+            Lifecycle::Pristine => return Err(RunError::NotStarted),
+            Lifecycle::Runnable => {}
+        }
+        if budget == 0
+            || budget < self.image.minimum_slice_cost()
+            || budget > self.image.maximum_slice_budget()
+        {
+            return Err(RunError::InvalidSliceBudget {
+                minimum: self.image.minimum_slice_cost(),
+                maximum: self.image.maximum_slice_budget(),
+                supplied: budget,
+            });
+        }
+        let remaining = budget;
+        let frame_index = self
+            .frame_depth
+            .checked_sub(1)
+            .ok_or(RunError::NotRunnable)?;
+        let block_index = self.frames[frame_index].block;
+        let block = self.image.block(block_index).ok_or(RunError::NotRunnable)?;
+        if block.fixed_cost > remaining {
+            return Ok(Outcome::SliceExhausted);
+        }
+        let _remaining_after_charge = remaining - block.fixed_cost;
+        let Some(consumed) = self
+            .consumed_fixed_cost
+            .checked_add(u64::from(block.fixed_cost))
+        else {
+            return Ok(self.fault(VmFault::AccountingOverflow));
+        };
+        self.consumed_fixed_cost = consumed;
+
+        while self.frames[frame_index].instruction < block.instructions.len() {
+            let instruction_index = self.frames[frame_index].instruction;
+            let instruction = &block.instructions[instruction_index];
+            if let ResolvedInstruction::Return { value } = instruction {
+                let returned = if *value == u16::MAX {
+                    None
+                } else {
+                    match self.read_register(frame_index, *value) {
+                        Ok(value) => Some(value),
+                        Err(fault) => return Ok(self.fault(fault)),
+                    }
+                };
+                let outcome = Outcome::Halted(returned);
+                self.lifecycle = Lifecycle::Terminal(outcome);
+                self.frame_depth = 0;
+                return Ok(outcome);
+            }
+            let width = self.image.registers_per_frame();
+            let base = frame_index * width;
+            let registers = &mut self.registers[base..base + width];
+            let register_types = &self
+                .image
+                .function(self.frames[frame_index].function)
+                .ok_or(RunError::NotRunnable)?
+                .registers;
+            match execute_scalar(instruction, registers, register_types, &self.image) {
+                Ok(()) => self.frames[frame_index].instruction += 1,
+                Err(InstructionFailure::Trap(trap)) => {
+                    let outcome = Outcome::Crashed(trap);
+                    self.lifecycle = Lifecycle::Terminal(outcome);
+                    return Ok(outcome);
+                }
+                Err(InstructionFailure::Fault(fault)) => {
+                    let outcome = self.fault(fault);
+                    return Ok(outcome);
+                }
+            }
+        }
+        Ok(self.fault(VmFault::CorruptLifecycle))
+    }
+
+    fn read_register(&self, frame: usize, register: u16) -> Result<RuntimeValue, VmFault> {
+        let index = frame
+            .checked_mul(self.image.registers_per_frame())
+            .and_then(|base| base.checked_add(register as usize))
+            .ok_or(VmFault::InvalidStoragePlan)?;
+        match self.registers.get(index) {
+            Some(RegisterValue::Initialized(value)) => Ok(*value),
+            _ => Err(VmFault::InvalidValueType),
+        }
+    }
+
+    fn fault(&mut self, fault: VmFault) -> Outcome {
+        let outcome = Outcome::Faulted(fault);
+        self.lifecycle = Lifecycle::Terminal(outcome);
+        outcome
+    }
+
+    pub(super) fn consumed_fixed_cost(&self) -> u64 {
+        self.consumed_fixed_cost
     }
 
     fn validate_argument(
@@ -167,9 +268,441 @@ impl Machine {
             match self.lifecycle {
                 Lifecycle::Pristine => 0,
                 Lifecycle::Runnable => 1,
+                Lifecycle::Terminal(_) => 2,
             },
             self.frame_depth,
             self.registers.clone(),
         )
+    }
+}
+
+enum InstructionFailure {
+    Trap(GuestTrap),
+    Fault(VmFault),
+}
+
+fn execute_scalar(
+    instruction: &ResolvedInstruction,
+    registers: &mut [RegisterValue],
+    register_types: &[ResolvedValueType],
+    image: &ExecutionImage,
+) -> Result<(), InstructionFailure> {
+    let read = |register: u16| match registers.get(register as usize) {
+        Some(RegisterValue::Initialized(value)) => Ok(*value),
+        _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+    };
+    let write = |registers: &mut [RegisterValue], register: u16, value| {
+        let slot = registers
+            .get_mut(register as usize)
+            .ok_or(InstructionFailure::Fault(VmFault::InvalidStoragePlan))?;
+        *slot = RegisterValue::Initialized(value);
+        Ok(())
+    };
+    macro_rules! binary {
+        ($dst:expr, $lhs:expr, $rhs:expr, $body:expr) => {{
+            let lhs = read(*$lhs)?;
+            let rhs = read(*$rhs)?;
+            let value = ($body)(lhs, rhs)?;
+            write(registers, *$dst, value)
+        }};
+    }
+    match instruction {
+        ResolvedInstruction::Nop => Ok(()),
+        ResolvedInstruction::Move { dst, src } => {
+            let value = read(*src)?;
+            write(registers, *dst, value)
+        }
+        ResolvedInstruction::Const { dst, constant } => write(
+            registers,
+            *dst,
+            image
+                .constant(*constant)
+                .ok_or(InstructionFailure::Fault(VmFault::InvalidResolvedId))?,
+        ),
+        ResolvedInstruction::Null { dst } => write(registers, *dst, RuntimeValue::Null),
+        ResolvedInstruction::Convert { dst, src } => {
+            let destination = register_types
+                .get(*dst as usize)
+                .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?
+                .kind;
+            let value = convert(read(*src)?, destination)?;
+            write(registers, *dst, value)
+        }
+        ResolvedInstruction::Add {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| arithmetic(
+            *form,
+            a,
+            b,
+            Arithmetic::Add
+        )),
+        ResolvedInstruction::Sub {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| arithmetic(
+            *form,
+            a,
+            b,
+            Arithmetic::Sub
+        )),
+        ResolvedInstruction::Mul {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| arithmetic(
+            *form,
+            a,
+            b,
+            Arithmetic::Mul
+        )),
+        ResolvedInstruction::Div {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| arithmetic(
+            *form,
+            a,
+            b,
+            Arithmetic::Div
+        )),
+        ResolvedInstruction::Rem {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| arithmetic(
+            *form,
+            a,
+            b,
+            Arithmetic::Rem
+        )),
+        ResolvedInstruction::Neg { form, dst, src } => {
+            let value = negate(*form, read(*src)?)?;
+            write(registers, *dst, value)
+        }
+        ResolvedInstruction::BitAnd {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| integer_binary(*form, a, b, |x, y| x
+            & y)),
+        ResolvedInstruction::BitOr {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| integer_binary(*form, a, b, |x, y| x
+            | y)),
+        ResolvedInstruction::BitXor {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| integer_binary(*form, a, b, |x, y| x
+            ^ y)),
+        ResolvedInstruction::ShiftLeft {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| shift(*form, a, b, Shift::Left)),
+        ResolvedInstruction::ShiftRight {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| shift(*form, a, b, Shift::Right)),
+        ResolvedInstruction::ShiftUnsigned {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| shift(*form, a, b, Shift::Unsigned)),
+        ResolvedInstruction::Equal {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| compare(
+            *form,
+            a,
+            b,
+            Comparison::Equal
+        )),
+        ResolvedInstruction::NotEqual {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| compare(
+            *form,
+            a,
+            b,
+            Comparison::NotEqual
+        )),
+        ResolvedInstruction::Less {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| compare(*form, a, b, Comparison::Less)),
+        ResolvedInstruction::LessEqual {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| compare(
+            *form,
+            a,
+            b,
+            Comparison::LessEqual
+        )),
+        ResolvedInstruction::Greater {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| compare(
+            *form,
+            a,
+            b,
+            Comparison::Greater
+        )),
+        ResolvedInstruction::GreaterEqual {
+            form,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| compare(
+            *form,
+            a,
+            b,
+            Comparison::GreaterEqual
+        )),
+        ResolvedInstruction::RefEqual { dst, lhs, rhs } => {
+            binary!(dst, lhs, rhs, |a, b| Ok(RuntimeValue::Bool(a == b)))
+        }
+        ResolvedInstruction::RefNotEqual { dst, lhs, rhs } => {
+            binary!(dst, lhs, rhs, |a, b| Ok(RuntimeValue::Bool(a != b)))
+        }
+        _ => Err(InstructionFailure::Fault(VmFault::UnsupportedInstruction)),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Arithmetic {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+#[derive(Clone, Copy)]
+enum Shift {
+    Left,
+    Right,
+    Unsigned,
+}
+#[derive(Clone, Copy)]
+enum Comparison {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+fn arithmetic(
+    form: u8,
+    lhs: RuntimeValue,
+    rhs: RuntimeValue,
+    operation: Arithmetic,
+) -> Result<RuntimeValue, InstructionFailure> {
+    match (form, lhs, rhs) {
+        (1, RuntimeValue::I32(a), RuntimeValue::I32(b)) => Ok(RuntimeValue::I32(match operation {
+            Arithmetic::Add => numeric::add_i32(a, b),
+            Arithmetic::Sub => numeric::sub_i32(a, b),
+            Arithmetic::Mul => numeric::mul_i32(a, b),
+            Arithmetic::Div => numeric::div_i32(a, b).map_err(InstructionFailure::Trap)?,
+            Arithmetic::Rem => numeric::rem_i32(a, b).map_err(InstructionFailure::Trap)?,
+        })),
+        (2, RuntimeValue::I64(a), RuntimeValue::I64(b)) => Ok(RuntimeValue::I64(match operation {
+            Arithmetic::Add => numeric::add_i64(a, b),
+            Arithmetic::Sub => numeric::sub_i64(a, b),
+            Arithmetic::Mul => numeric::mul_i64(a, b),
+            Arithmetic::Div => numeric::div_i64(a, b).map_err(InstructionFailure::Trap)?,
+            Arithmetic::Rem => numeric::rem_i64(a, b).map_err(InstructionFailure::Trap)?,
+        })),
+        (3, RuntimeValue::F32(a), RuntimeValue::F32(b)) => {
+            let (a, b) = (f32::from_bits(a), f32::from_bits(b));
+            Ok(RuntimeValue::F32(
+                match operation {
+                    Arithmetic::Add => numeric::add_f32(a, b),
+                    Arithmetic::Sub => numeric::sub_f32(a, b),
+                    Arithmetic::Mul => numeric::mul_f32(a, b),
+                    Arithmetic::Div => numeric::div_f32(a, b),
+                    Arithmetic::Rem => numeric::rem_f32(a, b),
+                }
+                .to_bits(),
+            ))
+        }
+        (4, RuntimeValue::F64(a), RuntimeValue::F64(b)) => {
+            let (a, b) = (f64::from_bits(a), f64::from_bits(b));
+            Ok(RuntimeValue::F64(
+                match operation {
+                    Arithmetic::Add => numeric::add_f64(a, b),
+                    Arithmetic::Sub => numeric::sub_f64(a, b),
+                    Arithmetic::Mul => numeric::mul_f64(a, b),
+                    Arithmetic::Div => numeric::div_f64(a, b),
+                    Arithmetic::Rem => numeric::rem_f64(a, b),
+                }
+                .to_bits(),
+            ))
+        }
+        _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+    }
+}
+
+fn negate(form: u8, value: RuntimeValue) -> Result<RuntimeValue, InstructionFailure> {
+    match (form, value) {
+        (1, RuntimeValue::I32(v)) => Ok(RuntimeValue::I32(numeric::neg_i32(v))),
+        (2, RuntimeValue::I64(v)) => Ok(RuntimeValue::I64(numeric::neg_i64(v))),
+        (3, RuntimeValue::F32(v)) => Ok(RuntimeValue::F32(
+            numeric::neg_f32(f32::from_bits(v)).to_bits(),
+        )),
+        (4, RuntimeValue::F64(v)) => Ok(RuntimeValue::F64(
+            numeric::neg_f64(f64::from_bits(v)).to_bits(),
+        )),
+        _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+    }
+}
+
+fn integer_binary(
+    form: u8,
+    lhs: RuntimeValue,
+    rhs: RuntimeValue,
+    op: impl Fn(i64, i64) -> i64,
+) -> Result<RuntimeValue, InstructionFailure> {
+    match (form, lhs, rhs) {
+        (1, RuntimeValue::I32(a), RuntimeValue::I32(b)) => {
+            Ok(RuntimeValue::I32(op(a as i64, b as i64) as i32))
+        }
+        (2, RuntimeValue::I64(a), RuntimeValue::I64(b)) => Ok(RuntimeValue::I64(op(a, b))),
+        _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+    }
+}
+fn shift(
+    form: u8,
+    lhs: RuntimeValue,
+    rhs: RuntimeValue,
+    op: Shift,
+) -> Result<RuntimeValue, InstructionFailure> {
+    match (form, lhs, rhs) {
+        (1, RuntimeValue::I32(a), RuntimeValue::I32(b)) => Ok(RuntimeValue::I32(match op {
+            Shift::Left => numeric::shl_i32(a, b),
+            Shift::Right => numeric::shr_i32(a, b),
+            Shift::Unsigned => numeric::ushr_i32(a, b),
+        })),
+        (2, RuntimeValue::I64(a), RuntimeValue::I32(b)) => Ok(RuntimeValue::I64(match op {
+            Shift::Left => numeric::shl_i64(a, b),
+            Shift::Right => numeric::shr_i64(a, b),
+            Shift::Unsigned => numeric::ushr_i64(a, b),
+        })),
+        _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+    }
+}
+
+fn compare(
+    form: u8,
+    lhs: RuntimeValue,
+    rhs: RuntimeValue,
+    op: Comparison,
+) -> Result<RuntimeValue, InstructionFailure> {
+    let result = match (form, lhs, rhs) {
+        (1, RuntimeValue::I32(a), RuntimeValue::I32(b)) => ordered(a, b, op),
+        (2, RuntimeValue::I64(a), RuntimeValue::I64(b)) => ordered(a, b, op),
+        (3, RuntimeValue::F32(a), RuntimeValue::F32(b)) => {
+            float_compare_f32(f32::from_bits(a), f32::from_bits(b), op)
+        }
+        (4, RuntimeValue::F64(a), RuntimeValue::F64(b)) => {
+            float_compare_f64(f64::from_bits(a), f64::from_bits(b), op)
+        }
+        (5, RuntimeValue::Bool(a), RuntimeValue::Bool(b)) => match op {
+            Comparison::Equal => a == b,
+            Comparison::NotEqual => a != b,
+            _ => return Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+        },
+        (6, RuntimeValue::Char(a), RuntimeValue::Char(b)) => ordered(a, b, op),
+        _ => return Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+    };
+    Ok(RuntimeValue::Bool(result))
+}
+fn ordered<T: Ord>(a: T, b: T, op: Comparison) -> bool {
+    match op {
+        Comparison::Equal => a == b,
+        Comparison::NotEqual => a != b,
+        Comparison::Less => a < b,
+        Comparison::LessEqual => a <= b,
+        Comparison::Greater => a > b,
+        Comparison::GreaterEqual => a >= b,
+    }
+}
+fn float_compare_f32(a: f32, b: f32, op: Comparison) -> bool {
+    match op {
+        Comparison::Equal => numeric::eq_f32(a, b),
+        Comparison::NotEqual => numeric::ne_f32(a, b),
+        Comparison::Less => numeric::lt_f32(a, b),
+        Comparison::LessEqual => numeric::le_f32(a, b),
+        Comparison::Greater => numeric::gt_f32(a, b),
+        Comparison::GreaterEqual => numeric::ge_f32(a, b),
+    }
+}
+fn float_compare_f64(a: f64, b: f64, op: Comparison) -> bool {
+    match op {
+        Comparison::Equal => numeric::eq_f64(a, b),
+        Comparison::NotEqual => numeric::ne_f64(a, b),
+        Comparison::Less => numeric::lt_f64(a, b),
+        Comparison::LessEqual => numeric::le_f64(a, b),
+        Comparison::Greater => numeric::gt_f64(a, b),
+        Comparison::GreaterEqual => numeric::ge_f64(a, b),
+    }
+}
+
+fn convert(value: RuntimeValue, destination: u8) -> Result<RuntimeValue, InstructionFailure> {
+    match (value, destination) {
+        (RuntimeValue::I32(v), 1) => Ok(RuntimeValue::I32(v)),
+        (RuntimeValue::I32(v), 2) => Ok(RuntimeValue::I64(numeric::i32_to_i64(v))),
+        (RuntimeValue::I32(v), 3) => Ok(RuntimeValue::F32(numeric::i32_to_f32(v).to_bits())),
+        (RuntimeValue::I32(v), 4) => Ok(RuntimeValue::F64(numeric::i32_to_f64(v).to_bits())),
+        (RuntimeValue::I32(v), 6) => numeric::i32_to_char(v)
+            .map(RuntimeValue::Char)
+            .map_err(InstructionFailure::Trap),
+        (RuntimeValue::I64(v), 1) => Ok(RuntimeValue::I32(numeric::i64_to_i32(v))),
+        (RuntimeValue::I64(v), 2) => Ok(RuntimeValue::I64(v)),
+        (RuntimeValue::I64(v), 3) => Ok(RuntimeValue::F32(numeric::i64_to_f32(v).to_bits())),
+        (RuntimeValue::I64(v), 4) => Ok(RuntimeValue::F64(numeric::i64_to_f64(v).to_bits())),
+        (RuntimeValue::F32(v), 1) => Ok(RuntimeValue::I32(numeric::f32_to_i32(f32::from_bits(v)))),
+        (RuntimeValue::F32(v), 2) => Ok(RuntimeValue::I64(numeric::f32_to_i64(f32::from_bits(v)))),
+        (RuntimeValue::F32(v), 3) => Ok(RuntimeValue::F32(v)),
+        (RuntimeValue::F32(v), 4) => Ok(RuntimeValue::F64(
+            numeric::f32_to_f64(f32::from_bits(v)).to_bits(),
+        )),
+        (RuntimeValue::F64(v), 1) => Ok(RuntimeValue::I32(numeric::f64_to_i32(f64::from_bits(v)))),
+        (RuntimeValue::F64(v), 2) => Ok(RuntimeValue::I64(numeric::f64_to_i64(f64::from_bits(v)))),
+        (RuntimeValue::F64(v), 3) => Ok(RuntimeValue::F32(
+            numeric::f64_to_f32(f64::from_bits(v)).to_bits(),
+        )),
+        (RuntimeValue::F64(v), 4) => Ok(RuntimeValue::F64(v)),
+        (RuntimeValue::Char(v), 1) => Ok(RuntimeValue::I32(numeric::char_to_i32(v))),
+        _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
     }
 }

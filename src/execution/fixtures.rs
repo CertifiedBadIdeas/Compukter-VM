@@ -1,15 +1,142 @@
 use std::sync::Arc;
 
 use crate::{
-    artifact::{NominalType, TypeId, ValueType},
+    artifact::{Constant, Instruction, NominalType, TypeId, ValueType},
     verify_artifact, ArtifactLimits, VerifiedArtifact,
 };
 
 use super::{
     image::{AdmittedReference, ExecutionImage, ExecutionProfile},
-    value::{ReferenceValue, RuntimeValue},
+    value::{EntryArgument, ReferenceValue, RuntimeValue},
     TypeKey,
 };
+
+pub(super) struct ScalarCase {
+    pub name: &'static str,
+    pub artifact: VerifiedArtifact,
+    pub args: Box<[EntryArgument]>,
+    pub expected: Result<RuntimeValue, super::error::GuestTrap>,
+    pub expected_fixed_cost: u64,
+}
+
+pub(super) fn scalar_cases() -> Vec<ScalarCase> {
+    let case = |name, registers: Vec<ValueType>, args: Vec<RuntimeValue>, instruction, expected| {
+        let instructions = vec![
+            instruction,
+            Instruction::Return {
+                value: (registers.len() - 1) as u16,
+            },
+        ];
+        let cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap() as u64)
+            .sum();
+        ScalarCase {
+            name,
+            artifact: verified_program(
+                registers.last().copied().unwrap(),
+                args.len(),
+                registers,
+                Vec::new(),
+                instructions,
+            ),
+            args: args.into_iter().map(EntryArgument).collect(),
+            expected,
+            expected_fixed_cost: cost,
+        }
+    };
+    vec![
+        case(
+            "move_alias",
+            vec![primitive(1)],
+            vec![RuntimeValue::I32(7)],
+            Instruction::Move { dst: 0, src: 0 },
+            Ok(RuntimeValue::I32(7)),
+        ),
+        case(
+            "wrapping_add_i32",
+            vec![primitive(1), primitive(1), primitive(1)],
+            vec![RuntimeValue::I32(i32::MAX), RuntimeValue::I32(1)],
+            Instruction::Add {
+                form: 1,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Ok(RuntimeValue::I32(i32::MIN)),
+        ),
+        case(
+            "division_by_zero",
+            vec![primitive(2), primitive(2), primitive(2)],
+            vec![RuntimeValue::I64(1), RuntimeValue::I64(0)],
+            Instruction::Div {
+                form: 2,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Err(super::error::GuestTrap::DivisionByZero),
+        ),
+        case(
+            "canonical_float_remainder_nan",
+            vec![primitive(4), primitive(4), primitive(4)],
+            vec![
+                RuntimeValue::F64(f64::INFINITY.to_bits()),
+                RuntimeValue::F64(1.0_f64.to_bits()),
+            ],
+            Instruction::Rem {
+                form: 4,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Ok(RuntimeValue::F64(super::numeric::CANONICAL_F64_NAN)),
+        ),
+        case(
+            "invalid_character",
+            vec![primitive(1), primitive(6)],
+            vec![RuntimeValue::I32(0xd800)],
+            Instruction::Convert { dst: 1, src: 0 },
+            Err(super::error::GuestTrap::InvalidCharacter),
+        ),
+        case(
+            "i64_to_f32_rounding",
+            vec![primitive(2), primitive(3)],
+            vec![RuntimeValue::I64(16_777_217)],
+            Instruction::Convert { dst: 1, src: 0 },
+            Ok(RuntimeValue::F32(16_777_216.0_f32.to_bits())),
+        ),
+        case(
+            "f64_to_i32_saturation",
+            vec![primitive(4), primitive(1)],
+            vec![RuntimeValue::F64(f64::INFINITY.to_bits())],
+            Instruction::Convert { dst: 1, src: 0 },
+            Ok(RuntimeValue::I32(i32::MAX)),
+        ),
+        case(
+            "char_to_i32",
+            vec![primitive(6), primitive(1)],
+            vec![RuntimeValue::Char('🦀')],
+            Instruction::Convert { dst: 1, src: 0 },
+            Ok(RuntimeValue::I32(0x1f980)),
+        ),
+        case(
+            "nan_primitive_equality",
+            vec![primitive(3), primitive(3), primitive(5)],
+            vec![
+                RuntimeValue::F32(f32::NAN.to_bits()),
+                RuntimeValue::F32(f32::NAN.to_bits()),
+            ],
+            Instruction::Equal {
+                form: 3,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Ok(RuntimeValue::Bool(false)),
+        ),
+    ]
+}
 
 pub(super) fn scalar_artifact() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::minimal_vector(), 32)
@@ -167,6 +294,40 @@ fn verified_mutated(
     change(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+fn verified_program(
+    result: ValueType,
+    parameter_count: usize,
+    registers: Vec<ValueType>,
+    constants: Vec<Constant>,
+    instructions: Vec<Instruction>,
+) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result,
+            parameters: registers[..parameter_count].to_vec(),
+        };
+        artifact.modules[0].constants = constants;
+        let register_count = registers.len() as u16;
+        artifact.modules[0].functions[0].register_count = register_count;
+        artifact.modules[0].functions[0].parameter_count = parameter_count as u16;
+        artifact.modules[0].functions[0].registers = registers;
+        let fixed_cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        artifact.modules[0].blocks[0].instruction_count = instructions.len() as u32;
+        artifact.modules[0].blocks[0].declared_fixed_cost = fixed_cost;
+        artifact.modules[0].code[0].instructions = instructions.into_boxed_slice();
+        artifact.modules[0].code[0].fixed_cost = fixed_cost;
+        artifact.manifest.maximum_block_cost = fixed_cost;
+        artifact.manifest.minimum_slice_cost = fixed_cost;
+        artifact.manifest.required_stack_bytes =
+            super::image::frame_charge(register_count.into()).unwrap() as u32;
+    })
 }
 
 fn primitive(kind: u8) -> ValueType {
