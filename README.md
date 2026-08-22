@@ -1,7 +1,7 @@
 # Compukter VM
 
 Compukter VM is the standalone managed Rust runtime used by
-[Compukter Kraft](https://github.com/CertifiedBadIdeas/Compukter-Kraft).
+[Compukters](https://github.com/CertifiedBadIdeas/Compukters).
 
 The project is in an intentional clean-break interval. The retired RISC-V
 machine, ELF runtime, and native-code backends have been removed. The new
@@ -9,7 +9,7 @@ platform compiles Kotlin scripts through a pinned K2/Kotlin IR target into a
 versioned Compukter bytecode executed only inside this resource-bounded VM.
 
 The accepted architecture is tracked by
-[Compukter-Kraft issue #500](https://github.com/CertifiedBadIdeas/Compukter-Kraft/issues/500).
+[Compukters issue #500](https://github.com/CertifiedBadIdeas/Compukters/issues/500).
 Artifact, verifier, interpreter, heap, scheduler, snapshot, and optimization
 contracts will be introduced through independently verified roadmap slices.
 
@@ -75,9 +75,9 @@ cargo test --test golden_fixtures regenerate_committed_fixtures --locked --offli
 Review regenerated binaries and their manifests together before committing
 them. CI intentionally runs only the read-only golden suite.
 
-## Compukter Kraft integration
+## Compukters integration
 
-Compukter Kraft consumes this repository as its pinned
+Compukters consumes this repository as its pinned
 `host/compukter-vm` submodule. Runtime changes are committed in the submodule
 repository first; the consuming repository then records the selected submodule
 commit.
