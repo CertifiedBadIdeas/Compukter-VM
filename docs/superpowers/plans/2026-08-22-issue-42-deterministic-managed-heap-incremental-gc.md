@@ -565,14 +565,14 @@ git add docs/superpowers/plans/2026-08-22-issue-42-deterministic-managed-heap-in
 git commit -m "docs(vm): record managed heap verification (#42)"
 ```
 
-- [ ] **Step 4: Update GitHub only after every acceptance item is evidenced**
+- [x] **Step 4: Update GitHub only after every acceptance item is evidenced**
 
 Comment on #42 with the commit range, exact test counts/commands, zero-allocation
 results, baseline path, and crate-private API confirmation. Close #42 as
 completed and move it to Done. If any item lacks evidence, leave it open in Now
 and identify that exact item.
 
-- [ ] **Step 5: Pin the VM commit in the `Compukters` superproject**
+- [x] **Step 5: Pin the VM commit in the `Compukters` superproject**
 
 Create or reuse the roadmap-tracked superproject pin issue, update only
 `host/compukter-vm`, run the parent verification required by its issue, commit
