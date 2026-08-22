@@ -547,18 +547,18 @@ git commit -m "test(vm): lock managed heap conformance and baselines (#42)"
 - Modify: `docs/superpowers/plans/2026-08-22-issue-42-deterministic-managed-heap-incremental-gc.md`
 - Modify in superproject: `host/compukter-vm` gitlink
 
-- [ ] **Step 1: Mark every verified plan checkbox complete**
+- [x] **Step 1: Mark every verified plan checkbox complete**
 
 Change only steps supported by fresh command output from `[ ]` to `[x]`.
 
-- [ ] **Step 2: Run final clean-tree verification**
+- [x] **Step 2: Run final clean-tree verification**
 
 Run in VM: `cargo fmt --all -- --check && cargo test --locked --offline && cargo test --release --locked --offline && cargo clippy --all-targets --all-features --locked --offline -- -D warnings && git status --short`
 
 Expected: verification commands exit zero and status contains only the plan
 checkbox update before its final commit.
 
-- [ ] **Step 3: Commit the verified plan record**
+- [x] **Step 3: Commit the verified plan record**
 
 ```bash
 git add docs/superpowers/plans/2026-08-22-issue-42-deterministic-managed-heap-incremental-gc.md
