@@ -693,6 +693,12 @@ impl Heap {
     }
 
     #[cfg(test)]
+    pub(super) fn test_reserved_bytes(&self) -> usize {
+        self.arena.len() * core::mem::size_of::<u128>()
+            + self.handles.len() * core::mem::size_of::<HandleEntry>()
+    }
+
+    #[cfg(test)]
     pub(super) fn test_managed_payload(&self, reference: ReferenceValue) -> Option<Box<[u8]>> {
         let entry = self.handles.get(reference.slot() as usize)?;
         if reference.domain() != ReferenceDomain::Managed

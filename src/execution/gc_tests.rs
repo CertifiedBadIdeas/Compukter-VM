@@ -610,3 +610,122 @@ fn collector_steady_state_allocates_nothing() {
     let allocations = super::tests::allocation_counter::disable_and_read();
     assert_eq!(0, allocations);
 }
+
+#[test]
+#[ignore = "records a hardware-specific managed-heap performance baseline"]
+fn managed_heap_performance_gc_units() {
+    use std::time::Instant;
+
+    const CYCLES: u32 = 10_000;
+    let image = ExecutionImage::admit(fixtures::gc_graph_artifact(), fixtures::profile()).unwrap();
+    let mut heap = Heap::new(&image.storage_plan()).unwrap();
+    let ty = TypeKey { module: 0, ty: 1 };
+    let RuntimeTypeLayout::Object(layout) = image.type_layout(ty).unwrap() else {
+        unreachable!()
+    };
+    let [first, second] = layout.reference_offsets.as_ref() else {
+        unreachable!()
+    };
+    let root = allocate(&mut heap, ty, layout.block_bytes);
+    let left = allocate(&mut heap, ty, layout.block_bytes);
+    let right = allocate(&mut heap, ty, layout.block_bytes);
+    let shared = allocate(&mut heap, ty, layout.block_bytes);
+    for (owner, offset, value) in [
+        (root, *first, left),
+        (root, *second, right),
+        (left, *first, shared),
+        (right, *first, shared),
+        (shared, *first, root),
+    ] {
+        store_value(
+            &mut heap,
+            owner,
+            offset,
+            ValueWidth::Ref,
+            RuntimeValue::Reference(value),
+        )
+        .unwrap();
+    }
+    let frames = [Frame::test_entry(image.entry_index())];
+    let registers = [RegisterValue::Initialized(RuntimeValue::Reference(root))];
+    let statics = [RuntimeValue::Reference(shared)];
+    let mut collector = Collector::new();
+    let mut counts = [0_u64; 6];
+
+    let started = Instant::now();
+    for _ in 0..CYCLES {
+        collector.start();
+        while collector.is_active() {
+            assert_eq!(
+                1,
+                collector
+                    .step(&mut heap, &image, &statics, &frames, &registers, 1)
+                    .unwrap()
+            );
+            let index = match collector.test_last_action().unwrap() {
+                CollectorAction::Root => 0,
+                CollectorAction::Dequeue(_) => 1,
+                CollectorAction::Edge => 2,
+                CollectorAction::Leaf(_) => 3,
+                CollectorAction::Sweep(_) => 4,
+                CollectorAction::Transition => 5,
+            };
+            counts[index] += 1;
+        }
+    }
+    let elapsed = started.elapsed();
+    let units: u64 = counts.iter().sum();
+    println!("workload\tcycles\telapsed_ns\tunits\tunits_per_s\troot\tdequeue\tedge\tleaf\tsweep\ttransition");
+    println!(
+        "gc_graph\t{CYCLES}\t{}\t{units}\t{:.0}\t{}\t{}\t{}\t{}\t{}\t{}",
+        elapsed.as_nanos(),
+        units as f64 / elapsed.as_secs_f64(),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        counts[5],
+    );
+    println!(
+        "gc_pause_units\tminimum={}\tmaximum={}\tconfigured_slice=1",
+        units / u64::from(CYCLES),
+        units / u64::from(CYCLES)
+    );
+
+    let leaf_image =
+        ExecutionImage::admit(fixtures::object_allocation_artifact(0), fixtures::profile())
+            .unwrap();
+    let mut leaf_heap = Heap::new(&leaf_image.storage_plan()).unwrap();
+    let leaf = allocate(&mut leaf_heap, TypeKey { module: 0, ty: 1 }, 32);
+    let leaf_frames = [Frame::test_entry(leaf_image.entry_index())];
+    let leaf_registers = [RegisterValue::Initialized(RuntimeValue::Reference(leaf))];
+    let mut leaf_collector = Collector::new();
+    let started = Instant::now();
+    let mut leaf_units = 0_u64;
+    for _ in 0..CYCLES {
+        leaf_collector.start();
+        while leaf_collector.is_active() {
+            leaf_collector
+                .step(
+                    &mut leaf_heap,
+                    &leaf_image,
+                    &[],
+                    &leaf_frames,
+                    &leaf_registers,
+                    1,
+                )
+                .unwrap();
+            leaf_units += u64::from(matches!(
+                leaf_collector.test_last_action(),
+                Some(CollectorAction::Leaf(_))
+            ));
+        }
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "gc_leaf\t{CYCLES}\t{}\t{leaf_units}\t{:.0}",
+        elapsed.as_nanos(),
+        leaf_units as f64 / elapsed.as_secs_f64(),
+    );
+}

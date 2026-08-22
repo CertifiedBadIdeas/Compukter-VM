@@ -1687,6 +1687,15 @@ impl Machine {
     }
 
     #[cfg(test)]
+    pub(super) fn test_reserved_bytes(&self) -> usize {
+        core::mem::size_of::<Self>()
+            + self.frames.len() * core::mem::size_of::<Frame>()
+            + self.registers.len() * core::mem::size_of::<RegisterValue>()
+            + self.static_slots.len() * core::mem::size_of::<RuntimeValue>()
+            + self.heap.test_reserved_bytes()
+    }
+
+    #[cfg(test)]
     pub(super) fn test_snapshot(&self) -> (u8, usize, Box<[RegisterValue]>) {
         (
             match self.lifecycle {

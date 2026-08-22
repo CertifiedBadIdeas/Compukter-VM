@@ -359,6 +359,40 @@ fn dynamic_string_execution_allocates_nothing_natively() {
 }
 
 #[test]
+#[ignore = "records a hardware-specific managed-heap performance baseline"]
+fn managed_heap_performance_text_encodings() {
+    use std::time::Instant;
+
+    const ITERATIONS: u32 = 10_000;
+    println!("workload\titerations\telapsed_ns\toperations_per_s");
+    for (name, units) in [
+        ("latin1_concat", vec![u16::from(b'x'); 25]),
+        ("utf16_concat", vec![0xd83d, 0xde00, 0x0100, 0xd800]),
+    ] {
+        let image = super::image::ExecutionImage::admit(
+            fixtures::literal_string_concat_units_artifact(&units),
+            fixtures::profile(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut machine = super::machine::Machine::new(image.clone()).unwrap();
+            machine.start(&[]).unwrap();
+            assert!(matches!(
+                machine.run_slice(128, 0).unwrap(),
+                Outcome::Halted(Some(RuntimeValue::Reference(_)))
+            ));
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "{name}\t{ITERATIONS}\t{}\t{:.0}",
+            elapsed.as_nanos(),
+            f64::from(ITERATIONS) / elapsed.as_secs_f64(),
+        );
+    }
+}
+
+#[test]
 fn equal_dynamic_strings_are_fresh_but_content_equal() {
     for content_equality in [false, true] {
         let mut machine =

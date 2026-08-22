@@ -7,6 +7,118 @@ use super::{
 };
 use sha2::{Digest, Sha256};
 
+#[test]
+fn managed_heap_vertical_conformance() {
+    fn record(machine: &Machine, digest: &mut Sha256, totals: &mut [u64; 3]) {
+        let heap = machine.test_heap_diagnostic();
+        digest.update(machine.trace_digest());
+        for value in [
+            machine.consumed_fixed_cost(),
+            machine.consumed_dynamic_cost(),
+            machine.consumed_maintenance_cost(),
+            u64::from(heap.total_free),
+            u64::from(heap.largest_free_block),
+            u64::from(heap.live_handles),
+            u64::from(heap.retired_handles),
+        ] {
+            digest.update(value.to_le_bytes());
+        }
+        totals[0] += machine.consumed_fixed_cost();
+        totals[1] += machine.consumed_dynamic_cost();
+        totals[2] += machine.consumed_maintenance_cost();
+    }
+
+    let mut digest = Sha256::new();
+    let mut totals = [0_u64; 3];
+
+    let mut inherited = fixtures::started_zero_arg(fixtures::field_roundtrip_artifact());
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::I32(42))),
+        inherited.run_slice(64, 0).unwrap()
+    );
+    assert_eq!(Some(RuntimeValue::Bool(true)), inherited.test_register(3));
+    record(&inherited, &mut digest, &mut totals);
+
+    let mut references = fixtures::started_zero_arg(fixtures::reference_array_roundtrip_artifact());
+    assert!(matches!(
+        references.run_slice(64, 0).unwrap(),
+        Outcome::Halted(Some(RuntimeValue::Reference(_)))
+    ));
+    assert_eq!(references.test_register(2), references.test_register(4));
+    record(&references, &mut digest, &mut totals);
+
+    let static_image =
+        ExecutionImage::admit(fixtures::static_roundtrip_artifact(), fixtures::profile()).unwrap();
+    let mut static_root = Machine::new(static_image).unwrap();
+    static_root
+        .start(&[
+            EntryArgument::unowned(RuntimeValue::Bool(true)),
+            EntryArgument::unowned(RuntimeValue::I32(42)),
+        ])
+        .unwrap();
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::I32(42))),
+        static_root.run_slice(32, 0).unwrap()
+    );
+    record(&static_root, &mut digest, &mut totals);
+
+    let mut text = fixtures::started_zero_arg(fixtures::repeated_concat_artifact(true));
+    let mut outcome = text.run_slice(3, 0).unwrap();
+    while outcome == Outcome::SliceExhausted {
+        outcome = text.run_slice(8, 0).unwrap();
+    }
+    assert_eq!(Outcome::Halted(Some(RuntimeValue::Bool(true))), outcome);
+    record(&text, &mut digest, &mut totals);
+
+    let mut recovery_profile = fixtures::profile();
+    recovery_profile.heap_bytes = 32;
+    let recovery_image =
+        ExecutionImage::admit(fixtures::gc_retry_artifact(), recovery_profile).unwrap();
+    let recovery_budget = recovery_image.minimum_slice_cost();
+    let mut recovery = Machine::new(recovery_image).unwrap();
+    recovery.start(&[]).unwrap();
+    let recovery_outcome = loop {
+        let outcome = recovery.run_slice(recovery_budget, 1).unwrap();
+        if outcome.is_terminal() {
+            break outcome;
+        }
+    };
+    assert!(matches!(
+        recovery_outcome,
+        Outcome::Halted(Some(RuntimeValue::Reference(_)))
+    ));
+    assert_eq!(1, recovery.test_heap_diagnostic().live_handles);
+    record(&recovery, &mut digest, &mut totals);
+
+    let mut oom_profile = fixtures::profile();
+    oom_profile.heap_bytes = 32;
+    let oom_image =
+        ExecutionImage::admit(fixtures::gc_failed_retry_artifact(), oom_profile).unwrap();
+    let oom_budget = oom_image.minimum_slice_cost();
+    let mut oom = Machine::new(oom_image).unwrap();
+    oom.start(&[]).unwrap();
+    let oom_outcome = loop {
+        let outcome = oom.run_slice(oom_budget, 1).unwrap();
+        if outcome.is_terminal() {
+            break outcome;
+        }
+    };
+    assert!(matches!(oom_outcome, Outcome::AllocationExhausted(_)));
+    record(&oom, &mut digest, &mut totals);
+
+    let observation = (totals, <[u8; 32]>::from(digest.finalize()));
+    assert_eq!(
+        (
+            [69, 7, 12],
+            [
+                163, 47, 70, 26, 245, 57, 36, 152, 93, 253, 243, 4, 30, 128, 51, 37, 254, 105, 211,
+                242, 74, 160, 16, 41, 33, 135, 235, 21, 181, 67, 78, 100,
+            ],
+        ),
+        observation
+    );
+}
+
 pub(super) mod allocation_counter {
     use std::{
         alloc::{GlobalAlloc, Layout, System},
@@ -263,6 +375,101 @@ fn tier0_performance_baseline() {
             cpu
         );
     }
+}
+
+#[test]
+#[ignore = "records a hardware-specific managed-heap performance baseline"]
+fn managed_heap_performance_operations_and_idle_instances() {
+    use std::time::Instant;
+
+    const ITERATIONS: u32 = 10_000;
+    println!("workload\titerations\telapsed_ns\toperations_per_s");
+
+    let field_image =
+        ExecutionImage::admit(fixtures::field_roundtrip_artifact(), fixtures::profile()).unwrap();
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        let mut machine = Machine::new(field_image.clone()).unwrap();
+        machine.start(&[]).unwrap();
+        assert_eq!(
+            Outcome::Halted(Some(RuntimeValue::I32(42))),
+            machine.run_slice(64, 0).unwrap()
+        );
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "inherited_field_roundtrip\t{ITERATIONS}\t{}\t{:.0}",
+        elapsed.as_nanos(),
+        f64::from(ITERATIONS) / elapsed.as_secs_f64(),
+    );
+
+    let array_image = ExecutionImage::admit(
+        fixtures::reference_array_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        let mut machine = Machine::new(array_image.clone()).unwrap();
+        machine.start(&[]).unwrap();
+        assert!(matches!(
+            machine.run_slice(64, 0).unwrap(),
+            Outcome::Halted(Some(RuntimeValue::Reference(_)))
+        ));
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "reference_array_roundtrip\t{ITERATIONS}\t{}\t{:.0}",
+        elapsed.as_nanos(),
+        f64::from(ITERATIONS) / elapsed.as_secs_f64(),
+    );
+
+    let text_image = ExecutionImage::admit(
+        fixtures::repeated_concat_artifact(true),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        let mut machine = Machine::new(text_image.clone()).unwrap();
+        machine.start(&[]).unwrap();
+        assert_eq!(
+            Outcome::Halted(Some(RuntimeValue::Bool(true))),
+            machine.run_slice(128, 0).unwrap()
+        );
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "compact_string_concat_equals\t{ITERATIONS}\t{}\t{:.0}",
+        elapsed.as_nanos(),
+        f64::from(ITERATIONS) / elapsed.as_secs_f64(),
+    );
+
+    let mut idle_profile = fixtures::profile();
+    idle_profile.heap_bytes = 32;
+    let idle_heap_bytes = idle_profile.heap_bytes;
+    let idle_image =
+        ExecutionImage::admit(fixtures::object_allocation_artifact(0), idle_profile).unwrap();
+    let started = Instant::now();
+    let mut instances = Vec::with_capacity(ITERATIONS as usize);
+    for _ in 0..ITERATIONS {
+        instances.push(Machine::new(idle_image.clone()).unwrap());
+    }
+    let elapsed = started.elapsed();
+    assert!(instances
+        .iter()
+        .all(|machine| machine.consumed_maintenance_cost() == 0));
+    let resident_reserved_bytes: usize = instances.iter().map(Machine::test_reserved_bytes).sum();
+    println!(
+        "idle_instance_admission\t{ITERATIONS}\t{}\t{:.0}",
+        elapsed.as_nanos(),
+        f64::from(ITERATIONS) / elapsed.as_secs_f64(),
+    );
+    println!(
+        "idle_zero_work\tinstances={ITERATIONS}\tmaintenance_units=0\tmachine_struct_bytes={}\theap_bytes_per_instance={}\tinstance_reserved_bytes={resident_reserved_bytes}\tshared_image=excluded\tallocator_overhead=excluded",
+        core::mem::size_of::<Machine>(),
+        idle_heap_bytes,
+    );
 }
 
 #[test]
