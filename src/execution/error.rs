@@ -6,6 +6,7 @@ pub(super) enum AdmissionError {
     StandardLibraryAbiMismatch,
     MissingCapability { index: u8 },
     HeapLimit { required: u32, available: u32 },
+    InvalidHeapSize { supplied: u32 },
     FrameStorageLimit { required: u64, available: u64 },
     CallDepthLimit { required: u32, available: u32 },
     CoroutineLimit { required: u32, available: u32 },

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use crate::artifact::{
-    Constant, DecodedArtifact, Instruction, NominalType, SwitchCase, TypeId, ValueType,
+    ByteRange, Constant, DecodedArtifact, Instruction, NominalType, SwitchCase, TypeId, ValueType,
 };
 use crate::VerifiedArtifact;
 
 use super::{
     error::AdmissionError,
+    layout::{object_layout, FieldSpec, RuntimeTypeLayout, StoragePlan, ValueWidth},
     value::{ReferenceValue, RuntimeValue},
     FunctionKey, TypeKey,
 };
@@ -231,17 +232,40 @@ pub(super) struct ResolvedHostReference {
     pub assignable_to: Box<[TypeKey]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedField {
+    pub owner: TypeKey,
+    pub value_type: ResolvedValueType,
+    pub offset: Option<u32>,
+    pub static_slot: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedLiteral {
+    pub bytes: ByteRange,
+    pub code_units: u32,
+}
+
+type ResolvedLiterals = (Box<[ResolvedLiteral]>, Box<[usize]>);
+
 #[derive(Clone, Debug)]
 pub(super) struct ExecutionImage(Arc<ExecutionImageInner>);
 
 #[derive(Debug)]
 struct ExecutionImageInner {
     content_hash: [u8; 32],
+    artifact_bytes: Arc<[u8]>,
     entry: usize,
     functions: Box<[ResolvedFunction]>,
     blocks: Box<[ResolvedBlock]>,
     constants: Box<[RuntimeValue]>,
     host_references: Box<[ResolvedHostReference]>,
+    type_offsets: Box<[usize]>,
+    type_layouts: Box<[RuntimeTypeLayout]>,
+    fields: Box<[ResolvedField]>,
+    literals: Box<[ResolvedLiteral]>,
+    literal_ids: Box<[usize]>,
+    storage_plan: StoragePlan,
     registers_per_frame: usize,
     maximum_call_depth: usize,
     minimum_slice_cost: u32,
@@ -260,6 +284,37 @@ impl ExecutionImage {
         let block_offsets = offsets(decoded.modules.iter().map(|module| module.blocks.len()))?;
         let constant_offsets =
             offsets(decoded.modules.iter().map(|module| module.constants.len()))?;
+        let type_offsets = offsets(decoded.modules.iter().map(|module| module.types.len()))?;
+        let field_offsets = offsets(decoded.modules.iter().map(|module| module.fields.len()))?;
+        let literal_offsets = offsets(
+            decoded
+                .modules
+                .iter()
+                .map(|module| module.utf16_literals.len()),
+        )?;
+        let type_layouts = derive_type_layouts(decoded, &type_offsets, &field_offsets)?;
+        let (fields, static_slot_count) =
+            resolve_fields(decoded, &type_offsets, &field_offsets, &type_layouts)?;
+        let (literals, literal_ids) = resolve_literals(decoded, &literal_offsets)?;
+        let storage_plan = StoragePlan {
+            heap_bytes: profile.heap_bytes,
+            handle_capacity: profile.heap_bytes / 32,
+            type_count: checked_u32(type_layouts.len())?,
+            field_count: checked_u32(fields.len())?,
+            static_slot_count,
+            literal_count: checked_u32(literals.len())?,
+            literal_id_count: checked_u32(literal_ids.len())?,
+            reference_offset_count: checked_u32(
+                type_layouts
+                    .iter()
+                    .map(|layout| match layout {
+                        RuntimeTypeLayout::Object(object) => object.reference_offsets.len(),
+                        RuntimeTypeLayout::Array { .. } | RuntimeTypeLayout::NonHeap => 0,
+                    })
+                    .try_fold(0_usize, |total, count| total.checked_add(count))
+                    .ok_or(AdmissionError::StoragePlanOverflow)?,
+            )?,
+        };
 
         let mut constants = reserved(
             *constant_offsets
@@ -378,11 +433,18 @@ impl ExecutionImage {
 
         Ok(Self(Arc::new(ExecutionImageInner {
             content_hash: artifact.content_hash(),
+            artifact_bytes: decoded.bytes.clone(),
             entry,
             functions: functions.into_boxed_slice(),
             blocks: blocks.into_boxed_slice(),
             constants: constants.into_boxed_slice(),
             host_references: host_references.into_boxed_slice(),
+            type_offsets,
+            type_layouts,
+            fields,
+            literals,
+            literal_ids,
+            storage_plan,
             registers_per_frame,
             maximum_call_depth: decoded.manifest.maximum_call_depth as usize,
             minimum_slice_cost: decoded.manifest.minimum_slice_cost,
@@ -439,6 +501,296 @@ impl ExecutionImage {
             reference.value.handle == value.handle && reference.value.generation == value.generation
         })
     }
+
+    pub(super) fn storage_plan(&self) -> StoragePlan {
+        self.0.storage_plan
+    }
+
+    pub(super) fn type_layout(&self, key: TypeKey) -> Option<&RuntimeTypeLayout> {
+        let index = checked_global_index(&self.0.type_offsets, key)?;
+        self.0.type_layouts.get(index)
+    }
+
+    pub(super) fn field(&self, index: usize) -> Option<&ResolvedField> {
+        self.0.fields.get(index)
+    }
+
+    pub(super) fn literal(&self, index: usize) -> Option<&ResolvedLiteral> {
+        let canonical = *self.0.literal_ids.get(index)?;
+        self.0.literals.get(canonical)
+    }
+
+    pub(super) fn literal_bytes(&self, literal: ResolvedLiteral) -> &[u8] {
+        literal.bytes.slice(&self.0.artifact_bytes)
+    }
+}
+
+fn derive_type_layouts(
+    artifact: &DecodedArtifact,
+    type_offsets: &[usize],
+    field_offsets: &[usize],
+) -> Result<Box<[RuntimeTypeLayout]>, AdmissionError> {
+    let total = *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?;
+    let mut layouts = reserved(total)?;
+    layouts.resize_with(total, || None);
+    let mut visiting = reserved(total)?;
+    visiting.resize(total, false);
+    for (module, module_types) in artifact.modules.iter().enumerate() {
+        for ty in 0..module_types.types.len() {
+            derive_type_layout(
+                artifact,
+                type_offsets,
+                field_offsets,
+                TypeKey {
+                    module: checked_u32(module)?,
+                    ty: checked_u32(ty)?,
+                },
+                &mut layouts,
+                &mut visiting,
+            )?;
+        }
+    }
+    let mut resolved = reserved(total)?;
+    for layout in layouts {
+        resolved.push(layout.ok_or(AdmissionError::InvalidEntry)?);
+    }
+    Ok(resolved.into_boxed_slice())
+}
+
+fn derive_type_layout(
+    artifact: &DecodedArtifact,
+    type_offsets: &[usize],
+    field_offsets: &[usize],
+    key: TypeKey,
+    layouts: &mut [Option<RuntimeTypeLayout>],
+    visiting: &mut [bool],
+) -> Result<(), AdmissionError> {
+    let index = global_index(type_offsets, key)?;
+    if layouts[index].is_some() {
+        return Ok(());
+    }
+    if core::mem::replace(&mut visiting[index], true) {
+        return Err(AdmissionError::InvalidEntry);
+    }
+    let module = artifact
+        .modules
+        .get(key.module as usize)
+        .ok_or(AdmissionError::InvalidEntry)?;
+    let nominal = module
+        .types
+        .get(key.ty as usize)
+        .ok_or(AdmissionError::InvalidEntry)?;
+    let layout = match nominal {
+        NominalType::Class {
+            super_type,
+            field_start,
+            field_count,
+            ..
+        } => {
+            let superclass = resolve_type(artifact, key.module as usize, *super_type);
+            let inherited = if let Some(superclass) = superclass {
+                derive_type_layout(
+                    artifact,
+                    type_offsets,
+                    field_offsets,
+                    superclass,
+                    layouts,
+                    visiting,
+                )?;
+                match layouts[global_index(type_offsets, superclass)?].as_ref() {
+                    Some(RuntimeTypeLayout::Object(layout)) => Some(layout),
+                    _ => return Err(AdmissionError::InvalidEntry),
+                }
+            } else {
+                None
+            };
+            let start = *field_start as usize;
+            let count = *field_count as usize;
+            let end = start
+                .checked_add(count)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            let declared = module
+                .fields
+                .get(start..end)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let mut specs = reserved(declared.len())?;
+            for (relative, field) in declared.iter().enumerate() {
+                if field.flags & 2 != 0 {
+                    continue;
+                }
+                let local_field = start
+                    .checked_add(relative)
+                    .ok_or(AdmissionError::StoragePlanOverflow)?;
+                let field = field_offsets[key.module as usize]
+                    .checked_add(local_field)
+                    .ok_or(AdmissionError::StoragePlanOverflow)?;
+                specs.push(FieldSpec {
+                    field: checked_u32(field)?,
+                    width: value_width(field_value_type(module, local_field)?)?,
+                });
+            }
+            RuntimeTypeLayout::Object(object_layout(inherited, &specs)?)
+        }
+        NominalType::Array { element, .. } => RuntimeTypeLayout::Array {
+            element: value_width(*element)?,
+        },
+        NominalType::Interface { .. } | NominalType::Function { .. } => RuntimeTypeLayout::NonHeap,
+    };
+    visiting[index] = false;
+    layouts[index] = Some(layout);
+    Ok(())
+}
+
+fn field_value_type(
+    module: &crate::artifact::DecodedModule,
+    local_field: usize,
+) -> Result<ValueType, AdmissionError> {
+    module
+        .fields
+        .get(local_field)
+        .map(|field| field.value_type)
+        .ok_or(AdmissionError::InvalidEntry)
+}
+
+fn resolve_fields(
+    artifact: &DecodedArtifact,
+    type_offsets: &[usize],
+    field_offsets: &[usize],
+    type_layouts: &[RuntimeTypeLayout],
+) -> Result<(Box<[ResolvedField]>, u32), AdmissionError> {
+    let total = *field_offsets.last().ok_or(AdmissionError::InvalidEntry)?;
+    let mut fields = reserved(total)?;
+    let mut static_slot_count = 0_u32;
+    for (module_id, module) in artifact.modules.iter().enumerate() {
+        for (local_field, field) in module.fields.iter().enumerate() {
+            let owner = resolve_type(artifact, module_id, field.owner)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let global_field = field_offsets[module_id]
+                .checked_add(local_field)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            let is_static = field.flags & 2 != 0;
+            let static_slot = if is_static {
+                let slot = static_slot_count;
+                static_slot_count = static_slot_count
+                    .checked_add(1)
+                    .ok_or(AdmissionError::StoragePlanOverflow)?;
+                Some(slot)
+            } else {
+                None
+            };
+            let offset = if is_static {
+                None
+            } else {
+                match type_layouts.get(global_index(type_offsets, owner)?) {
+                    Some(RuntimeTypeLayout::Object(layout)) => layout
+                        .fields
+                        .iter()
+                        .find(|layout| layout.field as usize == global_field)
+                        .map(|layout| layout.offset),
+                    _ => None,
+                }
+                .ok_or(AdmissionError::InvalidEntry)
+                .map(Some)?
+            };
+            fields.push(ResolvedField {
+                owner,
+                value_type: resolve_value_type(artifact, module_id, field.value_type)?,
+                offset,
+                static_slot,
+            });
+        }
+    }
+    Ok((fields.into_boxed_slice(), static_slot_count))
+}
+
+fn resolve_literals(
+    artifact: &DecodedArtifact,
+    literal_offsets: &[usize],
+) -> Result<ResolvedLiterals, AdmissionError> {
+    let total = *literal_offsets.last().ok_or(AdmissionError::InvalidEntry)?;
+    let mut ranges = reserved(total)?;
+    for module in &artifact.modules {
+        for range in &module.utf16_literals {
+            ranges.push(*range);
+        }
+    }
+    deduplicate_literal_ranges(&artifact.bytes, &ranges)
+}
+
+pub(super) fn deduplicate_literal_ranges(
+    bytes: &[u8],
+    ranges: &[ByteRange],
+) -> Result<ResolvedLiterals, AdmissionError> {
+    let mut order = reserved(ranges.len())?;
+    order.extend(0..ranges.len());
+    order.sort_unstable_by(|left, right| {
+        ranges[*left]
+            .slice(bytes)
+            .cmp(ranges[*right].slice(bytes))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut unique_count = 0_usize;
+    let mut previous: Option<&[u8]> = None;
+    for index in &order {
+        let raw = ranges[*index].slice(bytes);
+        if previous != Some(raw) {
+            unique_count = unique_count
+                .checked_add(1)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            previous = Some(raw);
+        }
+    }
+
+    let mut literals: Vec<ResolvedLiteral> = reserved(unique_count)?;
+    let mut literal_ids = reserved(ranges.len())?;
+    literal_ids.resize(ranges.len(), usize::MAX);
+    for source_id in order {
+        let range = ranges[source_id];
+        let raw = range.slice(bytes);
+        if literals
+            .last()
+            .is_none_or(|literal| literal.bytes.slice(bytes) != raw)
+        {
+            let code_units = checked_u32(raw.len() / 2)?;
+            literals.push(ResolvedLiteral {
+                bytes: range,
+                code_units,
+            });
+        }
+        literal_ids[source_id] = literals.len() - 1;
+    }
+    Ok((literals.into_boxed_slice(), literal_ids.into_boxed_slice()))
+}
+
+fn global_index(offsets: &[usize], key: TypeKey) -> Result<usize, AdmissionError> {
+    checked_global_index(offsets, key).ok_or(AdmissionError::InvalidEntry)
+}
+
+fn checked_global_index(offsets: &[usize], key: TypeKey) -> Option<usize> {
+    let module = key.module as usize;
+    let start = *offsets.get(module)?;
+    let end = *offsets.get(module.checked_add(1)?)?;
+    start
+        .checked_add(key.ty as usize)
+        .filter(|index| *index < end)
+}
+
+fn checked_u32(value: usize) -> Result<u32, AdmissionError> {
+    u32::try_from(value).map_err(|_| AdmissionError::StoragePlanOverflow)
+}
+
+fn value_width(value: ValueType) -> Result<ValueWidth, AdmissionError> {
+    match value.kind {
+        1 => Ok(ValueWidth::I32),
+        2 => Ok(ValueWidth::I64),
+        3 => Ok(ValueWidth::F32),
+        4 => Ok(ValueWidth::F64),
+        5 => Ok(ValueWidth::Bool),
+        6 => Ok(ValueWidth::Char),
+        7 => Ok(ValueWidth::Ref),
+        _ => Err(AdmissionError::InvalidEntry),
+    }
 }
 
 pub(super) fn frame_charge(registers: u64) -> Result<u64, AdmissionError> {
@@ -456,6 +808,11 @@ fn check_profile(
     artifact: &DecodedArtifact,
     profile: &ExecutionProfile,
 ) -> Result<(), AdmissionError> {
+    if profile.heap_bytes < 32 || !profile.heap_bytes.is_multiple_of(16) {
+        return Err(AdmissionError::InvalidHeapSize {
+            supplied: profile.heap_bytes,
+        });
+    }
     let manifest = artifact.manifest;
     if manifest.compiler_abi != profile.compiler_abi {
         return Err(AdmissionError::CompilerAbiMismatch);

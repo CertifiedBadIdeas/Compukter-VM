@@ -2,12 +2,15 @@
 
 mod error;
 mod image;
+mod layout;
 mod machine;
 mod numeric;
 mod value;
 
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod heap_tests;
 #[cfg(test)]
 mod tests;
 
