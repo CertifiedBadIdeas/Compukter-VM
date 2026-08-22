@@ -397,12 +397,12 @@ fn verify_instruction(
             read(function, state, *src, module_id, function_id, limits)?;
             let source = register_type(function, *src, module_id, function_id, limits)?;
             let destination = register_type(function, *dst, module_id, function_id, limits)?;
-            if !numeric(source.kind) || !numeric(destination.kind) {
+            if !convertible(source.kind, destination.kind) {
                 return Err(type_failure(
                     limits,
                     module_id,
                     function_id,
-                    "convert requires numeric registers",
+                    "convert register types are incompatible",
                 ));
             }
             write(state, *dst, function, module_id, function_id, limits)?;
@@ -1365,6 +1365,10 @@ fn constant_assignable(constant: &Constant, destination: ValueType) -> bool {
 
 fn numeric(kind: u8) -> bool {
     matches!(kind, 1..=4)
+}
+
+fn convertible(source: u8, destination: u8) -> bool {
+    numeric(source) && numeric(destination) || matches!((source, destination), (1, 6) | (6, 1))
 }
 
 fn require_kind(

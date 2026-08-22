@@ -199,6 +199,8 @@ git commit -m "feat(vm): define private Tier 0 execution boundary (#39)"
 - Modify: `src/execution/mod.rs`
 - Modify: `src/execution/value.rs`
 - Create: `src/execution/numeric.rs`
+- Modify: `src/verify/functions.rs`
+- Modify: `src/verify/tests.rs`
 
 - [ ] **Step 1: Write exhaustive numeric table tests**
 
@@ -251,6 +253,17 @@ mod tests {
 Run: `cargo test --locked --offline execution::numeric::tests -- --nocapture`
 
 Expected: FAIL with missing constants/functions and `RuntimeValue`.
+
+- [ ] **Step 2a: Write and run verifier tests for character conversions**
+
+Add verifier cases that accept `Convert` from `i32` to `char` and from `char`
+to `i32`, while still rejecting `char` conversions involving `i64`, `f32`, or
+`f64`.
+
+Run: `cargo test --locked --offline verify::tests::cfg_accepts_i32_char_conversions -- --nocapture`
+
+Expected: FAIL with `Code::BadType` because the current verifier limits
+`Convert` to kinds `1..=4`.
 
 - [ ] **Step 3: Implement the fixed-size runtime value model**
 
@@ -326,8 +339,11 @@ truncated toward zero, followed by canonical NaN normalization; cover NaN,
 infinite dividend, zero divisor, and finite-modulo-infinity explicitly in the
 tests. Implement all `i32/i64/f32/f64` conversions, including NaN-to-zero and
 saturation, as named functions so dispatch never relies on ambiguous `as`
-casts. Implement equality and ordered comparison as primitive Rust float
-comparisons, then canonicalize only values, not boolean results.
+casts. Add checked `i32_to_char` and lossless `char_to_i32` helpers. Narrow the
+verifier rule to accept the existing numeric pairs plus exactly `i32 -> char`
+and `char -> i32`; do not alter encoding or fixed cost. Implement equality and
+ordered comparison as primitive Rust float comparisons, then canonicalize only
+values, not boolean results.
 
 - [ ] **Step 5: Run numeric tests in debug and release modes**
 
@@ -342,7 +358,7 @@ Expected: PASS with identical assertions.
 - [ ] **Step 6: Commit numeric semantics**
 
 ```bash
-git add src/execution/mod.rs src/execution/value.rs src/execution/numeric.rs
+git add src/execution/mod.rs src/execution/value.rs src/execution/numeric.rs src/verify/functions.rs src/verify/tests.rs docs/superpowers/specs/2026-08-22-issue-38-deterministic-tier0-execution-semantics-design.md docs/superpowers/plans/2026-08-22-issue-39-tier0-scalar-control-interpreter.md
 git commit -m "feat(vm): implement Kotlin scalar semantics (#39)"
 ```
 
