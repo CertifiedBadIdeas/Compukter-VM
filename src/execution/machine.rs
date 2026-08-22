@@ -41,6 +41,7 @@ pub(super) struct Machine {
     consumed_fixed_cost: u64,
     consumed_dynamic_cost: u64,
     entered_blocks: u64,
+    executed_instructions: u64,
     maximum_observed_frame_depth: usize,
     trace: Sha256,
 }
@@ -70,6 +71,7 @@ impl Machine {
             consumed_fixed_cost: 0,
             consumed_dynamic_cost: 0,
             entered_blocks: 0,
+            executed_instructions: 0,
             maximum_observed_frame_depth: 0,
             trace: Sha256::new(),
         })
@@ -170,6 +172,10 @@ impl Machine {
             while self.frames[frame_index].instruction < block.instructions.len() {
                 let instruction_index = self.frames[frame_index].instruction;
                 let instruction = &block.instructions[instruction_index];
+                let Some(executed_instructions) = self.executed_instructions.checked_add(1) else {
+                    return Ok(self.fault(VmFault::AccountingOverflow));
+                };
+                self.executed_instructions = executed_instructions;
                 match instruction {
                     ResolvedInstruction::Return { value } => {
                         let returned = if *value == u16::MAX {
@@ -374,6 +380,10 @@ impl Machine {
 
     pub(super) fn entered_blocks(&self) -> u64 {
         self.entered_blocks
+    }
+
+    pub(super) fn executed_instructions(&self) -> u64 {
+        self.executed_instructions
     }
 
     fn trace_block_entry(

@@ -158,6 +158,164 @@ pub(super) fn empty_loop_artifact(cost: u32) -> VerifiedArtifact {
     )
 }
 
+pub(super) fn allocation_workloads() -> Vec<VerifiedArtifact> {
+    vec![empty_loop_artifact(3), arithmetic_loop_artifact()]
+}
+
+pub(super) struct PerformanceWorkload {
+    pub name: &'static str,
+    pub artifact: VerifiedArtifact,
+}
+
+pub(super) fn performance_workloads() -> Vec<PerformanceWorkload> {
+    vec![
+        PerformanceWorkload {
+            name: "hot_integer",
+            artifact: arithmetic_loop_artifact(),
+        },
+        PerformanceWorkload {
+            name: "mixed_branch_switch",
+            artifact: mixed_control_loop_artifact(),
+        },
+        PerformanceWorkload {
+            name: "nested_direct_calls",
+            artifact: nested_call_loop_artifact(),
+        },
+        PerformanceWorkload {
+            name: "empty_quota_loop",
+            artifact: empty_loop_artifact(3),
+        },
+    ]
+}
+
+fn arithmetic_loop_artifact() -> VerifiedArtifact {
+    verified_blocks(
+        primitive(0),
+        0,
+        vec![primitive(1)],
+        vec![Constant::I32(1)],
+        vec![(
+            1,
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Add {
+                    form: 1,
+                    dst: 0,
+                    lhs: 0,
+                    rhs: 0,
+                },
+                Instruction::Jump { target: 0 },
+            ],
+        )],
+        1,
+    )
+}
+
+fn mixed_control_loop_artifact() -> VerifiedArtifact {
+    verified_blocks(
+        primitive(0),
+        0,
+        vec![primitive(5), primitive(1)],
+        vec![Constant::I32(1), Constant::Bool(false)],
+        vec![
+            (
+                1,
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 1,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Branch {
+                        condition: 0,
+                        true_block: 1,
+                        false_block: 2,
+                    },
+                ],
+            ),
+            (0, vec![Instruction::Jump { target: 3 }]),
+            (
+                0,
+                vec![Instruction::SwitchI32 {
+                    key: 1,
+                    default_block: 3,
+                    cases: Box::new([SwitchCase {
+                        value: 1,
+                        target: 3,
+                    }]),
+                }],
+            ),
+            (0, vec![Instruction::Jump { target: 0 }]),
+        ],
+        1,
+    )
+}
+
+fn nested_call_loop_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let i32_type = primitive(1);
+        artifact.modules[0].types = vec![
+            function_type(primitive(0), Vec::new()),
+            function_type(i32_type, vec![i32_type]),
+            function_type(i32_type, vec![i32_type, i32_type]),
+        ];
+        artifact.modules[0].declared_types = 3;
+        artifact.modules[0].constants = vec![Constant::I32(20), Constant::I32(22)];
+        artifact.modules[0].functions = vec![
+            function(0, 0, vec![i32_type], 0),
+            function(1, 1, vec![i32_type, i32_type], 1),
+            function(2, 2, vec![i32_type, i32_type], 2),
+        ];
+        artifact.modules[0].declared_functions = 3;
+        install_function_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::CallDirect {
+                        dst: 0,
+                        function_ref: 1,
+                        args: Box::new([0]),
+                    },
+                    Instruction::Jump { target: 0 },
+                ],
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 1,
+                    },
+                    Instruction::CallDirect {
+                        dst: 0,
+                        function_ref: 2,
+                        args: Box::new([0, 1]),
+                    },
+                    Instruction::Return { value: 0 },
+                ],
+                vec![
+                    Instruction::Add {
+                        form: 1,
+                        dst: 0,
+                        lhs: 0,
+                        rhs: 1,
+                    },
+                    Instruction::Return { value: 0 },
+                ],
+            ],
+        );
+        artifact.modules[0].blocks[0].flags = 1;
+        configure_stack(artifact, 2, 3);
+    })
+}
+
 pub(super) fn trap_after_write_artifact(cost: u32) -> VerifiedArtifact {
     let instructions = vec![
         Instruction::Const {
