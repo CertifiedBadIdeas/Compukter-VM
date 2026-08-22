@@ -15,7 +15,7 @@ pub(super) enum RuntimeValue {
     F32(u32),
     F64(u64),
     Bool(bool),
-    Char(char),
+    Char(u16),
     Null,
     Reference(ReferenceValue),
 }
@@ -28,7 +28,7 @@ impl RuntimeValue {
             Self::F32(bits) => bits as u64,
             Self::F64(bits) => bits,
             Self::Bool(value) => u64::from(value),
-            Self::Char(value) => value as u32 as u64,
+            Self::Char(value) => u64::from(value),
             Self::Null => 0,
             Self::Reference(value) => value.handle as u64,
         }
@@ -49,7 +49,8 @@ impl RuntimeValue {
 
     pub(super) fn trace_payload_len(self) -> u32 {
         match self {
-            Self::I32(_) | Self::F32(_) | Self::Char(_) => 4,
+            Self::I32(_) | Self::F32(_) => 4,
+            Self::Char(_) => 2,
             Self::I64(_) | Self::F64(_) => 8,
             Self::Bool(_) => 1,
             Self::Null => 0,

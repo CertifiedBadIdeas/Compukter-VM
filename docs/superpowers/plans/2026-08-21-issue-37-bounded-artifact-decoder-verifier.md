@@ -318,7 +318,7 @@ pub(crate) fn decode_artifact(
 ) -> Result<DecodedArtifact, DiagnosticSet>;
 ```
 
-Before pushing each table, validate its directory count against the relevant limit and reserve with `try_reserve_exact`; map reserve failure to `LimitExceeded`. Require all core global/module sections exactly once, `DEBUG` at most once, dense scopes, matching declared counts, reserved zero fields, canonical record order, scalar tags, Unicode scalars, and absent sentinels.
+Before pushing each table, validate its directory count against the relevant limit and reserve with `try_reserve_exact`; map reserve failure to `LimitExceeded`. Require all core global/module sections exactly once, `DEBUG` at most once, dense scopes, matching declared counts, reserved zero fields, canonical record order, scalar tags, arbitrary UTF-16 `u16` character code units under the later #41 correction, and absent sentinels.
 
 - [ ] **Step 4: Run record and container tests**
 

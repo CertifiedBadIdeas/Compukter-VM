@@ -533,7 +533,7 @@ fn trace_register(trace: &mut Sha256, register: RegisterValue) {
                 RuntimeValue::F32(bits) => trace.update(bits.to_le_bytes()),
                 RuntimeValue::F64(bits) => trace.update(bits.to_le_bytes()),
                 RuntimeValue::Bool(value) => trace.update([u8::from(value)]),
-                RuntimeValue::Char(value) => trace.update((value as u32).to_le_bytes()),
+                RuntimeValue::Char(value) => trace.update(value.to_le_bytes()),
                 RuntimeValue::Null => {}
                 RuntimeValue::Reference(value) => {
                     trace.update(value.ty.module.to_le_bytes());
@@ -953,9 +953,7 @@ fn convert(value: RuntimeValue, destination: u8) -> Result<RuntimeValue, Instruc
         (RuntimeValue::I32(v), 2) => Ok(RuntimeValue::I64(numeric::i32_to_i64(v))),
         (RuntimeValue::I32(v), 3) => Ok(RuntimeValue::F32(numeric::i32_to_f32(v).to_bits())),
         (RuntimeValue::I32(v), 4) => Ok(RuntimeValue::F64(numeric::i32_to_f64(v).to_bits())),
-        (RuntimeValue::I32(v), 6) => numeric::i32_to_char(v)
-            .map(RuntimeValue::Char)
-            .map_err(InstructionFailure::Trap),
+        (RuntimeValue::I32(v), 6) => Ok(RuntimeValue::Char(numeric::i32_to_char(v))),
         (RuntimeValue::I64(v), 1) => Ok(RuntimeValue::I32(numeric::i64_to_i32(v))),
         (RuntimeValue::I64(v), 2) => Ok(RuntimeValue::I64(v)),
         (RuntimeValue::I64(v), 3) => Ok(RuntimeValue::F32(numeric::i64_to_f32(v).to_bits())),

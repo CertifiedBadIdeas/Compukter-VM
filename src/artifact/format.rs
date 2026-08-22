@@ -24,6 +24,7 @@ pub(crate) const FUNCTIONS: u16 = 0x0106;
 pub(crate) const BLOCKS: u16 = 0x0107;
 pub(crate) const CODE: u16 = 0x0108;
 pub(crate) const EXCEPTIONS: u16 = 0x0109;
+pub(crate) const UTF16_LITERALS: u16 = 0x010a;
 pub(crate) const DEBUG: u16 = 0x0110;
 pub(crate) const OPTIONAL_EXTENSION_START: u16 = 0x8000;
 
@@ -44,6 +45,7 @@ pub(crate) fn is_module(kind: u16) -> bool {
             | BLOCKS
             | CODE
             | EXCEPTIONS
+            | UTF16_LITERALS
             | DEBUG
     )
 }
@@ -56,5 +58,15 @@ pub(crate) fn valid_instruction_form(opcode: u8, form: u8) -> bool {
         0x22..=0x25 => matches!(form, 1..=4 | 6),
         0x26..=0x27 => form == 7,
         _ => form == 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_module;
+
+    #[test]
+    fn utf16_literals_is_a_module_section() {
+        assert!(is_module(0x010a));
     }
 }

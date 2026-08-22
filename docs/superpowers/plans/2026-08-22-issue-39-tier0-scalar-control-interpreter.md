@@ -10,6 +10,8 @@
 
 **Tech Stack:** Rust 2021, existing artifact v1 decoder/verifier, `sha2` for canonical trace digests, Rust unit tests, a test-only counting allocator, and release-mode ignored tests for performance reporting.
 
+> Historical correction: issue [#41](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/41) supersedes this completed plan wherever its original snippets use Rust `char`, Unicode-scalar validation, `InvalidCharacter`, or a four-byte character trace payload. The current contract is `RuntimeValue::Char(u16)`, total low-16-bit `i32 -> char`, zero-extending `char -> i32`, and a two-byte trace payload.
+
 ---
 
 ## File map
@@ -126,7 +128,6 @@ pub(super) enum RunError {
 pub(super) enum GuestTrap {
     DivisionByZero,
     StackOverflow,
-    InvalidCharacter,
 }
 
 #[repr(u8)]
@@ -167,7 +168,7 @@ pub(super) enum RuntimeValue {
     F32(u32),
     F64(u64),
     Bool(bool),
-    Char(char),
+    Char(u16),
     Null,
 }
 ```
@@ -288,7 +289,7 @@ pub(super) enum RuntimeValue {
     F32(u32),
     F64(u64),
     Bool(bool),
-    Char(char),
+    Char(u16),
     Null,
     Reference(ReferenceValue),
 }
@@ -301,7 +302,7 @@ impl RuntimeValue {
             Self::F32(bits) => bits as u64,
             Self::F64(bits) => bits,
             Self::Bool(value) => u64::from(value),
-            Self::Char(value) => value as u32 as u64,
+            Self::Char(value) => u64::from(value),
             Self::Null => 0,
             Self::Reference(value) => value.handle as u64,
         }
@@ -618,7 +619,7 @@ Expected: FAIL because `run_slice` and scalar dispatch are absent.
 
 - [x] **Step 3: Implement read-before-write scalar dispatch**
 
-For each instruction, copy all source `RuntimeValue`s to locals before touching the destination. Match the verified form and value variants; delegate every numeric operation to `numeric.rs`. Load constants without rewriting their stored raw NaN bits. On a successful operation, write one destination. On division by zero or invalid character conversion, return `GuestTrap` before destination publication. Any form/value mismatch is `VmFault::InvalidValueType`.
+For each instruction, copy all source `RuntimeValue`s to locals before touching the destination. Match the verified form and value variants; delegate every numeric operation to `numeric.rs`. Load constants without rewriting their stored raw NaN bits. On a successful operation, write one destination. On division by zero, return `GuestTrap` before destination publication. Character conversions are total under the #41 correction. Any form/value mismatch is `VmFault::InvalidValueType`.
 
 - [x] **Step 4: Implement root return and terminal stability**
 

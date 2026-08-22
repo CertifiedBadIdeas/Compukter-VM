@@ -15,6 +15,7 @@ id_type!(ModuleId);
 id_type!(TypeId);
 id_type!(FunctionId);
 id_type!(BlockId);
+id_type!(Utf16LiteralId);
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ImportId(pub u32);
@@ -128,6 +129,7 @@ pub(crate) struct DecodedModule {
     pub declared_types: u32,
     pub declared_functions: u32,
     pub strings: Vec<ByteRange>,
+    pub utf16_literals: Vec<ByteRange>,
     pub types: Vec<NominalType>,
     pub constants: Vec<Constant>,
     pub imports: Vec<Import>,
@@ -188,8 +190,8 @@ pub(crate) enum Constant {
     F32(u32),
     F64(u64),
     Bool(bool),
-    Char(char),
-    String(u32),
+    Char(u16),
+    String(Utf16LiteralId),
     Null,
 }
 

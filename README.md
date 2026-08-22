@@ -16,9 +16,14 @@ contracts will be introduced through independently verified roadmap slices.
 Artifacts can currently be decoded, verified, and exercised by a crate-private
 Tier 0 scalar/control semantic oracle. Public execution remains intentionally
 unavailable until the mandatory artifact v1 runtime families are implemented.
+Artifact 1.0 models Kotlin `Char` as one arbitrary UTF-16 code unit and keeps
+guest string literals in a bounded `UTF16_LITERALS` pool separate from strict
+UTF-8 metadata; heap materialization of those literals is the next runtime
+slice.
 The accepted semantics and implementation evidence are tracked in
 [#38](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/38),
 [#39](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/39), the
+[#41 text ABI correction](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/41), the
 [execution design](docs/superpowers/specs/2026-08-22-issue-38-deterministic-tier0-execution-semantics-design.md),
 [implementation plan](docs/superpowers/plans/2026-08-22-issue-39-tier0-scalar-control-interpreter.md),
 and [release baseline](docs/performance/tier0-baseline.md).
