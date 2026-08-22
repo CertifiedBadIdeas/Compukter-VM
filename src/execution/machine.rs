@@ -4,6 +4,7 @@ use super::{
     numeric,
     value::{EntryArgument, RegisterValue, RuntimeValue},
 };
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Lifecycle {
@@ -38,8 +39,10 @@ pub(super) struct Machine {
     registers: Box<[RegisterValue]>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
+    consumed_dynamic_cost: u64,
     entered_blocks: u64,
     maximum_observed_frame_depth: usize,
+    trace: Sha256,
 }
 
 impl Machine {
@@ -65,8 +68,10 @@ impl Machine {
             registers: registers.into_boxed_slice(),
             frame_depth: 0,
             consumed_fixed_cost: 0,
+            consumed_dynamic_cost: 0,
             entered_blocks: 0,
             maximum_observed_frame_depth: 0,
+            trace: Sha256::new(),
         })
     }
 
@@ -139,15 +144,17 @@ impl Machine {
                 .checked_sub(1)
                 .ok_or(RunError::NotRunnable)?;
             let block_index = self.frames[frame_index].block;
-            let block = self.image.block(block_index).ok_or(RunError::NotRunnable)?;
+            let block_cost = self
+                .image
+                .block(block_index)
+                .ok_or(RunError::NotRunnable)?
+                .fixed_cost;
             if self.frames[frame_index].instruction == 0 {
-                if block.fixed_cost > remaining {
+                if block_cost > remaining {
                     return Ok(Outcome::SliceExhausted);
                 }
-                remaining -= block.fixed_cost;
-                let Some(consumed) = self
-                    .consumed_fixed_cost
-                    .checked_add(u64::from(block.fixed_cost))
+                remaining -= block_cost;
+                let Some(consumed) = self.consumed_fixed_cost.checked_add(u64::from(block_cost))
                 else {
                     return Ok(self.fault(VmFault::AccountingOverflow));
                 };
@@ -156,7 +163,9 @@ impl Machine {
                 };
                 self.consumed_fixed_cost = consumed;
                 self.entered_blocks = entered_blocks;
+                self.trace_block_entry(frame_index, block_index, remaining)?;
             }
+            let block = self.image.block(block_index).ok_or(RunError::NotRunnable)?;
 
             while self.frames[frame_index].instruction < block.instructions.len() {
                 let instruction_index = self.frames[frame_index].instruction;
@@ -355,8 +364,66 @@ impl Machine {
         self.consumed_fixed_cost
     }
 
+    pub(super) fn consumed_dynamic_cost(&self) -> u64 {
+        self.consumed_dynamic_cost
+    }
+
+    pub(super) fn trace_digest(&self) -> [u8; 32] {
+        self.trace.clone().finalize().into()
+    }
+
     pub(super) fn entered_blocks(&self) -> u64 {
         self.entered_blocks
+    }
+
+    fn trace_block_entry(
+        &mut self,
+        frame_index: usize,
+        block_index: usize,
+        remaining: u32,
+    ) -> Result<(), RunError> {
+        let function = self
+            .image
+            .function(self.frames[frame_index].function)
+            .ok_or(RunError::NotRunnable)?;
+        let local_block = block_index
+            .checked_sub(function.first_block)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(RunError::NotRunnable)?;
+        trace_field(&mut self.trace, &[1]);
+        trace_field(&mut self.trace, &self.image.content_hash());
+        trace_field(&mut self.trace, &function.key.module.to_le_bytes());
+        trace_field(&mut self.trace, &function.key.function.to_le_bytes());
+        trace_field(&mut self.trace, &local_block.to_le_bytes());
+        trace_field(
+            &mut self.trace,
+            &u32::try_from(self.frame_depth)
+                .map_err(|_| RunError::NotRunnable)?
+                .to_le_bytes(),
+        );
+        trace_field(&mut self.trace, &remaining.to_le_bytes());
+        trace_field(&mut self.trace, &self.consumed_fixed_cost.to_le_bytes());
+        trace_field(&mut self.trace, &self.consumed_dynamic_cost.to_le_bytes());
+        let width = self.image.registers_per_frame();
+        for active_frame in 0..self.frame_depth {
+            let active_function = self
+                .image
+                .function(self.frames[active_frame].function)
+                .ok_or(RunError::NotRunnable)?;
+            trace_field(
+                &mut self.trace,
+                &u32::try_from(active_function.register_count)
+                    .map_err(|_| RunError::NotRunnable)?
+                    .to_le_bytes(),
+            );
+            let base = active_frame
+                .checked_mul(width)
+                .ok_or(RunError::NotRunnable)?;
+            for register in &self.registers[base..base + active_function.register_count] {
+                trace_register(&mut self.trace, *register);
+            }
+        }
+        Ok(())
     }
 
     fn validate_argument(
@@ -436,6 +503,36 @@ impl Machine {
     #[cfg(test)]
     pub(super) fn maximum_observed_frame_depth_for_test(&self) -> usize {
         self.maximum_observed_frame_depth
+    }
+}
+
+fn trace_field(trace: &mut Sha256, bytes: &[u8]) {
+    trace.update((bytes.len() as u32).to_le_bytes());
+    trace.update(bytes);
+}
+
+fn trace_register(trace: &mut Sha256, register: RegisterValue) {
+    match register {
+        RegisterValue::Uninitialized => trace_field(trace, &[0]),
+        RegisterValue::Initialized(value) => {
+            trace.update((2 + value.trace_payload_len()).to_le_bytes());
+            trace.update([1, value.trace_tag()]);
+            match value {
+                RuntimeValue::I32(value) => trace.update(value.to_le_bytes()),
+                RuntimeValue::I64(value) => trace.update(value.to_le_bytes()),
+                RuntimeValue::F32(bits) => trace.update(bits.to_le_bytes()),
+                RuntimeValue::F64(bits) => trace.update(bits.to_le_bytes()),
+                RuntimeValue::Bool(value) => trace.update([u8::from(value)]),
+                RuntimeValue::Char(value) => trace.update((value as u32).to_le_bytes()),
+                RuntimeValue::Null => {}
+                RuntimeValue::Reference(value) => {
+                    trace.update(value.ty.module.to_le_bytes());
+                    trace.update(value.ty.ty.to_le_bytes());
+                    trace.update(value.handle.to_le_bytes());
+                    trace.update(value.generation.to_le_bytes());
+                }
+            }
+        }
     }
 }
 

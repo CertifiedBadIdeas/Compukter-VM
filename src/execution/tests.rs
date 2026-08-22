@@ -5,6 +5,7 @@ use super::{
     machine::Machine,
     value::{EntryArgument, RuntimeValue},
 };
+use sha2::{Digest, Sha256};
 
 #[test]
 fn direct_calls_copy_arguments_and_publish_results_on_return() {
@@ -52,6 +53,50 @@ fn scalar_vectors_match_kotlin_jvm_semantics() {
             case.name
         );
     }
+}
+
+#[test]
+fn block_boundary_trace_digests_are_stable() {
+    for case in fixtures::trace_cases() {
+        let mut machine = fixtures::started(case.artifact, &case.args);
+        let outcome = machine.run_slice(case.budget).unwrap();
+        assert_eq!(case.outcome, outcome, "{}", case.name);
+        assert_eq!(case.digest, machine.trace_digest(), "{}", case.name);
+        assert_eq!(
+            case.fixed_cost,
+            machine.consumed_fixed_cost(),
+            "{}",
+            case.name
+        );
+        assert_eq!(0, machine.consumed_dynamic_cost(), "{}", case.name);
+    }
+}
+
+#[test]
+fn straight_line_trace_digest_matches_documented_field_encoding() {
+    let case = fixtures::scalar_cases().remove(0);
+    let content_hash = case.artifact.content_hash();
+    let mut trace = Sha256::new();
+    let field = |trace: &mut Sha256, bytes: &[u8]| {
+        trace.update((bytes.len() as u32).to_le_bytes());
+        trace.update(bytes);
+    };
+    field(&mut trace, &[1]);
+    field(&mut trace, &content_hash);
+    for value in [0_u32, 0, 0, 1, 0] {
+        field(&mut trace, &value.to_le_bytes());
+    }
+    field(&mut trace, &2_u64.to_le_bytes());
+    field(&mut trace, &0_u64.to_le_bytes());
+    field(&mut trace, &1_u32.to_le_bytes());
+    field(&mut trace, &[1, 1, 7, 0, 0, 0]);
+    assert_eq!(
+        [
+            166, 84, 34, 161, 100, 88, 173, 25, 105, 181, 10, 183, 116, 180, 193, 205, 85, 40, 175,
+            96, 101, 147, 151, 218, 69, 87, 171, 59, 106, 147, 61, 44
+        ],
+        <[u8; 32]>::from(trace.finalize())
+    );
 }
 
 #[test]
