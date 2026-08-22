@@ -1,9 +1,9 @@
 use super::{
     error::{AdmissionError, AllocationExhaustion, GuestTrap, Outcome, RunError, VmFault},
     heap::{AllocationRequest, Heap},
-    heap_ops::{PendingAllocation, PendingState},
+    heap_ops::{load_value, store_value, PendingAllocation, PendingState},
     image::{ExecutionImage, ResolvedInstruction, ResolvedValueType},
-    layout::{array_layout, RuntimeTypeLayout},
+    layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     numeric,
     value::{EntryArgument, RegisterValue, RuntimeValue},
 };
@@ -40,6 +40,7 @@ pub(super) struct Machine {
     lifecycle: Lifecycle,
     frames: Box<[Frame]>,
     registers: Box<[RegisterValue]>,
+    static_slots: Box<[RuntimeValue]>,
     heap: Heap,
     pending_allocation: Option<PendingAllocation>,
     frame_depth: usize,
@@ -68,11 +69,27 @@ impl Machine {
             .try_reserve_exact(register_count)
             .map_err(|_| AdmissionError::AllocationFailed)?;
         registers.resize(register_count, RegisterValue::Uninitialized);
+        let static_count = usize::try_from(image.storage_plan().static_slot_count)
+            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+        let mut static_slots = Vec::new();
+        static_slots
+            .try_reserve_exact(static_count)
+            .map_err(|_| AdmissionError::AllocationFailed)?;
+        static_slots.resize(static_count, RuntimeValue::Null);
+        for field in image.fields() {
+            if let Some(slot) = field.static_slot {
+                let value = zero_value(field.value_type)?;
+                *static_slots
+                    .get_mut(slot as usize)
+                    .ok_or(AdmissionError::InvalidEntry)? = value;
+            }
+        }
         Ok(Self {
             image,
             lifecycle: Lifecycle::Pristine,
             frames: frames.into_boxed_slice(),
             registers: registers.into_boxed_slice(),
+            static_slots: static_slots.into_boxed_slice(),
             heap,
             pending_allocation: None,
             frame_depth: 0,
@@ -426,6 +443,311 @@ impl Machine {
                             return Ok(outcome);
                         }
                     }
+                    ResolvedInstruction::StaticGet { dst, field } => {
+                        let Some(static_slot) = field.static_slot else {
+                            return Ok(self.fault(VmFault::InvalidResolvedId));
+                        };
+                        let Some(value) = self.static_slots.get(static_slot as usize).copied()
+                        else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        if value == RuntimeValue::Null && !field.value_type.nullable {
+                            let outcome = Outcome::Crashed(GuestTrap::NullReference);
+                            self.lifecycle = Lifecycle::Terminal(outcome);
+                            return Ok(outcome);
+                        }
+                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
+                        let Some(slot) = self.registers.get_mut(index) else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        *slot = RegisterValue::Initialized(value);
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::StaticSet { field, value } => {
+                        let value = match self.read_register(frame_index, *value) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let Some(static_slot) = field.static_slot else {
+                            return Ok(self.fault(VmFault::InvalidResolvedId));
+                        };
+                        let Some(slot) = self.static_slots.get_mut(static_slot as usize) else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        *slot = value;
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::FieldGet {
+                        dst,
+                        receiver,
+                        field,
+                    } => {
+                        let receiver = match self.read_register(frame_index, *receiver) {
+                            Ok(RuntimeValue::Null) => {
+                                let outcome = Outcome::Crashed(GuestTrap::NullReference);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Ok(RuntimeValue::Reference(reference)) => reference,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let actual = match self.heap.managed_type(receiver) {
+                            Ok(actual) => actual,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        if !self.image.is_assignable(actual, field.owner) {
+                            return Ok(self.fault(VmFault::InvalidReference));
+                        }
+                        let Some(offset) = field.offset else {
+                            return Ok(self.fault(VmFault::InvalidResolvedId));
+                        };
+                        let Some(width) = width_for_type(field.value_type) else {
+                            return Ok(self.fault(VmFault::InvalidValueType));
+                        };
+                        let value = match load_value(&self.heap, receiver, offset, width) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        if value == RuntimeValue::Null && !field.value_type.nullable {
+                            let outcome = Outcome::Crashed(GuestTrap::NullReference);
+                            self.lifecycle = Lifecycle::Terminal(outcome);
+                            return Ok(outcome);
+                        }
+                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
+                        let Some(slot) = self.registers.get_mut(index) else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        *slot = RegisterValue::Initialized(value);
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::FieldSet {
+                        receiver,
+                        field,
+                        value,
+                    } => {
+                        let receiver_value = match self.read_register(frame_index, *receiver) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let value = match self.read_register(frame_index, *value) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let receiver = match receiver_value {
+                            RuntimeValue::Null => {
+                                let outcome = Outcome::Crashed(GuestTrap::NullReference);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            RuntimeValue::Reference(reference) => reference,
+                            _ => return Ok(self.fault(VmFault::InvalidValueType)),
+                        };
+                        let actual = match self.heap.managed_type(receiver) {
+                            Ok(actual) => actual,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        if !self.image.is_assignable(actual, field.owner)
+                            || !self.runtime_value_matches(value, field.value_type)
+                        {
+                            return Ok(self.fault(VmFault::InvalidReference));
+                        }
+                        let Some(offset) = field.offset else {
+                            return Ok(self.fault(VmFault::InvalidResolvedId));
+                        };
+                        let Some(width) = width_for_type(field.value_type) else {
+                            return Ok(self.fault(VmFault::InvalidValueType));
+                        };
+                        if let Err(fault) =
+                            store_value(&mut self.heap, receiver, offset, width, value)
+                        {
+                            return Ok(self.fault(fault));
+                        }
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::IsType { dst, value, ty } => {
+                        let value = match self.read_register(frame_index, *value) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let result = match value {
+                            RuntimeValue::Null => false,
+                            RuntimeValue::Reference(reference) => {
+                                let actual = match self.reference_type(reference) {
+                                    Ok(actual) => actual,
+                                    Err(fault) => return Ok(self.fault(fault)),
+                                };
+                                self.image.is_assignable(actual, *ty)
+                            }
+                            _ => return Ok(self.fault(VmFault::InvalidValueType)),
+                        };
+                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
+                        let Some(slot) = self.registers.get_mut(index) else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        *slot = RegisterValue::Initialized(RuntimeValue::Bool(result));
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::CheckedCast { dst, value, ty } => {
+                        let value = match self.read_register(frame_index, *value) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let destination_type = self
+                            .image
+                            .function(self.frames[frame_index].function)
+                            .and_then(|function| function.registers.get(*dst as usize))
+                            .copied()
+                            .ok_or(RunError::NotRunnable)?;
+                        match value {
+                            RuntimeValue::Null if !destination_type.nullable => {
+                                let outcome = Outcome::Crashed(GuestTrap::NullReference);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            RuntimeValue::Null => {}
+                            RuntimeValue::Reference(reference) => {
+                                let actual = match self.reference_type(reference) {
+                                    Ok(actual) => actual,
+                                    Err(fault) => return Ok(self.fault(fault)),
+                                };
+                                if !self.image.is_assignable(actual, *ty) {
+                                    let outcome = Outcome::Crashed(GuestTrap::ClassCast);
+                                    self.lifecycle = Lifecycle::Terminal(outcome);
+                                    return Ok(outcome);
+                                }
+                            }
+                            _ => return Ok(self.fault(VmFault::InvalidValueType)),
+                        }
+                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
+                        let Some(slot) = self.registers.get_mut(index) else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        *slot = RegisterValue::Initialized(value);
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::ArrayLength { dst, array } => {
+                        let array = match self.read_register(frame_index, *array) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let (_, _, _, length) = match self.resolve_array(array) {
+                            Ok(array) => array,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
+                        };
+                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
+                        let Some(slot) = self.registers.get_mut(index) else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        *slot = RegisterValue::Initialized(RuntimeValue::I32(length));
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::ArrayLoad { dst, array, index } => {
+                        let array = match self.read_register(frame_index, *array) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let index_value = match self.read_register(frame_index, *index) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let (reference, _, element, length) = match self.resolve_array(array) {
+                            Ok(array) => array,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
+                        };
+                        let offset = match array_element_offset(index_value, length, element) {
+                            Ok(offset) => offset,
+                            Err(trap) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                        };
+                        let value = match load_value(&self.heap, reference, offset, element) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let destination_type = self
+                            .image
+                            .function(self.frames[frame_index].function)
+                            .and_then(|function| function.registers.get(*dst as usize))
+                            .copied()
+                            .ok_or(RunError::NotRunnable)?;
+                        if value == RuntimeValue::Null && !destination_type.nullable {
+                            let outcome = Outcome::Crashed(GuestTrap::NullReference);
+                            self.lifecycle = Lifecycle::Terminal(outcome);
+                            return Ok(outcome);
+                        }
+                        let destination =
+                            frame_index * self.image.registers_per_frame() + *dst as usize;
+                        let Some(slot) = self.registers.get_mut(destination) else {
+                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        };
+                        *slot = RegisterValue::Initialized(value);
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::ArrayStore {
+                        array,
+                        index,
+                        value,
+                    } => {
+                        let array = match self.read_register(frame_index, *array) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let index_value = match self.read_register(frame_index, *index) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let value = match self.read_register(frame_index, *value) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let (reference, array_type, element, length) = match self
+                            .resolve_array(array)
+                        {
+                            Ok(array) => array,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
+                        };
+                        let element_type = self
+                            .image
+                            .array_element_type(array_type)
+                            .ok_or(RunError::NotRunnable)?;
+                        if !self.runtime_value_matches(value, element_type) {
+                            return Ok(self.fault(VmFault::InvalidReference));
+                        }
+                        let offset = match array_element_offset(index_value, length, element) {
+                            Ok(offset) => offset,
+                            Err(trap) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                        };
+                        if let Err(fault) =
+                            store_value(&mut self.heap, reference, offset, element, value)
+                        {
+                            return Ok(self.fault(fault));
+                        }
+                        self.frames[frame_index].instruction += 1;
+                    }
                     ResolvedInstruction::Unreachable => {
                         return Ok(self.fault(VmFault::ReachedUnreachable));
                     }
@@ -545,6 +867,77 @@ impl Machine {
         }
     }
 
+    fn reference_type(
+        &self,
+        reference: super::value::ReferenceValue,
+    ) -> Result<super::TypeKey, VmFault> {
+        match reference.domain() {
+            super::value::ReferenceDomain::Managed => self.heap.managed_type(reference),
+            super::value::ReferenceDomain::Host => self
+                .image
+                .reference_type(reference)
+                .ok_or(VmFault::InvalidReference),
+            super::value::ReferenceDomain::Literal | super::value::ReferenceDomain::Emergency => {
+                Err(VmFault::InvalidReference)
+            }
+        }
+    }
+
+    fn runtime_value_matches(&self, value: RuntimeValue, expected: ResolvedValueType) -> bool {
+        match value {
+            RuntimeValue::I32(_) => expected.kind == 1,
+            RuntimeValue::I64(_) => expected.kind == 2,
+            RuntimeValue::F32(_) => expected.kind == 3,
+            RuntimeValue::F64(_) => expected.kind == 4,
+            RuntimeValue::Bool(_) => expected.kind == 5,
+            RuntimeValue::Char(_) => expected.kind == 6,
+            RuntimeValue::Null => expected.kind == 7 && expected.nullable,
+            RuntimeValue::Reference(reference) if expected.kind == 7 => expected
+                .nominal
+                .and_then(|target| {
+                    self.reference_type(reference)
+                        .ok()
+                        .map(|actual| (actual, target))
+                })
+                .is_some_and(|(actual, target)| self.image.is_assignable(actual, target)),
+            RuntimeValue::Reference(_) => false,
+        }
+    }
+
+    fn resolve_array(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<
+        (
+            super::value::ReferenceValue,
+            super::TypeKey,
+            ValueWidth,
+            i32,
+        ),
+        InstructionFailure,
+    > {
+        let reference = match value {
+            RuntimeValue::Null => return Err(InstructionFailure::Trap(GuestTrap::NullReference)),
+            RuntimeValue::Reference(reference) => reference,
+            _ => return Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+        };
+        let ty = self
+            .heap
+            .managed_type(reference)
+            .map_err(InstructionFailure::Fault)?;
+        let element = match self.image.type_layout(ty) {
+            Some(RuntimeTypeLayout::Array { element }) => *element,
+            _ => return Err(InstructionFailure::Fault(VmFault::InvalidReference)),
+        };
+        let length = match load_value(&self.heap, reference, 0, ValueWidth::I32)
+            .map_err(InstructionFailure::Fault)?
+        {
+            RuntimeValue::I32(length) if length >= 0 => length,
+            _ => return Err(InstructionFailure::Fault(VmFault::CorruptHeap)),
+        };
+        Ok((reference, ty, element, length))
+    }
+
     pub(super) fn consumed_fixed_cost(&self) -> u64 {
         self.consumed_fixed_cost
     }
@@ -609,7 +1002,14 @@ impl Machine {
                 .checked_mul(width)
                 .ok_or(RunError::NotRunnable)?;
             for register in &self.registers[base..base + active_function.register_count] {
-                trace_register(&mut self.trace, *register, &self.image)?;
+                let reference_type = match register {
+                    RegisterValue::Initialized(RuntimeValue::Reference(reference)) => Some(
+                        self.reference_type(*reference)
+                            .map_err(|_| RunError::NotRunnable)?,
+                    ),
+                    _ => None,
+                };
+                trace_register(&mut self.trace, *register, reference_type)?;
             }
         }
         Ok(())
@@ -729,6 +1129,45 @@ impl Drop for Machine {
     }
 }
 
+fn zero_value(value_type: ResolvedValueType) -> Result<RuntimeValue, AdmissionError> {
+    match value_type.kind {
+        1 => Ok(RuntimeValue::I32(0)),
+        2 => Ok(RuntimeValue::I64(0)),
+        3 => Ok(RuntimeValue::F32(0)),
+        4 => Ok(RuntimeValue::F64(0)),
+        5 => Ok(RuntimeValue::Bool(false)),
+        6 => Ok(RuntimeValue::Char(0)),
+        7 => Ok(RuntimeValue::Null),
+        _ => Err(AdmissionError::InvalidEntry),
+    }
+}
+
+fn width_for_type(value_type: ResolvedValueType) -> Option<ValueWidth> {
+    match value_type.kind {
+        1 => Some(ValueWidth::I32),
+        2 => Some(ValueWidth::I64),
+        3 => Some(ValueWidth::F32),
+        4 => Some(ValueWidth::F64),
+        5 => Some(ValueWidth::Bool),
+        6 => Some(ValueWidth::Char),
+        7 => Some(ValueWidth::Ref),
+        _ => None,
+    }
+}
+
+fn array_element_offset(index: i32, length: i32, element: ValueWidth) -> Result<u32, GuestTrap> {
+    if index < 0 || index >= length {
+        return Err(GuestTrap::IndexOutOfBounds);
+    }
+    8_u32
+        .checked_add(
+            (index as u32)
+                .checked_mul(element.bytes())
+                .ok_or(GuestTrap::IndexOutOfBounds)?,
+        )
+        .ok_or(GuestTrap::IndexOutOfBounds)
+}
+
 fn trace_field(trace: &mut Sha256, bytes: &[u8]) {
     trace.update((bytes.len() as u32).to_le_bytes());
     trace.update(bytes);
@@ -737,7 +1176,7 @@ fn trace_field(trace: &mut Sha256, bytes: &[u8]) {
 fn trace_register(
     trace: &mut Sha256,
     register: RegisterValue,
-    image: &ExecutionImage,
+    reference_type: Option<super::TypeKey>,
 ) -> Result<(), RunError> {
     match register {
         RegisterValue::Uninitialized => trace_field(trace, &[0]),
@@ -753,7 +1192,7 @@ fn trace_register(
                 RuntimeValue::Char(value) => trace.update(value.to_le_bytes()),
                 RuntimeValue::Null => {}
                 RuntimeValue::Reference(value) => {
-                    let ty = image.reference_type(value).ok_or(RunError::NotRunnable)?;
+                    let ty = reference_type.ok_or(RunError::NotRunnable)?;
                     trace.update(ty.module.to_le_bytes());
                     trace.update(ty.ty.to_le_bytes());
                     trace.update(value.slot().to_le_bytes());

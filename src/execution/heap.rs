@@ -392,15 +392,94 @@ impl Heap {
     }
 
     pub(super) fn runtime_type(&self, reference: ReferenceValue) -> Option<TypeKey> {
+        self.managed_type(reference).ok()
+    }
+
+    pub(super) fn managed_type(&self, reference: ReferenceValue) -> Result<TypeKey, VmFault> {
         if reference.domain() != ReferenceDomain::Managed {
-            return None;
+            return Err(VmFault::InvalidReference);
         }
+        let entry = self
+            .handles
+            .get(reference.slot() as usize)
+            .ok_or(VmFault::InvalidReference)?;
+        if entry.state != HandleState::Live || entry.generation != reference.generation() {
+            return Err(VmFault::InvalidReference);
+        }
+        Ok(entry.ty)
+    }
+
+    pub(super) fn read_payload(
+        &self,
+        reference: ReferenceValue,
+        offset: u32,
+        length: u32,
+    ) -> Result<[u8; 8], VmFault> {
+        let entry = self.live_entry(reference)?;
+        let capacity = self
+            .block_size(entry.block)?
+            .checked_sub(16)
+            .ok_or(VmFault::CorruptHeap)?;
+        let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
+        if length > 8 || end > capacity {
+            return Err(VmFault::CorruptHeap);
+        }
+        let start = entry
+            .block
+            .0
+            .checked_add(16)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(VmFault::CorruptHeap)?;
+        let mut bytes = [0; 8];
+        for index in 0..length {
+            let position = start + index;
+            let unit = self
+                .arena
+                .get((position / 16) as usize)
+                .ok_or(VmFault::CorruptHeap)?;
+            bytes[index as usize] = unit.0[(position % 16) as usize];
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn write_payload(
+        &mut self,
+        reference: ReferenceValue,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), VmFault> {
+        let entry = *self.live_entry(reference)?;
+        let length = u32::try_from(bytes.len()).map_err(|_| VmFault::CorruptHeap)?;
+        let capacity = self
+            .block_size(entry.block)?
+            .checked_sub(16)
+            .ok_or(VmFault::CorruptHeap)?;
+        let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
+        if end > capacity {
+            return Err(VmFault::CorruptHeap);
+        }
+        let start = entry
+            .block
+            .0
+            .checked_add(16)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(VmFault::CorruptHeap)?;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            let position = start + index as u32;
+            let unit = self
+                .arena
+                .get_mut((position / 16) as usize)
+                .ok_or(VmFault::CorruptHeap)?;
+            unit.0[(position % 16) as usize] = byte;
+        }
+        Ok(())
+    }
+
+    fn live_entry(&self, reference: ReferenceValue) -> Result<&HandleEntry, VmFault> {
+        self.managed_type(reference)?;
         self.handles
             .get(reference.slot() as usize)
-            .and_then(|entry| {
-                (entry.state == HandleState::Live && entry.generation == reference.generation())
-                    .then_some(entry.ty)
-            })
+            .ok_or(VmFault::InvalidReference)
     }
 
     pub(super) fn identity_hash(&self, reference: ReferenceValue) -> Option<u32> {

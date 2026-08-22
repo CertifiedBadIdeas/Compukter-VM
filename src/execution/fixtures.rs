@@ -896,6 +896,696 @@ pub(super) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
     })
 }
 
+pub(super) fn static_roundtrip_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(1),
+            parameters: vec![primitive(5), primitive(1)],
+        };
+        artifact.modules[0].types.push(NominalType::Class {
+            flags: 0,
+            generic_arity: 0,
+            name: 0,
+            super_type: TypeId(u32::MAX),
+            interfaces: Vec::new(),
+            field_start: 0,
+            field_count: 1,
+            method_start: 0,
+            method_count: 0,
+        });
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].fields = vec![Field {
+            owner: TypeId(1),
+            name: 0,
+            value_type: primitive(1),
+            flags: 3,
+        }];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 3;
+        function.parameter_count = 2;
+        function.registers = vec![primitive(5), primitive(1), primitive(1)];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![Instruction::Branch {
+                    condition: 0,
+                    true_block: 1,
+                    false_block: 2,
+                }],
+                vec![
+                    Instruction::StaticSet {
+                        field_ref: 0,
+                        value: 1,
+                    },
+                    Instruction::Jump { target: 2 },
+                ],
+                vec![
+                    Instruction::StaticGet {
+                        dst: 2,
+                        field_ref: 0,
+                    },
+                    Instruction::Return { value: 2 },
+                ],
+            ],
+        );
+        configure_stack(artifact, 3, 1);
+    })
+}
+
+pub(super) fn field_roundtrip_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let subclass = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(3),
+        };
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(1),
+            parameters: Vec::new(),
+        };
+        artifact.modules[0].types.extend([
+            NominalType::Interface {
+                flags: 0,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: Vec::new(),
+                method_start: 0,
+                method_count: 0,
+            },
+            NominalType::Class {
+                flags: 0,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: vec![TypeId(1)],
+                field_start: 0,
+                field_count: 1,
+                method_start: 0,
+                method_count: 0,
+            },
+            NominalType::Class {
+                flags: 0,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(2),
+                interfaces: Vec::new(),
+                field_start: 1,
+                field_count: 0,
+                method_start: 0,
+                method_count: 0,
+            },
+        ]);
+        artifact.modules[0].declared_types = 4;
+        artifact.modules[0].fields = vec![Field {
+            owner: TypeId(2),
+            name: 0,
+            value_type: primitive(1),
+            flags: 1,
+        }];
+        artifact.modules[0].constants = vec![Constant::I32(42)];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 4;
+        function.registers = vec![subclass, primitive(1), primitive(1), primitive(5)];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::NewObject {
+                        dst: 0,
+                        type_ref: 3,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::FieldSet {
+                        receiver: 0,
+                        field_ref: 0,
+                        value: 1,
+                    },
+                    Instruction::FieldGet {
+                        dst: 2,
+                        receiver: 0,
+                        field_ref: 0,
+                    },
+                    Instruction::IsType {
+                        dst: 3,
+                        value: 0,
+                        type_ref: 1,
+                    },
+                    Instruction::Return { value: 2 },
+                ],
+            ],
+        );
+        configure_stack(artifact, 4, 1);
+    })
+}
+
+pub(super) fn primitive_array_roundtrip_cases() -> Vec<(VerifiedArtifact, RuntimeValue)> {
+    vec![
+        primitive_array_roundtrip_artifact(1, Constant::I32(-7), RuntimeValue::I32(-7)),
+        primitive_array_roundtrip_artifact(
+            2,
+            Constant::I64(i64::MIN + 9),
+            RuntimeValue::I64(i64::MIN + 9),
+        ),
+        primitive_array_roundtrip_artifact(
+            3,
+            Constant::F32(0x7fc0_1234),
+            RuntimeValue::F32(0x7fc0_1234),
+        ),
+        primitive_array_roundtrip_artifact(
+            4,
+            Constant::F64(0x7ff8_0000_0000_1234),
+            RuntimeValue::F64(0x7ff8_0000_0000_1234),
+        ),
+        primitive_array_roundtrip_artifact(5, Constant::Bool(true), RuntimeValue::Bool(true)),
+        primitive_array_roundtrip_artifact(6, Constant::Char(0xd800), RuntimeValue::Char(0xd800)),
+    ]
+}
+
+fn primitive_array_roundtrip_artifact(
+    kind: u8,
+    constant: Constant,
+    expected: RuntimeValue,
+) -> (VerifiedArtifact, RuntimeValue) {
+    let element = primitive(kind);
+    let array = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    let artifact = verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: element,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0]
+            .types
+            .push(NominalType::Array { name: 0, element });
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].constants = vec![Constant::I32(0), Constant::I32(1), constant];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 6;
+        function.registers = vec![
+            primitive(1),
+            primitive(1),
+            element,
+            array,
+            element,
+            primitive(1),
+        ];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 1,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 2,
+                        constant: 2,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::NewArray {
+                        dst: 3,
+                        type_ref: 1,
+                        length: 0,
+                    },
+                    Instruction::ArrayStore {
+                        array: 3,
+                        index: 1,
+                        value: 2,
+                    },
+                    Instruction::ArrayLoad {
+                        dst: 4,
+                        array: 3,
+                        index: 1,
+                    },
+                    Instruction::ArrayLength { dst: 5, array: 3 },
+                    Instruction::Return { value: 4 },
+                ],
+            ],
+        );
+        configure_stack(artifact, 6, 1);
+    });
+    (artifact, expected)
+}
+
+pub(super) fn reference_array_roundtrip_artifact() -> VerifiedArtifact {
+    let base = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    let subclass = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(2),
+    };
+    let array = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(3),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: base,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0].types.extend([
+            plain_class(TypeId(u32::MAX), 0, 0),
+            plain_class(TypeId(1), 0, 0),
+            NominalType::Array {
+                name: 0,
+                element: base,
+            },
+        ]);
+        artifact.modules[0].declared_types = 4;
+        artifact.modules[0].constants = vec![Constant::I32(0), Constant::I32(1)];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 5;
+        function.registers = vec![primitive(1), primitive(1), subclass, array, base];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::NewObject {
+                        dst: 2,
+                        type_ref: 2,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 1,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Jump { target: 2 },
+                ],
+                vec![
+                    Instruction::NewArray {
+                        dst: 3,
+                        type_ref: 3,
+                        length: 0,
+                    },
+                    Instruction::ArrayStore {
+                        array: 3,
+                        index: 1,
+                        value: 2,
+                    },
+                    Instruction::ArrayLoad {
+                        dst: 4,
+                        array: 3,
+                        index: 1,
+                    },
+                    Instruction::Return { value: 4 },
+                ],
+            ],
+        );
+        configure_stack(artifact, 5, 1);
+    })
+}
+
+pub(super) fn array_bounds_artifact() -> VerifiedArtifact {
+    let array = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(1),
+            parameters: vec![primitive(1)],
+        };
+        artifact.modules[0].types.push(NominalType::Array {
+            name: 0,
+            element: primitive(1),
+        });
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].constants = vec![Constant::I32(1), Constant::I32(99)];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 4;
+        function.parameter_count = 1;
+        function.registers = vec![primitive(1), primitive(1), primitive(1), array];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 2,
+                        constant: 1,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::NewArray {
+                        dst: 3,
+                        type_ref: 1,
+                        length: 1,
+                    },
+                    Instruction::ArrayLoad {
+                        dst: 2,
+                        array: 3,
+                        index: 0,
+                    },
+                    Instruction::Return { value: 2 },
+                ],
+            ],
+        );
+        configure_stack(artifact, 4, 1);
+    })
+}
+
+pub(super) fn nonnull_zero_field_artifact() -> VerifiedArtifact {
+    let reference = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: reference,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0]
+            .types
+            .push(plain_class(TypeId(u32::MAX), 0, 1));
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].fields = vec![Field {
+            owner: TypeId(1),
+            name: 0,
+            value_type: reference,
+            flags: 1,
+        }];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 2;
+        function.registers = vec![reference, reference];
+        install_entry_blocks(
+            artifact,
+            vec![vec![
+                Instruction::NewObject {
+                    dst: 0,
+                    type_ref: 1,
+                },
+                Instruction::FieldGet {
+                    dst: 1,
+                    receiver: 0,
+                    field_ref: 0,
+                },
+                Instruction::Return { value: 1 },
+            ]],
+        );
+        configure_stack(artifact, 2, 1);
+    })
+}
+
+pub(super) fn nullable_cast_artifact(destination_nullable: bool) -> VerifiedArtifact {
+    let source = ValueType {
+        kind: 7,
+        flags: 1,
+        nominal_type: TypeId(1),
+    };
+    let destination = ValueType {
+        kind: 7,
+        flags: u8::from(destination_nullable),
+        nominal_type: TypeId(2),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: destination,
+            parameters: vec![source],
+        };
+        artifact.modules[0].types.extend([
+            plain_class(TypeId(u32::MAX), 0, 0),
+            plain_class(TypeId(1), 0, 0),
+        ]);
+        artifact.modules[0].declared_types = 3;
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 2;
+        function.parameter_count = 1;
+        function.registers = vec![source, destination];
+        install_entry_blocks(
+            artifact,
+            vec![vec![
+                Instruction::CheckedCast {
+                    dst: 1,
+                    value: 0,
+                    type_ref: 2,
+                },
+                Instruction::Return { value: 1 },
+            ]],
+        );
+        configure_stack(artifact, 2, 1);
+    })
+}
+
+pub(super) fn incompatible_cast_artifact() -> VerifiedArtifact {
+    let source = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    let target = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(2),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: target,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0].types.extend([
+            plain_class(TypeId(u32::MAX), 0, 0),
+            plain_class(TypeId(u32::MAX), 0, 0),
+        ]);
+        artifact.modules[0].declared_types = 3;
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 2;
+        function.registers = vec![source, target];
+        install_entry_blocks(
+            artifact,
+            vec![vec![
+                Instruction::NewObject {
+                    dst: 0,
+                    type_ref: 1,
+                },
+                Instruction::CheckedCast {
+                    dst: 1,
+                    value: 0,
+                    type_ref: 2,
+                },
+                Instruction::Return { value: 1 },
+            ]],
+        );
+        configure_stack(artifact, 2, 1);
+    })
+}
+
+pub(super) fn reference_field_roundtrip_artifact() -> VerifiedArtifact {
+    let reference = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: reference,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0]
+            .types
+            .push(plain_class(TypeId(u32::MAX), 0, 1));
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].fields = vec![Field {
+            owner: TypeId(1),
+            name: 0,
+            value_type: reference,
+            flags: 1,
+        }];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 3;
+        function.registers = vec![reference, reference, reference];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::NewObject {
+                        dst: 0,
+                        type_ref: 1,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::NewObject {
+                        dst: 1,
+                        type_ref: 1,
+                    },
+                    Instruction::Jump { target: 2 },
+                ],
+                vec![
+                    Instruction::FieldSet {
+                        receiver: 0,
+                        field_ref: 0,
+                        value: 1,
+                    },
+                    Instruction::FieldGet {
+                        dst: 2,
+                        receiver: 0,
+                        field_ref: 0,
+                    },
+                    Instruction::Return { value: 2 },
+                ],
+            ],
+        );
+        configure_stack(artifact, 3, 1);
+    })
+}
+
+pub(super) fn failed_array_store_artifact() -> VerifiedArtifact {
+    let array = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: vec![primitive(1)],
+        };
+        artifact.modules[0].types.push(NominalType::Array {
+            name: 0,
+            element: primitive(1),
+        });
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].constants = vec![Constant::I32(1), Constant::I32(7)];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 4;
+        function.parameter_count = 1;
+        function.registers = vec![primitive(1), primitive(1), array, primitive(1)];
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 3,
+                        constant: 1,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::NewArray {
+                        dst: 2,
+                        type_ref: 1,
+                        length: 1,
+                    },
+                    Instruction::ArrayStore {
+                        array: 2,
+                        index: 0,
+                        value: 3,
+                    },
+                    Instruction::Return { value: u16::MAX },
+                ],
+            ],
+        );
+        configure_stack(artifact, 4, 1);
+    })
+}
+
+pub(super) fn null_is_type_artifact() -> VerifiedArtifact {
+    let nullable = ValueType {
+        kind: 7,
+        flags: 1,
+        nominal_type: TypeId(1),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(5),
+            parameters: Vec::new(),
+        };
+        artifact.modules[0]
+            .types
+            .push(plain_class(TypeId(u32::MAX), 0, 0));
+        artifact.modules[0].declared_types = 2;
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 2;
+        function.registers = vec![nullable, primitive(5)];
+        install_entry_blocks(
+            artifact,
+            vec![vec![
+                Instruction::Null { dst: 0 },
+                Instruction::IsType {
+                    dst: 1,
+                    value: 0,
+                    type_ref: 1,
+                },
+                Instruction::Return { value: 1 },
+            ]],
+        );
+        configure_stack(artifact, 2, 1);
+    })
+}
+
+fn plain_class(super_type: TypeId, field_start: u32, field_count: u32) -> NominalType {
+    NominalType::Class {
+        flags: 0,
+        generic_arity: 0,
+        name: 0,
+        super_type,
+        interfaces: Vec::new(),
+        field_start,
+        field_count,
+        method_start: 0,
+        method_count: 0,
+    }
+}
+
 pub(super) fn artifact_with_new_object() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::language_runtime_vector(), 160)
 }
@@ -1184,6 +1874,41 @@ fn install_function_blocks(
         blocks.push(Block {
             owner_function: FunctionId(function_id as u32),
             code_record: BlockId(function_id as u32),
+            instruction_count: instructions.len() as u32,
+            declared_fixed_cost: fixed_cost,
+            flags: 0,
+        });
+        code.push(DecodedCode {
+            bytes: ByteRange { start: 0, end: 0 },
+            instructions: instructions.into_boxed_slice(),
+            fixed_cost,
+        });
+    }
+    artifact.modules[0].blocks = blocks;
+    artifact.modules[0].code = code;
+    artifact.manifest.maximum_block_cost = maximum_block_cost;
+    artifact.manifest.minimum_slice_cost = maximum_block_cost;
+}
+
+fn install_entry_blocks(
+    artifact: &mut crate::artifact::DecodedArtifact,
+    programs: Vec<Vec<Instruction>>,
+) {
+    let function = &mut artifact.modules[0].functions[0];
+    function.first_block = BlockId(0);
+    function.block_count = programs.len() as u32;
+    let mut blocks = Vec::with_capacity(programs.len());
+    let mut code = Vec::with_capacity(programs.len());
+    let mut maximum_block_cost = 0;
+    for (block_id, instructions) in programs.into_iter().enumerate() {
+        let fixed_cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        maximum_block_cost = maximum_block_cost.max(fixed_cost);
+        blocks.push(Block {
+            owner_function: FunctionId(0),
+            code_record: BlockId(block_id as u32),
             instruction_count: instructions.len() as u32,
             declared_fixed_cost: fixed_cost,
             flags: 0,

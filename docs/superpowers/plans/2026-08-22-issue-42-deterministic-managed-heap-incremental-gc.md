@@ -302,7 +302,7 @@ git commit -m "feat(vm): initialize managed allocations incrementally (#42)"
 - Modify: `src/execution/fixtures.rs`
 - Modify: `src/execution/heap_tests.rs`
 
-- [ ] **Step 1: Write failing semantic vectors**
+- [x] **Step 1: Write failing semantic vectors**
 
 Exercise inherited field offsets, primitive/reference fields, per-instance
 statics, all primitive/reference array widths, negative and upper bounds,
@@ -310,13 +310,13 @@ read-before-write aliasing, zero-initialized non-null failures, exact dynamic
 type/interface tests, nullable/non-null casts, stale handles, and atomic failed
 stores.
 
-- [ ] **Step 2: Prove the red state**
+- [x] **Step 2: Prove the red state**
 
 Run: `cargo test --locked --offline execution::heap_tests::heap_instructions -- --nocapture`
 
 Expected: FAIL with admission rejection or unsupported instructions.
 
-- [ ] **Step 3: Implement resolved heap instruction dispatch**
+- [x] **Step 3: Implement resolved heap instruction dispatch**
 
 Admit and dispatch `array_length/load/store`, `field_get/set`, `static_get/set`,
 `is_type`, and `checked_cast`. Read all sources first, resolve the token and
@@ -324,13 +324,13 @@ runtime type, perform bounds/null/type checks, then publish one destination or
 store. Add bounded traps for null, bounds, and cast failures; impossible dead,
 foreign, or type-confused internal tokens produce the specified `VmFault`.
 
-- [ ] **Step 4: Run heap semantics in debug and release**
+- [x] **Step 4: Run heap semantics in debug and release**
 
 Run: `cargo test --locked --offline execution::heap_tests::heap_instructions -- --nocapture && cargo test --release --locked --offline execution::heap_tests::heap_instructions -- --nocapture`
 
 Expected: exact values, traps, charges, and traces match.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/execution/image.rs src/execution/heap_ops.rs src/execution/machine.rs src/execution/error.rs src/execution/fixtures.rs src/execution/heap_tests.rs

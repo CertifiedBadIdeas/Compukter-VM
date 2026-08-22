@@ -62,6 +62,17 @@ impl ReferenceValue {
     pub(super) const fn generation(self) -> u32 {
         self.generation
     }
+
+    pub(super) const fn to_bits(self) -> u64 {
+        (self.tagged_slot as u64) | ((self.generation as u64) << 32)
+    }
+
+    pub(super) const fn from_bits(bits: u64) -> Self {
+        Self {
+            tagged_slot: bits as u32,
+            generation: (bits >> 32) as u32,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
