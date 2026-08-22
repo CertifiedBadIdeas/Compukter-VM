@@ -676,6 +676,18 @@ impl Heap {
     }
 
     #[cfg(test)]
+    pub(super) fn test_exhaust_handle_capacity(&mut self) {
+        self.free_handle = NULL_OFFSET;
+        self.retired_handles = self.handles.len() as u32;
+        for entry in &mut self.handles {
+            if entry.state == HandleState::Free {
+                entry.state = HandleState::Retired;
+                entry.next_free = NULL_OFFSET;
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn test_arena_address(&self) -> usize {
         self.arena.as_ptr() as usize
     }

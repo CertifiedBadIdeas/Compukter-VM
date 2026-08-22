@@ -1,5 +1,5 @@
 use super::{
-    error::{AllocationExhaustion, Outcome},
+    error::{AllocationExhaustion, Outcome, VmFault},
     fixtures,
     gc::{Collector, CollectorAction, CollectorPhase},
     heap::{AllocationRequest, Heap},
@@ -7,7 +7,7 @@ use super::{
     image::ExecutionImage,
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     machine::Frame,
-    value::{RegisterValue, RuntimeValue},
+    value::{ReferenceDomain, RegisterValue, RuntimeValue},
     TypeKey,
 };
 
@@ -100,7 +100,7 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
 }
 
 #[test]
-fn machine_stops_guest_for_collection_and_retries_once_after_sweep() {
+fn oom_dropped_root_is_collected_and_the_retry_recovers() {
     let mut profile = fixtures::profile();
     profile.heap_bytes = 32;
     let image = ExecutionImage::admit(fixtures::gc_retry_artifact(), profile).unwrap();
@@ -154,14 +154,280 @@ fn machine_reports_one_failed_post_collection_retry() {
     };
     assert_eq!(
         Outcome::AllocationExhausted(AllocationExhaustion {
-            requested_block_bytes: 32,
-            total_free: 0,
-            largest_free_block: 0,
+            exception: super::value::ReferenceValue::emergency(),
+            diagnostic: super::error::AllocationDiagnostic {
+                request_kind: super::error::AllocationRequestKind::Object,
+                requested: 0,
+                live: 32,
+                total_free: 0,
+                largest_free_block: 0,
+                source: super::error::AllocationSource {
+                    module: 0,
+                    function: 0,
+                    block: 1,
+                    instruction: 0,
+                },
+            },
             collection_attempted: true,
         }),
         outcome
     );
     assert_eq!(outcome, machine.run_slice(minimum, 1).unwrap());
+}
+
+#[test]
+fn oom_delivery_reuses_the_immortal_emergency_identity() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 32;
+    let image = ExecutionImage::admit(fixtures::gc_failed_retry_artifact(), profile).unwrap();
+    let minimum = image.minimum_slice_cost();
+    let mut machine = super::machine::Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+
+    let outcome = loop {
+        let outcome = machine.run_slice(minimum, 1).unwrap();
+        if outcome.is_terminal() {
+            break outcome;
+        }
+    };
+    let Outcome::AllocationExhausted(exhaustion) = outcome else {
+        panic!("allocation did not deliver OOM");
+    };
+    assert_eq!(ReferenceDomain::Emergency, exhaustion.exception.domain());
+    let Outcome::AllocationExhausted(repeated) = machine.run_slice(minimum, 1).unwrap() else {
+        panic!("terminal OOM was not stable");
+    };
+    assert_eq!(exhaustion.exception, repeated.exception);
+}
+
+#[test]
+fn oom_missing_emergency_state_faults_instead_of_allocating() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 64;
+    let image = ExecutionImage::admit(fixtures::array_allocation_artifact(100), profile).unwrap();
+    let minimum = image.minimum_slice_cost();
+    let mut machine = super::machine::Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    machine.test_remove_emergency_oom();
+
+    assert_eq!(
+        Outcome::SliceExhausted,
+        machine.run_slice(minimum, 0).unwrap()
+    );
+    assert_eq!(
+        Outcome::Faulted(VmFault::InvalidStoragePlan),
+        machine.run_slice(minimum, 0).unwrap()
+    );
+    assert_eq!(0, machine.consumed_maintenance_cost());
+}
+
+#[test]
+fn oom_delivery_allocates_nothing() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 64;
+    let image = ExecutionImage::admit(fixtures::array_allocation_artifact(100), profile).unwrap();
+    let minimum = image.minimum_slice_cost();
+    let mut machine = super::machine::Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    assert_eq!(
+        Outcome::SliceExhausted,
+        machine.run_slice(minimum, 0).unwrap()
+    );
+
+    super::tests::allocation_counter::reset_and_enable();
+    let outcome = machine.run_slice(minimum, 0).unwrap();
+    let allocations = super::tests::allocation_counter::disable_and_read();
+
+    let Outcome::AllocationExhausted(exhaustion) = outcome else {
+        panic!("oversized request did not deliver OOM");
+    };
+    assert_eq!(ReferenceDomain::Emergency, exhaustion.exception.domain());
+    assert_eq!(0, allocations);
+    assert_eq!(0, machine.consumed_maintenance_cost());
+}
+
+#[test]
+fn oom_diagnostic_records_request_heap_and_source_scalars() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 64;
+    let image = ExecutionImage::admit(fixtures::array_allocation_artifact(100), profile).unwrap();
+    let minimum = image.minimum_slice_cost();
+    let mut machine = super::machine::Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    assert_eq!(
+        Outcome::SliceExhausted,
+        machine.run_slice(minimum, 0).unwrap()
+    );
+    let Outcome::AllocationExhausted(exhaustion) = machine.run_slice(minimum, 0).unwrap() else {
+        panic!("oversized array did not deliver OOM");
+    };
+
+    assert_eq!(
+        super::error::AllocationRequestKind::Array,
+        exhaustion.diagnostic.request_kind
+    );
+    assert_eq!(108, exhaustion.diagnostic.requested);
+    assert_eq!(0, exhaustion.diagnostic.live);
+    assert_eq!(64, exhaustion.diagnostic.total_free);
+    assert_eq!(64, exhaustion.diagnostic.largest_free_block);
+    assert_eq!(0, exhaustion.diagnostic.source.module);
+    assert_eq!(0, exhaustion.diagnostic.source.function);
+    assert_eq!(1, exhaustion.diagnostic.source.block);
+    assert_eq!(0, exhaustion.diagnostic.source.instruction);
+}
+
+#[test]
+fn oom_oversized_string_request_skips_collection_and_reports_its_source() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 64;
+    let code_units = [u16::from(b'x'); 25];
+    let image = ExecutionImage::admit(
+        fixtures::literal_string_concat_units_artifact(&code_units),
+        profile,
+    )
+    .unwrap();
+    let minimum = image.minimum_slice_cost();
+    let mut machine = super::machine::Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+
+    let outcome = loop {
+        let outcome = machine.run_slice(minimum, 0).unwrap();
+        if outcome.is_terminal() {
+            break outcome;
+        }
+    };
+    let Outcome::AllocationExhausted(exhaustion) = outcome else {
+        panic!("oversized string did not deliver OOM");
+    };
+    assert_eq!(
+        super::error::AllocationDiagnostic {
+            request_kind: super::error::AllocationRequestKind::String,
+            requested: 58,
+            live: 0,
+            total_free: 64,
+            largest_free_block: 64,
+            source: super::error::AllocationSource {
+                module: 0,
+                function: 0,
+                block: 1,
+                instruction: 0,
+            },
+        },
+        exhaustion.diagnostic
+    );
+    assert!(!exhaustion.collection_attempted);
+    assert_eq!(0, machine.consumed_maintenance_cost());
+}
+
+#[test]
+fn oom_string_allocation_collects_once_then_reports_a_failed_retry() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 32;
+    let image = ExecutionImage::admit(fixtures::repeated_concat_artifact(false), profile).unwrap();
+    let minimum = image.minimum_slice_cost();
+    let mut machine = super::machine::Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+
+    while !machine.test_collector_active() {
+        assert_eq!(
+            Outcome::SliceExhausted,
+            machine.run_slice(minimum, 0).unwrap()
+        );
+    }
+    let outcome = loop {
+        let outcome = machine.run_slice(minimum, 1).unwrap();
+        if outcome.is_terminal() {
+            break outcome;
+        }
+    };
+    let Outcome::AllocationExhausted(exhaustion) = outcome else {
+        panic!("string retry did not deliver OOM");
+    };
+    assert_eq!(
+        super::error::AllocationDiagnostic {
+            request_kind: super::error::AllocationRequestKind::String,
+            requested: 12,
+            live: 32,
+            total_free: 0,
+            largest_free_block: 0,
+            source: super::error::AllocationSource {
+                module: 0,
+                function: 0,
+                block: 2,
+                instruction: 0,
+            },
+        },
+        exhaustion.diagnostic
+    );
+    assert!(exhaustion.collection_attempted);
+    assert!(machine.consumed_maintenance_cost() > 0);
+}
+
+#[test]
+fn oom_capacity_failure_collects_once_and_preserves_free_space_diagnostics() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 64;
+    let image = ExecutionImage::admit(fixtures::object_allocation_artifact(0), profile).unwrap();
+    let minimum = image.minimum_slice_cost();
+    let mut machine = super::machine::Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    machine.test_exhaust_handle_capacity();
+
+    let outcome = loop {
+        let outcome = machine.run_slice(minimum, 1).unwrap();
+        if outcome.is_terminal() {
+            break outcome;
+        }
+    };
+    let Outcome::AllocationExhausted(exhaustion) = outcome else {
+        panic!("handle-capacity failure did not deliver OOM");
+    };
+    assert_eq!(
+        super::error::AllocationRequestKind::Object,
+        exhaustion.diagnostic.request_kind
+    );
+    assert_eq!(64, exhaustion.diagnostic.total_free);
+    assert_eq!(64, exhaustion.diagnostic.largest_free_block);
+    assert!(exhaustion.collection_attempted);
+}
+
+#[test]
+fn oom_fragmentation_survives_full_collection_with_sufficient_total_free() {
+    let image = ExecutionImage::admit(
+        fixtures::reference_field_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let mut heap = Heap::new(&super::layout::StoragePlan {
+        heap_bytes: 128,
+        handle_capacity: 4,
+        ..image.storage_plan()
+    })
+    .unwrap();
+    let ty = TypeKey { module: 0, ty: 1 };
+    let references = [
+        allocate(&mut heap, ty, 32),
+        allocate(&mut heap, ty, 32),
+        allocate(&mut heap, ty, 32),
+        allocate(&mut heap, ty, 32),
+    ];
+    let frames = [Frame::test_entry(image.entry_index())];
+    let mut registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
+    registers[0] = RegisterValue::Initialized(RuntimeValue::Reference(references[1]));
+    registers[1] = RegisterValue::Initialized(RuntimeValue::Reference(references[3]));
+    let mut collector = Collector::new();
+
+    collect(&mut collector, &mut heap, &image, &[], &frames, &registers);
+
+    assert_eq!(64, heap.diagnostic().total_free);
+    assert_eq!(32, heap.diagnostic().largest_free_block);
+    assert!(heap
+        .reserve(AllocationRequest {
+            block_bytes: 48,
+            ty,
+        })
+        .unwrap()
+        .is_none());
 }
 
 #[test]

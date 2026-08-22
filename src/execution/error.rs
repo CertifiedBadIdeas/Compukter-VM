@@ -1,4 +1,4 @@
-use super::value::RuntimeValue;
+use super::value::{ReferenceValue, RuntimeValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AdmissionError {
@@ -55,10 +55,34 @@ pub(super) enum GuestTrap {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct AllocationExhaustion {
-    pub requested_block_bytes: u32,
+pub(super) enum AllocationRequestKind {
+    Object,
+    Array,
+    String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct AllocationSource {
+    pub module: u32,
+    pub function: u32,
+    pub block: u32,
+    pub instruction: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AllocationDiagnostic {
+    pub request_kind: AllocationRequestKind,
+    pub requested: u32,
+    pub live: u32,
     pub total_free: u32,
     pub largest_free_block: u32,
+    pub source: AllocationSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AllocationExhaustion {
+    pub exception: ReferenceValue,
+    pub diagnostic: AllocationDiagnostic,
     pub collection_attempted: bool,
 }
 

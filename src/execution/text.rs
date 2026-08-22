@@ -198,6 +198,7 @@ pub(super) struct PendingConcat {
     reservation: Option<ReservedAllocation>,
     layout: Option<StringLayout>,
     written: u32,
+    collection_attempted: bool,
 }
 
 impl PendingConcat {
@@ -226,6 +227,7 @@ impl PendingConcat {
             reservation: None,
             layout: None,
             written: 0,
+            collection_attempted: false,
         })
     }
 
@@ -262,6 +264,7 @@ impl PendingConcat {
             reservation: None,
             layout: None,
             written: 0,
+            collection_attempted: false,
         }))
     }
 
@@ -295,14 +298,21 @@ impl PendingConcat {
             let ty = image
                 .string_type()
                 .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?;
-            self.reservation = heap
-                .reserve(AllocationRequest {
-                    block_bytes: layout.block_bytes,
-                    ty,
-                })
-                .map_err(TextError::Fault)?;
+            self.reservation = match heap.reserve(AllocationRequest {
+                block_bytes: layout.block_bytes,
+                ty,
+            }) {
+                Ok(reservation) => reservation,
+                Err(VmFault::HandleExhausted) => None,
+                Err(fault) => return Err(TextError::Fault(fault)),
+            };
             if self.reservation.is_none() {
-                return Err(TextError::Fault(VmFault::HandleExhausted));
+                return Err(TextError::Exhausted {
+                    used,
+                    block_bytes: layout.block_bytes,
+                    requested: layout.payload_bytes,
+                    collection_attempted: self.collection_attempted,
+                });
             }
             self.layout = Some(layout);
         }
@@ -363,6 +373,10 @@ impl PendingConcat {
         Ok(())
     }
 
+    pub(super) fn mark_collection_attempted(&mut self) {
+        self.collection_attempted = true;
+    }
+
     fn source_unit(
         &self,
         image: &ExecutionImage,
@@ -391,6 +405,12 @@ pub(super) enum SubstringPlan {
 pub(super) enum TextError {
     Trap(GuestTrap),
     Fault(VmFault),
+    Exhausted {
+        used: u32,
+        block_bytes: u32,
+        requested: u32,
+        collection_attempted: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

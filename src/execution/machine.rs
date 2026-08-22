@@ -1,5 +1,8 @@
 use super::{
-    error::{AdmissionError, AllocationExhaustion, GuestTrap, Outcome, RunError, VmFault},
+    error::{
+        AdmissionError, AllocationDiagnostic, AllocationExhaustion, AllocationRequestKind,
+        AllocationSource, GuestTrap, Outcome, RunError, VmFault,
+    },
     gc::Collector,
     heap::{AllocationRequest, Heap},
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
@@ -59,6 +62,9 @@ pub(super) struct Machine {
     pending_allocation: Option<PendingAllocation>,
     pending_text: Option<text::PendingText>,
     pending_concat: Option<text::PendingConcat>,
+    pending_concat_source: Option<AllocationSource>,
+    string_collection_pending: bool,
+    emergency_oom: Option<super::value::ReferenceValue>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
     consumed_dynamic_cost: u64,
@@ -75,17 +81,32 @@ enum AllocationShape {
     Array { length: u32 },
 }
 
+impl AllocationShape {
+    const fn request_kind(self) -> AllocationRequestKind {
+        match self {
+            Self::Object => AllocationRequestKind::Object,
+            Self::Array { .. } => AllocationRequestKind::Array,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AllocationRetry {
     request: AllocationRequest,
     destination: u16,
     logical_bytes: u32,
     shape: AllocationShape,
+    source: AllocationSource,
 }
 
 impl AllocationRetry {
     fn reserve(self, heap: &mut Heap) -> Result<Option<PendingAllocation>, VmFault> {
-        let Some(reservation) = heap.reserve(self.request)? else {
+        let reservation = match heap.reserve(self.request) {
+            Ok(reservation) => reservation,
+            Err(VmFault::HandleExhausted) => None,
+            Err(fault) => return Err(fault),
+        };
+        let Some(reservation) = reservation else {
             return Ok(None);
         };
         let state = PendingState {
@@ -148,6 +169,9 @@ impl Machine {
             pending_allocation: None,
             pending_text: None,
             pending_concat: None,
+            pending_concat_source: None,
+            string_collection_pending: false,
+            emergency_oom: Some(super::value::ReferenceValue::emergency()),
             frame_depth: 0,
             consumed_fixed_cost: 0,
             consumed_dynamic_cost: 0,
@@ -461,6 +485,17 @@ impl Machine {
                                     destination: *dst,
                                     logical_bytes,
                                     shape: AllocationShape::Object,
+                                    source: self.allocation_source(frame_index),
+                                };
+                                return self.start_collection(retry, maintenance_budget);
+                            }
+                            Err(VmFault::HandleExhausted) => {
+                                let retry = AllocationRetry {
+                                    request,
+                                    destination: *dst,
+                                    logical_bytes,
+                                    shape: AllocationShape::Object,
+                                    source: self.allocation_source(frame_index),
                                 };
                                 return self.start_collection(retry, maintenance_budget);
                             }
@@ -562,14 +597,26 @@ impl Machine {
                         };
                         let layout = match array_layout(*element, length) {
                             Ok(layout) => layout,
-                            Err(_) => return Ok(self.allocation_exhausted(u32::MAX, false)),
+                            Err(_) => {
+                                return Ok(self.allocation_exhausted(
+                                    AllocationRequestKind::Array,
+                                    u32::MAX,
+                                    false,
+                                    self.allocation_source(frame_index),
+                                ));
+                            }
                         };
                         let request = AllocationRequest {
                             block_bytes: layout.block_bytes,
                             ty: *ty,
                         };
                         if request.block_bytes > self.image.storage_plan().heap_bytes {
-                            return Ok(self.allocation_exhausted(request.block_bytes, false));
+                            return Ok(self.allocation_exhausted(
+                                AllocationRequestKind::Array,
+                                layout.payload_bytes,
+                                false,
+                                self.allocation_source(frame_index),
+                            ));
                         }
                         let reservation = match self.heap.reserve(request) {
                             Ok(Some(reservation)) => reservation,
@@ -581,6 +628,19 @@ impl Machine {
                                     shape: AllocationShape::Array {
                                         length: layout.length,
                                     },
+                                    source: self.allocation_source(frame_index),
+                                };
+                                return self.start_collection(retry, maintenance_budget);
+                            }
+                            Err(VmFault::HandleExhausted) => {
+                                let retry = AllocationRetry {
+                                    request,
+                                    destination: *dst,
+                                    logical_bytes: layout.payload_bytes,
+                                    shape: AllocationShape::Array {
+                                        length: layout.length,
+                                    },
+                                    source: self.allocation_source(frame_index),
                                 };
                                 return self.start_collection(retry, maintenance_budget);
                             }
@@ -613,12 +673,14 @@ impl Machine {
                             Ok(value) => value,
                             Err(fault) => return Ok(self.fault(fault)),
                         };
-                        self.pending_concat =
+                        let pending =
                             match text::PendingConcat::new(&self.image, &self.heap, lhs, rhs, *dst)
                             {
-                                Ok(pending) => Some(pending),
+                                Ok(pending) => pending,
                                 Err(error) => return Ok(self.text_outcome(error)),
                             };
+                        self.pending_concat_source = Some(self.allocation_source(frame_index));
+                        self.pending_concat = Some(pending);
                         if let Some(outcome) =
                             self.resume_pending_concat(frame_index, &mut remaining)
                         {
@@ -663,6 +725,8 @@ impl Machine {
                                 self.frames[frame_index].instruction += 1;
                             }
                             Ok(text::SubstringPlan::Build(pending)) => {
+                                self.pending_concat_source =
+                                    Some(self.allocation_source(frame_index));
                                 self.pending_concat = Some(pending);
                                 if let Some(outcome) =
                                     self.resume_pending_concat(frame_index, &mut remaining)
@@ -1039,6 +1103,24 @@ impl Machine {
         }
     }
 
+    fn allocation_source(&self, frame_index: usize) -> AllocationSource {
+        let frame = self.frames[frame_index];
+        let key = self
+            .image
+            .function(frame.function)
+            .map(|function| function.key)
+            .unwrap_or(super::FunctionKey {
+                module: u32::MAX,
+                function: u32::MAX,
+            });
+        AllocationSource {
+            module: key.module,
+            function: key.function,
+            block: u32::try_from(frame.block).unwrap_or(u32::MAX),
+            instruction: u32::try_from(frame.instruction).unwrap_or(u32::MAX),
+        }
+    }
+
     fn fault(&mut self, fault: VmFault) -> Outcome {
         self.cancel_pending_allocation();
         self.cancel_pending_concat();
@@ -1049,14 +1131,29 @@ impl Machine {
 
     fn allocation_exhausted(
         &mut self,
-        requested_block_bytes: u32,
+        request_kind: AllocationRequestKind,
+        requested: u32,
         collection_attempted: bool,
+        source: AllocationSource,
     ) -> Outcome {
+        let Some(exception) = self.emergency_oom else {
+            return self.fault(VmFault::InvalidStoragePlan);
+        };
         let diagnostic = self.heap.diagnostic();
         let outcome = Outcome::AllocationExhausted(AllocationExhaustion {
-            requested_block_bytes,
-            total_free: diagnostic.total_free,
-            largest_free_block: diagnostic.largest_free_block,
+            exception,
+            diagnostic: AllocationDiagnostic {
+                request_kind,
+                requested,
+                live: self
+                    .image
+                    .storage_plan()
+                    .heap_bytes
+                    .saturating_sub(diagnostic.total_free),
+                total_free: diagnostic.total_free,
+                largest_free_block: diagnostic.largest_free_block,
+                source,
+            },
             collection_attempted,
         });
         self.lifecycle = Lifecycle::Terminal(outcome);
@@ -1068,7 +1165,10 @@ impl Machine {
         retry: AllocationRetry,
         maintenance_budget: u32,
     ) -> Result<Outcome, RunError> {
-        if self.collector.is_active() || self.allocation_retry.is_some() {
+        if self.collector.is_active()
+            || self.allocation_retry.is_some()
+            || self.string_collection_pending
+        {
             return Ok(self.fault(VmFault::CorruptLifecycle));
         }
         self.allocation_retry = Some(retry);
@@ -1098,13 +1198,26 @@ impl Machine {
             }
         }
         if !self.collector.is_active() {
+            if self.string_collection_pending {
+                self.string_collection_pending = false;
+                let Some(pending) = self.pending_concat.as_mut() else {
+                    return Ok(self.fault(VmFault::CorruptLifecycle));
+                };
+                pending.mark_collection_attempted();
+                return Ok(Outcome::SliceExhausted);
+            }
             let Some(retry) = self.allocation_retry.take() else {
                 return Ok(self.fault(VmFault::CorruptLifecycle));
             };
             match retry.reserve(&mut self.heap) {
                 Ok(Some(pending)) => self.pending_allocation = Some(pending),
                 Ok(None) => {
-                    return Ok(self.allocation_exhausted(retry.request.block_bytes, true));
+                    return Ok(self.allocation_exhausted(
+                        retry.shape.request_kind(),
+                        retry.logical_bytes,
+                        true,
+                        retry.source,
+                    ));
                 }
                 Err(fault) => return Ok(self.fault(fault)),
             }
@@ -1191,8 +1304,57 @@ impl Machine {
         let mut pending = self.pending_concat.take()?;
         let (used, result) = match pending.resume(&self.image, &mut self.heap, *remaining) {
             Ok(result) => result,
+            Err(text::TextError::Exhausted {
+                used,
+                block_bytes,
+                requested,
+                collection_attempted,
+            }) => {
+                let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used)) else {
+                    let _ = pending.abort(&mut self.heap);
+                    return Some(self.fault(VmFault::AccountingOverflow));
+                };
+                self.consumed_dynamic_cost = consumed;
+                *remaining -= used;
+                let Some(source) = self.pending_concat_source else {
+                    let _ = pending.abort(&mut self.heap);
+                    return Some(self.fault(VmFault::CorruptLifecycle));
+                };
+                if block_bytes > self.image.storage_plan().heap_bytes {
+                    let _ = pending.abort(&mut self.heap);
+                    self.pending_concat_source = None;
+                    return Some(self.allocation_exhausted(
+                        AllocationRequestKind::String,
+                        requested,
+                        false,
+                        source,
+                    ));
+                }
+                if collection_attempted {
+                    let _ = pending.abort(&mut self.heap);
+                    self.pending_concat_source = None;
+                    return Some(self.allocation_exhausted(
+                        AllocationRequestKind::String,
+                        requested,
+                        true,
+                        source,
+                    ));
+                }
+                if self.collector.is_active()
+                    || self.allocation_retry.is_some()
+                    || self.string_collection_pending
+                {
+                    let _ = pending.abort(&mut self.heap);
+                    return Some(self.fault(VmFault::CorruptLifecycle));
+                }
+                self.pending_concat = Some(pending);
+                self.string_collection_pending = true;
+                self.collector.start();
+                return Some(Outcome::SliceExhausted);
+            }
             Err(error) => {
                 let _ = pending.abort(&mut self.heap);
+                self.pending_concat_source = None;
                 return Some(self.text_outcome(error));
             }
         };
@@ -1212,6 +1374,7 @@ impl Machine {
             return Some(self.fault(VmFault::InvalidStoragePlan));
         };
         *slot = RegisterValue::Initialized(value);
+        self.pending_concat_source = None;
         self.frames[frame_index].instruction += 1;
         None
     }
@@ -1219,11 +1382,13 @@ impl Machine {
     fn text_outcome(&mut self, error: text::TextError) -> Outcome {
         match error {
             text::TextError::Trap(trap) => {
+                self.cancel_pending_concat();
                 let outcome = Outcome::Crashed(trap);
                 self.lifecycle = Lifecycle::Terminal(outcome);
                 outcome
             }
             text::TextError::Fault(fault) => self.fault(fault),
+            text::TextError::Exhausted { .. } => self.fault(VmFault::CorruptLifecycle),
         }
     }
 
@@ -1237,6 +1402,8 @@ impl Machine {
         if let Some(pending) = self.pending_concat.take() {
             let _ = pending.abort(&mut self.heap);
         }
+        self.pending_concat_source = None;
+        self.string_collection_pending = false;
     }
 
     fn reference_type(
@@ -1507,6 +1674,16 @@ impl Machine {
     #[cfg(test)]
     pub(super) fn test_collector_active(&self) -> bool {
         self.collector.is_active()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_remove_emergency_oom(&mut self) {
+        self.emergency_oom = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_exhaust_handle_capacity(&mut self) {
+        self.heap.test_exhaust_handle_capacity();
     }
 
     #[cfg(test)]
@@ -1839,6 +2016,9 @@ fn execute_scalar(
             let value = text::length(image, heap, read(*string)?).map_err(|error| match error {
                 text::TextError::Trap(trap) => InstructionFailure::Trap(trap),
                 text::TextError::Fault(fault) => InstructionFailure::Fault(fault),
+                text::TextError::Exhausted { .. } => {
+                    InstructionFailure::Fault(VmFault::CorruptLifecycle)
+                }
             })?;
             write(registers, *dst, RuntimeValue::I32(value))
         }
@@ -1850,6 +2030,9 @@ fn execute_scalar(
                 text::get(image, heap, read(*string)?, index).map_err(|error| match error {
                     text::TextError::Trap(trap) => InstructionFailure::Trap(trap),
                     text::TextError::Fault(fault) => InstructionFailure::Fault(fault),
+                    text::TextError::Exhausted { .. } => {
+                        InstructionFailure::Fault(VmFault::CorruptLifecycle)
+                    }
                 })?;
             write(registers, *dst, RuntimeValue::Char(value))
         }
