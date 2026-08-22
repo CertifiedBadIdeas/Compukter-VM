@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     artifact::{
-        Block, BlockId, ByteRange, Constant, DecodedCode, Function, FunctionId, Instruction,
+        Block, BlockId, ByteRange, Constant, DecodedCode, Field, Function, FunctionId, Instruction,
         NominalType, SwitchCase, TypeId, ValueType,
     },
     verify_artifact, ArtifactLimits, VerifiedArtifact,
@@ -698,6 +698,79 @@ pub(super) fn scalar_artifact() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::minimal_vector(), 32)
 }
 
+pub(super) fn portable_layout_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let base_reference = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types.extend([
+            NominalType::Class {
+                flags: 0,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: Vec::new(),
+                field_start: 0,
+                field_count: 2,
+                method_start: 0,
+                method_count: 0,
+            },
+            NominalType::Class {
+                flags: 0,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(1),
+                interfaces: Vec::new(),
+                field_start: 2,
+                field_count: 3,
+                method_start: 0,
+                method_count: 0,
+            },
+            NominalType::Array {
+                name: 0,
+                element: primitive(6),
+            },
+        ]);
+        artifact.modules[0].declared_types = 4;
+        artifact.modules[0].fields = vec![
+            Field {
+                owner: TypeId(1),
+                name: 0,
+                value_type: primitive(2),
+                flags: 0,
+            },
+            Field {
+                owner: TypeId(1),
+                name: 0,
+                value_type: primitive(5),
+                flags: 0,
+            },
+            Field {
+                owner: TypeId(2),
+                name: 0,
+                value_type: primitive(6),
+                flags: 0,
+            },
+            Field {
+                owner: TypeId(2),
+                name: 0,
+                value_type: base_reference,
+                flags: 0,
+            },
+            Field {
+                owner: TypeId(2),
+                name: 0,
+                value_type: primitive(1),
+                flags: 2,
+            },
+        ];
+        artifact.modules[0].utf16_literals = vec![ByteRange { start: 0, end: 4 }];
+        configure_stack(artifact, 0, 1);
+    })
+}
+
 pub(super) fn artifact_with_new_object() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::language_runtime_vector(), 160)
 }
@@ -795,7 +868,7 @@ pub(super) fn reference_entry_case() -> (
 
 pub(super) fn profile() -> ExecutionProfile {
     ExecutionProfile {
-        heap_bytes: u32::MAX,
+        heap_bytes: !15_u32,
         frame_storage_bytes: 1024 * 1024,
         maximum_call_depth: 64,
         maximum_coroutines: 64,

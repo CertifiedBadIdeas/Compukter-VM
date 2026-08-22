@@ -98,9 +98,11 @@ git commit -m "fix(vm): require dedicated allocation blocks (#42)"
 - Create: `src/execution/layout.rs`
 - Modify: `src/execution/mod.rs`
 - Modify: `src/execution/image.rs`
+- Modify: `src/execution/error.rs`
+- Modify: `src/execution/fixtures.rs`
 - Create: `src/execution/heap_tests.rs`
 
-- [ ] **Step 1: Write failing layout tests**
+- [x] **Step 1: Write failing layout tests**
 
 Add tests for empty/minimum objects, mixed `bool/char/i64/ref` fields,
 superclass prefixes, primitive/reference arrays, both string encodings, every
@@ -114,13 +116,15 @@ assert_eq!(32, string_layout(StringEncoding::Latin1, 8)?.block_bytes);
 assert_eq!(48, string_layout(StringEncoding::Utf16, 8)?.block_bytes);
 ```
 
-- [ ] **Step 2: Prove the module is missing**
+- [x] **Step 2: Prove the behavior is missing**
 
 Run: `cargo test --locked --offline execution::heap_tests::portable -- --nocapture`
 
-Expected: FAIL because `layout` and `heap_tests` do not exist.
+Expected: FAIL with compiling placeholder layouts returning the wrong sizes and
+accepting invalid lengths. This keeps RED behavioral rather than treating a
+compiler error as a regression test.
 
-- [ ] **Step 3: Implement checked portable layout types**
+- [x] **Step 3: Implement checked portable layout types**
 
 Create `ValueWidth`, `FieldLayout`, `ObjectLayout`, `ArrayLayout`,
 `StringEncoding`, `StringLayout`, and `StoragePlan`. Use 16-byte block headers,
@@ -134,13 +138,13 @@ static-slot IDs/types, reference-field lists, artifact-wide raw-byte literal
 deduplication, and `floor(heap_bytes / 32)` handle capacity. Admission must
 reserve every derived collection before publishing the image.
 
-- [ ] **Step 4: Run layout, admission, and full tests**
+- [x] **Step 4: Run layout, admission, and full tests**
 
 Run: `cargo test --locked --offline execution::heap_tests::portable -- --nocapture && cargo test --locked --offline execution::image::tests -- --nocapture && cargo test --locked --offline`
 
 Expected: all tests PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/execution/mod.rs src/execution/layout.rs src/execution/image.rs src/execution/heap_tests.rs
