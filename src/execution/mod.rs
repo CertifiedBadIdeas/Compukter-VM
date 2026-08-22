@@ -1,8 +1,12 @@
 #![allow(dead_code)]
 
 mod error;
+mod image;
 mod numeric;
 mod value;
+
+#[cfg(test)]
+mod fixtures;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct FunctionKey {
