@@ -458,20 +458,20 @@ git commit -m "feat(vm): execute compact Kotlin strings (#42)"
 - Modify: `src/execution/machine.rs`
 - Modify: `src/execution/gc_tests.rs`
 
-- [ ] **Step 1: Write failing OOM vectors**
+- [x] **Step 1: Write failing OOM vectors**
 
 Cover oversized immediate OOM with zero GC units, failed-fit full collection
 plus one retry, capacity and fragmentation failures, identical singleton
 identity across catches, bounded scalar diagnostics, dropping roots then
 successful recollection, and injected missing-emergency-state `VmFault`.
 
-- [ ] **Step 2: Prove the red state**
+- [x] **Step 2: Prove the red state**
 
 Run: `cargo test --locked --offline execution::gc_tests::oom -- --nocapture`
 
 Expected: FAIL because allocation exhaustion has no managed emergency identity.
 
-- [ ] **Step 3: Implement immortal OOM delivery**
+- [x] **Step 3: Implement immortal OOM delivery**
 
 Create the OOM-domain token during instance construction, keep its message,
 cause, suppressed list, and writable trace absent, and update the fixed
@@ -480,13 +480,13 @@ source }`. Map exhaustion to the reusable reference after exactly the specified
 GC/retry sequence. Keep exception-table unwinding out of scope by exposing the
 structured trap plus emergency token to its follow-up.
 
-- [ ] **Step 4: Run OOM, debug/release determinism, and allocation tests**
+- [x] **Step 4: Run OOM, debug/release determinism, and allocation tests**
 
 Run: `cargo test --locked --offline execution::gc_tests::oom -- --nocapture && cargo test --release --locked --offline execution::gc_tests::oom -- --nocapture && cargo test --release --locked --offline execution::gc_tests::oom_delivery_allocates_nothing -- --nocapture --test-threads=1`
 
 Expected: all tests PASS with identical accounting and zero native allocation.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/execution/error.rs src/execution/heap.rs src/execution/heap_ops.rs src/execution/machine.rs src/execution/gc_tests.rs

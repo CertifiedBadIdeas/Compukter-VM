@@ -163,6 +163,7 @@ fn allocator_handles_commit_abort_generation_and_retirement() -> Result<(), Admi
 #[test]
 fn allocator_diagnostics_are_bounded_scalars() {
     assert!(core::mem::size_of::<super::heap::HeapDiagnostic>() <= 32);
+    assert!(core::mem::size_of::<super::error::AllocationDiagnostic>() <= 40);
 }
 
 #[test]
@@ -456,9 +457,20 @@ fn allocation_oversized_request_reports_immediate_exhaustion() {
     assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
     assert_eq!(
         Outcome::AllocationExhausted(AllocationExhaustion {
-            requested_block_bytes: 128,
-            total_free: 64,
-            largest_free_block: 64,
+            exception: super::value::ReferenceValue::emergency(),
+            diagnostic: super::error::AllocationDiagnostic {
+                request_kind: super::error::AllocationRequestKind::Array,
+                requested: 108,
+                live: 0,
+                total_free: 64,
+                largest_free_block: 64,
+                source: super::error::AllocationSource {
+                    module: 0,
+                    function: 0,
+                    block: 1,
+                    instruction: 0,
+                },
+            },
             collection_attempted: false,
         }),
         machine.run_slice(5, 0).unwrap()
