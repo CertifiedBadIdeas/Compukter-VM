@@ -457,3 +457,144 @@ fn outbound_string_limit_exhausts_before_request_publication() {
         session.advance(1, 1).unwrap()
     );
 }
+
+fn string_response_session(mut execution_profile: ExecutionProfile) -> (Session, RequestId) {
+    execution_profile.maximum_host_arguments = 0;
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::String)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::string_response_capability_artifact(),
+        execution_profile,
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = match session.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(request) => request.id(),
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    (session, id)
+}
+
+fn kotlin_string_hash(units: &[u16]) -> i32 {
+    units.iter().fold(0_i32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(*unit))
+    })
+}
+
+#[test]
+fn inbound_string_materializes_exact_utf16_in_compact_managed_storage() {
+    for units in [
+        &[][..],
+        &[0x0041, 0x00ff][..],
+        &[0x0100, 0xd83d, 0xde00, 0xd800, 0xdc00][..],
+    ] {
+        let (mut session, id) = string_response_session(profile());
+        session
+            .resume(id, HostResponse::Success(HostValueInput::String(units)))
+            .unwrap();
+        assert_eq!(
+            ResumeError::NoPendingRequest,
+            session
+                .resume(id, HostResponse::Success(HostValueInput::String(units)))
+                .unwrap_err()
+        );
+        if !units.is_empty() {
+            assert_eq!(
+                AdvanceOutcome::SliceExhausted,
+                session.advance(1, 1).unwrap()
+            );
+        }
+        let terminal = loop {
+            match session.advance(64, 1).unwrap() {
+                AdvanceOutcome::SliceExhausted => {}
+                outcome => break outcome,
+            }
+        };
+        assert_eq!(
+            AdvanceOutcome::Halted(Some(HostValueView::I32(kotlin_string_hash(units)))),
+            terminal
+        );
+    }
+}
+
+#[test]
+fn oversized_inbound_string_is_correctable_and_keeps_request_pending() {
+    let mut limited = profile();
+    limited.maximum_inbound_utf16_code_units = 2;
+    let (mut session, id) = string_response_session(limited);
+    assert_eq!(
+        ResumeError::ResponseTooLarge,
+        session
+            .resume(
+                id,
+                HostResponse::Success(HostValueInput::String(&[0x41, 0x42, 0x43])),
+            )
+            .unwrap_err()
+    );
+    assert!(matches!(
+        session.advance(1, 1).unwrap(),
+        AdvanceOutcome::HostRequest(request) if request.id() == id
+    ));
+    session
+        .resume(
+            id,
+            HostResponse::Success(HostValueInput::String(&[0x41, 0x42])),
+        )
+        .unwrap();
+}
+
+#[test]
+fn inbound_string_oom_uses_the_managed_allocation_outcome() {
+    let mut tiny = profile();
+    tiny.heap_bytes = 32;
+    let (mut session, id) = string_response_session(tiny);
+    let units = [0x0100; 64];
+    session
+        .resume(id, HostResponse::Success(HostValueInput::String(&units)))
+        .unwrap();
+    let outcome = loop {
+        match session.advance(1, 1).unwrap() {
+            AdvanceOutcome::SliceExhausted => {}
+            outcome => break outcome,
+        }
+    };
+    assert!(matches!(outcome, AdvanceOutcome::AllocationExhausted(_)));
+}
+
+#[test]
+fn inbound_string_collects_dead_guest_string_and_retries_once() {
+    let mut constrained = profile();
+    constrained.heap_bytes = 64;
+    constrained.maximum_host_arguments = 0;
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::String)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::string_response_gc_retry_artifact(),
+        constrained,
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = loop {
+        match session.advance(64, 1).unwrap() {
+            AdvanceOutcome::SliceExhausted => {}
+            AdvanceOutcome::HostRequest(request) => break request.id(),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    };
+    let units = [0x0101; 8];
+    session
+        .resume(id, HostResponse::Success(HostValueInput::String(&units)))
+        .unwrap();
+    let terminal = loop {
+        match session.advance(64, 1).unwrap() {
+            AdvanceOutcome::SliceExhausted => {}
+            outcome => break outcome,
+        }
+    };
+    assert_eq!(
+        AdvanceOutcome::Halted(Some(HostValueView::I32(kotlin_string_hash(&units)))),
+        terminal
+    );
+}
