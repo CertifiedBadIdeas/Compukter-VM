@@ -96,6 +96,10 @@ impl VerifiedArtifact {
     pub fn module_count(&self) -> usize {
         self.inner.decoded.modules.len()
     }
+
+    pub(crate) fn decoded(&self) -> &DecodedArtifact {
+        &self.inner.decoded
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
