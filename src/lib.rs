@@ -56,8 +56,10 @@ mod verify;
 pub use artifact::{EntryPoint, VerifiedArtifact};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{
-    AdmissionError, CapabilityBinding, EntryValue, ExecutionProfile, HostValueType,
-    OperationSchema, RunError, Session,
+    AdmissionError, AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, GuestTrap,
+    HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput,
+    HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema, RequestId,
+    ResumeError, RunError, Session, VmFault,
 };
 pub use limits::ArtifactLimits;
 

@@ -29,6 +29,13 @@ pub(super) struct Frame {
     pub(super) destination: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CapabilitySuspension<'a> {
+    pub capability: u32,
+    pub operation: u32,
+    pub arguments: &'a [u16],
+}
+
 impl Frame {
     const EMPTY: Self = Self {
         function: usize::MAX,
@@ -1054,6 +1061,9 @@ impl Machine {
                         }
                         self.frames[frame_index].instruction += 1;
                     }
+                    ResolvedInstruction::CapabilityCallAsync { .. } => {
+                        return Ok(Outcome::HostRequest);
+                    }
                     ResolvedInstruction::Unreachable => {
                         return Ok(self.fault(VmFault::ReachedUnreachable));
                     }
@@ -1481,6 +1491,99 @@ impl Machine {
 
     pub(super) fn consumed_fixed_cost(&self) -> u64 {
         self.consumed_fixed_cost
+    }
+
+    pub(super) fn capability_suspension(&self) -> Result<CapabilitySuspension<'_>, VmFault> {
+        let frame_index = self
+            .frame_depth
+            .checked_sub(1)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let frame = self
+            .frames
+            .get(frame_index)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let instruction = self
+            .image
+            .block(frame.block)
+            .and_then(|block| block.instructions.get(frame.instruction))
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let ResolvedInstruction::CapabilityCallAsync {
+            capability,
+            operation,
+            args,
+            ..
+        } = instruction
+        else {
+            return Err(VmFault::CorruptLifecycle);
+        };
+        Ok(CapabilitySuspension {
+            capability: *capability,
+            operation: *operation,
+            arguments: args,
+        })
+    }
+
+    pub(super) fn capability_argument(&self, register: u16) -> Result<RuntimeValue, VmFault> {
+        let frame_index = self
+            .frame_depth
+            .checked_sub(1)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        self.read_register(frame_index, register)
+    }
+
+    pub(super) fn complete_capability(
+        &mut self,
+        value: Option<RuntimeValue>,
+    ) -> Result<(), VmFault> {
+        let frame_index = self
+            .frame_depth
+            .checked_sub(1)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let frame = *self
+            .frames
+            .get(frame_index)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let (destination, resume_block) = match self
+            .image
+            .block(frame.block)
+            .and_then(|block| block.instructions.get(frame.instruction))
+        {
+            Some(ResolvedInstruction::CapabilityCallAsync {
+                dst, resume_block, ..
+            }) => (*dst, *resume_block),
+            _ => return Err(VmFault::CorruptLifecycle),
+        };
+        if (destination == u16::MAX) != value.is_none() {
+            return Err(VmFault::InvalidValueType);
+        }
+        if let Some(value) = value {
+            let function = self
+                .image
+                .function(frame.function)
+                .ok_or(VmFault::InvalidResolvedId)?;
+            let expected = *function
+                .registers
+                .get(destination as usize)
+                .ok_or(VmFault::InvalidStoragePlan)?;
+            if !self.runtime_value_matches(value, expected) {
+                return Err(VmFault::InvalidValueType);
+            }
+            let index = frame_index
+                .checked_mul(self.image.registers_per_frame())
+                .and_then(|base| base.checked_add(destination as usize))
+                .ok_or(VmFault::InvalidStoragePlan)?;
+            *self
+                .registers
+                .get_mut(index)
+                .ok_or(VmFault::InvalidStoragePlan)? = RegisterValue::Initialized(value);
+        }
+        let frame = self
+            .frames
+            .get_mut(frame_index)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        frame.block = resume_block;
+        frame.instruction = 0;
+        Ok(())
     }
 
     pub(super) fn consumed_dynamic_cost(&self) -> u64 {

@@ -13,8 +13,12 @@ mod session;
 mod text;
 mod value;
 
-pub use error::{AdmissionError, RunError};
-pub use host::{CapabilityBinding, EntryValue, ExecutionProfile, HostValueType, OperationSchema};
+pub use error::{AdmissionError, GuestTrap, RunError, VmFault};
+pub use host::{
+    AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, HostArguments, HostFailure,
+    HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView,
+    ManagedAllocationFailure, OperationSchema, RequestId, ResumeError,
+};
 pub use session::Session;
 
 #[cfg(test)]

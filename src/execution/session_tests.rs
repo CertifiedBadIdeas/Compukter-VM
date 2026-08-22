@@ -1,9 +1,14 @@
 use super::{
     error::AdmissionError,
     fixtures,
-    host::{CapabilityBinding, ExecutionProfile, HostValueType, OperationSchema},
+    host::{
+        AdvanceOutcome, CapabilityBinding, ExecutionProfile, HostFailure, HostFailureKind,
+        HostResponse, HostValueInput, HostValueType, HostValueView, OperationSchema, RequestId,
+        ResumeError,
+    },
     session::Session,
 };
+use crate::artifact::{Constant, ValueType};
 
 fn profile() -> ExecutionProfile {
     ExecutionProfile {
@@ -108,5 +113,240 @@ fn admission_rejects_invoked_unbound_optional_and_sync_calls() {
             &[binding],
         )
         .unwrap_err()
+    );
+}
+
+fn scalar_case(
+    value_type: ValueType,
+    constant: Constant,
+    host_type: HostValueType,
+    expected: HostValueView<'static>,
+    response: HostValueInput<'static>,
+) {
+    let arguments = [host_type];
+    let operations = [OperationSchema::asynchronous(&arguments, host_type)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::scalar_capability_artifact(value_type, constant),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+
+    let request_id = {
+        let AdvanceOutcome::HostRequest(request) = session.advance(64, 0).unwrap() else {
+            panic!("scalar call did not suspend");
+        };
+        assert_eq!("app", request.namespace());
+        assert_eq!("entry", request.name());
+        assert_eq!(0, request.operation());
+        assert_eq!(Some(expected), request.arguments().get(0));
+        request.id()
+    };
+    session
+        .resume(request_id, HostResponse::Success(response))
+        .unwrap();
+    assert_eq!(
+        AdvanceOutcome::Halted(Some(expected)),
+        session.advance(64, 0).unwrap()
+    );
+}
+
+#[test]
+fn scalar_requests_round_trip_every_primitive_type() {
+    for (value_type, constant, host_type, expected, response) in [
+        (
+            ValueType {
+                kind: 1,
+                flags: 0,
+                nominal_type: crate::artifact::TypeId(u32::MAX),
+            },
+            Constant::I32(42),
+            HostValueType::I32,
+            HostValueView::I32(42),
+            HostValueInput::I32(42),
+        ),
+        (
+            ValueType {
+                kind: 2,
+                flags: 0,
+                nominal_type: crate::artifact::TypeId(u32::MAX),
+            },
+            Constant::I64(42),
+            HostValueType::I64,
+            HostValueView::I64(42),
+            HostValueInput::I64(42),
+        ),
+        (
+            ValueType {
+                kind: 3,
+                flags: 0,
+                nominal_type: crate::artifact::TypeId(u32::MAX),
+            },
+            Constant::F32(42),
+            HostValueType::F32,
+            HostValueView::F32(42),
+            HostValueInput::F32(42),
+        ),
+        (
+            ValueType {
+                kind: 4,
+                flags: 0,
+                nominal_type: crate::artifact::TypeId(u32::MAX),
+            },
+            Constant::F64(42),
+            HostValueType::F64,
+            HostValueView::F64(42),
+            HostValueInput::F64(42),
+        ),
+        (
+            ValueType {
+                kind: 5,
+                flags: 0,
+                nominal_type: crate::artifact::TypeId(u32::MAX),
+            },
+            Constant::Bool(true),
+            HostValueType::Bool,
+            HostValueView::Bool(true),
+            HostValueInput::Bool(true),
+        ),
+        (
+            ValueType {
+                kind: 6,
+                flags: 0,
+                nominal_type: crate::artifact::TypeId(u32::MAX),
+            },
+            Constant::Char(42),
+            HostValueType::Char,
+            HostValueView::Char(42),
+            HostValueInput::Char(42),
+        ),
+    ] {
+        scalar_case(value_type, constant, host_type, expected, response);
+    }
+}
+
+#[test]
+fn waiting_poll_is_stable_and_invalid_responses_are_atomic() {
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+    let mut session = Session::admit(
+        fixtures::capability_artifact(true, true, 1, 0),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let first_id = match session.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(request) => request.id(),
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    let repeated_id = match session.advance(1, 1).unwrap() {
+        AdvanceOutcome::HostRequest(request) => request.id(),
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    assert_eq!(first_id, repeated_id);
+    assert_eq!(
+        ResumeError::WrongResponseType,
+        session
+            .resume(first_id, HostResponse::Success(HostValueInput::I32(7)))
+            .unwrap_err()
+    );
+    assert!(matches!(
+        session.advance(1, 1).unwrap(),
+        AdvanceOutcome::HostRequest(_)
+    ));
+    assert_eq!(
+        ResumeError::WrongRequestId,
+        session
+            .resume(
+                RequestId::new(first_id.get() + 1).unwrap(),
+                HostResponse::Success(HostValueInput::Unit)
+            )
+            .unwrap_err()
+    );
+    assert!(matches!(
+        session.advance(1, 1).unwrap(),
+        AdvanceOutcome::HostRequest(_)
+    ));
+    session
+        .resume(first_id, HostResponse::Success(HostValueInput::Unit))
+        .unwrap();
+    assert_eq!(
+        ResumeError::NoPendingRequest,
+        session
+            .resume(first_id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap_err()
+    );
+    assert_eq!(
+        AdvanceOutcome::Halted(None),
+        session.advance(64, 0).unwrap()
+    );
+}
+
+#[test]
+fn request_ids_are_monotonic_and_overflow_faults_before_publication() {
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::two_unit_capability_calls_artifact(),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let first = match session.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(r) => r.id(),
+        other => panic!("{other:?}"),
+    };
+    session
+        .resume(first, HostResponse::Success(HostValueInput::Unit))
+        .unwrap();
+    let second = match session.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(r) => r.id(),
+        other => panic!("{other:?}"),
+    };
+    assert!(second.get() > first.get());
+
+    let overflow_binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+    let mut overflow = Session::admit(
+        fixtures::capability_artifact(true, true, 1, 0),
+        profile(),
+        &[overflow_binding],
+    )
+    .unwrap();
+    overflow.start(&[]).unwrap();
+    overflow.test_set_next_request_id(u64::MAX);
+    assert!(matches!(
+        overflow.advance(64, 0).unwrap(),
+        AdvanceOutcome::Faulted(_)
+    ));
+}
+
+#[test]
+fn explicit_host_failure_is_a_stable_terminal_outcome() {
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+    let mut session = Session::admit(
+        fixtures::capability_artifact(true, true, 1, 0),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = match session.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(r) => r.id(),
+        other => panic!("{other:?}"),
+    };
+    let failure = HostFailure::new(HostFailureKind::Unavailable, 17);
+    session.resume(id, HostResponse::Failure(failure)).unwrap();
+    assert_eq!(
+        AdvanceOutcome::HostFailed(failure),
+        session.advance(64, 0).unwrap()
+    );
+    assert_eq!(
+        AdvanceOutcome::HostFailed(failure),
+        session.advance(1, 1).unwrap()
     );
 }

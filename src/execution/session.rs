@@ -3,7 +3,9 @@ use crate::VerifiedArtifact;
 use super::{
     error::{AdmissionError, RunError},
     host::{
-        CapabilityBinding, EntryValue, ExecutionProfile, ResolvedCapability, ResolvedOperation,
+        AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, HostArguments,
+        HostFailure, HostRequestView, HostResponse, HostValueInput, HostValueSlot, HostValueView,
+        ManagedAllocationFailure, RequestId, ResolvedCapability, ResolvedOperation, ResumeError,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::Machine,
@@ -17,6 +19,29 @@ pub struct Session {
     outbound_utf16: Box<[u16]>,
     inbound_utf16: Box<[u16]>,
     maximum_accepted_responses: u64,
+    argument_slots: Box<[HostValueSlot]>,
+    argument_count: usize,
+    pending_request: Option<PendingRequest>,
+    terminal: Option<SessionTerminal>,
+    next_request_id: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRequest {
+    id: RequestId,
+    capability: u32,
+    operation: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SessionTerminal {
+    HostFailed(HostFailure),
+    Faulted(super::error::VmFault),
+}
+
+struct CapabilityResolution {
+    capabilities: Box<[Option<ResolvedCapability>]>,
+    mask: u32,
 }
 
 impl core::fmt::Debug for Session {
@@ -31,6 +56,8 @@ impl core::fmt::Debug for Session {
                 "maximum_accepted_responses",
                 &self.maximum_accepted_responses,
             )
+            .field("pending_request", &self.pending_request)
+            .field("terminal", &self.terminal)
             .finish_non_exhaustive()
     }
 }
@@ -41,7 +68,10 @@ impl Session {
         profile: ExecutionProfile,
         bindings: &[CapabilityBinding<'_>],
     ) -> Result<Self, AdmissionError> {
-        let (capabilities, capability_mask) = resolve_capabilities(&artifact, bindings)?;
+        let CapabilityResolution {
+            capabilities,
+            mask: capability_mask,
+        } = resolve_capabilities(&artifact, bindings)?;
         let maximum_host_arguments = checked_usize(profile.maximum_host_arguments)?;
         let outbound_capacity = checked_usize(profile.maximum_outbound_utf16_code_units)?;
         let inbound_capacity = checked_usize(profile.maximum_inbound_utf16_code_units)?;
@@ -66,6 +96,7 @@ impl Session {
         )?;
         let machine = Machine::new(image)?;
         let entry_arguments = initialized_entries(maximum_host_arguments)?;
+        let argument_slots = empty_argument_slots(maximum_host_arguments)?;
         let outbound_utf16 = zeroed_u16(outbound_capacity)?;
         let inbound_utf16 = zeroed_u16(inbound_capacity)?;
         Ok(Self {
@@ -75,6 +106,11 @@ impl Session {
             outbound_utf16,
             inbound_utf16,
             maximum_accepted_responses,
+            argument_slots,
+            argument_count: 0,
+            pending_request: None,
+            terminal: None,
+            next_request_id: 1,
         })
     }
 
@@ -97,12 +133,188 @@ impl Session {
         }
         self.machine.start(&self.entry_arguments[..arguments.len()])
     }
+
+    pub fn advance(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+    ) -> Result<AdvanceOutcome<'_>, RunError> {
+        if let Some(terminal) = self.terminal {
+            return Ok(match terminal {
+                SessionTerminal::HostFailed(failure) => AdvanceOutcome::HostFailed(failure),
+                SessionTerminal::Faulted(fault) => AdvanceOutcome::Faulted(fault),
+            });
+        }
+        if self.pending_request.is_some() {
+            return self.request_outcome().map_err(|_| RunError::NotRunnable);
+        }
+        match self.machine.run_slice(guest_budget, maintenance_budget)? {
+            super::error::Outcome::SliceExhausted => Ok(AdvanceOutcome::SliceExhausted),
+            super::error::Outcome::HostRequest => self.publish_scalar_request(),
+            super::error::Outcome::AllocationExhausted(exhaustion) => Ok(
+                AdvanceOutcome::AllocationExhausted(ManagedAllocationFailure {
+                    diagnostic: exhaustion.diagnostic,
+                    collection_attempted: exhaustion.collection_attempted,
+                }),
+            ),
+            super::error::Outcome::Halted(value) => match value {
+                None => Ok(AdvanceOutcome::Halted(None)),
+                Some(value) => match runtime_view(value) {
+                    Some(value) => Ok(AdvanceOutcome::Halted(Some(value))),
+                    None => self.establish_fault(super::error::VmFault::InvalidValueType),
+                },
+            },
+            super::error::Outcome::Crashed(trap) => Ok(AdvanceOutcome::Crashed(trap)),
+            super::error::Outcome::Faulted(fault) => Ok(AdvanceOutcome::Faulted(fault)),
+        }
+    }
+
+    pub fn resume(
+        &mut self,
+        request_id: RequestId,
+        response: HostResponse<'_>,
+    ) -> Result<(), ResumeError> {
+        if self.terminal.is_some() {
+            return Err(ResumeError::NoPendingRequest);
+        }
+        let pending = self.pending_request.ok_or(ResumeError::NoPendingRequest)?;
+        if request_id != pending.id {
+            return Err(ResumeError::WrongRequestId);
+        }
+        if let HostResponse::Failure(failure) = response {
+            self.pending_request = None;
+            self.terminal = Some(SessionTerminal::HostFailed(failure));
+            return Ok(());
+        }
+        let HostResponse::Success(input) = response else {
+            unreachable!();
+        };
+        let expected = self
+            .capabilities
+            .get(pending.capability as usize)
+            .and_then(Option::as_ref)
+            .and_then(|capability| capability.operations.get(pending.operation as usize))
+            .map(|operation| operation.result)
+            .ok_or(ResumeError::NoPendingRequest)?;
+        if input.value_type() != expected {
+            return Err(ResumeError::WrongResponseType);
+        }
+        let value = match input {
+            HostValueInput::Unit => None,
+            HostValueInput::I32(value) => Some(RuntimeValue::I32(value)),
+            HostValueInput::I64(value) => Some(RuntimeValue::I64(value)),
+            HostValueInput::F32(value) => Some(RuntimeValue::F32(value)),
+            HostValueInput::F64(value) => Some(RuntimeValue::F64(value)),
+            HostValueInput::Bool(value) => Some(RuntimeValue::Bool(value)),
+            HostValueInput::Char(value) => Some(RuntimeValue::Char(value)),
+            HostValueInput::String(_) => return Err(ResumeError::ResponseTooLarge),
+        };
+        self.machine
+            .complete_capability(value)
+            .map_err(|_| ResumeError::WrongResponseType)?;
+        self.pending_request = None;
+        Ok(())
+    }
+
+    fn publish_scalar_request(&mut self) -> Result<AdvanceOutcome<'_>, RunError> {
+        let prepared = (|| {
+            let suspension = self.machine.capability_suspension()?;
+            if suspension.arguments.len() > self.argument_slots.len() {
+                return Err(super::error::VmFault::InvalidStoragePlan);
+            }
+            for (index, register) in suspension.arguments.iter().copied().enumerate() {
+                let value = self.machine.capability_argument(register)?;
+                let slot =
+                    runtime_slot(value).ok_or(super::error::VmFault::UnsupportedInstruction)?;
+                self.argument_slots[index] = slot;
+            }
+            Ok((
+                suspension.capability,
+                suspension.operation,
+                suspension.arguments.len(),
+            ))
+        })();
+        let (capability, operation, argument_count) = match prepared {
+            Ok(prepared) => prepared,
+            Err(fault) => return self.establish_fault(fault),
+        };
+        let next = self.next_request_id.checked_add(1);
+        let Some(next) = next else {
+            return self.establish_fault(super::error::VmFault::AccountingOverflow);
+        };
+        let id = RequestId::new(self.next_request_id).ok_or(RunError::NotRunnable)?;
+        self.next_request_id = next;
+        self.argument_count = argument_count;
+        self.pending_request = Some(PendingRequest {
+            id,
+            capability,
+            operation,
+        });
+        self.request_outcome().map_err(|_| RunError::NotRunnable)
+    }
+
+    fn request_outcome(&self) -> Result<AdvanceOutcome<'_>, super::error::VmFault> {
+        let pending = self
+            .pending_request
+            .ok_or(super::error::VmFault::CorruptLifecycle)?;
+        let capability = self
+            .capabilities
+            .get(pending.capability as usize)
+            .and_then(Option::as_ref)
+            .ok_or(super::error::VmFault::InvalidResolvedId)?;
+        Ok(AdvanceOutcome::HostRequest(HostRequestView {
+            id: pending.id,
+            capability,
+            operation: pending.operation,
+            arguments: HostArguments {
+                slots: &self.argument_slots[..self.argument_count],
+                utf16: &self.outbound_utf16,
+            },
+        }))
+    }
+
+    fn establish_fault(
+        &mut self,
+        fault: super::error::VmFault,
+    ) -> Result<AdvanceOutcome<'_>, RunError> {
+        self.terminal = Some(SessionTerminal::Faulted(fault));
+        Ok(AdvanceOutcome::Faulted(fault))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_set_next_request_id(&mut self, value: u64) {
+        self.next_request_id = value;
+    }
+}
+
+fn runtime_slot(value: RuntimeValue) -> Option<HostValueSlot> {
+    match value {
+        RuntimeValue::I32(value) => Some(HostValueSlot::I32(value)),
+        RuntimeValue::I64(value) => Some(HostValueSlot::I64(value)),
+        RuntimeValue::F32(value) => Some(HostValueSlot::F32(value)),
+        RuntimeValue::F64(value) => Some(HostValueSlot::F64(value)),
+        RuntimeValue::Bool(value) => Some(HostValueSlot::Bool(value)),
+        RuntimeValue::Char(value) => Some(HostValueSlot::Char(value)),
+        RuntimeValue::Null | RuntimeValue::Reference(_) => None,
+    }
+}
+
+fn runtime_view(value: RuntimeValue) -> Option<HostValueView<'static>> {
+    match runtime_slot(value)? {
+        HostValueSlot::I32(value) => Some(HostValueView::I32(value)),
+        HostValueSlot::I64(value) => Some(HostValueView::I64(value)),
+        HostValueSlot::F32(value) => Some(HostValueView::F32(value)),
+        HostValueSlot::F64(value) => Some(HostValueView::F64(value)),
+        HostValueSlot::Bool(value) => Some(HostValueView::Bool(value)),
+        HostValueSlot::Char(value) => Some(HostValueView::Char(value)),
+        HostValueSlot::Empty | HostValueSlot::String { .. } => None,
+    }
 }
 
 fn resolve_capabilities(
     artifact: &VerifiedArtifact,
     bindings: &[CapabilityBinding<'_>],
-) -> Result<(Box<[Option<ResolvedCapability>]>, u32), AdmissionError> {
+) -> Result<CapabilityResolution, AdmissionError> {
     for (index, binding) in bindings.iter().enumerate() {
         if bindings[..index].iter().any(|prior| {
             prior.namespace() == binding.namespace()
@@ -187,7 +399,10 @@ fn resolve_capabilities(
             operations: operations.into_boxed_slice(),
         }));
     }
-    Ok((resolved.into_boxed_slice(), capability_mask))
+    Ok(CapabilityResolution {
+        capabilities: resolved.into_boxed_slice(),
+        mask: capability_mask,
+    })
 }
 
 fn boxed_str(value: &str) -> Result<Box<str>, AdmissionError> {
@@ -211,6 +426,15 @@ fn initialized_entries(length: usize) -> Result<Box<[EntryArgument]>, AdmissionE
         .try_reserve_exact(length)
         .map_err(|_| AdmissionError::AllocationFailed)?;
     values.resize(length, EntryArgument::unowned(RuntimeValue::I32(0)));
+    Ok(values.into_boxed_slice())
+}
+
+fn empty_argument_slots(length: usize) -> Result<Box<[HostValueSlot]>, AdmissionError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| AdmissionError::AllocationFailed)?;
+    values.resize(length, HostValueSlot::Empty);
     Ok(values.into_boxed_slice())
 }
 
