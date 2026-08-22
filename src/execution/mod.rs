@@ -15,9 +15,10 @@ mod value;
 
 pub use error::{AdmissionError, GuestTrap, RunError, VmFault};
 pub use host::{
-    AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, HostArguments, HostFailure,
-    HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView,
-    ManagedAllocationFailure, OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError,
+    AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile,
+    HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput,
+    HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema, QuotaExhaustion,
+    QuotaKind, RequestId, ResumeError,
 };
 pub use session::Session;
 

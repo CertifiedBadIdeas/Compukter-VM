@@ -56,10 +56,11 @@ mod verify;
 pub use artifact::{EntryPoint, VerifiedArtifact};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{
-    AdmissionError, AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, GuestTrap,
-    HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput,
-    HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema, QuotaExhaustion,
-    QuotaKind, RequestId, ResumeError, RunError, Session, VmFault,
+    AccountingSnapshot, AdmissionError, AdvanceOutcome, CapabilityBinding, EntryValue,
+    ExecutionProfile, GuestTrap, HostArguments, HostFailure, HostFailureKind, HostRequestView,
+    HostResponse, HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure,
+    OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError, RunError, Session,
+    VmFault,
 };
 pub use limits::ArtifactLimits;
 
