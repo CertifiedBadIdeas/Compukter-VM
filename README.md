@@ -3,10 +3,8 @@
 Compukter VM is the standalone managed Rust runtime used by
 [Compukters](https://github.com/CertifiedBadIdeas/Compukters).
 
-The project is in an intentional clean-break interval. The retired RISC-V
-machine, ELF runtime, and native-code backends have been removed. The new
-platform compiles Kotlin scripts through a pinned K2/Kotlin IR target into a
-versioned Compukter bytecode executed only inside this resource-bounded VM.
+The platform compiles Kotlin projects through a pinned K2/Kotlin IR target into
+versioned Compukter bytecode executed inside this resource-bounded VM.
 
 The accepted architecture is tracked by
 [Compukters issue #500](https://github.com/CertifiedBadIdeas/Compukters/issues/500).
