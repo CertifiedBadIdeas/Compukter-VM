@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod error;
+mod numeric;
 mod value;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

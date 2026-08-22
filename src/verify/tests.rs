@@ -337,6 +337,40 @@ fn configure_entry(
 }
 
 #[test]
+fn cfg_accepts_i32_char_conversions() {
+    let mut artifact = decoded(support::minimal_vector());
+    configure_entry(
+        &mut artifact,
+        vec![primitive(1), primitive(6), primitive(6), primitive(1)],
+        2,
+        vec![
+            crate::artifact::Instruction::Convert { dst: 2, src: 0 },
+            crate::artifact::Instruction::Convert { dst: 3, src: 1 },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
+fn cfg_rejects_other_char_conversion_pairs() {
+    for numeric_kind in [2, 3, 4] {
+        let mut artifact = decoded(support::minimal_vector());
+        configure_entry(
+            &mut artifact,
+            vec![primitive(6), primitive(numeric_kind)],
+            1,
+            vec![
+                crate::artifact::Instruction::Convert { dst: 1, src: 0 },
+                crate::artifact::Instruction::Return { value: u16::MAX },
+            ],
+        );
+        let error = verify_cfg(&artifact).unwrap_err();
+        assert_eq!(error.first().unwrap().code, Code::BadType);
+    }
+}
+
+#[test]
 fn cfg_accepts_imported_direct_call() {
     let mut artifact = decoded(support::two_module_vector());
     configure_entry(

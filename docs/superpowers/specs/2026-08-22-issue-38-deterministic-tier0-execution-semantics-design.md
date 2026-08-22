@@ -35,7 +35,9 @@ instruction family can still fail merely because it is unimplemented.
 
 - Implement heap objects, arrays, GC, exception unwinding, coroutines,
   capabilities, snapshots, JNI, Kotlin IR lowering, JIT, or AOT in #38.
-- Change artifact v1 bytes, opcode identities, verifier rules, or fixed costs.
+- Change artifact v1 bytes, opcode identities, or fixed costs. The scalar
+  implementation may close the verifier omission for the already specified
+  `i32`/`char` `convert` pairs without changing the instruction encoding.
 - Expose the native representation or width of runtime values and references
   as a portable ABI.
 - Establish a hardware-dependent absolute throughput threshold.
