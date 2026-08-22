@@ -40,8 +40,11 @@
 - Modify: `src/verify/functions.rs`
 - Modify: `src/verify/tests.rs`
 - Modify: `src/execution/fixtures.rs`
+- Modify: `tests/support/mod.rs`
+- Regenerate: `tests/fixtures/language-runtime.cpkt`
+- Regenerate: `tests/fixtures/language-runtime.manifest.md`
 
-- [ ] **Step 1: Write failing verifier tests**
+- [x] **Step 1: Write failing verifier tests**
 
 Add `cfg_rejects_allocation_after_another_instruction`,
 `cfg_rejects_two_allocations_in_one_block`, and
@@ -49,14 +52,14 @@ Add `cfg_rejects_allocation_after_another_instruction`,
 `nop; new_object`, `new_object; new_array`, and one allocation followed only by
 non-allocating instructions plus a terminator.
 
-- [ ] **Step 2: Prove the red state**
+- [x] **Step 2: Prove the red state**
 
 Run: `cargo test --locked --offline verify::tests::cfg_rejects_allocation_after_another_instruction -- --nocapture && cargo test --locked --offline verify::tests::cfg_rejects_two_allocations_in_one_block -- --nocapture`
 
 Expected: both rejection tests FAIL because the current verifier accepts the
 instruction sequences.
 
-- [ ] **Step 3: Add the exact verifier rule**
+- [x] **Step 3: Add the exact verifier rule**
 
 In the per-block instruction walk, keep `allocation_seen: bool`. Reject a
 `NewObject` or `NewArray` unless its instruction index is zero, and reject a
@@ -72,18 +75,20 @@ if is_allocation && (instruction_index != 0 || allocation_seen) {
 allocation_seen |= is_allocation;
 ```
 
-Update every heap fixture so it remains verifier-valid.
+Update every heap fixture so it remains verifier-valid. In the committed
+language-runtime vector, move the array length/index constants into block zero,
+make block one begin with `new_array`, and regenerate its bytes and manifest.
 
-- [ ] **Step 4: Run verifier and full tests**
+- [x] **Step 4: Run verifier and full tests**
 
 Run: `cargo test --locked --offline verify::tests -- --nocapture && cargo test --locked --offline`
 
 Expected: all tests PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
-git add src/verify/functions.rs src/verify/tests.rs src/execution/fixtures.rs
+git add src/verify/functions.rs src/verify/tests.rs src/execution/fixtures.rs tests/support/mod.rs tests/fixtures/language-runtime.cpkt tests/fixtures/language-runtime.manifest.md docs/superpowers/plans/2026-08-22-issue-42-deterministic-managed-heap-incremental-gc.md
 git commit -m "fix(vm): require dedicated allocation blocks (#42)"
 ```
 

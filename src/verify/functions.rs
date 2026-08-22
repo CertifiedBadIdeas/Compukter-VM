@@ -216,7 +216,21 @@ fn verify_dataflow(
                 "declared and recomputed block costs disagree",
             ));
         }
-        for instruction in &code.instructions {
+        let mut allocation_seen = false;
+        for (instruction_index, instruction) in code.instructions.iter().enumerate() {
+            let is_allocation = matches!(
+                instruction,
+                Instruction::NewObject { .. } | Instruction::NewArray { .. }
+            );
+            if is_allocation && (instruction_index != 0 || allocation_seen) {
+                return Err(code_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "allocation must be the first and only allocating instruction in its block",
+                ));
+            }
+            allocation_seen |= is_allocation;
             if may_throw(instruction) {
                 for handler in handlers.iter().filter(|handler| {
                     block_id >= handler.protected_start && block_id < handler.protected_end

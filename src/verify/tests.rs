@@ -336,6 +336,82 @@ fn configure_entry(
     artifact.modules[0].code[0].fixed_cost = fixed_cost;
 }
 
+fn allocation_artifact(
+    instructions: Vec<crate::artifact::Instruction>,
+) -> crate::artifact::DecodedArtifact {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].types.push(class(0, 0, u32::MAX));
+    configure_entry(&mut artifact, vec![reference(1, false)], 0, instructions);
+    artifact
+}
+
+#[test]
+fn cfg_rejects_allocation_after_another_instruction() {
+    let artifact = allocation_artifact(vec![
+        crate::artifact::Instruction::Nop,
+        crate::artifact::Instruction::NewObject {
+            dst: 0,
+            type_ref: 1,
+        },
+        crate::artifact::Instruction::Return { value: u16::MAX },
+    ]);
+
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadInstruction);
+}
+
+#[test]
+fn cfg_rejects_two_allocations_in_one_block() {
+    let artifact = allocation_artifact(vec![
+        crate::artifact::Instruction::NewObject {
+            dst: 0,
+            type_ref: 1,
+        },
+        crate::artifact::Instruction::NewObject {
+            dst: 0,
+            type_ref: 1,
+        },
+        crate::artifact::Instruction::Return { value: u16::MAX },
+    ]);
+
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadInstruction);
+}
+
+#[test]
+fn cfg_accepts_dedicated_object_and_array_allocation_blocks() {
+    let object = allocation_artifact(vec![
+        crate::artifact::Instruction::NewObject {
+            dst: 0,
+            type_ref: 1,
+        },
+        crate::artifact::Instruction::Return { value: u16::MAX },
+    ]);
+    verify_cfg(&object).unwrap();
+
+    let mut array = decoded(support::minimal_vector());
+    array.modules[0]
+        .types
+        .push(crate::artifact::NominalType::Array {
+            name: 0,
+            element: primitive(1),
+        });
+    configure_entry(
+        &mut array,
+        vec![reference(1, false), primitive(1)],
+        2,
+        vec![
+            crate::artifact::Instruction::NewArray {
+                dst: 0,
+                type_ref: 1,
+                length: 1,
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    verify_cfg(&array).unwrap();
+}
+
 #[test]
 fn cfg_accepts_i32_char_conversions() {
     let mut artifact = decoded(support::minimal_vector());
