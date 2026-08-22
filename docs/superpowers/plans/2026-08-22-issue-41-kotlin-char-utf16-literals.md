@@ -78,7 +78,7 @@ Expected: the commit is on `main` and the push succeeds.
 - Modify: `tests/bounded_failures.rs`
 - Modify: `tests/support/mod.rs`
 
-- [ ] **Step 1: Add failing section-contract tests**
+- [x] **Step 1: Add failing section-contract tests**
 
 Extend decoder/container tests so a minimal artifact fails when module section `0x010a` is missing, duplicated, global-scoped, non-semantic, or non-critical. Add a bounded-failure test that sets `utf16_literal_code_units` below the fixture requirement. The test support builder must accept literal records but must not yet make the new section valid by default.
 
@@ -90,7 +90,7 @@ cargo test --locked --offline decode::tests::utf16_literal_section -- --nocaptur
 
 Expected: FAIL because `0x010a` is not a known required module section.
 
-- [ ] **Step 2: Add the format constant and required-section membership**
+- [x] **Step 2: Add the format constant and required-section membership**
 
 Add after `EXCEPTIONS` in `src/artifact/format.rs`:
 
@@ -100,7 +100,7 @@ pub(crate) const UTF16_LITERALS: u16 = 0x010a;
 
 Include it in `is_module`, and include it in the required semantic module-kind list in `src/verify/modules.rs`. Required flags are the existing `CRITICAL | SEMANTIC` contract used by semantic module sections.
 
-- [ ] **Step 3: Add the host policy limit**
+- [x] **Step 3: Add the host policy limit**
 
 Add to `ArtifactLimits` and its default:
 
@@ -118,7 +118,7 @@ rg -n "ArtifactLimits \{" src tests
 
 Use struct update syntax where appropriate; do not silently reuse `strings_bytes` for guest literal content.
 
-- [ ] **Step 4: Emit an empty required section in all test artifact builders**
+- [x] **Step 4: Emit an empty required section in all test artifact builders**
 
 In every `semantic_sections` list in `tests/support/mod.rs`, insert an indexed empty section at kind `0x010a`, ordered after `0x0109`. Add a helper that can replace it with caller-supplied raw records for later tests. Ensure module semantic hashing sees the section.
 
@@ -131,7 +131,7 @@ cargo test --locked --offline bounded_failures -- --nocapture
 
 Expected: section-contract tests pass; the independent limit test may remain red until Task 3 parses literal contents.
 
-- [ ] **Step 5: Commit the section skeleton**
+- [x] **Step 5: Commit the section skeleton**
 
 Run:
 
@@ -151,7 +151,7 @@ git commit -m "feat(format): reserve UTF-16 literal pool (#41)"
 - Modify: `tests/bounded_failures.rs`
 - Modify: `tests/support/mod.rs`
 
-- [ ] **Step 1: Add failing literal-pool vectors**
+- [x] **Step 1: Add failing literal-pool vectors**
 
 Add public-path verification tests for records containing:
 
@@ -174,7 +174,7 @@ cargo test --test bounded_failures --locked --offline utf16_literal_code_unit_li
 
 Expected: FAIL because decoded modules do not publish or validate the pool.
 
-- [ ] **Step 2: Add distinct literal identity and storage**
+- [x] **Step 2: Add distinct literal identity and storage**
 
 In `src/artifact/mod.rs`, add:
 
@@ -190,7 +190,7 @@ String(Utf16LiteralId),
 
 Do not decode records into owned `Vec<u16>` values. Their `ByteRange`s must continue to point into `DecodedArtifact.bytes`.
 
-- [ ] **Step 3: Validate and collect literal records before publishing a module**
+- [x] **Step 3: Validate and collect literal records before publishing a module**
 
 In `src/decode/records.rs`, find and decode `format::UTF16_LITERALS` for each module. Validate each record before `collect_ranges`:
 
@@ -210,7 +210,7 @@ add_to_limit(
 
 Use the existing raw-record ordering helper to require strict byte ordering and uniqueness. Empty records are valid, including in a non-empty pool. Keep `decode_string_table` unchanged and strict UTF-8.
 
-- [ ] **Step 4: Range-check string constant IDs against the new pool**
+- [x] **Step 4: Range-check string constant IDs against the new pool**
 
 Parse tag `6` as:
 
@@ -229,7 +229,7 @@ cargo test --test bounded_failures --locked --offline utf16_literal_code_unit_li
 
 Expected: PASS for all valid code-unit sequences and deterministic `BadRecord`/`LimitExceeded` for invalid structure or bounds.
 
-- [ ] **Step 5: Commit bounded literal decoding**
+- [x] **Step 5: Commit bounded literal decoding**
 
 Run:
 
@@ -247,7 +247,7 @@ git commit -m "feat(format): verify UTF-16 literal pools (#41)"
 - Modify: `src/decode/records.rs`
 - Modify: `src/test_encode.rs`
 
-- [ ] **Step 1: Add exact failing record tests**
+- [x] **Step 1: Add exact failing record tests**
 
 In the record decoder and test encoder tests, cover all boundary values:
 
@@ -266,7 +266,7 @@ cargo test --locked --offline test_encode::tests::constant -- --nocapture
 
 Expected: FAIL because tag `5` still reads and writes a `u32` scalar.
 
-- [ ] **Step 2: Replace Rust `char` in the artifact model**
+- [x] **Step 2: Replace Rust `char` in the artifact model**
 
 Change:
 
@@ -285,7 +285,7 @@ Constant::String(value) => {
 }
 ```
 
-- [ ] **Step 3: Make the test encoder preserve the literal pool**
+- [x] **Step 3: Make the test encoder preserve the literal pool**
 
 In `encode_module`, copy each `module.utf16_literals` range from the immutable artifact and emit `format::UTF16_LITERALS` after `EXCEPTIONS`. Its record count and bytes participate in `semantic_hash` exactly like every other semantic indexed section.
 
@@ -298,7 +298,7 @@ cargo test --locked --offline test_encode::tests -- --nocapture
 
 Expected: PASS, including exact three-byte records, isolated surrogates, and byte-for-byte re-encoding of literal records.
 
-- [ ] **Step 4: Commit the corrected records**
+- [x] **Step 4: Commit the corrected records**
 
 Run:
 
@@ -316,7 +316,7 @@ git commit -m "fix(format): encode Kotlin Char as u16 (#41)"
 - Modify as needed: `tests/golden_fixtures.rs`
 - Modify as needed: `tests/support/mod.rs`
 
-- [ ] **Step 1: Observe the stale-fixture failure**
+- [x] **Step 1: Observe the stale-fixture failure**
 
 Run:
 
@@ -326,7 +326,7 @@ cargo test --test golden_fixtures --locked --offline
 
 Expected: FAIL because committed pre-correction artifacts omit required section `0x010a` and their hashes no longer match.
 
-- [ ] **Step 2: Regenerate only through the committed generator**
+- [x] **Step 2: Regenerate only through the committed generator**
 
 Run:
 
@@ -336,7 +336,7 @@ cargo test --test golden_fixtures regenerate_committed_fixtures --locked --offli
 
 Expected: PASS and rewrite the `.cpkt`/manifest pairs.
 
-- [ ] **Step 3: Review deterministic changes**
+- [x] **Step 3: Review deterministic changes**
 
 Run:
 
@@ -348,7 +348,7 @@ cargo test --test golden_fixtures --locked --offline
 
 Expected: every module manifest contains required semantic `0x010a` after `0x0109`; offsets, module hashes, and content hashes change consistently; all fixture tests pass.
 
-- [ ] **Step 4: Commit regenerated artifacts**
+- [x] **Step 4: Commit regenerated artifacts**
 
 Run:
 
@@ -367,7 +367,7 @@ git commit -m "test(format): regenerate corrected artifact v1 fixtures (#41)"
 - Modify: `src/execution/machine.rs`
 - Modify: `src/execution/image.rs`
 
-- [ ] **Step 1: Add failing conversion tests**
+- [x] **Step 1: Add failing conversion tests**
 
 Replace scalar-validation tests with exact Kotlin truncation vectors:
 
@@ -389,7 +389,7 @@ cargo test --locked --offline execution::numeric::tests -- --nocapture
 
 Expected: FAIL because conversions currently return `Result<char, InvalidCharacter>`.
 
-- [ ] **Step 2: Implement total conversions and remove the obsolete trap**
+- [x] **Step 2: Implement total conversions and remove the obsolete trap**
 
 Use:
 
@@ -405,7 +405,7 @@ pub(super) fn char_to_i32(value: u16) -> i32 {
 
 Change `RuntimeValue::Char(char)` to `RuntimeValue::Char(u16)`. Remove `GuestTrap::InvalidCharacter`. In `machine.rs`, remove error mapping for `i32 -> char`; the conversion always publishes a value. Preserve the existing read-before-write behavior for aliased registers.
 
-- [ ] **Step 3: Make trace representation exactly two payload bytes**
+- [x] **Step 3: Make trace representation exactly two payload bytes**
 
 Keep the existing `Char` discriminant, return payload length `2`, and serialize `value.to_le_bytes()` without a `u32` widening. `trace_bits_u64` may zero-extend the `u16` for internal comparisons, but serialized trace bytes must not.
 
@@ -419,7 +419,7 @@ cargo test --locked --offline execution::image::tests -- --nocapture
 
 Expected: PASS with all 65,536 code units representable and no invalid-character guest path.
 
-- [ ] **Step 4: Commit runtime semantics**
+- [x] **Step 4: Commit runtime semantics**
 
 Run:
 
@@ -437,7 +437,7 @@ git commit -m "fix(vm): match Kotlin Char conversion semantics (#41)"
 - Modify: `src/execution/tests.rs`
 - Modify as needed: `src/verify/tests.rs`
 
-- [ ] **Step 1: Replace the invalid-character vector**
+- [x] **Step 1: Replace the invalid-character vector**
 
 Remove the vector expecting `GuestTrap::InvalidCharacter`. Add executable vectors for `-1`, `65535`, `65536`, `0xd800`, and a round trip `i32 -> char -> i32`. Use `u16` expectations and ensure the verifier still rejects every conversion pair except `i32 <-> char`.
 
@@ -450,7 +450,7 @@ cargo test --locked --offline verify::tests::cfg_accepts_i32_char_conversions --
 
 Expected: the semantic vector passes after updating expected values; old trace digest assertions fail because Char payloads shrink from four bytes to two.
 
-- [ ] **Step 2: Update trace assertions from observed canonical output**
+- [x] **Step 2: Update trace assertions from observed canonical output**
 
 Run the focused trace test with `--nocapture`, capture the digest produced by the corrected two-byte encoder, update only the corresponding expected digests, then prove debug/release agreement:
 
@@ -461,7 +461,7 @@ cargo test --release --locked --offline execution::tests::block_boundary_trace_d
 
 Expected: both modes pass with identical canonical digests.
 
-- [ ] **Step 3: Recheck allocation and execution determinism**
+- [x] **Step 3: Recheck allocation and execution determinism**
 
 Run:
 
@@ -472,7 +472,7 @@ cargo test --release --locked --offline execution::tests::scalar_control_steady_
 
 Expected: PASS; no steady-state allocations are introduced.
 
-- [ ] **Step 4: Commit conformance changes**
+- [x] **Step 4: Commit conformance changes**
 
 Run:
 
@@ -490,7 +490,7 @@ git commit -m "test(vm): lock UTF-16 Char conformance (#41)"
 - Modify: `docs/superpowers/plans/2026-08-22-issue-39-tier0-scalar-control-interpreter.md`
 - Modify as needed: `README.md`
 
-- [ ] **Step 1: Find all superseded claims**
+- [x] **Step 1: Find all superseded claims**
 
 Run:
 
@@ -500,13 +500,13 @@ rg -n "Unicode scalar|InvalidCharacter|Char\(char\)|CHAR|STRING|STRINGS|0x0109|f
 
 Expected: identify every statement that still treats Kotlin `Char` as a scalar, uses a four-byte CHAR payload, or sends guest string constants to metadata `STRINGS`.
 
-- [ ] **Step 2: Update the artifact and execution contracts**
+- [x] **Step 2: Update the artifact and execution contracts**
 
 In the #36 design, add `0x010a UTF16_LITERALS`, its indexed-record rules, the independent code-unit limit, the `Utf16LiteralId` payload, and three-byte CHAR record. In the #38 design, state low-16-bit truncation, zero extension, total conversion, and two-byte trace payload. In the completed #39 plan, annotate obsolete implementation snippets as superseded by issue #41 rather than leaving them as current guidance.
 
 Do not rewrite history to claim #39 initially implemented the corrected contract. Link the accepted #41 design wherever a prior statement is retained for historical context.
 
-- [ ] **Step 3: Prove no active documentation teaches the old ABI**
+- [x] **Step 3: Prove no active documentation teaches the old ABI**
 
 Run:
 
@@ -517,7 +517,7 @@ git diff --check
 
 Expected: no unqualified active contract remains; any match is explicitly marked superseded by #41.
 
-- [ ] **Step 4: Commit documentation reconciliation**
+- [x] **Step 4: Commit documentation reconciliation**
 
 Run:
 
@@ -533,7 +533,7 @@ git commit -m "docs(vm): align v1 text semantics with Kotlin (#41)"
 - Modify only if a gate exposes a defect: files already owned by Tasks 2-8
 - Update: `docs/superpowers/plans/2026-08-22-issue-41-kotlin-char-utf16-literals.md` checkbox state
 
-- [ ] **Step 1: Run formatting, lint, and all debug tests**
+- [x] **Step 1: Run formatting, lint, and all debug tests**
 
 Run:
 
@@ -546,7 +546,7 @@ cargo test --test golden_fixtures --locked --offline
 
 Expected: all commands pass with no warnings.
 
-- [ ] **Step 2: Run release-mode safety and semantic gates**
+- [x] **Step 2: Run release-mode safety and semantic gates**
 
 Run:
 
@@ -557,7 +557,7 @@ cargo test --release --locked --offline execution::tests -- --nocapture --test-t
 
 Expected: PASS with the same Kotlin Char results and trace digests as debug mode.
 
-- [ ] **Step 3: Inspect the public API boundary**
+- [x] **Step 3: Inspect the public API boundary**
 
 Run:
 
@@ -568,7 +568,7 @@ rg -n "Utf16LiteralId|RuntimeValue|DecodedModule|UTF16_LITERALS" target/doc/comp
 
 Expected: documentation succeeds and `rg` finds no newly public internal representation. `ArtifactLimits::utf16_literal_code_units` is the only intended new public item.
 
-- [ ] **Step 4: Verify the diff and commit plan completion**
+- [x] **Step 4: Verify the diff and commit plan completion**
 
 Mark completed checkboxes only after their commands passed, then run:
 
@@ -583,7 +583,7 @@ git push origin main
 
 Expected: clean worktree after push and all issue #41 commits present on `origin/main`.
 
-- [ ] **Step 5: Close #41 and unblock #40**
+- [x] **Step 5: Close #41 and unblock #40**
 
 Using `gh` outside the sandbox, comment on #41 with the commit range and exact verification commands, close it as completed, and set its project item to `Done`. Move #40 from `Next` to `Now`, since the text ABI prerequisite is now fixed. Confirm both issue and project state with read-only `gh` queries.
 
