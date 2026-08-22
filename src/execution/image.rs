@@ -228,6 +228,7 @@ pub(super) struct ResolvedBlock {
 #[derive(Debug)]
 pub(super) struct ResolvedHostReference {
     pub value: ReferenceValue,
+    pub ty: TypeKey,
     pub live: bool,
     pub assignable_to: Box<[TypeKey]>,
 }
@@ -407,12 +408,9 @@ impl ExecutionImage {
             }
             let assignable_to = assignable_types(decoded, reference.ty)?;
             host_references.push(ResolvedHostReference {
-                value: ReferenceValue {
-                    image: artifact.content_hash(),
-                    ty: reference.ty,
-                    handle: reference.handle,
-                    generation: reference.generation,
-                },
+                value: ReferenceValue::host(reference.handle, reference.generation)
+                    .ok_or(AdmissionError::StoragePlanOverflow)?,
+                ty: reference.ty,
                 live: reference.live,
                 assignable_to,
             });
@@ -497,9 +495,22 @@ impl ExecutionImage {
     }
 
     pub(super) fn host_reference(&self, value: ReferenceValue) -> Option<&ResolvedHostReference> {
-        self.0.host_references.iter().find(|reference| {
-            reference.value.handle == value.handle && reference.value.generation == value.generation
-        })
+        self.0
+            .host_references
+            .iter()
+            .find(|reference| reference.value == value)
+    }
+
+    pub(super) fn reference_type(&self, value: ReferenceValue) -> Option<TypeKey> {
+        match value.domain() {
+            super::value::ReferenceDomain::Host => self
+                .host_reference(value)
+                .filter(|entry| entry.live)
+                .map(|entry| entry.ty),
+            super::value::ReferenceDomain::Managed
+            | super::value::ReferenceDomain::Literal
+            | super::value::ReferenceDomain::Emergency => None,
+        }
     }
 
     pub(super) fn storage_plan(&self) -> StoragePlan {

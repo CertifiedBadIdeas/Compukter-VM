@@ -98,7 +98,7 @@ impl Machine {
             .zip(&entry.registers[..entry.parameter_count])
             .enumerate()
         {
-            self.validate_argument(parameter as u16, argument.0, *expected)?;
+            self.validate_argument(parameter as u16, *argument, *expected)?;
         }
 
         let entry = self
@@ -115,7 +115,7 @@ impl Machine {
         let width = self.image.registers_per_frame();
         self.registers[..width].fill(RegisterValue::Uninitialized);
         for (slot, argument) in self.registers.iter_mut().zip(arguments) {
-            *slot = RegisterValue::Initialized(argument.0);
+            *slot = RegisterValue::Initialized(argument.value);
         }
         self.frame_depth = 1;
         self.maximum_observed_frame_depth = 1;
@@ -430,7 +430,7 @@ impl Machine {
                 .checked_mul(width)
                 .ok_or(RunError::NotRunnable)?;
             for register in &self.registers[base..base + active_function.register_count] {
-                trace_register(&mut self.trace, *register);
+                trace_register(&mut self.trace, *register, &self.image)?;
             }
         }
         Ok(())
@@ -439,9 +439,10 @@ impl Machine {
     fn validate_argument(
         &self,
         parameter: u16,
-        value: RuntimeValue,
+        argument: EntryArgument,
         expected: ResolvedValueType,
     ) -> Result<(), RunError> {
+        let value = argument.value;
         let primitive_matches = matches!(
             (expected.kind, value),
             (1, RuntimeValue::I32(_))
@@ -457,14 +458,14 @@ impl Machine {
         match value {
             RuntimeValue::Null if expected.kind == 7 && expected.nullable => Ok(()),
             RuntimeValue::Reference(value) if expected.kind == 7 => {
-                if value.image != self.image.content_hash() {
+                if argument.owner != Some(self.image.content_hash()) {
                     return Err(RunError::ForeignReference { parameter });
                 }
                 let admitted = self
                     .image
                     .host_reference(value)
                     .ok_or(RunError::DeadReference { parameter })?;
-                if !admitted.live || admitted.value.ty != value.ty {
+                if !admitted.live {
                     return Err(RunError::DeadReference { parameter });
                 }
                 let expected_type = expected.nominal.ok_or(RunError::EntryType { parameter })?;
@@ -521,7 +522,11 @@ fn trace_field(trace: &mut Sha256, bytes: &[u8]) {
     trace.update(bytes);
 }
 
-fn trace_register(trace: &mut Sha256, register: RegisterValue) {
+fn trace_register(
+    trace: &mut Sha256,
+    register: RegisterValue,
+    image: &ExecutionImage,
+) -> Result<(), RunError> {
     match register {
         RegisterValue::Uninitialized => trace_field(trace, &[0]),
         RegisterValue::Initialized(value) => {
@@ -536,14 +541,16 @@ fn trace_register(trace: &mut Sha256, register: RegisterValue) {
                 RuntimeValue::Char(value) => trace.update(value.to_le_bytes()),
                 RuntimeValue::Null => {}
                 RuntimeValue::Reference(value) => {
-                    trace.update(value.ty.module.to_le_bytes());
-                    trace.update(value.ty.ty.to_le_bytes());
-                    trace.update(value.handle.to_le_bytes());
-                    trace.update(value.generation.to_le_bytes());
+                    let ty = image.reference_type(value).ok_or(RunError::NotRunnable)?;
+                    trace.update(ty.module.to_le_bytes());
+                    trace.update(ty.ty.to_le_bytes());
+                    trace.update(value.slot().to_le_bytes());
+                    trace.update(value.generation().to_le_bytes());
                 }
             }
         }
     }
+    Ok(())
 }
 
 enum InstructionFailure {

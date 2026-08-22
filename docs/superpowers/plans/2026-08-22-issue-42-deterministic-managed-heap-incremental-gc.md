@@ -160,7 +160,7 @@ git commit -m "feat(vm): admit portable managed layouts (#42)"
 - Modify: `src/execution/tests.rs`
 - Modify: `src/execution/fixtures.rs`
 
-- [ ] **Step 1: Write failing token and entry-owner tests**
+- [x] **Step 1: Write failing token and entry-owner tests**
 
 Cover all four domains, the `2^30 - 1` slot limit, generation equality,
 cross-image entry rejection, stale admitted-host references, and unchanged
@@ -172,14 +172,14 @@ assert_ne!(managed(1, 7), literal(1));
 assert_eq!(ReferenceDomain::Managed, managed(1, 7).domain());
 ```
 
-- [ ] **Step 2: Prove the red state**
+- [x] **Step 2: Prove the red state**
 
 Run: `cargo test --locked --offline execution::tests::compact_reference -- --nocapture`
 
 Expected: FAIL because the current reference stores image and type metadata and
 is larger than eight bytes.
 
-- [ ] **Step 3: Implement the exact private token**
+- [x] **Step 3: Implement the exact private token**
 
 Define `ReferenceValue { tagged_slot: u32, generation: u32 }`, two high-bit
 domain tags, checked constructors, and accessors. Move entry ownership to
@@ -188,13 +188,13 @@ reference dynamic type through the image host/literal descriptors or the heap
 handle table. Adapt trace encoding to receive the resolved `TypeKey` while
 preserving the existing 16-byte symbolic trace payload.
 
-- [ ] **Step 4: Run reference, trace, release, and full tests**
+- [x] **Step 4: Run reference, trace, release, and full tests**
 
 Run: `cargo test --locked --offline execution::tests::references -- --nocapture && cargo test --locked --offline execution::tests::block_boundary_trace -- --nocapture && cargo test --release --locked --offline execution::tests::block_boundary_trace -- --nocapture && cargo test --locked --offline`
 
 Expected: all tests PASS and existing trace digests remain unchanged.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/execution/value.rs src/execution/image.rs src/execution/machine.rs src/execution/tests.rs src/execution/fixtures.rs

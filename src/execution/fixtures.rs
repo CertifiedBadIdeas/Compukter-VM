@@ -421,8 +421,8 @@ pub(super) fn branch_switch_artifact(key: i32) -> (VerifiedArtifact, Box<[EntryA
     (
         artifact,
         Box::new([
-            EntryArgument(RuntimeValue::Bool(key == 0)),
-            EntryArgument(RuntimeValue::I32(key)),
+            EntryArgument::unowned(RuntimeValue::Bool(key == 0)),
+            EntryArgument::unowned(RuntimeValue::I32(key)),
         ]),
     )
 }
@@ -570,7 +570,7 @@ pub(super) fn scalar_cases() -> Vec<ScalarCase> {
                 Vec::new(),
                 instructions,
             ),
-            args: args.into_iter().map(EntryArgument).collect(),
+            args: args.into_iter().map(EntryArgument::unowned).collect(),
             expected,
             expected_fixed_cost: cost,
         }
@@ -793,10 +793,10 @@ pub(super) fn typed_entry_artifact() -> VerifiedArtifact {
 
 pub(super) fn reference_entry_case() -> (
     ExecutionImage,
-    RuntimeValue,
-    RuntimeValue,
-    RuntimeValue,
-    RuntimeValue,
+    EntryArgument,
+    EntryArgument,
+    EntryArgument,
+    EntryArgument,
 ) {
     let artifact = verified_mutated(|artifact| {
         artifact.modules[0].types[0] = NominalType::Function {
@@ -849,13 +849,11 @@ pub(super) fn reference_entry_case() -> (
         },
     ]);
     let image = ExecutionImage::admit(artifact, profile).unwrap();
-    let reference = |image, handle, generation| {
-        RuntimeValue::Reference(ReferenceValue {
-            image,
-            ty,
-            handle,
-            generation,
-        })
+    let reference = |owner, handle, generation| {
+        EntryArgument::owned(
+            owner,
+            RuntimeValue::Reference(ReferenceValue::host(handle, generation).unwrap()),
+        )
     };
     (
         image,
