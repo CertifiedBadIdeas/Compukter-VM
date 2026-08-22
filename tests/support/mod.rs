@@ -44,6 +44,15 @@ pub(crate) fn minimal_vector() -> Vec<u8> {
 }
 
 #[allow(dead_code)]
+pub(crate) fn executable_minimal_vector() -> Vec<u8> {
+    let mut bytes = minimal_vector();
+    let manifest = section_offset(&bytes, 0x0001, 0);
+    bytes[manifest + 4..manifest + 8].copy_from_slice(&32_u32.to_le_bytes());
+    rehash(&mut bytes);
+    bytes
+}
+
+#[allow(dead_code)]
 pub(crate) fn bounded_vector() -> Vec<u8> {
     let strings = indexed(&[b"app", b"entry"]);
     let empty = indexed(&[]);
@@ -266,6 +275,15 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
         (0x010a, empty.clone(), 0),
     ];
     single_module_artifact(semantic_sections, None, 1 << 0, 1, 3, 10)
+}
+
+#[allow(dead_code)]
+pub(crate) fn executable_language_runtime_vector() -> Vec<u8> {
+    let mut bytes = language_runtime_vector();
+    let manifest = section_offset(&bytes, 0x0001, 0);
+    bytes[manifest + 4..manifest + 8].copy_from_slice(&160_u32.to_le_bytes());
+    rehash(&mut bytes);
+    bytes
 }
 
 #[allow(dead_code)]

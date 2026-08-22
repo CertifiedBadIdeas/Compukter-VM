@@ -4,12 +4,18 @@ mod error;
 mod gc;
 mod heap;
 mod heap_ops;
+mod host;
 mod image;
 mod layout;
 mod machine;
 mod numeric;
+mod session;
 mod text;
 mod value;
+
+pub use error::{AdmissionError, RunError};
+pub use host::{CapabilityBinding, EntryValue, ExecutionProfile, HostValueType, OperationSchema};
+pub use session::Session;
 
 #[cfg(test)]
 mod fixtures;
@@ -17,6 +23,8 @@ mod fixtures;
 mod gc_tests;
 #[cfg(test)]
 mod heap_tests;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

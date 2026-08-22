@@ -158,6 +158,81 @@ pub(super) fn empty_loop_artifact(cost: u32) -> VerifiedArtifact {
     )
 }
 
+pub(super) fn capability_artifact(
+    asynchronous: bool,
+    required: bool,
+    operation_count: u32,
+    operation: u32,
+) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.capabilities.push(crate::artifact::Capability {
+            namespace: 0,
+            name: 1,
+            abi_major: 1,
+            minimum_abi_minor: 2,
+            flags: if required { 1 } else { 2 },
+            operation_count,
+        });
+        artifact.header.semantic_features = if asynchronous { 0b110 } else { 0b100 };
+        artifact.manifest.required_capabilities = u32::from(required);
+        artifact.manifest.optional_capabilities = u32::from(!required);
+        artifact.manifest.maximum_host_requests = 1;
+        artifact.manifest.required_stack_bytes = 32;
+        artifact.modules[0].functions[0].flags = u32::from(asynchronous);
+        let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+            unreachable!();
+        };
+        *flags = u16::from(asynchronous);
+        let function = &mut artifact.modules[0].functions[0];
+        function.first_block = BlockId(0);
+        function.block_count = if asynchronous { 2 } else { 1 };
+        let call = if asynchronous {
+            Instruction::CapabilityCallAsync {
+                dst: u16::MAX,
+                capability: 0,
+                operation,
+                args: Box::new([]),
+                resume_block: 1,
+            }
+        } else {
+            Instruction::CapabilityCallSync {
+                dst: u16::MAX,
+                capability: 0,
+                operation,
+                args: Box::new([]),
+            }
+        };
+        let mut first = vec![call];
+        if !asynchronous {
+            first.push(Instruction::Return { value: u16::MAX });
+        }
+        let first_cost = first
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        artifact.modules[0].blocks[0].instruction_count = first.len() as u32;
+        artifact.modules[0].blocks[0].declared_fixed_cost = first_cost;
+        artifact.modules[0].code[0].instructions = first.into_boxed_slice();
+        artifact.modules[0].code[0].fixed_cost = first_cost;
+        if asynchronous {
+            artifact.modules[0].blocks.push(Block {
+                owner_function: FunctionId(0),
+                code_record: BlockId(1),
+                instruction_count: 1,
+                declared_fixed_cost: 1,
+                flags: 0,
+            });
+            artifact.modules[0].code.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: vec![Instruction::Return { value: u16::MAX }].into_boxed_slice(),
+                fixed_cost: 1,
+            });
+        }
+        artifact.manifest.maximum_block_cost = first_cost;
+        artifact.manifest.minimum_slice_cost = artifact.manifest.maximum_block_cost;
+    })
+}
+
 pub(super) fn allocation_workloads() -> Vec<VerifiedArtifact> {
     vec![empty_loop_artifact(3), arithmetic_loop_artifact()]
 }

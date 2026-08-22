@@ -1,25 +1,61 @@
 use super::value::{ReferenceValue, RuntimeValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AdmissionError {
+pub enum AdmissionError {
     CompilerAbiMismatch,
     StandardLibraryAbiMismatch,
-    MissingCapability { index: u8 },
-    HeapLimit { required: u32, available: u32 },
-    InvalidHeapSize { supplied: u32 },
-    FrameStorageLimit { required: u64, available: u64 },
-    CallDepthLimit { required: u32, available: u32 },
-    CoroutineLimit { required: u32, available: u32 },
-    HostRequestLimit { required: u32, available: u32 },
-    EventLimit { required: u32, available: u32 },
-    SliceLimit { required: u32, available: u32 },
+    MissingCapability {
+        index: u8,
+    },
+    HeapLimit {
+        required: u32,
+        available: u32,
+    },
+    InvalidHeapSize {
+        supplied: u32,
+    },
+    FrameStorageLimit {
+        required: u64,
+        available: u64,
+    },
+    CallDepthLimit {
+        required: u32,
+        available: u32,
+    },
+    CoroutineLimit {
+        required: u32,
+        available: u32,
+    },
+    HostRequestLimit {
+        required: u32,
+        available: u32,
+    },
+    EventLimit {
+        required: u32,
+        available: u32,
+    },
+    SliceLimit {
+        required: u32,
+        available: u32,
+    },
     StoragePlanOverflow,
     AllocationFailed,
     InvalidEntry,
+    DuplicateCapabilityBinding,
+    CapabilityOperationCount {
+        capability: u32,
+        required: u32,
+        available: u32,
+    },
+    CapabilitySchema {
+        capability: u32,
+        operation: u32,
+    },
+    SynchronousCapabilityUnsupported,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RunError {
+pub enum RunError {
     AlreadyStarted,
     NotStarted,
     NotRunnable,
