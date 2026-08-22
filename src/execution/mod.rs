@@ -2,11 +2,14 @@
 
 mod error;
 mod image;
+mod machine;
 mod numeric;
 mod value;
 
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct FunctionKey {

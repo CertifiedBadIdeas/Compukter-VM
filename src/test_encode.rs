@@ -83,6 +83,27 @@ pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, Enc
     )
 }
 
+pub(crate) fn encode_artifact_rehashed(
+    mut artifact: DecodedArtifact,
+) -> Result<Vec<u8>, EncodeError> {
+    let hashes = artifact
+        .modules
+        .iter()
+        .map(|module| encode_module(&artifact, module).map(|(_, hash)| hash))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (module, hash) in artifact.modules.iter_mut().zip(&hashes) {
+        module.semantic_hash = *hash;
+    }
+    for module in &mut artifact.modules {
+        for import in &mut module.imports {
+            import.target_hash = *hashes
+                .get(import.target_module.0 as usize)
+                .ok_or(EncodeError("import target module is out of range"))?;
+        }
+    }
+    encode_artifact(&artifact)
+}
+
 fn encode_module(
     artifact: &DecodedArtifact,
     module: &DecodedModule,
