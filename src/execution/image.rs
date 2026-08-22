@@ -203,6 +203,48 @@ pub(super) enum ResolvedInstruction {
         ty: TypeKey,
         length: u16,
     },
+    StaticGet {
+        dst: u16,
+        field: ResolvedField,
+    },
+    StaticSet {
+        field: ResolvedField,
+        value: u16,
+    },
+    FieldGet {
+        dst: u16,
+        receiver: u16,
+        field: ResolvedField,
+    },
+    FieldSet {
+        receiver: u16,
+        field: ResolvedField,
+        value: u16,
+    },
+    IsType {
+        dst: u16,
+        value: u16,
+        ty: TypeKey,
+    },
+    ArrayLength {
+        dst: u16,
+        array: u16,
+    },
+    ArrayLoad {
+        dst: u16,
+        array: u16,
+        index: u16,
+    },
+    ArrayStore {
+        array: u16,
+        index: u16,
+        value: u16,
+    },
+    CheckedCast {
+        dst: u16,
+        value: u16,
+        ty: TypeKey,
+    },
     CallDirect {
         dst: u16,
         target: usize,
@@ -272,6 +314,8 @@ struct ExecutionImageInner {
     host_references: Box<[ResolvedHostReference]>,
     type_offsets: Box<[usize]>,
     type_layouts: Box<[RuntimeTypeLayout]>,
+    assignable_types: Box<[Box<[TypeKey]>]>,
+    array_element_types: Box<[Option<ResolvedValueType>]>,
     fields: Box<[ResolvedField]>,
     literals: Box<[ResolvedLiteral]>,
     literal_ids: Box<[usize]>,
@@ -303,6 +347,31 @@ impl ExecutionImage {
                 .map(|module| module.utf16_literals.len()),
         )?;
         let type_layouts = derive_type_layouts(decoded, &type_offsets, &field_offsets)?;
+        let mut assignable_type_sets =
+            reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+        for (module, nominal_types) in decoded.modules.iter().enumerate() {
+            for ty in 0..nominal_types.types.len() {
+                assignable_type_sets.push(assignable_types(
+                    decoded,
+                    TypeKey {
+                        module: checked_u32(module)?,
+                        ty: checked_u32(ty)?,
+                    },
+                )?);
+            }
+        }
+        let mut array_element_types =
+            reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+        for (module, nominal_types) in decoded.modules.iter().enumerate() {
+            for nominal in &nominal_types.types {
+                array_element_types.push(match nominal {
+                    NominalType::Array { element, .. } => {
+                        Some(resolve_value_type(decoded, module, *element)?)
+                    }
+                    _ => None,
+                });
+            }
+        }
         let (fields, static_slot_count) =
             resolve_fields(decoded, &type_offsets, &field_offsets, &type_layouts)?;
         let (literals, literal_ids) = resolve_literals(decoded, &literal_offsets)?;
@@ -378,6 +447,13 @@ impl ExecutionImage {
         }
 
         let mut blocks = reserved(*block_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+        let instruction_resolution = InstructionResolution {
+            function_offsets: &function_offsets,
+            block_offsets: &block_offsets,
+            constant_offsets: &constant_offsets,
+            field_offsets: &field_offsets,
+            fields: &fields,
+        };
         for (module_id, module) in decoded.modules.iter().enumerate() {
             for (block_id, block) in module.blocks.iter().enumerate() {
                 let function = function_offsets[module_id]
@@ -392,9 +468,7 @@ impl ExecutionImage {
                     instructions.push(resolve_instruction(
                         decoded,
                         module_id,
-                        &function_offsets,
-                        &block_offsets,
-                        &constant_offsets,
+                        &instruction_resolution,
                         instruction,
                     )?);
                 }
@@ -448,6 +522,8 @@ impl ExecutionImage {
             host_references: host_references.into_boxed_slice(),
             type_offsets,
             type_layouts,
+            assignable_types: assignable_type_sets.into_boxed_slice(),
+            array_element_types: array_element_types.into_boxed_slice(),
             fields,
             literals,
             literal_ids,
@@ -531,8 +607,23 @@ impl ExecutionImage {
         self.0.type_layouts.get(index)
     }
 
+    pub(super) fn is_assignable(&self, actual: TypeKey, target: TypeKey) -> bool {
+        checked_global_index(&self.0.type_offsets, actual)
+            .and_then(|index| self.0.assignable_types.get(index))
+            .is_some_and(|types| types.contains(&target))
+    }
+
+    pub(super) fn array_element_type(&self, array: TypeKey) -> Option<ResolvedValueType> {
+        let index = checked_global_index(&self.0.type_offsets, array)?;
+        self.0.array_element_types.get(index).copied().flatten()
+    }
+
     pub(super) fn field(&self, index: usize) -> Option<&ResolvedField> {
         self.0.fields.get(index)
+    }
+
+    pub(super) fn fields(&self) -> &[ResolvedField] {
+        &self.0.fields
     }
 
     pub(super) fn literal(&self, index: usize) -> Option<&ResolvedLiteral> {
@@ -1080,12 +1171,68 @@ fn resolve_function(
         })
 }
 
+fn resolve_field_index(
+    artifact: &DecodedArtifact,
+    module: usize,
+    field_offsets: &[usize],
+    reference: u32,
+) -> Result<usize, AdmissionError> {
+    let (target_module, local_field) = if reference & 0x8000_0000 == 0 {
+        (module, reference)
+    } else {
+        let import = artifact
+            .modules
+            .get(module)
+            .and_then(|module| module.imports.get((reference & 0x7fff_ffff) as usize))
+            .filter(|import| import.kind == 2)
+            .ok_or(AdmissionError::InvalidEntry)?;
+        let target_module = import.target_module.0 as usize;
+        let target = artifact
+            .modules
+            .get(target_module)
+            .ok_or(AdmissionError::InvalidEntry)?;
+        let import_name = target
+            .strings
+            .get(import.target_name as usize)
+            .ok_or(AdmissionError::InvalidEntry)?
+            .slice(&artifact.bytes);
+        let export = target
+            .exports
+            .iter()
+            .find(|export| {
+                export.kind == 2
+                    && target
+                        .strings
+                        .get(export.name as usize)
+                        .is_some_and(|range| range.slice(&artifact.bytes) == import_name)
+            })
+            .ok_or(AdmissionError::InvalidEntry)?;
+        (target_module, export.local_symbol)
+    };
+    let start = *field_offsets
+        .get(target_module)
+        .ok_or(AdmissionError::InvalidEntry)?;
+    let end = *field_offsets
+        .get(target_module + 1)
+        .ok_or(AdmissionError::InvalidEntry)?;
+    start
+        .checked_add(local_field as usize)
+        .filter(|index| *index < end)
+        .ok_or(AdmissionError::InvalidEntry)
+}
+
+struct InstructionResolution<'a> {
+    function_offsets: &'a [usize],
+    block_offsets: &'a [usize],
+    constant_offsets: &'a [usize],
+    field_offsets: &'a [usize],
+    fields: &'a [ResolvedField],
+}
+
 fn resolve_instruction(
     artifact: &DecodedArtifact,
     module: usize,
-    function_offsets: &[usize],
-    block_offsets: &[usize],
-    constant_offsets: &[usize],
+    resolution: &InstructionResolution<'_>,
     instruction: &Instruction,
 ) -> Result<ResolvedInstruction, AdmissionError> {
     macro_rules! binary {
@@ -1099,7 +1246,7 @@ fn resolve_instruction(
         };
     }
     let block = |target: u32| {
-        block_offsets[module]
+        resolution.block_offsets[module]
             .checked_add(target as usize)
             .ok_or(AdmissionError::StoragePlanOverflow)
     };
@@ -1111,7 +1258,7 @@ fn resolve_instruction(
         },
         Instruction::Const { dst, constant } => ResolvedInstruction::Const {
             dst: *dst,
-            constant: constant_offsets[module]
+            constant: resolution.constant_offsets[module]
                 .checked_add(*constant as usize)
                 .ok_or(AdmissionError::StoragePlanOverflow)?,
         },
@@ -1252,6 +1399,102 @@ fn resolve_instruction(
                 .ok_or(AdmissionError::InvalidEntry)?,
             length: *length,
         },
+        Instruction::StaticGet { dst, field_ref } => ResolvedInstruction::StaticGet {
+            dst: *dst,
+            field: *resolution
+                .fields
+                .get(resolve_field_index(
+                    artifact,
+                    module,
+                    resolution.field_offsets,
+                    *field_ref,
+                )?)
+                .ok_or(AdmissionError::InvalidEntry)?,
+        },
+        Instruction::StaticSet { field_ref, value } => ResolvedInstruction::StaticSet {
+            field: *resolution
+                .fields
+                .get(resolve_field_index(
+                    artifact,
+                    module,
+                    resolution.field_offsets,
+                    *field_ref,
+                )?)
+                .ok_or(AdmissionError::InvalidEntry)?,
+            value: *value,
+        },
+        Instruction::FieldGet {
+            dst,
+            receiver,
+            field_ref,
+        } => ResolvedInstruction::FieldGet {
+            dst: *dst,
+            receiver: *receiver,
+            field: *resolution
+                .fields
+                .get(resolve_field_index(
+                    artifact,
+                    module,
+                    resolution.field_offsets,
+                    *field_ref,
+                )?)
+                .ok_or(AdmissionError::InvalidEntry)?,
+        },
+        Instruction::FieldSet {
+            receiver,
+            field_ref,
+            value,
+        } => ResolvedInstruction::FieldSet {
+            receiver: *receiver,
+            field: *resolution
+                .fields
+                .get(resolve_field_index(
+                    artifact,
+                    module,
+                    resolution.field_offsets,
+                    *field_ref,
+                )?)
+                .ok_or(AdmissionError::InvalidEntry)?,
+            value: *value,
+        },
+        Instruction::IsType {
+            dst,
+            value,
+            type_ref,
+        } => ResolvedInstruction::IsType {
+            dst: *dst,
+            value: *value,
+            ty: resolve_type(artifact, module, TypeId(*type_ref))
+                .ok_or(AdmissionError::InvalidEntry)?,
+        },
+        Instruction::ArrayLength { dst, array } => ResolvedInstruction::ArrayLength {
+            dst: *dst,
+            array: *array,
+        },
+        Instruction::ArrayLoad { dst, array, index } => ResolvedInstruction::ArrayLoad {
+            dst: *dst,
+            array: *array,
+            index: *index,
+        },
+        Instruction::ArrayStore {
+            array,
+            index,
+            value,
+        } => ResolvedInstruction::ArrayStore {
+            array: *array,
+            index: *index,
+            value: *value,
+        },
+        Instruction::CheckedCast {
+            dst,
+            value,
+            type_ref,
+        } => ResolvedInstruction::CheckedCast {
+            dst: *dst,
+            value: *value,
+            ty: resolve_type(artifact, module, TypeId(*type_ref))
+                .ok_or(AdmissionError::InvalidEntry)?,
+        },
         Instruction::CallDirect {
             dst,
             function_ref,
@@ -1259,7 +1502,7 @@ fn resolve_instruction(
         } => {
             let key = resolve_function(artifact, module, *function_ref)
                 .ok_or(AdmissionError::InvalidEntry)?;
-            let target = function_offsets[key.module as usize]
+            let target = resolution.function_offsets[key.module as usize]
                 .checked_add(key.function as usize)
                 .ok_or(AdmissionError::StoragePlanOverflow)?;
             ResolvedInstruction::CallDirect {

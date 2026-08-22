@@ -12,7 +12,7 @@ use super::{
         RuntimeTypeLayout, StoragePlan, StringEncoding, ValueWidth,
     },
     machine::Machine,
-    value::RuntimeValue,
+    value::{EntryArgument, RuntimeValue},
     TypeKey,
 };
 use crate::artifact::ByteRange;
@@ -502,4 +502,209 @@ fn allocation_zeroes_minimum_object_padding_without_dynamic_charge() {
     assert_eq!(0, used);
     let payload = heap.test_managed_payload(reference.unwrap()).unwrap();
     assert!(payload.iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn heap_instructions_static_opcodes_are_admitted() {
+    assert!(
+        ExecutionImage::admit(fixtures::static_roundtrip_artifact(), fixtures::profile(),).is_ok()
+    );
+}
+
+#[test]
+fn heap_instructions_statics_are_zeroed_and_isolated_per_instance() {
+    let image =
+        ExecutionImage::admit(fixtures::static_roundtrip_artifact(), fixtures::profile()).unwrap();
+    let run = |write, value| {
+        let mut machine = Machine::new(image.clone()).unwrap();
+        machine
+            .start(&[
+                EntryArgument::unowned(RuntimeValue::Bool(write)),
+                EntryArgument::unowned(RuntimeValue::I32(value)),
+            ])
+            .unwrap();
+        machine.run_slice(32).unwrap()
+    };
+
+    assert_eq!(Outcome::Halted(Some(RuntimeValue::I32(42))), run(true, 42));
+    assert_eq!(Outcome::Halted(Some(RuntimeValue::I32(0))), run(false, 99));
+}
+
+#[test]
+fn heap_instructions_use_inherited_fields_and_interface_closure() {
+    let image = ExecutionImage::admit(fixtures::field_roundtrip_artifact(), fixtures::profile())
+        .expect("field and type opcodes must be admitted");
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::I32(42))),
+        machine.run_slice(64).unwrap()
+    );
+    assert_eq!(Some(RuntimeValue::Bool(true)), machine.test_register(3));
+}
+
+#[test]
+fn heap_instructions_round_trip_every_primitive_array_width() {
+    for (artifact, expected) in fixtures::primitive_array_roundtrip_cases() {
+        let image = ExecutionImage::admit(artifact, fixtures::profile())
+            .expect("array instructions must be admitted");
+        let mut machine = Machine::new(image).unwrap();
+        machine.start(&[]).unwrap();
+        assert_eq!(
+            Outcome::Halted(Some(expected)),
+            machine.run_slice(64).unwrap()
+        );
+        assert_eq!(Some(RuntimeValue::I32(1)), machine.test_register(5));
+    }
+}
+
+#[test]
+fn heap_instructions_round_trip_reference_arrays() {
+    let image = ExecutionImage::admit(
+        fixtures::reference_array_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    let Outcome::Halted(Some(RuntimeValue::Reference(returned))) = machine.run_slice(64).unwrap()
+    else {
+        panic!("reference array must return its stored reference")
+    };
+    let RuntimeValue::Reference(source) = machine.test_register(2).unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(source, returned);
+}
+
+#[test]
+fn heap_instructions_bounds_fail_before_destination_publication() {
+    let image =
+        ExecutionImage::admit(fixtures::array_bounds_artifact(), fixtures::profile()).unwrap();
+    for index in [-1, 1] {
+        let mut machine = Machine::new(image.clone()).unwrap();
+        machine
+            .start(&[EntryArgument::unowned(RuntimeValue::I32(index))])
+            .unwrap();
+        assert_eq!(
+            Outcome::Crashed(GuestTrap::IndexOutOfBounds),
+            machine.run_slice(64).unwrap()
+        );
+        assert_eq!(Some(RuntimeValue::I32(99)), machine.test_register(2));
+    }
+}
+
+#[test]
+fn heap_instructions_nonnull_zero_reference_traps_without_publication() {
+    let image = ExecutionImage::admit(fixtures::nonnull_zero_field_artifact(), fixtures::profile())
+        .unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::NullReference),
+        machine.run_slice(64).unwrap()
+    );
+    assert_eq!(None, machine.test_register(1));
+}
+
+#[test]
+fn heap_instructions_checked_cast_handles_nullability_and_incompatibility() {
+    let nullable =
+        ExecutionImage::admit(fixtures::nullable_cast_artifact(true), fixtures::profile()).unwrap();
+    let mut machine = Machine::new(nullable).unwrap();
+    machine
+        .start(&[EntryArgument::unowned(RuntimeValue::Null)])
+        .unwrap();
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::Null)),
+        machine.run_slice(32).unwrap()
+    );
+
+    let nonnull =
+        ExecutionImage::admit(fixtures::nullable_cast_artifact(false), fixtures::profile())
+            .unwrap();
+    let mut machine = Machine::new(nonnull).unwrap();
+    machine
+        .start(&[EntryArgument::unowned(RuntimeValue::Null)])
+        .unwrap();
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::NullReference),
+        machine.run_slice(32).unwrap()
+    );
+    assert_eq!(None, machine.test_register(1));
+
+    let incompatible =
+        ExecutionImage::admit(fixtures::incompatible_cast_artifact(), fixtures::profile()).unwrap();
+    let mut machine = Machine::new(incompatible).unwrap();
+    machine.start(&[]).unwrap();
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::ClassCast),
+        machine.run_slice(32).unwrap()
+    );
+    assert_eq!(None, machine.test_register(1));
+}
+
+#[test]
+fn heap_instructions_round_trip_reference_fields() {
+    let image = ExecutionImage::admit(
+        fixtures::reference_field_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    let Outcome::Halted(Some(RuntimeValue::Reference(returned))) = machine.run_slice(64).unwrap()
+    else {
+        panic!("reference field must return its stored reference")
+    };
+    let RuntimeValue::Reference(source) = machine.test_register(1).unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(source, returned);
+}
+
+#[test]
+fn heap_instructions_failed_array_store_is_atomic() {
+    let image = ExecutionImage::admit(fixtures::failed_array_store_artifact(), fixtures::profile())
+        .unwrap();
+    for index in [-1, 1] {
+        let mut machine = Machine::new(image.clone()).unwrap();
+        machine
+            .start(&[EntryArgument::unowned(RuntimeValue::I32(index))])
+            .unwrap();
+        assert_eq!(
+            Outcome::Crashed(GuestTrap::IndexOutOfBounds),
+            machine.run_slice(64).unwrap()
+        );
+        let RuntimeValue::Reference(array) = machine.test_register(2).unwrap() else {
+            unreachable!()
+        };
+        let payload = machine.test_managed_payload(array).unwrap();
+        assert_eq!([0, 0, 0, 0], payload[8..12]);
+    }
+}
+
+#[test]
+fn heap_instructions_stale_managed_handles_fault() {
+    let mut heap = Heap::new(&allocator_plan(32)).unwrap();
+    let reservation = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    let reference = heap.commit(reservation).unwrap();
+    assert!(heap.free(reference).unwrap());
+    assert_eq!(
+        Err(VmFault::InvalidReference),
+        super::heap_ops::load_value(&heap, reference, 0, ValueWidth::I32)
+    );
+}
+
+#[test]
+fn heap_instructions_is_type_returns_false_for_null() {
+    let image =
+        ExecutionImage::admit(fixtures::null_is_type_artifact(), fixtures::profile()).unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::Bool(false))),
+        machine.run_slice(32).unwrap()
+    );
 }

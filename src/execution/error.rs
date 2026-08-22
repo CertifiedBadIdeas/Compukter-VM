@@ -49,6 +49,9 @@ pub(super) enum GuestTrap {
     DivisionByZero,
     StackOverflow,
     NegativeArraySize,
+    NullReference,
+    IndexOutOfBounds,
+    ClassCast,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +74,7 @@ pub(super) enum VmFault {
     UnsupportedInstruction,
     HandleExhausted,
     CorruptHeap,
+    InvalidReference,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

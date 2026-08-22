@@ -1,7 +1,8 @@
 use super::{
     error::VmFault,
     heap::{AllocationRequest, Heap, ReservedAllocation},
-    value::ReferenceValue,
+    layout::ValueWidth,
+    value::{ReferenceValue, RuntimeValue},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -13,6 +14,67 @@ pub(super) struct PendingState {
     pub initialized_bytes: u32,
     pub fixed_cost_paid: bool,
     pub collection_attempted: bool,
+}
+
+pub(super) fn load_value(
+    heap: &Heap,
+    reference: ReferenceValue,
+    offset: u32,
+    width: ValueWidth,
+) -> Result<RuntimeValue, VmFault> {
+    let bytes = heap.read_payload(reference, offset, width.bytes())?;
+    Ok(match width {
+        ValueWidth::Bool => RuntimeValue::Bool(bytes[0] != 0),
+        ValueWidth::Char => RuntimeValue::Char(u16::from_le_bytes(bytes[..2].try_into().unwrap())),
+        ValueWidth::I32 => RuntimeValue::I32(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
+        ValueWidth::F32 => RuntimeValue::F32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+        ValueWidth::I64 => RuntimeValue::I64(i64::from_le_bytes(bytes)),
+        ValueWidth::F64 => RuntimeValue::F64(u64::from_le_bytes(bytes)),
+        ValueWidth::Ref => {
+            let bits = u64::from_le_bytes(bytes);
+            if bits == 0 {
+                RuntimeValue::Null
+            } else {
+                RuntimeValue::Reference(ReferenceValue::from_bits(bits))
+            }
+        }
+    })
+}
+
+pub(super) fn store_value(
+    heap: &mut Heap,
+    reference: ReferenceValue,
+    offset: u32,
+    width: ValueWidth,
+    value: RuntimeValue,
+) -> Result<(), VmFault> {
+    match (width, value) {
+        (ValueWidth::Bool, RuntimeValue::Bool(value)) => {
+            heap.write_payload(reference, offset, &[u8::from(value)])
+        }
+        (ValueWidth::Char, RuntimeValue::Char(value)) => {
+            heap.write_payload(reference, offset, &value.to_le_bytes())
+        }
+        (ValueWidth::I32, RuntimeValue::I32(value)) => {
+            heap.write_payload(reference, offset, &value.to_le_bytes())
+        }
+        (ValueWidth::F32, RuntimeValue::F32(value)) => {
+            heap.write_payload(reference, offset, &value.to_le_bytes())
+        }
+        (ValueWidth::I64, RuntimeValue::I64(value)) => {
+            heap.write_payload(reference, offset, &value.to_le_bytes())
+        }
+        (ValueWidth::F64, RuntimeValue::F64(value)) => {
+            heap.write_payload(reference, offset, &value.to_le_bytes())
+        }
+        (ValueWidth::Ref, RuntimeValue::Null) => {
+            heap.write_payload(reference, offset, &0_u64.to_le_bytes())
+        }
+        (ValueWidth::Ref, RuntimeValue::Reference(value)) => {
+            heap.write_payload(reference, offset, &value.to_bits().to_le_bytes())
+        }
+        _ => Err(VmFault::InvalidValueType),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
