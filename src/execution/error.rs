@@ -60,6 +60,8 @@ pub(super) enum VmFault {
     CorruptLifecycle,
     ReachedUnreachable,
     UnsupportedInstruction,
+    HandleExhausted,
+    CorruptHeap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

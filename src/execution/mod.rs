@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod error;
+mod heap;
 mod image;
 mod layout;
 mod machine;

@@ -7,7 +7,7 @@ use super::{
 };
 use sha2::{Digest, Sha256};
 
-mod allocation_counter {
+pub(super) mod allocation_counter {
     use std::{
         alloc::{GlobalAlloc, Layout, System},
         cell::Cell,
@@ -55,12 +55,12 @@ mod allocation_counter {
         });
     }
 
-    pub(super) fn reset_and_enable() {
+    pub(crate) fn reset_and_enable() {
         ALLOCATIONS.with(|allocations| allocations.set(0));
         ENABLED.with(|enabled| enabled.set(true));
     }
 
-    pub(super) fn disable_and_read() -> u64 {
+    pub(crate) fn disable_and_read() -> u64 {
         ENABLED.with(|enabled| enabled.set(false));
         ALLOCATIONS.with(Cell::get)
     }

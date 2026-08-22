@@ -1,6 +1,10 @@
 use super::{
-    error::AdmissionError,
+    error::{AdmissionError, VmFault},
     fixtures,
+    heap::{
+        free_size_class, request_size_class, splitmix64, AllocationRequest, BlockOffset, Heap,
+        SizeClass,
+    },
     image::{deduplicate_literal_ranges, ExecutionImage},
     layout::{
         array_layout, empty_object_layout, object_layout, string_layout, FieldSpec,
@@ -9,6 +13,175 @@ use super::{
     TypeKey,
 };
 use crate::artifact::ByteRange;
+
+#[test]
+fn allocator_size_classes_map_free_blocks_down_and_requests_up() {
+    let class = |first, second| Some(SizeClass { first, second });
+    for (size, expected) in [
+        (32, class(5, 0)),
+        (48, class(5, 1)),
+        (64, class(6, 0)),
+        (112, class(6, 3)),
+        (128, class(7, 0)),
+        (240, class(7, 7)),
+        (256, class(8, 0)),
+        (272, class(8, 0)),
+        (288, class(8, 1)),
+    ] {
+        assert_eq!(expected, free_size_class(size), "free size {size}");
+    }
+    assert_eq!(class(8, 0), request_size_class(256));
+    assert_eq!(class(8, 1), request_size_class(272));
+    assert_eq!(class(8, 1), request_size_class(288));
+    assert_eq!(None, free_size_class(16));
+    assert_eq!(None, free_size_class(33));
+}
+
+fn allocator_plan(heap_bytes: u32) -> StoragePlan {
+    StoragePlan {
+        heap_bytes,
+        handle_capacity: heap_bytes / 32,
+        ..StoragePlan::default()
+    }
+}
+
+fn allocator_request(block_bytes: u32) -> AllocationRequest {
+    AllocationRequest {
+        block_bytes,
+        ty: TypeKey { module: 0, ty: 1 },
+    }
+}
+
+#[test]
+fn allocator_splits_exactly_and_absorbs_a_16_byte_tail() -> Result<(), AdmissionError> {
+    let mut heap = Heap::new(&allocator_plan(128))?;
+    let first = heap.reserve(allocator_request(48)).unwrap().unwrap();
+    assert_eq!(BlockOffset(0), first.block);
+    assert_eq!(80, heap.diagnostic().total_free);
+
+    let second = heap.reserve(allocator_request(64)).unwrap().unwrap();
+    assert_eq!(BlockOffset(48), second.block);
+    assert_eq!(0, heap.diagnostic().total_free);
+    assert!(heap.reserve(allocator_request(32)).unwrap().is_none());
+    Ok(())
+}
+
+#[test]
+fn allocator_uses_conservative_upward_search_and_lifo_free_lists() -> Result<(), AdmissionError> {
+    let mut fragmented = Heap::new(&allocator_plan(272))?;
+    assert!(fragmented
+        .reserve(allocator_request(272))
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        BlockOffset(0),
+        fragmented
+            .reserve(allocator_request(256))
+            .unwrap()
+            .unwrap()
+            .block
+    );
+
+    let mut heap = Heap::new(&allocator_plan(160))?;
+    let mut references = Vec::new();
+    for _ in 0..5 {
+        let reserved = heap.reserve(allocator_request(32)).unwrap().unwrap();
+        references.push(heap.commit(reserved).unwrap());
+    }
+    assert!(heap.free(references[1]).unwrap());
+    assert!(heap.free(references[3]).unwrap());
+    assert_eq!(
+        BlockOffset(96),
+        heap.reserve(allocator_request(32)).unwrap().unwrap().block
+    );
+    Ok(())
+}
+
+#[test]
+fn allocator_coalesces_both_neighbors_and_restores_the_arena() -> Result<(), AdmissionError> {
+    let mut heap = Heap::new(&allocator_plan(128))?;
+    let first = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    let second = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    let third = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    heap.abort(first).unwrap();
+    heap.abort(third).unwrap();
+    heap.abort(second).unwrap();
+
+    assert_eq!(128, heap.diagnostic().total_free);
+    assert_eq!(128, heap.diagnostic().largest_free_block);
+    assert_eq!(
+        BlockOffset(0),
+        heap.reserve(allocator_request(128)).unwrap().unwrap().block
+    );
+    Ok(())
+}
+
+#[test]
+fn allocator_handles_commit_abort_generation_and_retirement() -> Result<(), AdmissionError> {
+    let mut heap = Heap::new(&allocator_plan(64))?;
+    let aborted = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    heap.abort(aborted).unwrap();
+    let reused = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    assert_eq!(aborted.slot, reused.slot);
+    assert_eq!(aborted.generation, reused.generation);
+
+    let first = heap.commit(reused).unwrap();
+    assert_eq!(Some(TypeKey { module: 0, ty: 1 }), heap.runtime_type(first));
+    assert_eq!(Some(splitmix64(1) as u32), heap.identity_hash(first));
+    assert!(heap.free(first).unwrap());
+    assert_eq!(None, heap.runtime_type(first));
+
+    let next = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    assert_eq!(first.slot(), next.slot);
+    assert_eq!(first.generation() + 1, next.generation);
+    heap.abort(next).unwrap();
+
+    heap.test_set_generation(0, u32::MAX);
+    let retiring = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    let retiring = heap.commit(retiring).unwrap();
+    assert!(heap.free(retiring).unwrap());
+    assert_eq!(1, heap.diagnostic().retired_handles);
+    let survivor = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    assert_eq!(1, survivor.slot);
+    heap.abort(survivor).unwrap();
+    heap.test_set_generation(1, u32::MAX);
+    let retiring = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    let retiring = heap.commit(retiring).unwrap();
+    assert_eq!(Some(splitmix64(3) as u32), heap.identity_hash(retiring));
+    assert!(heap.free(retiring).unwrap());
+    assert_eq!(2, heap.diagnostic().retired_handles);
+    assert_eq!(
+        Err(VmFault::HandleExhausted),
+        heap.reserve(allocator_request(32))
+    );
+    Ok(())
+}
+
+#[test]
+fn allocator_diagnostics_are_bounded_scalars() {
+    assert!(core::mem::size_of::<super::heap::HeapDiagnostic>() <= 32);
+}
+
+#[test]
+fn allocator_arena_is_physically_sixteen_byte_aligned() -> Result<(), AdmissionError> {
+    let heap = Heap::new(&allocator_plan(128))?;
+    assert_eq!(0, heap.test_arena_address() % 16);
+    Ok(())
+}
+
+#[test]
+fn allocator_steady_state_allocates_nothing() -> Result<(), AdmissionError> {
+    let mut heap = Heap::new(&allocator_plan(128))?;
+    super::tests::allocation_counter::reset_and_enable();
+    for _ in 0..1_000 {
+        let reserved = heap.reserve(allocator_request(32)).unwrap().unwrap();
+        let reference = heap.commit(reserved).unwrap();
+        assert!(heap.free(reference).unwrap());
+    }
+    let allocations = super::tests::allocation_counter::disable_and_read();
+    assert_eq!(0, allocations);
+    Ok(())
+}
 
 #[test]
 fn portable_minimum_and_representative_layouts() -> Result<(), AdmissionError> {

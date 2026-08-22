@@ -208,21 +208,23 @@ git commit -m "refactor(vm): compact opaque reference tokens (#42)"
 - Modify: `src/execution/mod.rs`
 - Modify: `src/execution/error.rs`
 - Modify: `src/execution/heap_tests.rs`
+- Modify: `src/execution/tests.rs`
 
-- [ ] **Step 1: Write failing allocator/handle tests**
+- [x] **Step 1: Write failing allocator/handle tests**
 
 Test canonical `(f,j)` mapping, upward request mapping, bitmap selection, LIFO
 reuse, 16-byte exact splits, 16-byte slack, neighbor coalescing, lowest valid
 generation reuse, wrap retirement through injected test state, SplitMix64
 identity hashes, and bounded diagnostic counters.
 
-- [ ] **Step 2: Prove the red state**
+- [x] **Step 2: Prove the red state**
 
 Run: `cargo test --locked --offline execution::heap_tests::allocator -- --nocapture`
 
-Expected: FAIL because `Heap` does not exist.
+Expected: FAIL with a compiling `Heap` seam returning no reservation, proving
+the missing allocator behavior rather than treating a compiler error as RED.
 
-- [ ] **Step 3: Implement fixed storage and invariants**
+- [x] **Step 3: Implement fixed storage and invariants**
 
 Create boxed arena bytes, boxed handle entries, fixed class heads, and bitmap
 words in `Heap::new(&StoragePlan)`. Define `BlockOffset(u32)`, `HandleEntry`,
@@ -231,13 +233,13 @@ words in `Heap::new(&StoragePlan)`. Define `BlockOffset(u32)`, `HandleEntry`,
 runtime type lookup, identity hash assignment, and scalar statistics. No method
 after `Heap::new` may reserve or grow a collection.
 
-- [ ] **Step 4: Run allocator tests under the allocation counter**
+- [x] **Step 4: Run allocator tests under the allocation counter**
 
 Run: `cargo test --locked --offline execution::heap_tests::allocator -- --nocapture --test-threads=1 && cargo test --release --locked --offline execution::heap_tests::allocator_steady_state_allocates_nothing -- --nocapture --test-threads=1`
 
 Expected: PASS with zero counted allocations in measured operations.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/execution/mod.rs src/execution/error.rs src/execution/heap.rs src/execution/heap_tests.rs
