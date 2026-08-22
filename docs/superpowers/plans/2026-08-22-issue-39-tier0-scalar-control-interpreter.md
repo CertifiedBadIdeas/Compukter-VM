@@ -968,6 +968,6 @@ git add README.md docs/superpowers/plans/2026-08-22-issue-39-tier0-scalar-contro
 git commit -m "docs(vm): record Tier 0 interpreter status (#39)"
 ```
 
-- [ ] **Step 5: Close the exact Roadmap unit only after acceptance is proven**
+- [x] **Step 5: Close the exact Roadmap unit only after acceptance is proven**
 
 Comment on #39 with commit range, exact verification commands/counts, allocation result, baseline document, and confirmation that execution remains private. Close #39 as `completed` and set its Roadmap item to Done. If any acceptance item is unverified, leave #39 open in Now and name the exact remaining check instead.
