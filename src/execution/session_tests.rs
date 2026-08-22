@@ -763,3 +763,140 @@ fn steady_state_request_resume_allocates_nothing() {
     let allocations = super::tests::allocation_counter::disable_and_read();
     assert_eq!(0, allocations);
 }
+
+#[test]
+fn terminal_vertical_conformance() {
+    const OUTPUT: &[u16] = &[0x003e, 0x0020, 0xd83d, 0xde00];
+    const INPUT: &[u16] = &[0x0041, 0xd800, 0x0100, 0xdc00, 0x0042];
+    let mut execution_profile = profile();
+    execution_profile.maximum_host_arguments = 1;
+    execution_profile.maximum_host_requests = 3;
+    execution_profile.maximum_accepted_responses = 3;
+    let string_argument = [HostValueType::String];
+    let operations = [
+        OperationSchema::asynchronous(&string_argument, HostValueType::Unit),
+        OperationSchema::asynchronous(&string_argument, HostValueType::Unit),
+        OperationSchema::asynchronous(&[], HostValueType::String),
+    ];
+    let binding = CapabilityBinding::new("compukter", "terminal", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::terminal_conformance_artifact(OUTPUT),
+        execution_profile,
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+
+    for (operation, expected_id) in [(0, 1), (1, 2)] {
+        let id = loop {
+            match session.advance(64, 64).unwrap() {
+                AdvanceOutcome::SliceExhausted => {}
+                AdvanceOutcome::HostRequest(request) => {
+                    assert_eq!("compukter", request.namespace());
+                    assert_eq!("terminal", request.name());
+                    assert_eq!(1, request.abi_major());
+                    assert_eq!(0, request.abi_minor());
+                    assert_eq!(operation, request.operation());
+                    assert_eq!(
+                        Some(HostValueView::String(OUTPUT)),
+                        request.arguments().get(0)
+                    );
+                    assert_eq!(expected_id, request.id().get());
+                    break request.id();
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        session
+            .resume(id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+    }
+
+    let read_id = loop {
+        match session.advance(64, 64).unwrap() {
+            AdvanceOutcome::SliceExhausted => {}
+            AdvanceOutcome::HostRequest(request) => {
+                assert_eq!("compukter", request.namespace());
+                assert_eq!("terminal", request.name());
+                assert_eq!(1, request.abi_major());
+                assert_eq!(0, request.abi_minor());
+                assert_eq!(2, request.operation());
+                assert!(request.arguments().is_empty());
+                assert_eq!(3, request.id().get());
+                break request.id();
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    session
+        .resume(
+            read_id,
+            HostResponse::Success(HostValueInput::String(INPUT)),
+        )
+        .unwrap();
+
+    let expected_terminal =
+        AdvanceOutcome::Halted(Some(HostValueView::I32(kotlin_string_hash(INPUT))));
+    loop {
+        match session.advance(64, 64).unwrap() {
+            AdvanceOutcome::SliceExhausted => {}
+            outcome => {
+                assert_eq!(expected_terminal, outcome);
+                break;
+            }
+        }
+    }
+    assert_eq!(expected_terminal, session.advance(1, 1).unwrap());
+
+    let accounting = session.accounting();
+    assert_eq!(23, accounting.fixed_guest_units);
+    assert_eq!(6, accounting.dynamic_guest_units);
+    assert_eq!(0, accounting.maintenance_units);
+    assert_eq!(4, accounting.entered_blocks);
+    assert_eq!(6, accounting.executed_instructions);
+    assert_eq!(3, accounting.published_requests);
+    assert_eq!(3, accounting.accepted_responses);
+    assert_eq!(
+        [
+            0x51, 0x58, 0x89, 0x60, 0x02, 0x3f, 0xe3, 0xb9, 0xd4, 0xc1, 0xfe, 0x95, 0x35, 0xa5,
+            0x12, 0x42, 0x7d, 0x34, 0xa4, 0x0a, 0xf5, 0x57, 0x40, 0xb9, 0xbc, 0x32, 0x9d, 0x4f,
+            0x17, 0x55, 0x52, 0xf4,
+        ],
+        accounting.trace_digest
+    );
+}
+
+#[test]
+#[ignore = "records a hardware-specific host-session performance baseline"]
+fn host_session_performance_baseline() {
+    use std::time::Instant;
+
+    const WARMUP: u32 = 10_000;
+    const ITERATIONS: u32 = 100_000;
+    let mut session =
+        unit_loop_session(WARMUP + ITERATIONS + 1, u64::from(WARMUP + ITERATIONS + 1));
+    let cycle = |session: &mut Session| {
+        let id = match session.advance(64, 0).unwrap() {
+            AdvanceOutcome::HostRequest(request) => request.id(),
+            other => panic!("{other:?}"),
+        };
+        session
+            .resume(id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+    };
+    for _ in 0..WARMUP {
+        cycle(&mut session);
+    }
+    let reserved = session.test_reserved_mutable_bytes();
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        cycle(&mut session);
+    }
+    let elapsed = started.elapsed();
+    println!("iterations\telapsed_ns\trequest_resume_per_s\treserved_mutable_bytes");
+    println!(
+        "{ITERATIONS}\t{}\t{:.0}\t{reserved}",
+        elapsed.as_nanos(),
+        f64::from(ITERATIONS) / elapsed.as_secs_f64(),
+    );
+}

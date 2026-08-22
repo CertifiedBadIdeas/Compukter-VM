@@ -531,6 +531,15 @@ impl Session {
     pub(super) fn test_set_next_request_id(&mut self, value: u64) {
         self.next_request_id = value;
     }
+
+    #[cfg(test)]
+    pub(super) fn test_reserved_mutable_bytes(&self) -> usize {
+        self.machine.test_reserved_bytes()
+            + self.entry_arguments.len() * core::mem::size_of::<EntryArgument>()
+            + self.outbound_utf16.len() * core::mem::size_of::<u16>()
+            + self.inbound_utf16.len() * core::mem::size_of::<u16>()
+            + self.argument_slots.len() * core::mem::size_of::<HostValueSlot>()
+    }
 }
 
 fn trace_request(
