@@ -194,6 +194,40 @@ pub(super) enum ResolvedInstruction {
         lhs: u16,
         rhs: u16,
     },
+    StringLength {
+        dst: u16,
+        string: u16,
+    },
+    StringGet {
+        dst: u16,
+        string: u16,
+        index: u16,
+    },
+    StringEquals {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    StringCompare {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    StringHash {
+        dst: u16,
+        string: u16,
+    },
+    StringConcat {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    StringSubstring {
+        dst: u16,
+        string: u16,
+        start: u16,
+        end: u16,
+    },
     NewObject {
         dst: u16,
         ty: TypeKey,
@@ -319,6 +353,7 @@ struct ExecutionImageInner {
     fields: Box<[ResolvedField]>,
     literals: Box<[ResolvedLiteral]>,
     literal_ids: Box<[usize]>,
+    string_type: Option<TypeKey>,
     storage_plan: StoragePlan,
     registers_per_frame: usize,
     maximum_call_depth: usize,
@@ -374,7 +409,19 @@ impl ExecutionImage {
         }
         let (fields, static_slot_count) =
             resolve_fields(decoded, &type_offsets, &field_offsets, &type_layouts)?;
-        let (literals, literal_ids) = resolve_literals(decoded, &literal_offsets)?;
+        let string_type = resolve_standard_string_type(decoded)?;
+        let (mut literals, literal_ids) = resolve_literals(decoded, &literal_offsets)?;
+        if string_type.is_some() && !literals.iter().any(|literal| literal.code_units == 0) {
+            let mut with_empty = literals.into_vec();
+            with_empty
+                .try_reserve_exact(1)
+                .map_err(|_| AdmissionError::AllocationFailed)?;
+            with_empty.push(ResolvedLiteral {
+                bytes: ByteRange { start: 0, end: 0 },
+                code_units: 0,
+            });
+            literals = with_empty.into_boxed_slice();
+        }
         let storage_plan = StoragePlan {
             heap_bytes: profile.heap_bytes,
             handle_capacity: profile.heap_bytes / 32,
@@ -400,9 +447,14 @@ impl ExecutionImage {
                 .last()
                 .ok_or(AdmissionError::InvalidEntry)?,
         )?;
-        for module in &decoded.modules {
+        for (module_id, module) in decoded.modules.iter().enumerate() {
             for constant in &module.constants {
-                constants.push(resolve_constant(constant)?);
+                constants.push(resolve_constant(
+                    constant,
+                    module_id,
+                    &literal_offsets,
+                    &literal_ids,
+                )?);
             }
         }
 
@@ -527,6 +579,7 @@ impl ExecutionImage {
             fields,
             literals,
             literal_ids,
+            string_type,
             storage_plan,
             registers_per_frame,
             maximum_call_depth: decoded.manifest.maximum_call_depth as usize,
@@ -592,9 +645,12 @@ impl ExecutionImage {
                 .host_reference(value)
                 .filter(|entry| entry.live)
                 .map(|entry| entry.ty),
-            super::value::ReferenceDomain::Managed
-            | super::value::ReferenceDomain::Literal
-            | super::value::ReferenceDomain::Emergency => None,
+            super::value::ReferenceDomain::Literal => {
+                self.literal_reference(value).and(self.0.string_type)
+            }
+            super::value::ReferenceDomain::Managed | super::value::ReferenceDomain::Emergency => {
+                None
+            }
         }
     }
 
@@ -634,6 +690,57 @@ impl ExecutionImage {
     pub(super) fn literal_bytes(&self, literal: ResolvedLiteral) -> &[u8] {
         literal.bytes.slice(&self.0.artifact_bytes)
     }
+
+    pub(super) fn literal_reference(&self, value: ReferenceValue) -> Option<ResolvedLiteral> {
+        (value.domain() == super::value::ReferenceDomain::Literal)
+            .then(|| self.0.literals.get(value.slot() as usize).copied())
+            .flatten()
+    }
+
+    pub(super) fn string_type(&self) -> Option<TypeKey> {
+        self.0.string_type
+    }
+
+    pub(super) fn empty_string(&self) -> Option<RuntimeValue> {
+        let index = self
+            .0
+            .literals
+            .iter()
+            .position(|literal| literal.code_units == 0)?;
+        Some(RuntimeValue::Reference(ReferenceValue::literal(
+            index as u32,
+        )?))
+    }
+}
+
+fn resolve_standard_string_type(
+    artifact: &DecodedArtifact,
+) -> Result<Option<TypeKey>, AdmissionError> {
+    let mut found = None;
+    for (module_id, module) in artifact.modules.iter().enumerate() {
+        if module.flags != 2 {
+            continue;
+        }
+        for export in &module.exports {
+            let is_string = export.kind == 0
+                && export.visibility == 1
+                && module
+                    .strings
+                    .get(export.name as usize)
+                    .is_some_and(|name| name.slice(&artifact.bytes) == b"kotlin.String");
+            if !is_string {
+                continue;
+            }
+            let candidate = TypeKey {
+                module: checked_u32(module_id)?,
+                ty: export.local_symbol,
+            };
+            if found.replace(candidate).is_some() {
+                return Err(AdmissionError::InvalidEntry);
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn derive_type_layouts(
@@ -1046,7 +1153,12 @@ fn reserved<T>(capacity: usize) -> Result<Vec<T>, AdmissionError> {
     Ok(values)
 }
 
-fn resolve_constant(value: &Constant) -> Result<RuntimeValue, AdmissionError> {
+fn resolve_constant(
+    value: &Constant,
+    module_id: usize,
+    literal_offsets: &[usize],
+    literal_ids: &[usize],
+) -> Result<RuntimeValue, AdmissionError> {
     Ok(match value {
         Constant::I32(value) => RuntimeValue::I32(*value),
         Constant::I64(value) => RuntimeValue::I64(*value),
@@ -1055,7 +1167,21 @@ fn resolve_constant(value: &Constant) -> Result<RuntimeValue, AdmissionError> {
         Constant::Bool(value) => RuntimeValue::Bool(*value),
         Constant::Char(value) => RuntimeValue::Char(*value),
         Constant::Null => RuntimeValue::Null,
-        Constant::String(_) => return Err(AdmissionError::InvalidEntry),
+        Constant::String(literal) => {
+            let source = literal_offsets
+                .get(module_id)
+                .and_then(|offset| offset.checked_add(literal.0 as usize))
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let canonical = *literal_ids
+                .get(source)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            RuntimeValue::Reference(
+                ReferenceValue::literal(
+                    u32::try_from(canonical).map_err(|_| AdmissionError::StoragePlanOverflow)?,
+                )
+                .ok_or(AdmissionError::StoragePlanOverflow)?,
+            )
+        }
     })
 }
 
@@ -1383,6 +1509,45 @@ fn resolve_instruction(
             dst: *dst,
             lhs: *lhs,
             rhs: *rhs,
+        },
+        Instruction::StringLength { dst, string } => ResolvedInstruction::StringLength {
+            dst: *dst,
+            string: *string,
+        },
+        Instruction::StringGet { dst, string, index } => ResolvedInstruction::StringGet {
+            dst: *dst,
+            string: *string,
+            index: *index,
+        },
+        Instruction::StringEquals { dst, lhs, rhs } => ResolvedInstruction::StringEquals {
+            dst: *dst,
+            lhs: *lhs,
+            rhs: *rhs,
+        },
+        Instruction::StringCompare { dst, lhs, rhs } => ResolvedInstruction::StringCompare {
+            dst: *dst,
+            lhs: *lhs,
+            rhs: *rhs,
+        },
+        Instruction::StringHash { dst, string } => ResolvedInstruction::StringHash {
+            dst: *dst,
+            string: *string,
+        },
+        Instruction::StringConcat { dst, lhs, rhs } => ResolvedInstruction::StringConcat {
+            dst: *dst,
+            lhs: *lhs,
+            rhs: *rhs,
+        },
+        Instruction::StringSubstring {
+            dst,
+            string,
+            start,
+            end,
+        } => ResolvedInstruction::StringSubstring {
+            dst: *dst,
+            string: *string,
+            start: *start,
+            end: *end,
         },
         Instruction::NewObject { dst, type_ref } => ResolvedInstruction::NewObject {
             dst: *dst,

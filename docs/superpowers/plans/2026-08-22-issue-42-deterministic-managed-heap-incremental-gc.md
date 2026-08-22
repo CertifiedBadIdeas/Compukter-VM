@@ -390,6 +390,11 @@ git commit -m "feat(vm): collect managed graphs incrementally (#42)"
 **Files:**
 - Create: `src/execution/text.rs`
 - Create: `src/execution/text_tests.rs`
+- Modify: `src/artifact/mod.rs`
+- Modify: `src/decode/code.rs`
+- Modify: `src/verify/functions.rs`
+- Modify: `src/verify/tests.rs`
+- Modify: `src/test_encode.rs`
 - Modify: `src/execution/mod.rs`
 - Modify: `src/execution/image.rs`
 - Modify: `src/execution/heap.rs`
@@ -397,21 +402,32 @@ git commit -m "feat(vm): collect managed graphs incrementally (#42)"
 - Modify: `src/execution/machine.rs`
 - Modify: `src/execution/fixtures.rs`
 
-- [ ] **Step 1: Write failing literal and string-operation tests**
+- [x] **Step 1: Write failing literal and string-operation tests**
 
-Cover cross-module raw UTF-16 deduplication, zero-copy loads, empty/Latin-1/BMP/
+First add decoder/verifier vectors for opcodes `0x60` through `0x66`, form-zero
+and operand canonicality, exact `kotlin.String` export resolution, operand and
+result types, and dedicated-block rules for concat/substring. Then cover
+cross-module raw UTF-16 deduplication, zero-copy loads, empty/Latin-1/BMP/
 surrogate literals, literal identity, dynamic non-interning, compact selection,
 length/get, content equality, unsigned comparison, exact wrapping hash, full/
 empty/proper substring identity, fresh concat, resumable publication, and
 strict/replacement UTF-8 conversion.
 
-- [ ] **Step 2: Prove the red state**
+- [x] **Step 2: Prove the red state**
 
 Run: `cargo test --locked --offline execution::text_tests -- --nocapture`
 
-Expected: FAIL because string constants are not admitted as runtime references.
+Expected: FAIL first because the String opcodes are unknown, then because
+string constants are not admitted as runtime references.
 
-- [ ] **Step 3: Implement immutable literal and dynamic string access**
+- [x] **Step 3: Implement immutable literal and dynamic string access**
+
+Add the closed Artifact v1 instruction family `StringLength`, `StringGet`,
+`StringEquals`, `StringCompare`, `StringHash`, `StringConcat`, and
+`StringSubstring` at opcodes `0x60..=0x66`. Resolve exactly one public-library
+`kotlin.String` final class when the family or a String constant is used, and
+verify its exact register signatures. Treat concat and substring as potential
+allocations for dedicated-block verification.
 
 Resolve `Constant::String` to immortal literal-domain tokens. Keep payload as
 verified artifact byte ranges. Implement a unified code-unit reader over
@@ -420,16 +436,16 @@ hash/compare/concat/substring/UTF-8; charge one guest unit per eight code units
 plus ordinary allocation initialization. Preserve isolated surrogates and
 publish dynamic results only after complete initialization.
 
-- [ ] **Step 4: Run text tests in debug/release and allocation counting**
+- [x] **Step 4: Run text tests in debug/release and allocation counting**
 
 Run: `cargo test --locked --offline execution::text_tests -- --nocapture && cargo test --release --locked --offline execution::text_tests -- --nocapture && cargo test --release --locked --offline execution::text_tests::literal_load_allocates_nothing -- --nocapture --test-threads=1`
 
 Expected: all tests PASS and literal load performs zero allocations.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
-git add src/execution/mod.rs src/execution/text.rs src/execution/text_tests.rs src/execution/image.rs src/execution/heap.rs src/execution/heap_ops.rs src/execution/machine.rs src/execution/fixtures.rs
+git add docs/superpowers/specs/2026-08-22-issue-40-deterministic-managed-heap-incremental-gc-design.md docs/superpowers/plans/2026-08-22-issue-42-deterministic-managed-heap-incremental-gc.md src/artifact/mod.rs src/decode/code.rs src/verify/functions.rs src/verify/tests.rs src/test_encode.rs src/execution/mod.rs src/execution/text.rs src/execution/text_tests.rs src/execution/image.rs src/execution/heap.rs src/execution/heap_ops.rs src/execution/machine.rs src/execution/fixtures.rs
 git commit -m "feat(vm): execute compact Kotlin strings (#42)"
 ```
 

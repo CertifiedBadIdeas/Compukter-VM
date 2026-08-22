@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     artifact::{
-        Block, BlockId, ByteRange, Constant, DecodedCode, Field, Function, FunctionId, Instruction,
-        NominalType, SwitchCase, TypeId, ValueType,
+        Block, BlockId, ByteRange, Constant, DecodedCode, Export, Field, Function, FunctionId,
+        Import, Instruction, ModuleId, NominalType, SwitchCase, TypeId, Utf16LiteralId, ValueType,
     },
     verify_artifact, ArtifactLimits, VerifiedArtifact,
 };
@@ -696,6 +696,542 @@ pub(super) fn scalar_cases() -> Vec<ScalarCase> {
 
 pub(super) fn scalar_artifact() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::minimal_vector(), 32)
+}
+
+pub(super) fn literal_string_artifact() -> VerifiedArtifact {
+    literal_string_program(
+        ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(0x8000_0000),
+        },
+        vec![ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(0x8000_0000),
+        }],
+        Vec::new(),
+        &[0x48, 0x69],
+        vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::Return { value: 0 },
+        ],
+    )
+}
+
+pub(super) fn literal_string_length_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program(
+        primitive(1),
+        vec![string, primitive(1)],
+        Vec::new(),
+        &[0x48, 0x69],
+        vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::StringLength { dst: 1, string: 0 },
+            Instruction::Return { value: 1 },
+        ],
+    )
+}
+
+pub(super) fn literal_string_get_artifact(index: i32) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program(
+        primitive(6),
+        vec![string, primitive(1), primitive(6)],
+        vec![Constant::I32(index)],
+        &[0x48, 0x69],
+        vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 1,
+            },
+            Instruction::Const {
+                dst: 1,
+                constant: 0,
+            },
+            Instruction::StringGet {
+                dst: 2,
+                string: 0,
+                index: 1,
+            },
+            Instruction::Return { value: 2 },
+        ],
+    )
+}
+
+pub(super) fn literal_string_equals_artifact() -> VerifiedArtifact {
+    literal_string_binary_artifact(
+        primitive(5),
+        primitive(5),
+        Instruction::StringEquals {
+            dst: 2,
+            lhs: 0,
+            rhs: 1,
+        },
+    )
+}
+
+pub(super) fn literal_string_compare_artifact() -> VerifiedArtifact {
+    literal_string_binary_artifact(
+        primitive(1),
+        primitive(1),
+        Instruction::StringCompare {
+            dst: 2,
+            lhs: 0,
+            rhs: 1,
+        },
+    )
+}
+
+fn literal_string_binary_artifact(
+    result: ValueType,
+    result_register: ValueType,
+    operation: Instruction,
+) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program(
+        result,
+        vec![string, string, result_register],
+        Vec::new(),
+        &[0x48, 0x69],
+        vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::Const {
+                dst: 1,
+                constant: 0,
+            },
+            operation,
+            Instruction::Return { value: 2 },
+        ],
+    )
+}
+
+pub(super) fn literal_string_hash_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program(
+        primitive(1),
+        vec![string, primitive(1)],
+        Vec::new(),
+        &[0x48, 0x69],
+        vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::StringHash { dst: 1, string: 0 },
+            Instruction::Return { value: 1 },
+        ],
+    )
+}
+
+pub(super) fn long_literal_string_hash_artifact(code_units: &[u16]) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program(
+        primitive(1),
+        vec![string, primitive(1)],
+        Vec::new(),
+        code_units,
+        vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::StringHash { dst: 1, string: 0 },
+            Instruction::Return { value: 1 },
+        ],
+    )
+}
+
+pub(super) fn literal_string_concat_artifact() -> VerifiedArtifact {
+    literal_string_concat_units_artifact(&[0x48, 0x69])
+}
+
+pub(super) fn literal_string_concat_units_artifact(code_units: &[u16]) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks(
+        string,
+        vec![string, string, string],
+        Vec::new(),
+        code_units,
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: 0,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::StringConcat {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Instruction::Return { value: 2 },
+            ],
+        ],
+    )
+}
+
+pub(super) fn literal_string_substring_artifact(start: i32, end: i32) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let mut bounds = vec![start, end];
+    bounds.sort_unstable_by_key(|value| value.to_le_bytes());
+    bounds.dedup();
+    let start_constant = bounds.iter().position(|value| *value == start).unwrap() as u32;
+    let end_constant = bounds.iter().position(|value| *value == end).unwrap() as u32;
+    let string_constant = bounds.len() as u32;
+    literal_string_program_blocks(
+        string,
+        vec![string, primitive(1), primitive(1), string],
+        bounds.into_iter().map(Constant::I32).collect(),
+        &[0x48, 0x69],
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: string_constant,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: start_constant,
+                },
+                Instruction::Const {
+                    dst: 2,
+                    constant: end_constant,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::StringSubstring {
+                    dst: 3,
+                    string: 0,
+                    start: 1,
+                    end: 2,
+                },
+                Instruction::Return { value: 3 },
+            ],
+        ],
+    )
+}
+
+pub(super) fn repeated_concat_artifact(content_equality: bool) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let comparison = if content_equality {
+        Instruction::StringEquals {
+            dst: 4,
+            lhs: 2,
+            rhs: 3,
+        }
+    } else {
+        Instruction::RefNotEqual {
+            dst: 4,
+            lhs: 2,
+            rhs: 3,
+        }
+    };
+    literal_string_program_blocks(
+        primitive(5),
+        vec![string, string, string, string, primitive(5)],
+        Vec::new(),
+        &[0x48, 0x69],
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: 0,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::StringConcat {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Instruction::Jump { target: 2 },
+            ],
+            vec![
+                Instruction::StringConcat {
+                    dst: 3,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Instruction::Jump { target: 3 },
+            ],
+            vec![comparison, Instruction::Return { value: 4 }],
+        ],
+    )
+}
+
+pub(super) fn unsigned_dynamic_string_compare_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks(
+        primitive(1),
+        vec![
+            string,
+            primitive(1),
+            primitive(1),
+            string,
+            string,
+            primitive(1),
+        ],
+        vec![Constant::I32(0), Constant::I32(1), Constant::I32(2)],
+        &[0xdfff, 0xe000],
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 3,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: 0,
+                },
+                Instruction::Const {
+                    dst: 2,
+                    constant: 1,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::StringSubstring {
+                    dst: 3,
+                    string: 0,
+                    start: 1,
+                    end: 2,
+                },
+                Instruction::Jump { target: 2 },
+            ],
+            vec![
+                Instruction::Const {
+                    dst: 1,
+                    constant: 1,
+                },
+                Instruction::Const {
+                    dst: 2,
+                    constant: 2,
+                },
+                Instruction::Jump { target: 3 },
+            ],
+            vec![
+                Instruction::StringSubstring {
+                    dst: 4,
+                    string: 0,
+                    start: 1,
+                    end: 2,
+                },
+                Instruction::Jump { target: 4 },
+            ],
+            vec![
+                Instruction::StringCompare {
+                    dst: 5,
+                    lhs: 3,
+                    rhs: 4,
+                },
+                Instruction::Return { value: 5 },
+            ],
+        ],
+    )
+}
+
+fn literal_string_program(
+    result: ValueType,
+    registers: Vec<ValueType>,
+    extra_constants: Vec<Constant>,
+    literal_code_units: &[u16],
+    instructions: Vec<Instruction>,
+) -> VerifiedArtifact {
+    literal_string_program_blocks(
+        result,
+        registers,
+        extra_constants,
+        literal_code_units,
+        vec![instructions],
+    )
+}
+
+fn literal_string_program_blocks(
+    result: ValueType,
+    registers: Vec<ValueType>,
+    extra_constants: Vec<Constant>,
+    literal_code_units: &[u16],
+    programs: Vec<Vec<Instruction>>,
+) -> VerifiedArtifact {
+    let mut decoded = crate::decode::records::decode_artifact(
+        Arc::from(crate::test_support::two_module_vector()),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let mut bytes = decoded.bytes.to_vec();
+    let library_name_start = bytes.len();
+    bytes.extend_from_slice(b"aaa");
+    let library_name_end = bytes.len();
+    let function_name_start = bytes.len();
+    bytes.extend_from_slice(b"bbb");
+    let function_name_end = bytes.len();
+    let name_start = bytes.len();
+    bytes.extend_from_slice(b"kotlin.String");
+    let name_end = bytes.len();
+    let literal_start = bytes.len();
+    for code_unit in literal_code_units {
+        bytes.extend_from_slice(&code_unit.to_le_bytes());
+    }
+    let literal_end = bytes.len();
+    decoded.bytes = Arc::from(bytes);
+
+    let library = &mut decoded.modules[1];
+    library.strings[0] = ByteRange {
+        start: library_name_start,
+        end: library_name_end,
+    };
+    library.strings[1] = ByteRange {
+        start: function_name_start,
+        end: function_name_end,
+    };
+    let string_name = library.strings.len() as u32;
+    library.strings.push(ByteRange {
+        start: name_start,
+        end: name_end,
+    });
+    library.types.push(NominalType::Class {
+        flags: 2,
+        generic_arity: 0,
+        name: string_name,
+        super_type: TypeId(u32::MAX),
+        interfaces: Vec::new(),
+        field_start: 0,
+        field_count: 0,
+        method_start: 0,
+        method_count: 0,
+    });
+    library.exports.insert(
+        0,
+        Export {
+            kind: 0,
+            visibility: 1,
+            name: string_name,
+            local_symbol: 1,
+            signature: TypeId(1),
+        },
+    );
+    library.declared_types = 2;
+    library.declared_exports = 2;
+
+    let application = &mut decoded.modules[0];
+    application.imports.clear();
+    application.imports.push(Import {
+        kind: 0,
+        target_module: ModuleId(1),
+        target_name: string_name,
+        expected_signature: TypeId(0x8000_0000),
+        target_hash: [0; 32],
+    });
+    application.declared_imports = 1;
+    application.utf16_literals.push(ByteRange {
+        start: literal_start,
+        end: literal_end,
+    });
+    application.constants = extra_constants;
+    application
+        .constants
+        .push(Constant::String(Utf16LiteralId(0)));
+    let register_count = registers.len();
+    application.types[0] = NominalType::Function {
+        name: 1,
+        flags: 0,
+        result,
+        parameters: Vec::new(),
+    };
+    let function = &mut application.functions[0];
+    function.register_count = register_count as u16;
+    function.parameter_count = 0;
+    function.registers = registers;
+    function.first_block = BlockId(0);
+    function.block_count = programs.len() as u32;
+    application.blocks.clear();
+    application.code.clear();
+    let mut maximum_block_cost = 0;
+    for (block_id, instructions) in programs.into_iter().enumerate() {
+        let fixed_cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        maximum_block_cost = maximum_block_cost.max(fixed_cost);
+        application.blocks.push(Block {
+            owner_function: FunctionId(0),
+            code_record: BlockId(block_id as u32),
+            instruction_count: instructions.len() as u32,
+            declared_fixed_cost: fixed_cost,
+            flags: 1,
+        });
+        application.code.push(DecodedCode {
+            bytes: ByteRange { start: 0, end: 0 },
+            instructions: instructions.into_boxed_slice(),
+            fixed_cost,
+        });
+    }
+    decoded.manifest.maximum_block_cost = maximum_block_cost;
+    decoded.manifest.minimum_slice_cost = maximum_block_cost;
+    decoded.manifest.required_stack_bytes =
+        super::image::frame_charge(register_count as u64).unwrap() as u32;
+
+    let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
+    verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
 
 pub(super) fn portable_layout_artifact() -> VerifiedArtifact {

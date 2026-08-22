@@ -383,6 +383,33 @@ automatically interned. The initial intrinsic semantic surface is:
 - `hashCode`: `h = 31 * h + code_unit` with wrapping `i32` arithmetic;
 - concatenation and substring: checked, atomic dynamic results.
 
+Artifact v1 encodes this closed surface as verifier-visible instructions in a
+dedicated opcode family. All instructions use form zero and little-endian
+`u16` register operands:
+
+- `0x60 string_length dst, string`;
+- `0x61 string_get dst, string, index`;
+- `0x62 string_equals dst, lhs, rhs`;
+- `0x63 string_compare dst, lhs, rhs`;
+- `0x64 string_hash dst, string`;
+- `0x65 string_concat dst, lhs, rhs`;
+- `0x66 string_substring dst, string, start, endExclusive`.
+
+An artifact using a String constant or String instruction contains exactly one
+public-library type export named `kotlin.String` in a library module. It must
+resolve to a final, non-abstract class with no artifact-declared instance
+fields; the selected `standard_library_abi` defines its runtime layout. The
+verifier resolves that nominal type once and requires every String operand and
+result to use it exactly. Length, compare, and hash return `I32`; indexed get
+returns `Char`; equality returns `Bool`; concat and substring return the
+non-null String type.
+
+Concat and substring are potentially allocating operations and therefore must
+be the first and only potentially allocating instruction in their block, even
+when a particular full-range or empty substring returns an existing identity.
+The opcode set is closed VM ABI. Trusted add-on intrinsics lower to ordinary
+bytecode or capability calls and cannot extend the opcode table dynamically.
+
 A full-range substring returns its receiver and an empty substring returns the
 canonical empty literal. Every other substring is fresh. Runtime concatenation
 creates a fresh result; compiler constant folding may instead emit an existing

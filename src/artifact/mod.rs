@@ -501,6 +501,40 @@ pub(crate) enum Instruction {
         operation: u32,
         args: Box<[u16]>,
     },
+    StringLength {
+        dst: u16,
+        string: u16,
+    },
+    StringGet {
+        dst: u16,
+        string: u16,
+        index: u16,
+    },
+    StringEquals {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    StringCompare {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    StringHash {
+        dst: u16,
+        string: u16,
+    },
+    StringConcat {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    StringSubstring {
+        dst: u16,
+        string: u16,
+        start: u16,
+        end: u16,
+    },
     Jump {
         target: u32,
     },

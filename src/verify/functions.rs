@@ -220,7 +220,10 @@ fn verify_dataflow(
         for (instruction_index, instruction) in code.instructions.iter().enumerate() {
             let is_allocation = matches!(
                 instruction,
-                Instruction::NewObject { .. } | Instruction::NewArray { .. }
+                Instruction::NewObject { .. }
+                    | Instruction::NewArray { .. }
+                    | Instruction::StringConcat { .. }
+                    | Instruction::StringSubstring { .. }
             );
             if is_allocation && (instruction_index != 0 || allocation_seen) {
                 return Err(code_failure(
@@ -392,6 +395,9 @@ fn verify_instruction(
                     function_id,
                     "constant is not assignable to destination",
                 ));
+            }
+            if matches!(value, Constant::String(_)) {
+                require_string(artifact, function, *dst, module_id, function_id, limits)?;
             }
             write(state, *dst, function, module_id, function_id, limits)?;
         }
@@ -1055,8 +1061,151 @@ fn verify_instruction(
                 write(state, *dst, function, module_id, function_id, limits)?;
             }
         }
+        Instruction::StringLength { dst, string } => {
+            read(function, state, *string, module_id, function_id, limits)?;
+            require_string(artifact, function, *string, module_id, function_id, limits)?;
+            require_kind(function, *dst, 1, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::StringGet { dst, string, index } => {
+            read(function, state, *string, module_id, function_id, limits)?;
+            read(function, state, *index, module_id, function_id, limits)?;
+            require_string(artifact, function, *string, module_id, function_id, limits)?;
+            require_kind(function, *index, 1, module_id, function_id, limits)?;
+            require_kind(function, *dst, 6, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::StringEquals { dst, lhs, rhs } => {
+            read(function, state, *lhs, module_id, function_id, limits)?;
+            read(function, state, *rhs, module_id, function_id, limits)?;
+            require_string(artifact, function, *lhs, module_id, function_id, limits)?;
+            require_string(artifact, function, *rhs, module_id, function_id, limits)?;
+            require_kind(function, *dst, 5, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::StringCompare { dst, lhs, rhs } => {
+            read(function, state, *lhs, module_id, function_id, limits)?;
+            read(function, state, *rhs, module_id, function_id, limits)?;
+            require_string(artifact, function, *lhs, module_id, function_id, limits)?;
+            require_string(artifact, function, *rhs, module_id, function_id, limits)?;
+            require_kind(function, *dst, 1, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::StringHash { dst, string } => {
+            read(function, state, *string, module_id, function_id, limits)?;
+            require_string(artifact, function, *string, module_id, function_id, limits)?;
+            require_kind(function, *dst, 1, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::StringConcat { dst, lhs, rhs } => {
+            read(function, state, *lhs, module_id, function_id, limits)?;
+            read(function, state, *rhs, module_id, function_id, limits)?;
+            require_string(artifact, function, *lhs, module_id, function_id, limits)?;
+            require_string(artifact, function, *rhs, module_id, function_id, limits)?;
+            require_string(artifact, function, *dst, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::StringSubstring {
+            dst,
+            string,
+            start,
+            end,
+        } => {
+            read(function, state, *string, module_id, function_id, limits)?;
+            read(function, state, *start, module_id, function_id, limits)?;
+            read(function, state, *end, module_id, function_id, limits)?;
+            require_string(artifact, function, *string, module_id, function_id, limits)?;
+            require_kind(function, *start, 1, module_id, function_id, limits)?;
+            require_kind(function, *end, 1, module_id, function_id, limits)?;
+            require_string(artifact, function, *dst, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
     }
     Ok(())
+}
+
+fn require_string(
+    artifact: &DecodedArtifact,
+    function: &Function,
+    register: u16,
+    module_id: usize,
+    function_id: usize,
+    limits: &ArtifactLimits,
+) -> Result<(), DiagnosticSet> {
+    let value = register_type(function, register, module_id, function_id, limits)?;
+    let actual = modules::resolved_type(artifact, module_id, value.nominal_type);
+    let expected = resolve_string_type(artifact, module_id, function_id, limits)?;
+    if value.kind != 7 || value.flags & 1 != 0 || actual != Some(expected) {
+        return Err(type_failure(
+            limits,
+            module_id,
+            function_id,
+            "register is not the non-null standard-library String type",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_string_type(
+    artifact: &DecodedArtifact,
+    module_id: usize,
+    function_id: usize,
+    limits: &ArtifactLimits,
+) -> Result<(usize, usize), DiagnosticSet> {
+    let mut found = None;
+    for (candidate_module_id, module) in artifact.modules.iter().enumerate() {
+        if module.flags != 2 {
+            continue;
+        }
+        for export in &module.exports {
+            let is_string = export.kind == 0
+                && export.visibility == 1
+                && module
+                    .strings
+                    .get(export.name as usize)
+                    .is_some_and(|name| name.slice(&artifact.bytes) == b"kotlin.String");
+            if !is_string {
+                continue;
+            }
+            let candidate = (candidate_module_id, export.local_symbol as usize);
+            if found.replace(candidate).is_some() {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "artifact has more than one public kotlin.String type",
+                ));
+            }
+        }
+    }
+    let string_type = found.ok_or_else(|| {
+        type_failure(
+            limits,
+            module_id,
+            function_id,
+            "artifact has no public kotlin.String type",
+        )
+    })?;
+    let Some(NominalType::Class {
+        flags, field_count, ..
+    }) = artifact.modules[string_type.0].types.get(string_type.1)
+    else {
+        return Err(type_failure(
+            limits,
+            module_id,
+            function_id,
+            "kotlin.String export does not resolve to a class",
+        ));
+    };
+    if flags & 1 != 0 || flags & 2 == 0 || *field_count != 0 {
+        return Err(type_failure(
+            limits,
+            module_id,
+            function_id,
+            "kotlin.String must be final, concrete, and fieldless",
+        ));
+    }
+    Ok(string_type)
 }
 
 #[derive(Clone, Copy)]

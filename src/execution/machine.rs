@@ -5,7 +5,7 @@ use super::{
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
     image::{ExecutionImage, ResolvedInstruction, ResolvedValueType},
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
-    numeric,
+    numeric, text,
     value::{EntryArgument, RegisterValue, RuntimeValue},
 };
 use sha2::{Digest, Sha256};
@@ -57,6 +57,8 @@ pub(super) struct Machine {
     collector: Collector,
     allocation_retry: Option<AllocationRetry>,
     pending_allocation: Option<PendingAllocation>,
+    pending_text: Option<text::PendingText>,
+    pending_concat: Option<text::PendingConcat>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
     consumed_dynamic_cost: u64,
@@ -144,6 +146,8 @@ impl Machine {
             collector: Collector::new(),
             allocation_retry: None,
             pending_allocation: None,
+            pending_text: None,
+            pending_concat: None,
             frame_depth: 0,
             consumed_fixed_cost: 0,
             consumed_dynamic_cost: 0,
@@ -244,6 +248,16 @@ impl Machine {
                 .ok_or(RunError::NotRunnable)?;
             if self.pending_allocation.is_some() {
                 if let Some(outcome) = self.resume_pending_allocation(frame_index, &mut remaining) {
+                    return Ok(outcome);
+                }
+            }
+            if self.pending_text.is_some() {
+                if let Some(outcome) = self.resume_pending_text(frame_index, &mut remaining) {
+                    return Ok(outcome);
+                }
+            }
+            if self.pending_concat.is_some() {
+                if let Some(outcome) = self.resume_pending_concat(frame_index, &mut remaining) {
                     return Ok(outcome);
                 }
             }
@@ -467,6 +481,69 @@ impl Machine {
                             return Ok(outcome);
                         }
                     }
+                    ResolvedInstruction::StringHash { dst, string } => {
+                        let value = match self.read_register(frame_index, *string) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        self.pending_text =
+                            match text::PendingText::hash(&self.image, &self.heap, value, *dst) {
+                                Ok(pending) => Some(pending),
+                                Err(error) => return Ok(self.text_outcome(error)),
+                            };
+                        if let Some(outcome) = self.resume_pending_text(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
+                    ResolvedInstruction::StringEquals { dst, lhs, rhs } => {
+                        let lhs = match self.read_register(frame_index, *lhs) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let rhs = match self.read_register(frame_index, *rhs) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        self.pending_text = match text::PendingText::equals(
+                            &self.image,
+                            &self.heap,
+                            lhs,
+                            rhs,
+                            *dst,
+                        ) {
+                            Ok(pending) => Some(pending),
+                            Err(error) => return Ok(self.text_outcome(error)),
+                        };
+                        if let Some(outcome) = self.resume_pending_text(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
+                    ResolvedInstruction::StringCompare { dst, lhs, rhs } => {
+                        let lhs = match self.read_register(frame_index, *lhs) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let rhs = match self.read_register(frame_index, *rhs) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        self.pending_text = match text::PendingText::compare(
+                            &self.image,
+                            &self.heap,
+                            lhs,
+                            rhs,
+                            *dst,
+                        ) {
+                            Ok(pending) => Some(pending),
+                            Err(error) => return Ok(self.text_outcome(error)),
+                        };
+                        if let Some(outcome) = self.resume_pending_text(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
                     ResolvedInstruction::NewArray { dst, ty, length } => {
                         let length = match self.read_register(frame_index, *length) {
                             Ok(RuntimeValue::I32(length)) => length,
@@ -525,6 +602,87 @@ impl Machine {
                             self.resume_pending_allocation(frame_index, &mut remaining)
                         {
                             return Ok(outcome);
+                        }
+                    }
+                    ResolvedInstruction::StringConcat { dst, lhs, rhs } => {
+                        let lhs = match self.read_register(frame_index, *lhs) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let rhs = match self.read_register(frame_index, *rhs) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        self.pending_concat =
+                            match text::PendingConcat::new(&self.image, &self.heap, lhs, rhs, *dst)
+                            {
+                                Ok(pending) => Some(pending),
+                                Err(error) => return Ok(self.text_outcome(error)),
+                            };
+                        if let Some(outcome) =
+                            self.resume_pending_concat(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
+                    ResolvedInstruction::StringSubstring {
+                        dst,
+                        string,
+                        start,
+                        end,
+                    } => {
+                        let value = match self.read_register(frame_index, *string) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let start = match self.read_register(frame_index, *start) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let end = match self.read_register(frame_index, *end) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        match text::PendingConcat::substring(
+                            &self.image,
+                            &self.heap,
+                            value,
+                            start,
+                            end,
+                            *dst,
+                        ) {
+                            Ok(text::SubstringPlan::Identity(value)) => {
+                                let index =
+                                    frame_index * self.image.registers_per_frame() + *dst as usize;
+                                let Some(slot) = self.registers.get_mut(index) else {
+                                    return Ok(self.fault(VmFault::InvalidStoragePlan));
+                                };
+                                *slot = RegisterValue::Initialized(value);
+                                self.frames[frame_index].instruction += 1;
+                            }
+                            Ok(text::SubstringPlan::Build(pending)) => {
+                                self.pending_concat = Some(pending);
+                                if let Some(outcome) =
+                                    self.resume_pending_concat(frame_index, &mut remaining)
+                                {
+                                    return Ok(outcome);
+                                }
+                            }
+                            Ok(text::SubstringPlan::Empty) => {
+                                let Some(value) = self.image.empty_string() else {
+                                    return Ok(self.fault(VmFault::InvalidResolvedId));
+                                };
+                                let index =
+                                    frame_index * self.image.registers_per_frame() + *dst as usize;
+                                let Some(slot) = self.registers.get_mut(index) else {
+                                    return Ok(self.fault(VmFault::InvalidStoragePlan));
+                                };
+                                *slot = RegisterValue::Initialized(value);
+                                self.frames[frame_index].instruction += 1;
+                            }
+                            Err(error) => return Ok(self.text_outcome(error)),
                         }
                     }
                     ResolvedInstruction::StaticGet { dst, field } => {
@@ -844,7 +1002,13 @@ impl Machine {
                             .function(self.frames[frame_index].function)
                             .ok_or(RunError::NotRunnable)?
                             .registers;
-                        match execute_scalar(instruction, registers, register_types, &self.image) {
+                        match execute_scalar(
+                            instruction,
+                            registers,
+                            register_types,
+                            &self.image,
+                            &self.heap,
+                        ) {
                             Ok(()) => self.frames[frame_index].instruction += 1,
                             Err(InstructionFailure::Trap(trap)) => {
                                 let outcome = Outcome::Crashed(trap);
@@ -877,6 +1041,7 @@ impl Machine {
 
     fn fault(&mut self, fault: VmFault) -> Outcome {
         self.cancel_pending_allocation();
+        self.cancel_pending_concat();
         let outcome = Outcome::Faulted(fault);
         self.lifecycle = Lifecycle::Terminal(outcome);
         outcome
@@ -994,8 +1159,82 @@ impl Machine {
         None
     }
 
+    fn resume_pending_text(&mut self, frame_index: usize, remaining: &mut u32) -> Option<Outcome> {
+        let mut pending = self.pending_text.take()?;
+        let (used, result) = match pending.resume(&self.image, &self.heap, *remaining) {
+            Ok(result) => result,
+            Err(error) => return Some(self.text_outcome(error)),
+        };
+        let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used)) else {
+            return Some(self.fault(VmFault::AccountingOverflow));
+        };
+        self.consumed_dynamic_cost = consumed;
+        *remaining -= used;
+        let Some((destination, value)) = result else {
+            self.pending_text = Some(pending);
+            return Some(Outcome::SliceExhausted);
+        };
+        let index = frame_index * self.image.registers_per_frame() + destination as usize;
+        let Some(slot) = self.registers.get_mut(index) else {
+            return Some(self.fault(VmFault::InvalidStoragePlan));
+        };
+        *slot = RegisterValue::Initialized(value);
+        self.frames[frame_index].instruction += 1;
+        None
+    }
+
+    fn resume_pending_concat(
+        &mut self,
+        frame_index: usize,
+        remaining: &mut u32,
+    ) -> Option<Outcome> {
+        let mut pending = self.pending_concat.take()?;
+        let (used, result) = match pending.resume(&self.image, &mut self.heap, *remaining) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = pending.abort(&mut self.heap);
+                return Some(self.text_outcome(error));
+            }
+        };
+        let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used)) else {
+            let _ = pending.abort(&mut self.heap);
+            return Some(self.fault(VmFault::AccountingOverflow));
+        };
+        self.consumed_dynamic_cost = consumed;
+        *remaining -= used;
+        let Some((destination, value)) = result else {
+            self.pending_concat = Some(pending);
+            return Some(Outcome::SliceExhausted);
+        };
+        let index = frame_index * self.image.registers_per_frame() + destination as usize;
+        let Some(slot) = self.registers.get_mut(index) else {
+            let _ = pending.abort(&mut self.heap);
+            return Some(self.fault(VmFault::InvalidStoragePlan));
+        };
+        *slot = RegisterValue::Initialized(value);
+        self.frames[frame_index].instruction += 1;
+        None
+    }
+
+    fn text_outcome(&mut self, error: text::TextError) -> Outcome {
+        match error {
+            text::TextError::Trap(trap) => {
+                let outcome = Outcome::Crashed(trap);
+                self.lifecycle = Lifecycle::Terminal(outcome);
+                outcome
+            }
+            text::TextError::Fault(fault) => self.fault(fault),
+        }
+    }
+
     fn cancel_pending_allocation(&mut self) {
         if let Some(pending) = self.pending_allocation.take() {
+            let _ = pending.abort(&mut self.heap);
+        }
+    }
+
+    fn cancel_pending_concat(&mut self) {
+        if let Some(pending) = self.pending_concat.take() {
             let _ = pending.abort(&mut self.heap);
         }
     }
@@ -1010,9 +1249,11 @@ impl Machine {
                 .image
                 .reference_type(reference)
                 .ok_or(VmFault::InvalidReference),
-            super::value::ReferenceDomain::Literal | super::value::ReferenceDomain::Emergency => {
-                Err(VmFault::InvalidReference)
-            }
+            super::value::ReferenceDomain::Literal => self
+                .image
+                .reference_type(reference)
+                .ok_or(VmFault::InvalidReference),
+            super::value::ReferenceDomain::Emergency => Err(VmFault::InvalidReference),
         }
     }
 
@@ -1077,6 +1318,35 @@ impl Machine {
 
     pub(super) fn consumed_dynamic_cost(&self) -> u64 {
         self.consumed_dynamic_cost
+    }
+
+    #[cfg(test)]
+    pub(super) fn string_length(&self, reference: super::value::ReferenceValue) -> i32 {
+        text::length(&self.image, &self.heap, RuntimeValue::Reference(reference))
+            .ok()
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    pub(super) fn string_get(&self, reference: super::value::ReferenceValue, index: i32) -> u16 {
+        text::get(
+            &self.image,
+            &self.heap,
+            RuntimeValue::Reference(reference),
+            index,
+        )
+        .ok()
+        .unwrap()
+    }
+
+    #[cfg(test)]
+    pub(super) fn string_encoding(
+        &self,
+        reference: super::value::ReferenceValue,
+    ) -> Option<super::layout::StringEncoding> {
+        text::encoding(&self.image, &self.heap, RuntimeValue::Reference(reference))
+            .ok()
+            .unwrap()
     }
 
     pub(super) fn trace_digest(&self) -> [u8; 32] {
@@ -1268,6 +1538,7 @@ impl Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         self.cancel_pending_allocation();
+        self.cancel_pending_concat();
     }
 }
 
@@ -1356,6 +1627,7 @@ fn execute_scalar(
     registers: &mut [RegisterValue],
     register_types: &[ResolvedValueType],
     image: &ExecutionImage,
+    heap: &Heap,
 ) -> Result<(), InstructionFailure> {
     let read = |register: u16| match registers.get(register as usize) {
         Some(RegisterValue::Initialized(value)) => Ok(*value),
@@ -1562,6 +1834,24 @@ fn execute_scalar(
         }
         ResolvedInstruction::RefNotEqual { dst, lhs, rhs } => {
             binary!(dst, lhs, rhs, |a, b| Ok(RuntimeValue::Bool(a != b)))
+        }
+        ResolvedInstruction::StringLength { dst, string } => {
+            let value = text::length(image, heap, read(*string)?).map_err(|error| match error {
+                text::TextError::Trap(trap) => InstructionFailure::Trap(trap),
+                text::TextError::Fault(fault) => InstructionFailure::Fault(fault),
+            })?;
+            write(registers, *dst, RuntimeValue::I32(value))
+        }
+        ResolvedInstruction::StringGet { dst, string, index } => {
+            let RuntimeValue::I32(index) = read(*index)? else {
+                return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
+            };
+            let value =
+                text::get(image, heap, read(*string)?, index).map_err(|error| match error {
+                    text::TextError::Trap(trap) => InstructionFailure::Trap(trap),
+                    text::TextError::Fault(fault) => InstructionFailure::Fault(fault),
+                })?;
+            write(registers, *dst, RuntimeValue::Char(value))
         }
         _ => Err(InstructionFailure::Fault(VmFault::UnsupportedInstruction)),
     }

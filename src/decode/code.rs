@@ -239,6 +239,39 @@ fn decode_instruction(
                 args,
             }
         }
+        0x60 => Instruction::StringLength {
+            dst: reg(&mut cursor, offset)?,
+            string: reg(&mut cursor, offset)?,
+        },
+        0x61 => {
+            let (dst, string, index) = regs3(&mut cursor, offset)?;
+            Instruction::StringGet { dst, string, index }
+        }
+        0x62 => {
+            let (dst, lhs, rhs) = regs3(&mut cursor, offset)?;
+            Instruction::StringEquals { dst, lhs, rhs }
+        }
+        0x63 => {
+            let (dst, lhs, rhs) = regs3(&mut cursor, offset)?;
+            Instruction::StringCompare { dst, lhs, rhs }
+        }
+        0x64 => Instruction::StringHash {
+            dst: reg(&mut cursor, offset)?,
+            string: reg(&mut cursor, offset)?,
+        },
+        0x65 => {
+            let (dst, lhs, rhs) = regs3(&mut cursor, offset)?;
+            Instruction::StringConcat { dst, lhs, rhs }
+        }
+        0x66 => {
+            let (dst, string, start, end) = regs4(&mut cursor, offset)?;
+            Instruction::StringSubstring {
+                dst,
+                string,
+                start,
+                end,
+            }
+        }
         0xe0 => Instruction::Jump {
             target: id(&mut cursor, offset)?,
         },
@@ -541,6 +574,15 @@ fn list_count(
 
 fn regs3(cursor: &mut Cursor<'_>, offset: usize) -> Result<(u16, u16, u16), DiagnosticSet> {
     Ok((
+        reg(cursor, offset)?,
+        reg(cursor, offset)?,
+        reg(cursor, offset)?,
+    ))
+}
+
+fn regs4(cursor: &mut Cursor<'_>, offset: usize) -> Result<(u16, u16, u16, u16), DiagnosticSet> {
+    Ok((
+        reg(cursor, offset)?,
         reg(cursor, offset)?,
         reg(cursor, offset)?,
         reg(cursor, offset)?,
