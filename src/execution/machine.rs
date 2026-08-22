@@ -1814,6 +1814,10 @@ impl Machine {
         self.trace.clone().finalize().into()
     }
 
+    pub(super) fn trace_host_field(&mut self, bytes: &[u8]) {
+        trace_field(&mut self.trace, bytes);
+    }
+
     pub(super) fn entered_blocks(&self) -> u64 {
         self.entered_blocks
     }

@@ -326,6 +326,18 @@ pub struct QuotaExhaustion {
     pub consumed: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountingSnapshot {
+    pub fixed_guest_units: u64,
+    pub dynamic_guest_units: u64,
+    pub maintenance_units: u64,
+    pub entered_blocks: u64,
+    pub executed_instructions: u64,
+    pub published_requests: u64,
+    pub accepted_responses: u64,
+    pub trace_digest: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AdvanceOutcome<'a> {
     SliceExhausted,

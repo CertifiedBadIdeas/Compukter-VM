@@ -242,17 +242,20 @@ fn waiting_poll_is_stable_and_invalid_responses_are_atomic() {
         AdvanceOutcome::HostRequest(request) => request.id(),
         other => panic!("unexpected outcome: {other:?}"),
     };
+    let waiting_accounting = session.accounting();
     let repeated_id = match session.advance(1, 1).unwrap() {
         AdvanceOutcome::HostRequest(request) => request.id(),
         other => panic!("unexpected outcome: {other:?}"),
     };
     assert_eq!(first_id, repeated_id);
+    assert_eq!(waiting_accounting, session.accounting());
     assert_eq!(
         ResumeError::WrongResponseType,
         session
             .resume(first_id, HostResponse::Success(HostValueInput::I32(7)))
             .unwrap_err()
     );
+    assert_eq!(waiting_accounting, session.accounting());
     assert!(matches!(
         session.advance(1, 1).unwrap(),
         AdvanceOutcome::HostRequest(_)
@@ -266,6 +269,7 @@ fn waiting_poll_is_stable_and_invalid_responses_are_atomic() {
             )
             .unwrap_err()
     );
+    assert_eq!(waiting_accounting, session.accounting());
     assert!(matches!(
         session.advance(1, 1).unwrap(),
         AdvanceOutcome::HostRequest(_)
@@ -322,6 +326,24 @@ fn request_ids_are_monotonic_and_overflow_faults_before_publication() {
         overflow.advance(64, 0).unwrap(),
         AdvanceOutcome::Faulted(_)
     ));
+}
+
+#[test]
+fn string_request_id_overflow_faults_before_copying_or_dynamic_charge() {
+    let units = [
+        0x0041, 0xd800, 0x0100, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
+    ];
+    let mut session = string_session(&units, false, false, profile());
+    session.test_set_next_request_id(u64::MAX);
+
+    assert_eq!(
+        AdvanceOutcome::Faulted(super::error::VmFault::AccountingOverflow),
+        session.advance(64, 0).unwrap()
+    );
+    let accounting = session.accounting();
+    assert_eq!(0, accounting.dynamic_guest_units);
+    assert_eq!(0, accounting.published_requests);
+    assert_eq!(0, accounting.accepted_responses);
 }
 
 #[test]
@@ -597,4 +619,147 @@ fn inbound_string_collects_dead_guest_string_and_retries_once() {
         AdvanceOutcome::Halted(Some(HostValueView::I32(kotlin_string_hash(&units)))),
         terminal
     );
+}
+
+fn unit_loop_session(maximum_requests: u32, maximum_responses: u64) -> Session {
+    let mut execution_profile = profile();
+    execution_profile.maximum_host_arguments = 0;
+    execution_profile.maximum_host_requests = maximum_requests;
+    execution_profile.maximum_accepted_responses = maximum_responses;
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::unit_capability_loop_artifact(maximum_requests),
+        execution_profile,
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    session
+}
+
+#[test]
+fn determinism_is_independent_of_wait_poll_count() {
+    let run = |polls: usize| {
+        let mut session = unit_loop_session(1, 1);
+        let id = match session.advance(64, 0).unwrap() {
+            AdvanceOutcome::HostRequest(request) => request.id(),
+            other => panic!("{other:?}"),
+        };
+        let waiting = session.accounting();
+        for _ in 0..polls {
+            assert!(matches!(
+                session.advance(1, 1).unwrap(),
+                AdvanceOutcome::HostRequest(_)
+            ));
+            assert_eq!(waiting, session.accounting());
+        }
+        session
+            .resume(id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+        assert!(matches!(
+            session.advance(64, 0).unwrap(),
+            AdvanceOutcome::QuotaExhausted(_)
+        ));
+        let accounting = session.accounting();
+        assert_eq!(1, accounting.published_requests);
+        assert_eq!(1, accounting.accepted_responses);
+        accounting
+    };
+    assert_eq!(run(0), run(17));
+}
+
+#[test]
+fn request_and_response_quotas_are_distinct_stable_outcomes() {
+    let mut request_limited = unit_loop_session(1, 1);
+    let id = match request_limited.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(request) => request.id(),
+        other => panic!("{other:?}"),
+    };
+    request_limited
+        .resume(id, HostResponse::Success(HostValueInput::Unit))
+        .unwrap();
+    let request_exhaustion = match request_limited.advance(64, 0).unwrap() {
+        AdvanceOutcome::QuotaExhausted(value) => value,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(QuotaKind::HostRequests, request_exhaustion.kind);
+    assert_eq!(1, request_exhaustion.limit);
+    assert_eq!(1, request_exhaustion.consumed);
+    assert_eq!(1, request_limited.accounting().published_requests);
+    assert_eq!(1, request_limited.accounting().accepted_responses);
+    assert_eq!(
+        AdvanceOutcome::QuotaExhausted(request_exhaustion),
+        request_limited.advance(1, 1).unwrap()
+    );
+
+    let mut response_limited = unit_loop_session(1, 0);
+    let id = match response_limited.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(request) => request.id(),
+        other => panic!("{other:?}"),
+    };
+    response_limited
+        .resume(id, HostResponse::Success(HostValueInput::Unit))
+        .unwrap();
+    let response_exhaustion = match response_limited.advance(1, 1).unwrap() {
+        AdvanceOutcome::QuotaExhausted(value) => value,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(QuotaKind::AcceptedResponses, response_exhaustion.kind);
+    assert_eq!(0, response_exhaustion.limit);
+    assert_eq!(0, response_exhaustion.consumed);
+    assert_eq!(1, response_limited.accounting().published_requests);
+    assert_eq!(0, response_limited.accounting().accepted_responses);
+    assert_eq!(
+        AdvanceOutcome::QuotaExhausted(response_exhaustion),
+        response_limited.advance(1, 1).unwrap()
+    );
+}
+
+#[test]
+fn steady_state_request_resume_allocates_nothing() {
+    const ITERATIONS: u32 = 10_000;
+    let mut session = unit_loop_session(ITERATIONS + 1, u64::from(ITERATIONS + 1));
+    super::tests::allocation_counter::reset_and_enable();
+    for _ in 0..ITERATIONS {
+        let id = match session.advance(64, 0).unwrap() {
+            AdvanceOutcome::HostRequest(request) => request.id(),
+            other => panic!("{other:?}"),
+        };
+        session
+            .resume(id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+    }
+    let allocations = super::tests::allocation_counter::disable_and_read();
+    assert_eq!(0, allocations);
+
+    let mut execution_profile = profile();
+    execution_profile.maximum_host_arguments = 0;
+    execution_profile.maximum_host_requests = ITERATIONS + 1;
+    execution_profile.maximum_accepted_responses = u64::from(ITERATIONS + 1);
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::String)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut string_session = Session::admit(
+        fixtures::string_response_loop_artifact(ITERATIONS + 1),
+        execution_profile,
+        &[binding],
+    )
+    .unwrap();
+    string_session.start(&[]).unwrap();
+    let units = [0x0041, 0xd800, 0xdc00, 0x0100];
+    super::tests::allocation_counter::reset_and_enable();
+    for _ in 0..ITERATIONS {
+        let id = loop {
+            match string_session.advance(64, 64).unwrap() {
+                AdvanceOutcome::SliceExhausted => {}
+                AdvanceOutcome::HostRequest(request) => break request.id(),
+                other => panic!("{other:?}"),
+            }
+        };
+        string_session
+            .resume(id, HostResponse::Success(HostValueInput::String(&units)))
+            .unwrap();
+    }
+    let allocations = super::tests::allocation_counter::disable_and_read();
+    assert_eq!(0, allocations);
 }

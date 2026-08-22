@@ -3,10 +3,10 @@ use crate::VerifiedArtifact;
 use super::{
     error::{AdmissionError, RunError},
     host::{
-        AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, HostArguments,
-        HostFailure, HostRequestView, HostResponse, HostValueInput, HostValueSlot, HostValueView,
-        ManagedAllocationFailure, QuotaExhaustion, QuotaKind, RequestId, ResolvedCapability,
-        ResolvedOperation, ResumeError,
+        AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile,
+        HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput,
+        HostValueSlot, HostValueView, ManagedAllocationFailure, QuotaExhaustion, QuotaKind,
+        RequestId, ResolvedCapability, ResolvedOperation, ResumeError,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::Machine,
@@ -19,6 +19,7 @@ pub struct Session {
     entry_arguments: Box<[EntryArgument]>,
     outbound_utf16: Box<[u16]>,
     inbound_utf16: Box<[u16]>,
+    maximum_host_requests: u64,
     maximum_accepted_responses: u64,
     argument_slots: Box<[HostValueSlot]>,
     argument_count: usize,
@@ -29,6 +30,8 @@ pub struct Session {
     maximum_slice_budget: u32,
     inbound_length: usize,
     resuming_host_string: bool,
+    published_requests: u64,
+    accepted_responses: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +43,7 @@ struct PendingRequest {
 
 #[derive(Clone, Copy, Debug)]
 struct PreparingRequest {
+    id: RequestId,
     capability: u32,
     operation: u32,
     argument: usize,
@@ -66,6 +70,7 @@ impl core::fmt::Debug for Session {
             .field("entry_capacity", &self.entry_arguments.len())
             .field("outbound_utf16_capacity", &self.outbound_utf16.len())
             .field("inbound_utf16_capacity", &self.inbound_utf16.len())
+            .field("maximum_host_requests", &self.maximum_host_requests)
             .field(
                 "maximum_accepted_responses",
                 &self.maximum_accepted_responses,
@@ -89,6 +94,7 @@ impl Session {
         let maximum_host_arguments = checked_usize(profile.maximum_host_arguments)?;
         let outbound_capacity = checked_usize(profile.maximum_outbound_utf16_code_units)?;
         let inbound_capacity = checked_usize(profile.maximum_inbound_utf16_code_units)?;
+        let maximum_host_requests = u64::from(profile.maximum_host_requests);
         let maximum_accepted_responses = profile.maximum_accepted_responses;
         let maximum_slice_budget = profile.maximum_slice_budget;
         let image_profile = ImageProfile {
@@ -120,6 +126,7 @@ impl Session {
             entry_arguments,
             outbound_utf16,
             inbound_utf16,
+            maximum_host_requests,
             maximum_accepted_responses,
             argument_slots,
             argument_count: 0,
@@ -130,6 +137,8 @@ impl Session {
             maximum_slice_budget,
             inbound_length: 0,
             resuming_host_string: false,
+            published_requests: 0,
+            accepted_responses: 0,
         })
     }
 
@@ -223,14 +232,6 @@ impl Session {
         if request_id != pending.id {
             return Err(ResumeError::WrongRequestId);
         }
-        if let HostResponse::Failure(failure) = response {
-            self.pending_request = None;
-            self.terminal = Some(SessionTerminal::HostFailed(failure));
-            return Ok(());
-        }
-        let HostResponse::Success(input) = response else {
-            unreachable!();
-        };
         let expected = self
             .capabilities
             .get(pending.capability as usize)
@@ -238,9 +239,33 @@ impl Session {
             .and_then(|capability| capability.operations.get(pending.operation as usize))
             .map(|operation| operation.result)
             .ok_or(ResumeError::NoPendingRequest)?;
-        if input.value_type() != expected {
-            return Err(ResumeError::WrongResponseType);
+        if let HostResponse::Success(input) = response {
+            if input.value_type() != expected {
+                return Err(ResumeError::WrongResponseType);
+            }
+            if let HostValueInput::String(units) = input {
+                if units.len() > self.inbound_utf16.len() {
+                    return Err(ResumeError::ResponseTooLarge);
+                }
+            }
         }
+        if self.accepted_responses >= self.maximum_accepted_responses {
+            self.terminal = Some(SessionTerminal::QuotaExhausted(QuotaExhaustion {
+                kind: QuotaKind::AcceptedResponses,
+                limit: self.maximum_accepted_responses,
+                consumed: self.accepted_responses,
+            }));
+            return Ok(());
+        }
+        if let HostResponse::Failure(failure) = response {
+            self.accept_response(request_id, response);
+            self.pending_request = None;
+            self.terminal = Some(SessionTerminal::HostFailed(failure));
+            return Ok(());
+        }
+        let HostResponse::Success(input) = response else {
+            unreachable!();
+        };
         let value = match input {
             HostValueInput::Unit => None,
             HostValueInput::I32(value) => Some(RuntimeValue::I32(value)),
@@ -250,20 +275,19 @@ impl Session {
             HostValueInput::Bool(value) => Some(RuntimeValue::Bool(value)),
             HostValueInput::Char(value) => Some(RuntimeValue::Char(value)),
             HostValueInput::String(units) => {
-                if units.len() > self.inbound_utf16.len() {
-                    return Err(ResumeError::ResponseTooLarge);
-                }
+                self.inbound_utf16[..units.len()].copy_from_slice(units);
                 if let Err(fault) = self
                     .machine
                     .begin_capability_string_response(units.is_empty())
                 {
+                    self.accept_response(request_id, response);
                     self.pending_request = None;
                     self.terminal = Some(SessionTerminal::Faulted(fault));
                     return Ok(());
                 }
-                self.inbound_utf16[..units.len()].copy_from_slice(units);
                 self.inbound_length = units.len();
                 self.resuming_host_string = self.machine.capability_string_response_pending();
+                self.accept_response(request_id, response);
                 self.pending_request = None;
                 return Ok(());
             }
@@ -271,11 +295,36 @@ impl Session {
         self.machine
             .complete_capability(value)
             .map_err(|_| ResumeError::WrongResponseType)?;
+        self.accept_response(request_id, response);
         self.pending_request = None;
         Ok(())
     }
 
+    pub fn accounting(&self) -> AccountingSnapshot {
+        AccountingSnapshot {
+            fixed_guest_units: self.machine.consumed_fixed_cost(),
+            dynamic_guest_units: self.machine.consumed_dynamic_cost(),
+            maintenance_units: self.machine.consumed_maintenance_cost(),
+            entered_blocks: self.machine.entered_blocks(),
+            executed_instructions: self.machine.executed_instructions(),
+            published_requests: self.published_requests,
+            accepted_responses: self.accepted_responses,
+            trace_digest: self.machine.trace_digest(),
+        }
+    }
+
     fn begin_request(&mut self) -> Result<AdvanceOutcome<'_>, RunError> {
+        if self.published_requests >= self.maximum_host_requests {
+            return self.establish_quota(QuotaExhaustion {
+                kind: QuotaKind::HostRequests,
+                limit: self.maximum_host_requests,
+                consumed: self.published_requests,
+            });
+        }
+        let Some(next_request_id) = self.next_request_id.checked_add(1) else {
+            return self.establish_fault(super::error::VmFault::AccountingOverflow);
+        };
+        let id = RequestId::new(self.next_request_id).ok_or(RunError::NotRunnable)?;
         let prepared = (|| {
             let suspension = self.machine.capability_suspension()?;
             if suspension.arguments.len() > self.argument_slots.len() {
@@ -331,6 +380,7 @@ impl Session {
         }
         if contains_string && outbound_used != 0 {
             self.preparing_request = Some(PreparingRequest {
+                id,
                 capability,
                 operation,
                 argument: 0,
@@ -338,25 +388,37 @@ impl Session {
             });
             return Ok(AdvanceOutcome::SliceExhausted);
         }
-        self.publish_prepared_request(capability, operation)
+        self.publish_prepared_request(id, next_request_id, capability, operation)
     }
 
     fn publish_prepared_request(
         &mut self,
+        id: RequestId,
+        next_request_id: u64,
         capability: u32,
         operation: u32,
     ) -> Result<AdvanceOutcome<'_>, RunError> {
-        let Some(next) = self.next_request_id.checked_add(1) else {
-            return self.establish_fault(super::error::VmFault::AccountingOverflow);
-        };
-        let id = RequestId::new(self.next_request_id).ok_or(RunError::NotRunnable)?;
-        self.next_request_id = next;
+        self.next_request_id = next_request_id;
         self.pending_request = Some(PendingRequest {
             id,
             capability,
             operation,
         });
+        self.published_requests += 1;
+        trace_request(
+            &mut self.machine,
+            id,
+            capability,
+            operation,
+            &self.argument_slots[..self.argument_count],
+            &self.outbound_utf16,
+        );
         self.request_outcome().map_err(|_| RunError::NotRunnable)
+    }
+
+    fn accept_response(&mut self, request_id: RequestId, response: HostResponse<'_>) {
+        self.accepted_responses += 1;
+        trace_response(&mut self.machine, request_id, response);
     }
 
     fn advance_request_preparation(
@@ -425,7 +487,8 @@ impl Session {
             state.string_offset = 0;
         }
         self.preparing_request = None;
-        self.publish_prepared_request(state.capability, state.operation)
+        let next_request_id = state.id.get().checked_add(1).ok_or(RunError::NotRunnable)?;
+        self.publish_prepared_request(state.id, next_request_id, state.capability, state.operation)
     }
 
     fn request_outcome(&self) -> Result<AdvanceOutcome<'_>, super::error::VmFault> {
@@ -468,6 +531,106 @@ impl Session {
     pub(super) fn test_set_next_request_id(&mut self, value: u64) {
         self.next_request_id = value;
     }
+}
+
+fn trace_request(
+    machine: &mut Machine,
+    id: RequestId,
+    capability: u32,
+    operation: u32,
+    arguments: &[HostValueSlot],
+    utf16: &[u16],
+) {
+    trace_field(machine, &[2]);
+    trace_field(machine, &id.get().to_le_bytes());
+    trace_field(machine, &capability.to_le_bytes());
+    trace_field(machine, &operation.to_le_bytes());
+    trace_field(
+        machine,
+        &u32::try_from(arguments.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    for argument in arguments {
+        trace_slot(machine, *argument, utf16);
+    }
+}
+
+fn trace_response(machine: &mut Machine, id: RequestId, response: HostResponse<'_>) {
+    trace_field(machine, &[3]);
+    trace_field(machine, &id.get().to_le_bytes());
+    match response {
+        HostResponse::Success(value) => {
+            trace_field(machine, &[0]);
+            trace_input(machine, value);
+        }
+        HostResponse::Failure(failure) => {
+            trace_field(machine, &[1]);
+            let kind = match failure.kind() {
+                HostFailureKind::EndOfFile => 0,
+                HostFailureKind::Unavailable => 1,
+                HostFailureKind::InputOutput => 2,
+                HostFailureKind::Cancelled => 3,
+                HostFailureKind::Other => 4,
+            };
+            trace_field(machine, &[kind]);
+            trace_field(machine, &failure.code().to_le_bytes());
+        }
+    }
+}
+
+fn trace_input(machine: &mut Machine, value: HostValueInput<'_>) {
+    match value {
+        HostValueInput::Unit => trace_field(machine, &[0]),
+        HostValueInput::I32(value) => trace_scalar(machine, 1, &value.to_le_bytes()),
+        HostValueInput::I64(value) => trace_scalar(machine, 2, &value.to_le_bytes()),
+        HostValueInput::F32(value) => trace_scalar(machine, 3, &value.to_le_bytes()),
+        HostValueInput::F64(value) => trace_scalar(machine, 4, &value.to_le_bytes()),
+        HostValueInput::Bool(value) => trace_scalar(machine, 5, &[u8::from(value)]),
+        HostValueInput::Char(value) => trace_scalar(machine, 6, &value.to_le_bytes()),
+        HostValueInput::String(units) => trace_utf16(machine, units),
+    }
+}
+
+fn trace_slot(machine: &mut Machine, value: HostValueSlot, utf16: &[u16]) {
+    match value {
+        HostValueSlot::Empty => trace_field(machine, &[0]),
+        HostValueSlot::I32(value) => trace_scalar(machine, 1, &value.to_le_bytes()),
+        HostValueSlot::I64(value) => trace_scalar(machine, 2, &value.to_le_bytes()),
+        HostValueSlot::F32(value) => trace_scalar(machine, 3, &value.to_le_bytes()),
+        HostValueSlot::F64(value) => trace_scalar(machine, 4, &value.to_le_bytes()),
+        HostValueSlot::Bool(value) => trace_scalar(machine, 5, &[u8::from(value)]),
+        HostValueSlot::Char(value) => trace_scalar(machine, 6, &value.to_le_bytes()),
+        HostValueSlot::String { start, length } => {
+            let start = usize::try_from(start).unwrap_or(usize::MAX);
+            let length = usize::try_from(length).unwrap_or(usize::MAX);
+            let units = start
+                .checked_add(length)
+                .and_then(|end| utf16.get(start..end))
+                .unwrap_or_default();
+            trace_utf16(machine, units);
+        }
+    }
+}
+
+fn trace_scalar(machine: &mut Machine, tag: u8, payload: &[u8]) {
+    trace_field(machine, &[tag]);
+    trace_field(machine, payload);
+}
+
+fn trace_utf16(machine: &mut Machine, units: &[u16]) {
+    trace_field(machine, &[7]);
+    trace_field(
+        machine,
+        &u32::try_from(units.len()).unwrap_or(u32::MAX).to_le_bytes(),
+    );
+    for unit in units {
+        trace_field(machine, &unit.to_le_bytes());
+    }
+}
+
+fn trace_field(machine: &mut Machine, bytes: &[u8]) {
+    machine.trace_host_field(bytes);
 }
 
 fn runtime_slot(value: RuntimeValue) -> Option<HostValueSlot> {

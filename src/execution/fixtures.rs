@@ -377,6 +377,46 @@ pub(super) fn two_unit_capability_calls_artifact() -> VerifiedArtifact {
     })
 }
 
+pub(super) fn unit_capability_loop_artifact(maximum_requests: u32) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.header.semantic_features = 0b110;
+        artifact.capabilities.push(crate::artifact::Capability {
+            namespace: 0,
+            name: 1,
+            abi_major: 1,
+            minimum_abi_minor: 0,
+            flags: 1,
+            operation_count: 1,
+        });
+        artifact.manifest.required_capabilities = 1;
+        artifact.manifest.maximum_host_requests = maximum_requests;
+        artifact.manifest.required_stack_bytes = 32;
+        let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+            unreachable!();
+        };
+        *flags = 1;
+        let function = &mut artifact.modules[0].functions[0];
+        function.flags = 1;
+        function.first_block = BlockId(0);
+        function.block_count = 1;
+        let call = Instruction::CapabilityCallAsync {
+            dst: u16::MAX,
+            capability: 0,
+            operation: 0,
+            args: Box::new([]),
+            resume_block: 0,
+        };
+        let cost = call.fixed_cost().unwrap();
+        artifact.modules[0].blocks[0].flags = 1;
+        artifact.modules[0].blocks[0].instruction_count = 1;
+        artifact.modules[0].blocks[0].declared_fixed_cost = cost;
+        artifact.modules[0].code[0].instructions = vec![call].into_boxed_slice();
+        artifact.modules[0].code[0].fixed_cost = cost;
+        artifact.manifest.maximum_block_cost = cost;
+        artifact.manifest.minimum_slice_cost = cost;
+    })
+}
+
 pub(super) fn allocation_workloads() -> Vec<VerifiedArtifact> {
     vec![empty_loop_artifact(3), arithmetic_loop_artifact()]
 }
@@ -1617,6 +1657,46 @@ pub(super) fn string_response_capability_artifact() -> VerifiedArtifact {
             };
             *flags = 1;
             artifact.modules[0].functions[0].flags = 1;
+        },
+    )
+}
+
+pub(super) fn string_response_loop_artifact(maximum_requests: u32) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks_configured(
+        primitive(0),
+        vec![string],
+        Vec::new(),
+        &[],
+        vec![vec![Instruction::CapabilityCallAsync {
+            dst: 0,
+            capability: 0,
+            operation: 0,
+            args: Box::new([]),
+            resume_block: 0,
+        }]],
+        |artifact| {
+            artifact.header.semantic_features = 0b1110;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 1,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = maximum_requests;
+            let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+                unreachable!();
+            };
+            *flags = 1;
+            artifact.modules[0].functions[0].flags = 1;
+            artifact.modules[0].blocks[0].flags = 1;
         },
     )
 }
