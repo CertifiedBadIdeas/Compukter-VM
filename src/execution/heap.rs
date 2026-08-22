@@ -266,6 +266,85 @@ impl Heap {
         self.free_block(reservation.block)
     }
 
+    pub(super) fn zero_reserved_payload(
+        &mut self,
+        reservation: ReservedAllocation,
+        offset: u32,
+        length: u32,
+    ) -> Result<(), VmFault> {
+        self.validate_reservation(reservation)?;
+        let capacity = self
+            .block_size(reservation.block)?
+            .checked_sub(16)
+            .ok_or(VmFault::CorruptHeap)?;
+        let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
+        if end > capacity {
+            return Err(VmFault::CorruptHeap);
+        }
+        let start = reservation
+            .block
+            .0
+            .checked_add(16)
+            .and_then(|value| value.checked_add(offset))
+            .ok_or(VmFault::CorruptHeap)?;
+        for byte in start..start + length {
+            let unit = self
+                .arena
+                .get_mut((byte / 16) as usize)
+                .ok_or(VmFault::CorruptHeap)?;
+            unit.0[(byte % 16) as usize] = 0;
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_reserved_u32(
+        &mut self,
+        reservation: ReservedAllocation,
+        offset: u32,
+        value: u32,
+    ) -> Result<(), VmFault> {
+        self.validate_reservation(reservation)?;
+        let capacity = self
+            .block_size(reservation.block)?
+            .checked_sub(16)
+            .ok_or(VmFault::CorruptHeap)?;
+        if offset.checked_add(4).ok_or(VmFault::CorruptHeap)? > capacity {
+            return Err(VmFault::CorruptHeap);
+        }
+        let start = reservation
+            .block
+            .0
+            .checked_add(16)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(VmFault::CorruptHeap)?;
+        for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+            let position = start
+                .checked_add(index as u32)
+                .ok_or(VmFault::CorruptHeap)?;
+            let unit = self
+                .arena
+                .get_mut((position / 16) as usize)
+                .ok_or(VmFault::CorruptHeap)?;
+            unit.0[(position % 16) as usize] = byte;
+        }
+        Ok(())
+    }
+
+    fn validate_reservation(&self, reservation: ReservedAllocation) -> Result<(), VmFault> {
+        let entry = self
+            .handles
+            .get(reservation.slot as usize)
+            .ok_or(VmFault::CorruptHeap)?;
+        if entry.state == HandleState::Reserved
+            && entry.generation == reservation.generation
+            && entry.block == reservation.block
+        {
+            Ok(())
+        } else {
+            Err(VmFault::CorruptHeap)
+        }
+    }
+
     pub(super) fn free(&mut self, reference: ReferenceValue) -> Result<bool, VmFault> {
         if reference.domain() != ReferenceDomain::Managed {
             return Ok(false);
@@ -373,6 +452,25 @@ impl Heap {
     #[cfg(test)]
     pub(super) fn test_arena_address(&self) -> usize {
         self.arena.as_ptr() as usize
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_managed_payload(&self, reference: ReferenceValue) -> Option<Box<[u8]>> {
+        let entry = self.handles.get(reference.slot() as usize)?;
+        if reference.domain() != ReferenceDomain::Managed
+            || entry.state != HandleState::Live
+            || entry.generation != reference.generation()
+        {
+            return None;
+        }
+        let length = self.block_size(entry.block).ok()?.checked_sub(16)?;
+        let start = entry.block.0.checked_add(16)?;
+        let mut bytes = Vec::with_capacity(length as usize);
+        for position in start..start + length {
+            let unit = self.arena.get((position / 16) as usize)?;
+            bytes.push(unit.0[(position % 16) as usize]);
+        }
+        Some(bytes.into_boxed_slice())
     }
 
     fn find_suitable(&self, size: u32) -> Result<Option<BlockOffset>, VmFault> {

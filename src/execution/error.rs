@@ -48,6 +48,15 @@ pub(super) enum RunError {
 pub(super) enum GuestTrap {
     DivisionByZero,
     StackOverflow,
+    NegativeArraySize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AllocationExhaustion {
+    pub requested_block_bytes: u32,
+    pub total_free: u32,
+    pub largest_free_block: u32,
+    pub collection_attempted: bool,
 }
 
 #[repr(u8)]
@@ -67,6 +76,7 @@ pub(super) enum VmFault {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Outcome {
     SliceExhausted,
+    AllocationExhausted(AllocationExhaustion),
     Halted(Option<RuntimeValue>),
     Crashed(GuestTrap),
     Faulted(VmFault),

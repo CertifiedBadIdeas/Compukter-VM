@@ -2,6 +2,7 @@
 
 mod error;
 mod heap;
+mod heap_ops;
 mod image;
 mod layout;
 mod machine;

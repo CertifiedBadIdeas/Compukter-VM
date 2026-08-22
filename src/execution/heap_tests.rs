@@ -1,15 +1,18 @@
 use super::{
-    error::{AdmissionError, VmFault},
+    error::{AdmissionError, AllocationExhaustion, GuestTrap, Outcome, VmFault},
     fixtures,
     heap::{
         free_size_class, request_size_class, splitmix64, AllocationRequest, BlockOffset, Heap,
         SizeClass,
     },
+    heap_ops::{PendingAllocation, PendingState},
     image::{deduplicate_literal_ranges, ExecutionImage},
     layout::{
         array_layout, empty_object_layout, object_layout, string_layout, FieldSpec,
         RuntimeTypeLayout, StoragePlan, StringEncoding, ValueWidth,
     },
+    machine::Machine,
+    value::RuntimeValue,
     TypeKey,
 };
 use crate::artifact::ByteRange;
@@ -379,4 +382,124 @@ fn portable_admission_rejects_unaligned_or_too_small_heap() {
             ExecutionImage::admit(fixtures::scalar_artifact(), profile).map(|_| ())
         );
     }
+}
+
+#[test]
+fn allocation_object_opcode_is_admitted() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 64;
+    assert!(ExecutionImage::admit(fixtures::object_allocation_artifact(0), profile).is_ok());
+}
+
+#[test]
+fn allocation_resumes_without_recharging_or_publishing_a_prefix() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 128;
+    let image = ExecutionImage::admit(fixtures::object_allocation_artifact(5), profile).unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5).unwrap());
+    assert_eq!(5, machine.consumed_fixed_cost());
+    assert_eq!(0, machine.consumed_dynamic_cost());
+    assert_eq!(None, machine.test_register(0));
+    assert_eq!(0, machine.test_pending_initialized_bytes());
+
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(1).unwrap());
+    assert_eq!(16, machine.test_pending_initialized_bytes());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(1).unwrap());
+    assert_eq!(32, machine.test_pending_initialized_bytes());
+    assert_eq!(5, machine.consumed_fixed_cost());
+    assert_eq!(2, machine.consumed_dynamic_cost());
+    assert_eq!(None, machine.test_register(0));
+
+    let Outcome::Halted(Some(RuntimeValue::Reference(reference))) = machine.run_slice(1).unwrap()
+    else {
+        panic!("allocation must publish and return its reference atomically");
+    };
+    assert_eq!(5, machine.consumed_fixed_cost());
+    assert_eq!(3, machine.consumed_dynamic_cost());
+    assert_eq!(1, machine.test_heap_diagnostic().live_handles);
+    assert!(machine
+        .test_managed_payload(reference)
+        .unwrap()
+        .iter()
+        .all(|byte| *byte == 0));
+}
+
+#[test]
+fn allocation_negative_array_length_traps_before_heap_mutation() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 64;
+    let image = ExecutionImage::admit(fixtures::array_allocation_artifact(-1), profile).unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5).unwrap());
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::NegativeArraySize),
+        machine.run_slice(5).unwrap()
+    );
+    assert_eq!(64, machine.test_heap_diagnostic().total_free);
+    assert_eq!(0, machine.test_heap_diagnostic().live_handles);
+}
+
+#[test]
+fn allocation_oversized_request_reports_immediate_exhaustion() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 64;
+    let image = ExecutionImage::admit(fixtures::array_allocation_artifact(100), profile).unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5).unwrap());
+    assert_eq!(
+        Outcome::AllocationExhausted(AllocationExhaustion {
+            requested_block_bytes: 128,
+            total_free: 64,
+            largest_free_block: 64,
+            collection_attempted: false,
+        }),
+        machine.run_slice(5).unwrap()
+    );
+    assert_eq!(64, machine.test_heap_diagnostic().total_free);
+}
+
+#[test]
+fn allocation_cancellation_rolls_back_private_storage() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 128;
+    let image = ExecutionImage::admit(fixtures::object_allocation_artifact(5), profile).unwrap();
+    let mut machine = Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5).unwrap());
+    assert_eq!(64, machine.test_heap_diagnostic().total_free);
+    machine.test_cancel_pending().unwrap();
+    assert_eq!(128, machine.test_heap_diagnostic().total_free);
+    assert_eq!(None, machine.test_register(0));
+}
+
+#[test]
+fn allocation_zeroes_minimum_object_padding_without_dynamic_charge() {
+    let mut heap = Heap::new(&allocator_plan(32)).unwrap();
+    let dirty = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    heap.write_reserved_u32(dirty, 0, u32::MAX).unwrap();
+    heap.abort(dirty).unwrap();
+
+    let reservation = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    let mut pending = PendingAllocation::Object(PendingState {
+        request: allocator_request(32),
+        reservation,
+        destination: 0,
+        logical_bytes: 0,
+        initialized_bytes: 0,
+        fixed_cost_paid: true,
+        collection_attempted: false,
+    });
+    let (used, reference) = pending.advance(&mut heap, 0).unwrap();
+
+    assert_eq!(0, used);
+    let payload = heap.test_managed_payload(reference.unwrap()).unwrap();
+    assert!(payload.iter().all(|byte| *byte == 0));
 }

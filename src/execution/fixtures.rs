@@ -771,6 +771,131 @@ pub(super) fn portable_layout_artifact() -> VerifiedArtifact {
     })
 }
 
+pub(super) fn object_allocation_artifact(field_count: u32) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let reference = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: reference,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0].types.push(NominalType::Class {
+            flags: 0,
+            generic_arity: 0,
+            name: 0,
+            super_type: TypeId(u32::MAX),
+            interfaces: Vec::new(),
+            field_start: 0,
+            field_count,
+            method_start: 0,
+            method_count: 0,
+        });
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].fields = (0..field_count)
+            .map(|_| Field {
+                owner: TypeId(1),
+                name: 0,
+                value_type: reference,
+                flags: 0,
+            })
+            .collect();
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 1;
+        function.registers = vec![reference];
+        let instructions = vec![
+            Instruction::NewObject {
+                dst: 0,
+                type_ref: 1,
+            },
+            Instruction::Return { value: 0 },
+        ];
+        let fixed_cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        artifact.modules[0].blocks[0].instruction_count = instructions.len() as u32;
+        artifact.modules[0].blocks[0].declared_fixed_cost = fixed_cost;
+        artifact.modules[0].code[0].instructions = instructions.into_boxed_slice();
+        artifact.modules[0].code[0].fixed_cost = fixed_cost;
+        artifact.manifest.maximum_block_cost = fixed_cost;
+        artifact.manifest.minimum_slice_cost = fixed_cost;
+        configure_stack(artifact, 1, 1);
+    })
+}
+
+pub(super) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
+    let reference = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    verified_mutated(|artifact| {
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: reference,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0].types.push(NominalType::Array {
+            name: 0,
+            element: primitive(5),
+        });
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].constants = vec![Constant::I32(length)];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 2;
+        function.registers = vec![primitive(1), reference];
+        function.block_count = 2;
+        let programs = [
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::NewArray {
+                    dst: 1,
+                    type_ref: 1,
+                    length: 0,
+                },
+                Instruction::Return { value: 1 },
+            ],
+        ];
+        let mut maximum = 0;
+        artifact.modules[0].blocks.clear();
+        artifact.modules[0].code.clear();
+        for (block_id, instructions) in programs.into_iter().enumerate() {
+            let fixed_cost = instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum();
+            maximum = maximum.max(fixed_cost);
+            artifact.modules[0].blocks.push(Block {
+                owner_function: FunctionId(0),
+                code_record: BlockId(block_id as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: fixed_cost,
+                flags: 0,
+            });
+            artifact.modules[0].code.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: instructions.into_boxed_slice(),
+                fixed_cost,
+            });
+        }
+        artifact.manifest.maximum_block_cost = maximum;
+        artifact.manifest.minimum_slice_cost = maximum;
+        configure_stack(artifact, 2, 1);
+    })
+}
+
 pub(super) fn artifact_with_new_object() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::language_runtime_vector(), 160)
 }
@@ -866,7 +991,7 @@ pub(super) fn reference_entry_case() -> (
 
 pub(super) fn profile() -> ExecutionProfile {
     ExecutionProfile {
-        heap_bytes: !15_u32,
+        heap_bytes: 1024 * 1024,
         frame_storage_bytes: 1024 * 1024,
         maximum_call_depth: 64,
         maximum_coroutines: 64,

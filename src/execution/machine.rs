@@ -1,6 +1,9 @@
 use super::{
-    error::{AdmissionError, GuestTrap, Outcome, RunError, VmFault},
+    error::{AdmissionError, AllocationExhaustion, GuestTrap, Outcome, RunError, VmFault},
+    heap::{AllocationRequest, Heap},
+    heap_ops::{PendingAllocation, PendingState},
     image::{ExecutionImage, ResolvedInstruction, ResolvedValueType},
+    layout::{array_layout, RuntimeTypeLayout},
     numeric,
     value::{EntryArgument, RegisterValue, RuntimeValue},
 };
@@ -37,6 +40,8 @@ pub(super) struct Machine {
     lifecycle: Lifecycle,
     frames: Box<[Frame]>,
     registers: Box<[RegisterValue]>,
+    heap: Heap,
+    pending_allocation: Option<PendingAllocation>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
     consumed_dynamic_cost: u64,
@@ -48,6 +53,7 @@ pub(super) struct Machine {
 
 impl Machine {
     pub(super) fn new(image: ExecutionImage) -> Result<Self, AdmissionError> {
+        let heap = Heap::new(&image.storage_plan())?;
         let frame_count = image.maximum_call_depth();
         let register_count = frame_count
             .checked_mul(image.registers_per_frame())
@@ -67,6 +73,8 @@ impl Machine {
             lifecycle: Lifecycle::Pristine,
             frames: frames.into_boxed_slice(),
             registers: registers.into_boxed_slice(),
+            heap,
+            pending_allocation: None,
             frame_depth: 0,
             consumed_fixed_cost: 0,
             consumed_dynamic_cost: 0,
@@ -129,12 +137,14 @@ impl Machine {
             Lifecycle::Pristine => return Err(RunError::NotStarted),
             Lifecycle::Runnable => {}
         }
-        if budget == 0
-            || budget < self.image.minimum_slice_cost()
-            || budget > self.image.maximum_slice_budget()
-        {
+        let minimum = if self.pending_allocation.is_some() {
+            1
+        } else {
+            self.image.minimum_slice_cost()
+        };
+        if budget == 0 || budget < minimum || budget > self.image.maximum_slice_budget() {
             return Err(RunError::InvalidSliceBudget {
-                minimum: self.image.minimum_slice_cost(),
+                minimum,
                 maximum: self.image.maximum_slice_budget(),
                 supplied: budget,
             });
@@ -145,6 +155,11 @@ impl Machine {
                 .frame_depth
                 .checked_sub(1)
                 .ok_or(RunError::NotRunnable)?;
+            if self.pending_allocation.is_some() {
+                if let Some(outcome) = self.resume_pending_allocation(frame_index, &mut remaining) {
+                    return Ok(outcome);
+                }
+            }
             let block_index = self.frames[frame_index].block;
             let block_cost = self
                 .image
@@ -167,11 +182,20 @@ impl Machine {
                 self.entered_blocks = entered_blocks;
                 self.trace_block_entry(frame_index, block_index, remaining)?;
             }
-            let block = self.image.block(block_index).ok_or(RunError::NotRunnable)?;
+            let block_len = self
+                .image
+                .block(block_index)
+                .ok_or(RunError::NotRunnable)?
+                .instructions
+                .len();
 
-            while self.frames[frame_index].instruction < block.instructions.len() {
+            while self.frames[frame_index].instruction < block_len {
                 let instruction_index = self.frames[frame_index].instruction;
-                let instruction = &block.instructions[instruction_index];
+                let instruction = &self
+                    .image
+                    .block(block_index)
+                    .ok_or(RunError::NotRunnable)?
+                    .instructions[instruction_index];
                 let Some(executed_instructions) = self.executed_instructions.checked_add(1) else {
                     return Ok(self.fault(VmFault::AccountingOverflow));
                 };
@@ -317,6 +341,91 @@ impl Machine {
                         self.frames[frame_index].instruction = 0;
                         break;
                     }
+                    ResolvedInstruction::NewObject { dst, ty } => {
+                        let RuntimeTypeLayout::Object(layout) =
+                            self.image.type_layout(*ty).ok_or(RunError::NotRunnable)?
+                        else {
+                            return Ok(self.fault(VmFault::InvalidResolvedId));
+                        };
+                        let request = AllocationRequest {
+                            block_bytes: layout.block_bytes,
+                            ty: *ty,
+                        };
+                        let logical_bytes = layout.payload_bytes;
+                        let reservation = match self.heap.reserve(request) {
+                            Ok(Some(reservation)) => reservation,
+                            Ok(None) => {
+                                return Ok(self.allocation_exhausted(request.block_bytes, false))
+                            }
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        self.pending_allocation = Some(PendingAllocation::Object(PendingState {
+                            request,
+                            reservation,
+                            destination: *dst,
+                            logical_bytes,
+                            initialized_bytes: 0,
+                            fixed_cost_paid: true,
+                            collection_attempted: false,
+                        }));
+                        if let Some(outcome) =
+                            self.resume_pending_allocation(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
+                    ResolvedInstruction::NewArray { dst, ty, length } => {
+                        let length = match self.read_register(frame_index, *length) {
+                            Ok(RuntimeValue::I32(length)) => length,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        if length < 0 {
+                            let outcome = Outcome::Crashed(GuestTrap::NegativeArraySize);
+                            self.lifecycle = Lifecycle::Terminal(outcome);
+                            return Ok(outcome);
+                        }
+                        let RuntimeTypeLayout::Array { element } =
+                            self.image.type_layout(*ty).ok_or(RunError::NotRunnable)?
+                        else {
+                            return Ok(self.fault(VmFault::InvalidResolvedId));
+                        };
+                        let layout = match array_layout(*element, length) {
+                            Ok(layout) => layout,
+                            Err(_) => return Ok(self.allocation_exhausted(u32::MAX, false)),
+                        };
+                        let request = AllocationRequest {
+                            block_bytes: layout.block_bytes,
+                            ty: *ty,
+                        };
+                        if request.block_bytes > self.image.storage_plan().heap_bytes {
+                            return Ok(self.allocation_exhausted(request.block_bytes, false));
+                        }
+                        let reservation = match self.heap.reserve(request) {
+                            Ok(Some(reservation)) => reservation,
+                            Ok(None) => {
+                                return Ok(self.allocation_exhausted(request.block_bytes, false))
+                            }
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        self.pending_allocation = Some(PendingAllocation::Array {
+                            state: PendingState {
+                                request,
+                                reservation,
+                                destination: *dst,
+                                logical_bytes: layout.payload_bytes,
+                                initialized_bytes: 0,
+                                fixed_cost_paid: true,
+                                collection_attempted: false,
+                            },
+                            length: layout.length,
+                        });
+                        if let Some(outcome) =
+                            self.resume_pending_allocation(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
                     ResolvedInstruction::Unreachable => {
                         return Ok(self.fault(VmFault::ReachedUnreachable));
                     }
@@ -343,7 +452,7 @@ impl Machine {
                     }
                 }
             }
-            if self.frames[frame_index].instruction == block.instructions.len() {
+            if self.frames[frame_index].instruction == block_len {
                 return Ok(self.fault(VmFault::CorruptLifecycle));
             }
         }
@@ -361,9 +470,79 @@ impl Machine {
     }
 
     fn fault(&mut self, fault: VmFault) -> Outcome {
+        self.cancel_pending_allocation();
         let outcome = Outcome::Faulted(fault);
         self.lifecycle = Lifecycle::Terminal(outcome);
         outcome
+    }
+
+    fn allocation_exhausted(
+        &mut self,
+        requested_block_bytes: u32,
+        collection_attempted: bool,
+    ) -> Outcome {
+        let diagnostic = self.heap.diagnostic();
+        let outcome = Outcome::AllocationExhausted(AllocationExhaustion {
+            requested_block_bytes,
+            total_free: diagnostic.total_free,
+            largest_free_block: diagnostic.largest_free_block,
+            collection_attempted,
+        });
+        self.lifecycle = Lifecycle::Terminal(outcome);
+        outcome
+    }
+
+    fn resume_pending_allocation(
+        &mut self,
+        frame_index: usize,
+        remaining: &mut u32,
+    ) -> Option<Outcome> {
+        let mut pending = self.pending_allocation.take()?;
+        let destination = pending.state().destination;
+        let collection_attempted = pending.state().collection_attempted;
+        let index = match frame_index
+            .checked_mul(self.image.registers_per_frame())
+            .and_then(|base| base.checked_add(destination as usize))
+            .filter(|index| *index < self.registers.len())
+        {
+            Some(index) => index,
+            None => {
+                let _ = pending.abort(&mut self.heap);
+                return Some(self.fault(VmFault::InvalidStoragePlan));
+            }
+        };
+        let expected_units = pending.units_for_budget(*remaining);
+        let Some(consumed_dynamic_cost) = self
+            .consumed_dynamic_cost
+            .checked_add(u64::from(expected_units))
+        else {
+            let _ = pending.abort(&mut self.heap);
+            return Some(self.fault(VmFault::AccountingOverflow));
+        };
+        let (used, published) = match pending.advance(&mut self.heap, *remaining) {
+            Ok(result) => result,
+            Err(fault) => {
+                let _ = pending.abort(&mut self.heap);
+                return Some(self.fault(fault));
+            }
+        };
+        debug_assert_eq!(expected_units, used);
+        *remaining -= used;
+        self.consumed_dynamic_cost = consumed_dynamic_cost;
+        let Some(reference) = published else {
+            debug_assert!(!collection_attempted);
+            self.pending_allocation = Some(pending);
+            return Some(Outcome::SliceExhausted);
+        };
+        self.registers[index] = RegisterValue::Initialized(RuntimeValue::Reference(reference));
+        self.frames[frame_index].instruction += 1;
+        None
+    }
+
+    fn cancel_pending_allocation(&mut self) {
+        if let Some(pending) = self.pending_allocation.take() {
+            let _ = pending.abort(&mut self.heap);
+        }
     }
 
     pub(super) fn consumed_fixed_cost(&self) -> u64 {
@@ -492,6 +671,33 @@ impl Machine {
     }
 
     #[cfg(test)]
+    pub(super) fn test_pending_initialized_bytes(&self) -> u32 {
+        self.pending_allocation
+            .map_or(0, PendingAllocation::initialized_bytes)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_heap_diagnostic(&self) -> super::heap::HeapDiagnostic {
+        self.heap.diagnostic()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_managed_payload(
+        &self,
+        reference: super::value::ReferenceValue,
+    ) -> Option<Box<[u8]>> {
+        self.heap.test_managed_payload(reference)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_cancel_pending(&mut self) -> Result<(), VmFault> {
+        let Some(pending) = self.pending_allocation.take() else {
+            return Ok(());
+        };
+        pending.abort(&mut self.heap)
+    }
+
+    #[cfg(test)]
     pub(super) fn test_snapshot(&self) -> (u8, usize, Box<[RegisterValue]>) {
         (
             match self.lifecycle {
@@ -514,6 +720,12 @@ impl Machine {
     #[cfg(test)]
     pub(super) fn maximum_observed_frame_depth_for_test(&self) -> usize {
         self.maximum_observed_frame_depth
+    }
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        self.cancel_pending_allocation();
     }
 }
 

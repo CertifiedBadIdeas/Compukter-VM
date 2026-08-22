@@ -256,20 +256,20 @@ git commit -m "feat(vm): add bounded TLSF managed arena (#42)"
 - Modify: `src/execution/fixtures.rs`
 - Modify: `src/execution/heap_tests.rs`
 
-- [ ] **Step 1: Write failing allocation-state tests**
+- [x] **Step 1: Write failing allocation-state tests**
 
 Cover fixed-cost-once behavior, negative array length before heap mutation,
 oversized immediate OOM, one 16-byte initialization unit per budget unit,
 multi-slice cursor persistence, zero/null initialization, destination
 non-publication, commit, and cancellation rollback.
 
-- [ ] **Step 2: Prove the red state**
+- [x] **Step 2: Prove the red state**
 
 Run: `cargo test --locked --offline execution::heap_tests::allocation -- --nocapture`
 
 Expected: FAIL because heap opcodes are still rejected at admission.
 
-- [ ] **Step 3: Implement the pending allocation state machine**
+- [x] **Step 3: Implement the pending allocation state machine**
 
 Add `PendingAllocation::{Object,Array}` with request, private handle/block,
 initialized cursor, fixed-cost-paid, and collection-attempted fields. Extend
@@ -279,13 +279,13 @@ once, validate operands, request or reserve storage, initialize at most
 Add `GuestTrap::NegativeArraySize` and a structured allocation-exhaustion state;
 do not yet start GC.
 
-- [ ] **Step 4: Run allocation and scalar regression suites**
+- [x] **Step 4: Run allocation and scalar regression suites**
 
 Run: `cargo test --locked --offline execution::heap_tests::allocation -- --nocapture && cargo test --locked --offline execution::tests -- --nocapture`
 
 Expected: all tests PASS and scalar/control accounting is unchanged.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/execution/mod.rs src/execution/error.rs src/execution/heap_ops.rs src/execution/machine.rs src/execution/fixtures.rs src/execution/heap_tests.rs
