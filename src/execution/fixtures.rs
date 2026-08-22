@@ -1701,6 +1701,87 @@ pub(super) fn string_response_loop_artifact(maximum_requests: u32) -> VerifiedAr
     )
 }
 
+pub(super) fn terminal_conformance_artifact(output: &[u16]) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![string, string, primitive(1)],
+        Vec::new(),
+        output,
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::CapabilityCallAsync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 0,
+                    args: vec![0].into_boxed_slice(),
+                    resume_block: 1,
+                },
+            ],
+            vec![Instruction::CapabilityCallAsync {
+                dst: u16::MAX,
+                capability: 0,
+                operation: 1,
+                args: vec![0].into_boxed_slice(),
+                resume_block: 2,
+            }],
+            vec![Instruction::CapabilityCallAsync {
+                dst: 1,
+                capability: 0,
+                operation: 2,
+                args: Box::new([]),
+                resume_block: 3,
+            }],
+            vec![
+                Instruction::StringHash { dst: 2, string: 1 },
+                Instruction::Return { value: 2 },
+            ],
+        ],
+        |artifact| {
+            let mut bytes = artifact.bytes.to_vec();
+            let namespace_start = bytes.len();
+            bytes.extend_from_slice(b"compukter");
+            let namespace_end = bytes.len();
+            let name_start = bytes.len();
+            bytes.extend_from_slice(b"terminal");
+            let name_end = bytes.len();
+            artifact.bytes = Arc::from(bytes);
+            artifact.modules[0].strings[0] = ByteRange {
+                start: namespace_start,
+                end: namespace_end,
+            };
+            artifact.modules[0].strings[1] = ByteRange {
+                start: name_start,
+                end: name_end,
+            };
+            artifact.header.semantic_features = 0b1110;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 3,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 3;
+            let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+                unreachable!();
+            };
+            *flags = 1;
+            artifact.modules[0].functions[0].flags = 1;
+        },
+    )
+}
+
 pub(super) fn string_response_gc_retry_artifact() -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
