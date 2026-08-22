@@ -194,6 +194,15 @@ pub(super) enum ResolvedInstruction {
         lhs: u16,
         rhs: u16,
     },
+    NewObject {
+        dst: u16,
+        ty: TypeKey,
+    },
+    NewArray {
+        dst: u16,
+        ty: TypeKey,
+        length: u16,
+    },
     CallDirect {
         dst: u16,
         target: usize,
@@ -1227,6 +1236,21 @@ fn resolve_instruction(
             dst: *dst,
             lhs: *lhs,
             rhs: *rhs,
+        },
+        Instruction::NewObject { dst, type_ref } => ResolvedInstruction::NewObject {
+            dst: *dst,
+            ty: resolve_type(artifact, module, TypeId(*type_ref))
+                .ok_or(AdmissionError::InvalidEntry)?,
+        },
+        Instruction::NewArray {
+            dst,
+            type_ref,
+            length,
+        } => ResolvedInstruction::NewArray {
+            dst: *dst,
+            ty: resolve_type(artifact, module, TypeId(*type_ref))
+                .ok_or(AdmissionError::InvalidEntry)?,
+            length: *length,
         },
         Instruction::CallDirect {
             dst,
