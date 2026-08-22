@@ -27,10 +27,10 @@ fn container_accepts_canonical_vector_a() {
     let bytes = support::minimal_vector();
     let container = super::container::decode_container(&bytes, &ArtifactLimits::default()).unwrap();
 
-    assert_eq!(container.header.section_count, 13);
-    assert_eq!(container.header.payload_end, 1056);
-    assert_eq!(container.directory.len(), 13);
-    assert_eq!(container.bytes.len(), 1088);
+    assert_eq!(container.header.section_count, 14);
+    assert_eq!(container.header.payload_end, 1112);
+    assert_eq!(container.directory.len(), 14);
+    assert_eq!(container.bytes.len(), 1144);
 }
 
 #[test]
@@ -143,7 +143,8 @@ fn indexed_accepts_canonical_string_table() {
 #[test]
 fn indexed_rejects_non_zero_first_offset() {
     let mut bytes = support::minimal_vector();
-    support::write_u32(&mut bytes, 720, 1);
+    let strings = support::section_offset(&bytes, crate::artifact::format::STRINGS, 1);
+    support::write_u32(&mut bytes, strings + 16, 1);
     support::rehash(&mut bytes);
     assert_eq!(strings_error(bytes), Code::BadRecord);
 }
@@ -151,8 +152,9 @@ fn indexed_rejects_non_zero_first_offset() {
 #[test]
 fn indexed_rejects_decreasing_offsets() {
     let mut bytes = support::minimal_vector();
-    support::write_u32(&mut bytes, 724, 6);
-    support::write_u32(&mut bytes, 728, 5);
+    let strings = support::section_offset(&bytes, crate::artifact::format::STRINGS, 1);
+    support::write_u32(&mut bytes, strings + 20, 6);
+    support::write_u32(&mut bytes, strings + 24, 5);
     support::rehash(&mut bytes);
     assert_eq!(strings_error(bytes), Code::BadRecord);
 }
@@ -160,7 +162,8 @@ fn indexed_rejects_decreasing_offsets() {
 #[test]
 fn indexed_rejects_last_offset_mismatch() {
     let mut bytes = support::minimal_vector();
-    support::write_u32(&mut bytes, 728, 7);
+    let strings = support::section_offset(&bytes, crate::artifact::format::STRINGS, 1);
+    support::write_u32(&mut bytes, strings + 24, 7);
     support::rehash(&mut bytes);
     assert_eq!(strings_error(bytes), Code::BadRecord);
 }
@@ -168,7 +171,8 @@ fn indexed_rejects_last_offset_mismatch() {
 #[test]
 fn indexed_rejects_non_zero_envelope_padding() {
     let mut bytes = support::minimal_vector();
-    bytes[732] = 1;
+    let strings = support::section_offset(&bytes, crate::artifact::format::STRINGS, 1);
+    bytes[strings + 28] = 1;
     support::rehash(&mut bytes);
     assert_eq!(strings_error(bytes), Code::BadRecord);
 }
@@ -176,7 +180,8 @@ fn indexed_rejects_non_zero_envelope_padding() {
 #[test]
 fn indexed_rejects_directory_count_disagreement() {
     let mut bytes = support::minimal_vector();
-    support::write_u32(&mut bytes, 704, 1);
+    let strings = support::directory_entry_offset(&bytes, crate::artifact::format::STRINGS, 1);
+    support::write_u32(&mut bytes, strings + 24, 1);
     support::rehash(&mut bytes);
     assert_eq!(strings_error(bytes), Code::BadRecord);
 }
@@ -247,13 +252,155 @@ fn indexed_rejects_record_id_outside_table() {
     assert_eq!(section.record(2).unwrap_err().code, Code::BadRecord);
 }
 
+fn utf16_literal_result(
+    records: &[&[u8]],
+) -> Result<crate::artifact::DecodedArtifact, crate::diagnostic::DiagnosticSet> {
+    super::records::decode_artifact(
+        Arc::from(support::minimal_vector_with_utf16_literal_records(records)),
+        &ArtifactLimits::default(),
+    )
+}
+
+#[test]
+fn utf16_literal_pool_preserves_every_code_unit_pattern() {
+    let empty = [];
+    let nul = [0x00, 0x00];
+    let high_surrogate = [0x00, 0xd8];
+    let low_surrogate = [0x00, 0xdc];
+    let surrogate_pair = [0x3d, 0xd8, 0x80, 0xde];
+    let artifact = utf16_literal_result(&[
+        &empty,
+        &nul,
+        &high_surrogate,
+        &low_surrogate,
+        &surrogate_pair,
+    ])
+    .unwrap();
+    let actual = artifact.modules[0]
+        .utf16_literals
+        .iter()
+        .map(|range| range.slice(&artifact.bytes))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            &empty[..],
+            &nul,
+            &high_surrogate,
+            &low_surrogate,
+            &surrogate_pair
+        ]
+    );
+}
+
+#[test]
+fn utf16_literal_pool_rejects_odd_byte_length() {
+    let error = utf16_literal_result(&[&[0x41]]).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadRecord);
+}
+
+#[test]
+fn utf16_literal_pool_rejects_duplicate_records() {
+    let error = utf16_literal_result(&[&[0x41, 0], &[0x41, 0]]).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadRecord);
+}
+
+#[test]
+fn utf16_literal_pool_rejects_non_increasing_raw_bytes() {
+    let error = utf16_literal_result(&[&[0x00, 0xdc], &[0x00, 0xd8]]).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadRecord);
+}
+
+fn verify_error_code(bytes: Vec<u8>) -> Code {
+    crate::verify_artifact(Arc::from(bytes), ArtifactLimits::default())
+        .unwrap_err()
+        .first()
+        .unwrap()
+        .code
+}
+
+#[test]
+fn utf16_literal_section_is_required() {
+    let mut bytes = support::minimal_vector();
+    let entry = support::directory_entry_offset(&bytes, crate::artifact::format::UTF16_LITERALS, 1);
+    support::write_u16(&mut bytes, entry, 0x8000);
+    support::write_u16(&mut bytes, entry + 2, 0);
+    support::rehash(&mut bytes);
+    assert_eq!(verify_error_code(bytes), Code::BadSection);
+}
+
+#[test]
+fn utf16_literal_section_rejects_global_scope() {
+    let mut bytes = support::minimal_vector();
+    let entry = support::directory_entry_offset(&bytes, crate::artifact::format::UTF16_LITERALS, 1);
+    support::write_u32(&mut bytes, entry + 4, 0);
+    support::rehash(&mut bytes);
+    assert_eq!(verify_error_code(bytes), Code::BadSection);
+}
+
+#[test]
+fn utf16_literal_section_requires_critical_semantic_flags() {
+    let mut bytes = support::minimal_vector();
+    let entry = support::directory_entry_offset(&bytes, crate::artifact::format::UTF16_LITERALS, 1);
+    support::write_u16(&mut bytes, entry + 2, 0);
+    support::rehash(&mut bytes);
+    assert_eq!(verify_error_code(bytes), Code::BadSection);
+}
+
+#[test]
+fn utf16_literal_section_rejects_duplicate_directory_key() {
+    let mut bytes = support::minimal_vector();
+    let exceptions =
+        support::directory_entry_offset(&bytes, crate::artifact::format::EXCEPTIONS, 1);
+    support::write_u16(
+        &mut bytes,
+        exceptions,
+        crate::artifact::format::UTF16_LITERALS,
+    );
+    support::rehash(&mut bytes);
+    assert_eq!(verify_error_code(bytes), Code::BadDirectory);
+}
+
+#[test]
+fn string_constants_address_the_utf16_literal_pool() {
+    let literals = [&[][..], &[0x00, 0x00][..], &[0x41, 0x00][..]];
+    let artifact = super::records::decode_artifact(
+        Arc::from(support::minimal_vector_with_utf16_string_constant(
+            &literals, 2,
+        )),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(artifact.modules[0].constants.len(), 1);
+
+    let error = super::records::decode_artifact(
+        Arc::from(support::minimal_vector_with_utf16_string_constant(
+            &literals, 3,
+        )),
+        &ArtifactLimits::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadRecord);
+}
+
+#[test]
+fn test_encoder_preserves_utf16_literal_pool_bytes() {
+    let records = [&[][..], &[0x00, 0xd8][..], &[0x3d, 0xd8, 0x80, 0xde][..]];
+    let original = support::minimal_vector_with_utf16_literal_records(&records);
+    let decoded =
+        super::records::decode_artifact(Arc::from(original.clone()), &ArtifactLimits::default())
+            .unwrap();
+    let encoded = crate::test_encode::encode_artifact(&decoded).unwrap();
+    assert_eq!(encoded, original);
+}
+
 #[test]
 fn records_decode_spec_vector_a() {
     let bytes = support::minimal_vector();
-    assert_eq!(bytes.len(), 1088);
+    assert_eq!(bytes.len(), 1144);
     assert_eq!(
         support::artifact_hash(&bytes),
-        support::hex32("88803a07260a3b0123ef230b482a682400e6cae03e90f3be0a117419406509d3")
+        support::hex32("23a3d933f13f78ac679e0cf10eca0355566f25e7e80a5937e45fb65ce8d06876")
     );
     let artifact =
         super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap();
@@ -306,7 +453,7 @@ fn records_decode_spec_vector_a() {
     assert!(artifact.modules[0].debug.is_empty());
     assert_eq!(
         artifact.modules[0].semantic_hash,
-        support::hex32("f73d8f8699e060aac0df1079d820a9fd778a649dd391980c23ee2a4e3c17c2cc")
+        support::hex32("f1379df5fe4e751a1df57cf6be2d1575956f8c3e3ebaabe795820b44de2185ee")
     );
 }
 
@@ -356,7 +503,8 @@ fn committed_artifacts_reencode_byte_for_byte() {
 #[test]
 fn records_reject_module_count_disagreement() {
     let mut bytes = support::minimal_vector();
-    support::write_u32(&mut bytes, 664, 0);
+    let module = support::indexed_record_offset(&bytes, crate::artifact::format::MODULES, 0, 0);
+    support::write_u32(&mut bytes, module + 48, 0);
     support::rehash(&mut bytes);
     let error =
         super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap_err();

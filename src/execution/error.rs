@@ -47,7 +47,6 @@ pub(super) enum RunError {
 pub(super) enum GuestTrap {
     DivisionByZero,
     StackOverflow,
-    InvalidCharacter,
 }
 
 #[repr(u8)]

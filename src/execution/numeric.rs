@@ -186,15 +186,12 @@ float_to_integer!(f32_to_i64, f32, i64);
 float_to_integer!(f64_to_i32, f64, i32);
 float_to_integer!(f64_to_i64, f64, i64);
 
-pub(super) fn i32_to_char(value: i32) -> Result<char, GuestTrap> {
-    u32::try_from(value)
-        .ok()
-        .and_then(char::from_u32)
-        .ok_or(GuestTrap::InvalidCharacter)
+pub(super) fn i32_to_char(value: i32) -> u16 {
+    value as u16
 }
 
-pub(super) fn char_to_i32(value: char) -> i32 {
-    value as u32 as i32
+pub(super) fn char_to_i32(value: u16) -> i32 {
+    i32::from(value)
 }
 
 macro_rules! float_comparisons {
@@ -292,9 +289,14 @@ mod tests {
         assert_eq!(3, f32_to_i32(3.99));
         assert_eq!(0, f32_to_i64(f32::NAN));
         assert_eq!(i64::MAX, f32_to_i64(f32::INFINITY));
-        assert_eq!(Some('A'), i32_to_char(65).ok());
-        assert_eq!(Err(GuestTrap::InvalidCharacter), i32_to_char(0xd800));
-        assert_eq!(0x1f980, char_to_i32('🦀'));
+        assert_eq!(0x0041, i32_to_char(65));
+        assert_eq!(0xffff, i32_to_char(-1));
+        assert_eq!(0xffff, i32_to_char(65_535));
+        assert_eq!(0x0000, i32_to_char(65_536));
+        assert_eq!(0x0000, i32_to_char(i32::MIN));
+        assert_eq!(0xffff, i32_to_char(i32::MAX));
+        assert_eq!(0xd800, i32_to_char(0xd800));
+        assert_eq!(0xd800, char_to_i32(0xd800));
     }
 
     #[test]

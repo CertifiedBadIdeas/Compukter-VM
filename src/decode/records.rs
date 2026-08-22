@@ -6,7 +6,7 @@ use crate::{
     artifact::{
         format, Block, BlockId, ByteRange, Capability, Constant, DebugEntry, DecodedArtifact,
         DecodedCode, DecodedModule, ExceptionEntry, Export, Field, Function, FunctionId, Import,
-        Manifest, ModuleId, NominalType, TypeId, ValueType,
+        Manifest, ModuleId, NominalType, TypeId, Utf16LiteralId, ValueType,
     },
     bytes::Cursor,
     decode::{container::decode_container, indexed::IndexedSection},
@@ -107,6 +107,7 @@ pub(crate) fn decode_artifact(
             )
         })?;
     let mut total_string_bytes = 0;
+    let mut total_utf16_literal_code_units = 0;
     let mut total_code_bytes = 0;
     let mut total_debug_bytes = 0;
     let mut total_imports = 0;
@@ -164,6 +165,7 @@ pub(crate) fn decode_artifact(
         let blocks_section = indexed(&container, scope, format::BLOCKS, limits)?;
         let code_section = indexed(&container, scope, format::CODE, limits)?;
         let exceptions_section = indexed(&container, scope, format::EXCEPTIONS, limits)?;
+        let utf16_literals_section = indexed(&container, scope, format::UTF16_LITERALS, limits)?;
         add_to_limit(
             &mut total_imports,
             imports_section.len(),
@@ -223,6 +225,11 @@ pub(crate) fn decode_artifact(
         let blocks = parse_blocks(&blocks_section, limits)?;
         let code = parse_code(&code_section, &blocks, limits)?;
         let exceptions = parse_exceptions(&exceptions_section, limits)?;
+        let utf16_literals = parse_utf16_literals(
+            &utf16_literals_section,
+            &mut total_utf16_literal_code_units,
+            limits,
+        )?;
         let debug = match optional(&container, scope, format::DEBUG) {
             Some(entry) => {
                 let section = IndexedSection::decode(&container, entry, limits)
@@ -247,6 +254,7 @@ pub(crate) fn decode_artifact(
             declared_types,
             declared_functions,
             strings,
+            utf16_literals,
             types,
             constants,
             imports,
@@ -280,6 +288,34 @@ pub(crate) fn decode_artifact(
         capabilities,
         modules,
     })
+}
+
+fn parse_utf16_literals(
+    section: &IndexedSection<'_>,
+    total_code_units: &mut usize,
+    limits: &ArtifactLimits,
+) -> Result<Vec<ByteRange>, DiagnosticSet> {
+    ensure_raw_order(section, limits, "UTF-16 literals are not sorted and unique")?;
+    for id in 0..section.len() {
+        let record = section
+            .record(id as u32)
+            .map_err(|error| single(limits, error))?;
+        if record.len() % 2 != 0 {
+            return Err(record_error(
+                limits,
+                format::UTF16_LITERALS,
+                "UTF-16 literal has odd byte length",
+            ));
+        }
+        add_to_limit(
+            total_code_units,
+            record.len() / 2,
+            limits.utf16_literal_code_units,
+            limits,
+            "total UTF-16 literal code-unit limit exceeded",
+        )?;
+    }
+    collect_ranges(section, limits)
 }
 
 fn indexed<'a>(
@@ -445,11 +481,13 @@ fn parse_constants(
                 1 => Constant::Bool(true),
                 _ => return Err(raw(Code::BadRecord, "invalid boolean constant")),
             },
-            5 => Constant::Char(
-                char::from_u32(ru32(cursor)?)
-                    .ok_or_else(|| raw(Code::BadRecord, "invalid Unicode scalar"))?,
-            ),
-            6 => Constant::String(ru32(cursor)?),
+            5 => {
+                if record.len() != 3 {
+                    return Err(raw(Code::BadRecord, "CHAR constant must be three bytes"));
+                }
+                Constant::Char(ru16(cursor)?)
+            }
+            6 => Constant::String(Utf16LiteralId(ru32(cursor)?)),
             7 => Constant::Null,
             _ => return Err(raw(Code::BadRecord, "unknown constant tag")),
         };
@@ -943,7 +981,13 @@ fn validate_module_tables(
     }
     for constant in &module.constants {
         if let Constant::String(id) = constant {
-            string(bytes, module, *id, limits)?;
+            if id.0 as usize >= module.utf16_literals.len() {
+                return Err(record_error(
+                    limits,
+                    format::CONSTANTS,
+                    "UTF-16 literal id is out of range",
+                ));
+            }
         }
     }
     for import in &module.imports {
@@ -1440,7 +1484,7 @@ mod tests {
             [vec![2], 1_u32.to_le_bytes().to_vec()].concat(),
             [vec![3], 2_u64.to_le_bytes().to_vec()].concat(),
             vec![4, 1],
-            [vec![5], ('x' as u32).to_le_bytes().to_vec()].concat(),
+            [vec![5], u16::from(b'x').to_le_bytes().to_vec()].concat(),
             [vec![6], 1_u32.to_le_bytes().to_vec()].concat(),
             vec![7],
         ];
@@ -1449,7 +1493,7 @@ mod tests {
             parse_constants(&section(format::CONSTANTS, &bytes, offsets), &limits).unwrap();
         assert_eq!(values.len(), 8);
         assert_eq!(values[4], Constant::Bool(true));
-        assert_eq!(values[5], Constant::Char('x'));
+        assert_eq!(values[5], Constant::Char(u16::from(b'x')));
 
         let mut import = vec![2, 0, 0, 0];
         for value in [1, 2, 3] {
@@ -1540,6 +1584,25 @@ mod tests {
         let (bytes, offsets) = table(&[debug], format::DEBUG);
         let values = parse_debug(&section(format::DEBUG, &bytes, offsets), &limits).unwrap();
         assert_eq!(values[0].source_path.slice(&bytes), b"src/a.kt");
+    }
+
+    #[test]
+    fn char_constants_use_exact_u16_payloads() {
+        let limits = ArtifactLimits::default();
+        for value in [0x0000_u16, 0xd7ff, 0xd800, 0xdfff, 0xe000, 0xffff] {
+            let record = [vec![5], value.to_le_bytes().to_vec()].concat();
+            let (bytes, offsets) = table(&[record], format::CONSTANTS);
+            let values =
+                parse_constants(&section(format::CONSTANTS, &bytes, offsets), &limits).unwrap();
+            assert_eq!(values, [Constant::Char(value)]);
+        }
+
+        for malformed in [vec![5, 0], vec![5, 0, 0, 0]] {
+            let (bytes, offsets) = table(&[malformed], format::CONSTANTS);
+            let error =
+                parse_constants(&section(format::CONSTANTS, &bytes, offsets), &limits).unwrap_err();
+            assert_eq!(error.first().unwrap().code, Code::BadRecord);
+        }
     }
 
     #[test]

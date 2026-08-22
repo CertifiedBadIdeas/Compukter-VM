@@ -4,9 +4,9 @@
 
 ## Status and ownership
 
-This design was accepted on 2026-08-21. It defines the portable boundary between the trusted Kotlin compiler service and the standalone Rust runtime. Kotlin IR, verifier proof state, decoded runtime structures, object layout, GC metadata, interpreter dispatch data, native pointers, SSA, JIT IR, and generated machine code are not part of this format.
+This design was accepted on 2026-08-21 and corrected in place by [issue #41](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/41) before artifact 1.0 shipped. It defines the portable boundary between the trusted Kotlin compiler service and the standalone Rust runtime. Kotlin IR, verifier proof state, decoded runtime structures, object layout, GC metadata, interpreter dispatch data, native pointers, SSA, JIT IR, and generated machine code are not part of this format.
 
-Artifact bytes are untrusted. A host policy supplies maximum artifact bytes, section count, record counts, string bytes, code bytes, modules, functions, registers, blocks, imports, exception entries, capabilities, and debug bytes before decoding begins. A conforming loader may impose lower limits than the representable v1 maxima, but must report a structured limit diagnostic rather than truncate data.
+Artifact bytes are untrusted. A host policy supplies maximum artifact bytes, section count, record counts, metadata string bytes, UTF-16 literal code units, code bytes, modules, functions, registers, blocks, imports, exception entries, capabilities, and debug bytes before decoding begins. A conforming loader may impose lower limits than the representable v1 maxima, but must report a structured limit diagnostic rather than truncate data.
 
 ## Compatibility contract
 
@@ -111,6 +111,7 @@ Known section kinds are:
 | `0x0107` | module | `BLOCKS` |
 | `0x0108` | module | `CODE` |
 | `0x0109` | module | `EXCEPTIONS` |
+| `0x010a` | module | `UTF16_LITERALS` |
 | `0x0110` | module | `DEBUG` |
 
 Kinds `0x8000..=0xffff` are reserved for optional non-semantic extensions. Unknown kinds below `0x8000` are rejected regardless of flags.
@@ -205,7 +206,11 @@ Every module contains exactly one of each core module section. Empty tables use 
 
 ### STRINGS
 
-Each record is raw non-empty UTF-8 bytes without a terminator. Records are sorted lexicographically by raw bytes and deduplicated. The empty string, when required, is represented by a single empty record at index zero; no other empty record is valid.
+Each record is raw non-empty strict UTF-8 metadata without a terminator. Module, type, function, field, namespace, capability, and source-path names use this table; guest string literal content never does. Records are sorted lexicographically by raw bytes and deduplicated. The empty string, when required, is represented by a single empty record at index zero; no other empty record is valid.
+
+### UTF16_LITERALS
+
+Each record contains zero or more little-endian `u16` Kotlin string code units. Empty literals, embedded nulls, surrogate pairs, and isolated high or low surrogates are all valid. Record byte lengths must be even, and records are strictly sorted and deduplicated by their exact raw bytes. `Utf16LiteralId` is the module-local record index. The host applies an independent checked limit to the cumulative code-unit count before publishing decoded module state.
 
 ### Value types
 
@@ -276,11 +281,11 @@ Each record begins with `u8 tag` followed by the canonical payload:
 | 2 | `F32` | raw `u32` bits |
 | 3 | `F64` | raw `u64` bits |
 | 4 | `BOOL` | one byte `0` or `1` |
-| 5 | `CHAR` | Unicode scalar as `u32` |
-| 6 | `STRING` | `u32 StringId` |
+| 5 | `CHAR` | arbitrary UTF-16 code unit as little-endian `u16` |
+| 6 | `STRING` | `u32 Utf16LiteralId` |
 | 7 | `NULL` | no payload |
 
-Constants are sorted first by tag and then by payload bytes and are deduplicated. Invalid Unicode scalars and non-canonical booleans reject the artifact. Constants cannot encode refs other than null and interned string construction; they cannot encode capabilities, functions, types as values, pointers, or host handles.
+Constants are sorted first by tag and then by payload bytes and are deduplicated. Every `u16` bit pattern is a valid `CHAR`; a tag-5 record is exactly three bytes. Non-canonical booleans and out-of-range `Utf16LiteralId` values reject the artifact. Constants cannot encode refs other than null and verified string-literal metadata; they cannot encode capabilities, functions, types as values, pointers, or host handles. Heap materialization and string identity belong to the managed-heap design.
 
 ### IMPORTS and EXPORTS
 
@@ -514,7 +519,7 @@ The decoder/verifier implementation issue must derive committed binary fixtures 
 4. Coroutine spawn/sleep/join and synchronous/asynchronous capability-call instruction records.
 5. An optional debug section demonstrating UTF-16 Kotlin source offsets and inline ancestry.
 
-Negative mutations cover truncated header/trailer, bad digest, size overflow, excessive count, directory overlap, non-zero gap, duplicate section, non-canonical ULEB128, invalid UTF-8, invalid Unicode scalar, bad module hash, unresolved/ambiguous import, unknown critical or semantic section, unknown opcode, bad instruction length, jump outside a function, missing terminator, uninitialized register read, type-confused register, forged symbol identity, bad exception nesting, wrong fixed cost, and an unsafepointed backedge.
+Negative mutations cover truncated header/trailer, bad digest, size overflow, excessive count, directory overlap, non-zero gap, duplicate section, non-canonical ULEB128, invalid UTF-8 metadata, odd-length or non-canonical UTF-16 literal records, malformed three-byte `CHAR` records, bad module hash, unresolved/ambiguous import, unknown critical or semantic section, unknown opcode, bad instruction length, jump outside a function, missing terminator, uninitialized register read, type-confused register, forged symbol identity, bad exception nesting, wrong fixed cost, and an unsafepointed backedge.
 
 Fixtures must include a hand-decodable offset manifest containing every section start, length, record offset, module hash, and artifact hash. Re-encoding a decoded artifact must reproduce identical bytes.
 
@@ -522,42 +527,43 @@ Fixtures must include a hand-decodable offset manifest containing every section 
 
 Vector A fixes the exact canonical encoding for a one-module application whose static entry function returns `unit`. Its strings are records `0 = "app"` and `1 = "entry"`. Type zero is a non-suspending zero-parameter function returning `unit`. Function zero is static, owns no registers, and contains block zero. Block zero declares one instruction and fixed cost one. Its complete code record payload is the six instruction bytes `e3 00 06 00 ff ff`, meaning `return` with the absent/unit register sentinel. All other module tables and the global capability table are empty. Compiler and standard-library ABI identities are zero only for this format vector.
 
-The vector has thirteen sections and this exact offset manifest:
+The vector has fourteen sections and this exact offset manifest:
 
 | Kind | Scope | Offset | Length | Count |
 |---:|---:|---:|---:|---:|
-| `0x0001` | 0 | 480 | 112 | 1 |
-| `0x0002` | 0 | 592 | 84 | 1 |
-| `0x0003` | 0 | 680 | 24 | 0 |
-| `0x0100` | 1 | 704 | 40 | 2 |
-| `0x0101` | 1 | 744 | 44 | 1 |
-| `0x0102` | 1 | 792 | 24 | 0 |
-| `0x0103` | 1 | 816 | 24 | 0 |
-| `0x0104` | 1 | 840 | 24 | 0 |
-| `0x0105` | 1 | 864 | 24 | 0 |
-| `0x0106` | 1 | 888 | 60 | 1 |
-| `0x0107` | 1 | 952 | 48 | 1 |
-| `0x0108` | 1 | 1000 | 30 | 1 |
-| `0x0109` | 1 | 1032 | 24 | 0 |
+| `0x0001` | 0 | 512 | 112 | 1 |
+| `0x0002` | 0 | 624 | 84 | 1 |
+| `0x0003` | 0 | 712 | 24 | 0 |
+| `0x0100` | 1 | 736 | 40 | 2 |
+| `0x0101` | 1 | 776 | 44 | 1 |
+| `0x0102` | 1 | 824 | 24 | 0 |
+| `0x0103` | 1 | 848 | 24 | 0 |
+| `0x0104` | 1 | 872 | 24 | 0 |
+| `0x0105` | 1 | 896 | 24 | 0 |
+| `0x0106` | 1 | 920 | 60 | 1 |
+| `0x0107` | 1 | 984 | 48 | 1 |
+| `0x0108` | 1 | 1032 | 30 | 1 |
+| `0x0109` | 1 | 1064 | 24 | 0 |
+| `0x010a` | 1 | 1088 | 24 | 0 |
 
 Its 64-byte header is:
 
 ```text
-43504b540100000001000000400020000d0000000000000040
-000000000000002004000000000000000000000000000000
+43504b540100000001000000400020000e0000000000000040
+000000000000005804000000000000000000000000000000
 00000000000000000000000000000000
 ```
 
 Its module semantic SHA-256 is:
 
 ```text
-f73d8f8699e060aac0df1079d820a9fd778a649dd391980c23ee2a4e3c17c2cc
+f1379df5fe4e751a1df57cf6be2d1575956f8c3e3ebaabe795820b44de2185ee
 ```
 
-`payload_end` is 1056, the complete file length is 1088, and the trailing artifact SHA-256 is:
+`payload_end` is 1112, the complete file length is 1144, and the trailing artifact SHA-256 is:
 
 ```text
-88803a07260a3b0123ef230b482a682400e6cae03e90f3be0a117419406509d3
+23a3d933f13f78ac679e0cf10eca0355566f25e7e80a5937e45fb65ce8d06876
 ```
 
 The two-module and language/runtime vectors are specified logically above and become checked binary goldens in the decoder/verifier implementation. Negative vectors are single named mutations of a valid golden; unless the mutation targets the digest check itself, their SHA-256 trailer is recomputed so validation reaches the intended stage.

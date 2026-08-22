@@ -108,6 +108,7 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
         (0x0107, blocks, 2),
         (0x0108, code, 2),
         (0x0109, exceptions, 1),
+        (0x010a, empty.clone(), 0),
     ];
     let module_hash = semantic_hash(&semantic_sections);
 
@@ -262,6 +263,7 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
         (0x0107, blocks, 5),
         (0x0108, code, 5),
         (0x0109, exceptions, 1),
+        (0x010a, empty.clone(), 0),
     ];
     single_module_artifact(semantic_sections, None, 1 << 0, 1, 3, 11)
 }
@@ -305,7 +307,8 @@ pub(crate) fn debug_vector() -> Vec<u8> {
         (0x0106, functions, 1),
         (0x0107, blocks, 1),
         (0x0108, code, 1),
-        (0x0109, empty, 0),
+        (0x0109, empty.clone(), 0),
+        (0x010a, empty, 0),
     ];
 
     let path = b"src/main.kts";
@@ -465,7 +468,8 @@ fn minimal_module_sections(
         (0x0106, functions, 1),
         (0x0107, blocks, 1),
         (0x0108, code, 1),
-        (0x0109, empty, 0),
+        (0x0109, empty.clone(), 0),
+        (0x010a, empty, 0),
     ]
 }
 
@@ -602,7 +606,32 @@ fn assemble(sections: Vec<(u16, u32, Vec<u8>, u32)>, semantic_features: u32) -> 
 }
 
 fn vector_with_strings(string_records: &[&[u8]]) -> Vec<u8> {
+    vector_with_tables(string_records, &[], &[])
+}
+
+#[allow(dead_code)]
+pub(crate) fn minimal_vector_with_utf16_literal_records(records: &[&[u8]]) -> Vec<u8> {
+    vector_with_tables(&[b"app", b"entry"], records, &[])
+}
+
+#[allow(dead_code)]
+pub(crate) fn minimal_vector_with_utf16_string_constant(
+    records: &[&[u8]],
+    literal_id: u32,
+) -> Vec<u8> {
+    let mut constant = vec![6];
+    push_u32(&mut constant, literal_id);
+    vector_with_tables(&[b"app", b"entry"], records, &[&constant])
+}
+
+fn vector_with_tables(
+    string_records: &[&[u8]],
+    utf16_literal_records: &[&[u8]],
+    constant_records: &[&[u8]],
+) -> Vec<u8> {
     let strings = indexed(string_records);
+    let utf16_literals = indexed(utf16_literal_records);
+    let constants = indexed(constant_records);
     let mut function_type = vec![3, 0];
     push_u16(&mut function_type, 0);
     push_u32(&mut function_type, 1);
@@ -637,7 +666,7 @@ fn vector_with_strings(string_records: &[&[u8]]) -> Vec<u8> {
     let module_sections = [
         (0x0100_u16, strings.clone()),
         (0x0101, types.clone()),
-        (0x0102, empty.clone()),
+        (0x0102, constants),
         (0x0103, empty.clone()),
         (0x0104, empty.clone()),
         (0x0105, empty.clone()),
@@ -645,6 +674,7 @@ fn vector_with_strings(string_records: &[&[u8]]) -> Vec<u8> {
         (0x0107, blocks.clone()),
         (0x0108, code.clone()),
         (0x0109, empty.clone()),
+        (0x010a, utf16_literals),
     ];
 
     let mut module_hasher = Sha256::new();
@@ -679,7 +709,9 @@ fn vector_with_strings(string_records: &[&[u8]]) -> Vec<u8> {
     for (kind, payload) in module_sections {
         let count = match kind {
             0x0100 => 2,
+            0x0102 => constant_records.len() as u32,
             0x0101 | 0x0106 | 0x0107 | 0x0108 => 1,
+            0x010a => utf16_literal_records.len() as u32,
             _ => 0,
         };
         sections.push((kind, 1, payload, count));
@@ -877,16 +909,21 @@ pub(crate) fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn indexed_record_offset(bytes: &[u8], kind: u16, scope: u32, id: usize) -> usize {
-    let section_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-    let entry = (0..section_count)
+pub(crate) fn directory_entry_offset(bytes: &[u8], kind: u16, scope: u32) -> usize {
+    let section_count = read_u32(bytes, 16) as usize;
+    (0..section_count)
         .map(|index| HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE)
-        .find(|offset| {
-            u16::from_le_bytes(bytes[*offset..*offset + 2].try_into().unwrap()) == kind
-                && u32::from_le_bytes(bytes[*offset + 4..*offset + 8].try_into().unwrap()) == scope
-        })
-        .unwrap();
-    let section = u64::from_le_bytes(bytes[entry + 8..entry + 16].try_into().unwrap()) as usize;
+        .find(|offset| read_u16(bytes, *offset) == kind && read_u32(bytes, *offset + 4) == scope)
+        .unwrap()
+}
+
+pub(crate) fn section_offset(bytes: &[u8], kind: u16, scope: u32) -> usize {
+    let entry = directory_entry_offset(bytes, kind, scope);
+    read_u64(bytes, entry + 8) as usize
+}
+
+pub(crate) fn indexed_record_offset(bytes: &[u8], kind: u16, scope: u32, id: usize) -> usize {
+    let section = section_offset(bytes, kind, scope);
     let count = u32::from_le_bytes(bytes[section..section + 4].try_into().unwrap()) as usize;
     assert!(id < count);
     let prefix = align8(16 + 4 * (count + 1));
@@ -909,7 +946,9 @@ pub(crate) fn minimal_vector_with_overlapping_sections() -> Vec<u8> {
 
 pub(crate) fn minimal_vector_with_non_zero_gap() -> Vec<u8> {
     let mut bytes = minimal_vector();
-    bytes[676] = 1;
+    let entry = directory_entry_offset(&bytes, 0x0002, 0);
+    let gap = section_offset(&bytes, 0x0002, 0) + read_u64(&bytes, entry + 16) as usize;
+    bytes[gap] = 1;
     rehash(&mut bytes);
     bytes
 }

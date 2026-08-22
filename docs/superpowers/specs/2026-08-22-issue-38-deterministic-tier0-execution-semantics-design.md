@@ -109,7 +109,7 @@ The private runtime value model contains:
 - `i32` and `i64` two's-complement integers;
 - `f32` and `f64` IEEE 754 bit patterns;
 - canonical `bool`;
-- Unicode-scalar `char`;
+- arbitrary UTF-16-code-unit `char` stored as `u16`;
 - `null`;
 - opaque non-null managed or admitted-host references.
 
@@ -118,7 +118,9 @@ slot. Rust enum layout, pointer width, NaN payload propagation, and internal
 reference handles are not portable ABI. Raw integers can never create or
 inspect a reference identity.
 
-For conformance traces, primitive values use canonical little-endian bits and
+For conformance traces, primitive values use canonical little-endian bits; a
+`char` has exactly two payload bytes. Other primitive widths retain their
+natural encoded size, and
 references use harness-assigned symbolic identities. The symbolic identity is
 test metadata, not an object-address or serialized VM promise.
 
@@ -290,14 +292,16 @@ bits when loaded, but the first operation producing a NaN canonicalizes it.
 - Float-to-integer truncates toward zero, maps NaN to zero, and saturates values
   outside the destination range.
 - Same-width conversions are ordinary value copies after verifier type checks.
-- Character conversion accepts only verified Unicode scalar values; an integer
-  outside that set produces a guest conversion trap rather than a Rust `char`
-  construction failure.
+- `i32 -> char` retains the low 16 bits and is total, matching Kotlin
+  `Int.toChar()`; `char -> i32` zero-extends the `u16`. Checked `Char(Int)` is a
+  compiler-lowered range check followed by this conversion, not a different VM
+  conversion opcode. No character conversion produces a guest trap.
 
 ### Comparisons
 
-Integer and character comparisons use mathematical signed integer or Unicode
-scalar order. Boolean values support equality only.
+Integer comparisons use mathematical signed order. Character comparisons use
+unsigned `u16` code-unit order, including for isolated surrogates. Boolean
+values support equality only.
 
 Primitive floating equality follows Kotlin/JVM primitive behavior: NaN is not
 equal to itself and negative zero equals positive zero. Ordered comparison with

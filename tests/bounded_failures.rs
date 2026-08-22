@@ -98,6 +98,15 @@ fn string_byte_limit_is_enforced() {
 }
 
 #[test]
+fn utf16_literal_code_unit_limit_is_enforced() {
+    let literal = [0x41, 0x00];
+    assert_limit(
+        support::minimal_vector_with_utf16_literal_records(&[&literal]),
+        |limits| limits.utf16_literal_code_units = 0,
+    );
+}
+
+#[test]
 fn code_byte_limit_is_enforced() {
     assert_limit(support::minimal_vector(), |limits| limits.code_bytes = 5);
 }

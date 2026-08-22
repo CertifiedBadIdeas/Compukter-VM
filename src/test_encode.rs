@@ -4,7 +4,8 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::{
     format, Block, Capability, Constant, DebugEntry, DecodedArtifact, DecodedModule,
-    ExceptionEntry, Export, Field, Function, Import, Instruction, Manifest, NominalType, ValueType,
+    ExceptionEntry, Export, Field, Function, Import, Instruction, Manifest, NominalType,
+    Utf16LiteralId, ValueType,
 };
 
 #[derive(Debug)]
@@ -113,6 +114,11 @@ fn encode_module(
         .iter()
         .map(|range| range.slice(&artifact.bytes).to_vec())
         .collect::<Vec<_>>();
+    let utf16_literals = module
+        .utf16_literals
+        .iter()
+        .map(|range| range.slice(&artifact.bytes).to_vec())
+        .collect::<Vec<_>>();
     let types = module.types.iter().map(encode_type).collect::<Vec<_>>();
     let constants = module
         .constants
@@ -150,6 +156,7 @@ fn encode_module(
         (format::BLOCKS, blocks),
         (format::CODE, code),
         (format::EXCEPTIONS, exceptions),
+        (format::UTF16_LITERALS, utf16_literals),
     ];
     let mut sections = Vec::new();
     for (kind, records) in records {
@@ -334,11 +341,11 @@ fn encode_constant(value: &Constant) -> Vec<u8> {
         Constant::Bool(value) => bytes.extend([4, u8::from(*value)]),
         Constant::Char(value) => {
             bytes.push(5);
-            u32le(&mut bytes, *value as u32);
+            u16le(&mut bytes, *value);
         }
         Constant::String(value) => {
             bytes.push(6);
-            u32le(&mut bytes, *value);
+            u32le(&mut bytes, value.0);
         }
         Constant::Null => bytes.push(7),
     }
@@ -1115,8 +1122,8 @@ mod tests {
             Constant::F32(0x3f80_0000),
             Constant::F64(0x3ff0_0000_0000_0000),
             Constant::Bool(true),
-            Constant::Char('x'),
-            Constant::String(0),
+            Constant::Char(u16::from(b'x')),
+            Constant::String(Utf16LiteralId(0)),
             Constant::Null,
         ];
         let encoded = values.iter().map(encode_constant).collect::<Vec<_>>();
@@ -1128,7 +1135,7 @@ mod tests {
         assert_eq!(encoded[2], [2, 0, 0, 0x80, 0x3f]);
         assert_eq!(encoded[3], [3, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
         assert_eq!(encoded[4], [4, 1]);
-        assert_eq!(encoded[5], [5, b'x', 0, 0, 0]);
+        assert_eq!(encoded[5], [5, b'x', 0]);
         assert_eq!(encoded[6], [6, 0, 0, 0, 0]);
         assert_eq!(encoded[7], [7]);
     }
