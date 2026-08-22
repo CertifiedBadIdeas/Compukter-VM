@@ -42,6 +42,7 @@ mod bytes;
 #[cfg_attr(not(test), allow(dead_code))]
 mod decode;
 pub mod diagnostic;
+mod execution;
 pub mod limits;
 
 #[cfg(test)]
