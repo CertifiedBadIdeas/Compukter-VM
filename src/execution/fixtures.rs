@@ -233,6 +233,150 @@ pub(super) fn capability_artifact(
     })
 }
 
+pub(super) fn scalar_capability_artifact(
+    value_type: ValueType,
+    constant: Constant,
+) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.header.semantic_features = 0b110;
+        artifact.capabilities.push(crate::artifact::Capability {
+            namespace: 0,
+            name: 1,
+            abi_major: 1,
+            minimum_abi_minor: 0,
+            flags: 1,
+            operation_count: 1,
+        });
+        artifact.manifest.required_capabilities = 1;
+        artifact.manifest.maximum_host_requests = 1;
+        artifact.manifest.required_stack_bytes = 64;
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 1,
+            result: value_type,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0].constants = vec![constant];
+        let function = &mut artifact.modules[0].functions[0];
+        function.flags = 1;
+        function.register_count = 2;
+        function.parameter_count = 0;
+        function.registers = vec![value_type, value_type];
+        function.first_block = BlockId(0);
+        function.block_count = 2;
+        let first = vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::CapabilityCallAsync {
+                dst: 1,
+                capability: 0,
+                operation: 0,
+                args: vec![0].into_boxed_slice(),
+                resume_block: 1,
+            },
+        ];
+        let first_cost = first
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        artifact.modules[0].blocks = vec![
+            Block {
+                owner_function: FunctionId(0),
+                code_record: BlockId(0),
+                instruction_count: first.len() as u32,
+                declared_fixed_cost: first_cost,
+                flags: 0,
+            },
+            Block {
+                owner_function: FunctionId(0),
+                code_record: BlockId(1),
+                instruction_count: 1,
+                declared_fixed_cost: 1,
+                flags: 0,
+            },
+        ];
+        artifact.modules[0].code = vec![
+            DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: first.into_boxed_slice(),
+                fixed_cost: first_cost,
+            },
+            DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: vec![Instruction::Return { value: 1 }].into_boxed_slice(),
+                fixed_cost: 1,
+            },
+        ];
+        artifact.manifest.maximum_block_cost = first_cost;
+        artifact.manifest.minimum_slice_cost = first_cost;
+    })
+}
+
+pub(super) fn two_unit_capability_calls_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.header.semantic_features = 0b110;
+        artifact.capabilities.push(crate::artifact::Capability {
+            namespace: 0,
+            name: 1,
+            abi_major: 1,
+            minimum_abi_minor: 0,
+            flags: 1,
+            operation_count: 1,
+        });
+        artifact.manifest.required_capabilities = 1;
+        artifact.manifest.maximum_host_requests = 2;
+        artifact.manifest.required_stack_bytes = 32;
+        let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+            unreachable!();
+        };
+        *flags = 1;
+        let function = &mut artifact.modules[0].functions[0];
+        function.flags = 1;
+        function.first_block = BlockId(0);
+        function.block_count = 3;
+        let call = |resume_block| Instruction::CapabilityCallAsync {
+            dst: u16::MAX,
+            capability: 0,
+            operation: 0,
+            args: Box::new([]),
+            resume_block,
+        };
+        let programs = [
+            vec![call(1)],
+            vec![call(2)],
+            vec![Instruction::Return { value: u16::MAX }],
+        ];
+        artifact.modules[0].blocks = programs
+            .iter()
+            .enumerate()
+            .map(|(index, instructions)| Block {
+                owner_function: FunctionId(0),
+                code_record: BlockId(index as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: instructions[0].fixed_cost().unwrap(),
+                flags: 0,
+            })
+            .collect();
+        artifact.modules[0].code = programs
+            .into_iter()
+            .map(|instructions| DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                fixed_cost: instructions[0].fixed_cost().unwrap(),
+                instructions: instructions.into_boxed_slice(),
+            })
+            .collect();
+        artifact.manifest.maximum_block_cost = artifact.modules[0]
+            .code
+            .iter()
+            .map(|code| code.fixed_cost)
+            .max()
+            .unwrap();
+        artifact.manifest.minimum_slice_cost = artifact.manifest.maximum_block_cost;
+    })
+}
+
 pub(super) fn allocation_workloads() -> Vec<VerifiedArtifact> {
     vec![empty_loop_artifact(3), arithmetic_loop_artifact()]
 }

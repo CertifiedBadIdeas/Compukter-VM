@@ -81,7 +81,7 @@ pub enum RunError {
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum GuestTrap {
+pub enum GuestTrap {
     DivisionByZero,
     StackOverflow,
     NegativeArraySize,
@@ -91,14 +91,14 @@ pub(super) enum GuestTrap {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AllocationRequestKind {
+pub enum AllocationRequestKind {
     Object,
     Array,
     String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct AllocationSource {
+pub struct AllocationSource {
     pub module: u32,
     pub function: u32,
     pub block: u32,
@@ -106,7 +106,7 @@ pub(super) struct AllocationSource {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct AllocationDiagnostic {
+pub struct AllocationDiagnostic {
     pub request_kind: AllocationRequestKind,
     pub requested: u32,
     pub live: u32,
@@ -124,7 +124,7 @@ pub(super) struct AllocationExhaustion {
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum VmFault {
+pub enum VmFault {
     InvalidResolvedId,
     InvalidValueType,
     AccountingOverflow,
@@ -140,6 +140,7 @@ pub(super) enum VmFault {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Outcome {
     SliceExhausted,
+    HostRequest,
     AllocationExhausted(AllocationExhaustion),
     Halted(Option<RuntimeValue>),
     Crashed(GuestTrap),
@@ -148,7 +149,7 @@ pub(super) enum Outcome {
 
 impl Outcome {
     pub(super) fn is_terminal(self) -> bool {
-        !matches!(self, Self::SliceExhausted)
+        !matches!(self, Self::SliceExhausted | Self::HostRequest)
     }
 }
 
