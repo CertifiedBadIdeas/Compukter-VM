@@ -399,21 +399,22 @@ fn allocation_resumes_without_recharging_or_publishing_a_prefix() {
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
 
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
     assert_eq!(5, machine.consumed_fixed_cost());
     assert_eq!(0, machine.consumed_dynamic_cost());
     assert_eq!(None, machine.test_register(0));
     assert_eq!(0, machine.test_pending_initialized_bytes());
 
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(1).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(1, 0).unwrap());
     assert_eq!(16, machine.test_pending_initialized_bytes());
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(1).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(1, 0).unwrap());
     assert_eq!(32, machine.test_pending_initialized_bytes());
     assert_eq!(5, machine.consumed_fixed_cost());
     assert_eq!(2, machine.consumed_dynamic_cost());
     assert_eq!(None, machine.test_register(0));
 
-    let Outcome::Halted(Some(RuntimeValue::Reference(reference))) = machine.run_slice(1).unwrap()
+    let Outcome::Halted(Some(RuntimeValue::Reference(reference))) =
+        machine.run_slice(1, 0).unwrap()
     else {
         panic!("allocation must publish and return its reference atomically");
     };
@@ -435,10 +436,10 @@ fn allocation_negative_array_length_traps_before_heap_mutation() {
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
 
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
     assert_eq!(
         Outcome::Crashed(GuestTrap::NegativeArraySize),
-        machine.run_slice(5).unwrap()
+        machine.run_slice(5, 0).unwrap()
     );
     assert_eq!(64, machine.test_heap_diagnostic().total_free);
     assert_eq!(0, machine.test_heap_diagnostic().live_handles);
@@ -452,7 +453,7 @@ fn allocation_oversized_request_reports_immediate_exhaustion() {
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
 
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
     assert_eq!(
         Outcome::AllocationExhausted(AllocationExhaustion {
             requested_block_bytes: 128,
@@ -460,7 +461,7 @@ fn allocation_oversized_request_reports_immediate_exhaustion() {
             largest_free_block: 64,
             collection_attempted: false,
         }),
-        machine.run_slice(5).unwrap()
+        machine.run_slice(5, 0).unwrap()
     );
     assert_eq!(64, machine.test_heap_diagnostic().total_free);
 }
@@ -473,7 +474,7 @@ fn allocation_cancellation_rolls_back_private_storage() {
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
 
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
     assert_eq!(64, machine.test_heap_diagnostic().total_free);
     machine.test_cancel_pending().unwrap();
     assert_eq!(128, machine.test_heap_diagnostic().total_free);
@@ -523,7 +524,7 @@ fn heap_instructions_statics_are_zeroed_and_isolated_per_instance() {
                 EntryArgument::unowned(RuntimeValue::I32(value)),
             ])
             .unwrap();
-        machine.run_slice(32).unwrap()
+        machine.run_slice(32, 0).unwrap()
     };
 
     assert_eq!(Outcome::Halted(Some(RuntimeValue::I32(42))), run(true, 42));
@@ -539,7 +540,7 @@ fn heap_instructions_use_inherited_fields_and_interface_closure() {
 
     assert_eq!(
         Outcome::Halted(Some(RuntimeValue::I32(42))),
-        machine.run_slice(64).unwrap()
+        machine.run_slice(64, 0).unwrap()
     );
     assert_eq!(Some(RuntimeValue::Bool(true)), machine.test_register(3));
 }
@@ -553,7 +554,7 @@ fn heap_instructions_round_trip_every_primitive_array_width() {
         machine.start(&[]).unwrap();
         assert_eq!(
             Outcome::Halted(Some(expected)),
-            machine.run_slice(64).unwrap()
+            machine.run_slice(64, 0).unwrap()
         );
         assert_eq!(Some(RuntimeValue::I32(1)), machine.test_register(5));
     }
@@ -568,7 +569,8 @@ fn heap_instructions_round_trip_reference_arrays() {
     .unwrap();
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
-    let Outcome::Halted(Some(RuntimeValue::Reference(returned))) = machine.run_slice(64).unwrap()
+    let Outcome::Halted(Some(RuntimeValue::Reference(returned))) =
+        machine.run_slice(64, 0).unwrap()
     else {
         panic!("reference array must return its stored reference")
     };
@@ -589,7 +591,7 @@ fn heap_instructions_bounds_fail_before_destination_publication() {
             .unwrap();
         assert_eq!(
             Outcome::Crashed(GuestTrap::IndexOutOfBounds),
-            machine.run_slice(64).unwrap()
+            machine.run_slice(64, 0).unwrap()
         );
         assert_eq!(Some(RuntimeValue::I32(99)), machine.test_register(2));
     }
@@ -603,7 +605,7 @@ fn heap_instructions_nonnull_zero_reference_traps_without_publication() {
     machine.start(&[]).unwrap();
     assert_eq!(
         Outcome::Crashed(GuestTrap::NullReference),
-        machine.run_slice(64).unwrap()
+        machine.run_slice(64, 0).unwrap()
     );
     assert_eq!(None, machine.test_register(1));
 }
@@ -618,7 +620,7 @@ fn heap_instructions_checked_cast_handles_nullability_and_incompatibility() {
         .unwrap();
     assert_eq!(
         Outcome::Halted(Some(RuntimeValue::Null)),
-        machine.run_slice(32).unwrap()
+        machine.run_slice(32, 0).unwrap()
     );
 
     let nonnull =
@@ -630,7 +632,7 @@ fn heap_instructions_checked_cast_handles_nullability_and_incompatibility() {
         .unwrap();
     assert_eq!(
         Outcome::Crashed(GuestTrap::NullReference),
-        machine.run_slice(32).unwrap()
+        machine.run_slice(32, 0).unwrap()
     );
     assert_eq!(None, machine.test_register(1));
 
@@ -640,7 +642,7 @@ fn heap_instructions_checked_cast_handles_nullability_and_incompatibility() {
     machine.start(&[]).unwrap();
     assert_eq!(
         Outcome::Crashed(GuestTrap::ClassCast),
-        machine.run_slice(32).unwrap()
+        machine.run_slice(32, 0).unwrap()
     );
     assert_eq!(None, machine.test_register(1));
 }
@@ -654,7 +656,8 @@ fn heap_instructions_round_trip_reference_fields() {
     .unwrap();
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
-    let Outcome::Halted(Some(RuntimeValue::Reference(returned))) = machine.run_slice(64).unwrap()
+    let Outcome::Halted(Some(RuntimeValue::Reference(returned))) =
+        machine.run_slice(64, 0).unwrap()
     else {
         panic!("reference field must return its stored reference")
     };
@@ -675,7 +678,7 @@ fn heap_instructions_failed_array_store_is_atomic() {
             .unwrap();
         assert_eq!(
             Outcome::Crashed(GuestTrap::IndexOutOfBounds),
-            machine.run_slice(64).unwrap()
+            machine.run_slice(64, 0).unwrap()
         );
         let RuntimeValue::Reference(array) = machine.test_register(2).unwrap() else {
             unreachable!()
@@ -705,6 +708,6 @@ fn heap_instructions_is_type_returns_false_for_null() {
     machine.start(&[]).unwrap();
     assert_eq!(
         Outcome::Halted(Some(RuntimeValue::Bool(false))),
-        machine.run_slice(32).unwrap()
+        machine.run_slice(32, 0).unwrap()
     );
 }

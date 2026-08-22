@@ -348,7 +348,7 @@ git commit -m "feat(vm): execute managed object operations (#42)"
 - Modify: `src/execution/machine.rs`
 - Modify: `src/execution/fixtures.rs`
 
-- [ ] **Step 1: Write failing graph/progress tests**
+- [x] **Step 1: Write failing graph/progress tests**
 
 Build cycles, diamonds, duplicate roots, shared children, reference arrays,
 unreachable islands, statics, and multiple frames. Assert one exact root/edge/
@@ -356,13 +356,13 @@ leaf/sweep action per maintenance unit, FIFO gray order, epoch switching,
 ascending sweep offsets, no guest progress while active, one retry, and zero
 heap reads/spend while idle.
 
-- [ ] **Step 2: Prove the red state**
+- [x] **Step 2: Prove the red state**
 
 Run: `cargo test --locked --offline execution::gc_tests -- --nocapture`
 
 Expected: FAIL because no collector module exists.
 
-- [ ] **Step 3: Implement `Collector` phases and machine scheduling**
+- [x] **Step 3: Implement `Collector` phases and machine scheduling**
 
 Define `CollectorPhase::{Idle,Roots,Mark,Sweep}` plus root/frame/register,
 object-field/array-element, and block cursors. Use the handle entry gray link and
@@ -372,13 +372,13 @@ and maintenance budgets, skip guest work when GC is active at entry, discard
 unused guest credit on a new collection, and never resume guest work after the
 maintenance phase in the same call.
 
-- [ ] **Step 4: Run one-unit, allocation-free, and full regressions**
+- [x] **Step 4: Run one-unit, allocation-free, and full regressions**
 
 Run: `cargo test --locked --offline execution::gc_tests -- --nocapture && cargo test --release --locked --offline execution::gc_tests::collector_steady_state_allocates_nothing -- --nocapture --test-threads=1 && cargo test --locked --offline`
 
 Expected: all tests PASS with zero measured allocations and zero idle work.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/execution/mod.rs src/execution/gc.rs src/execution/gc_tests.rs src/execution/heap.rs src/execution/heap_ops.rs src/execution/machine.rs src/execution/fixtures.rs

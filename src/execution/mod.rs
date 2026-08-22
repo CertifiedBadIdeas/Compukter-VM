@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod error;
+mod gc;
 mod heap;
 mod heap_ops;
 mod image;
@@ -11,6 +12,8 @@ mod value;
 
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod gc_tests;
 #[cfg(test)]
 mod heap_tests;
 #[cfg(test)]

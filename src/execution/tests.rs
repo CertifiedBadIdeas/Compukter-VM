@@ -96,7 +96,7 @@ fn direct_calls_copy_arguments_and_publish_results_on_return() {
     let mut machine = fixtures::started_zero_arg(fixtures::nested_call_artifact());
     assert_eq!(
         Outcome::Halted(Some(RuntimeValue::I32(42))),
-        machine.run_slice(128).unwrap()
+        machine.run_slice(128, 0).unwrap()
     );
     assert_eq!(3, machine.maximum_observed_frame_depth_for_test());
 }
@@ -108,7 +108,7 @@ fn stack_overflow_happens_before_a_new_frame_exists() {
     let mut machine = fixtures::started_with_profile(fixtures::recursive_artifact(3), profile);
     assert_eq!(
         Outcome::Crashed(GuestTrap::StackOverflow),
-        machine.run_slice(128).unwrap()
+        machine.run_slice(128, 0).unwrap()
     );
     assert_eq!(3, machine.frame_depth());
     assert_eq!(
@@ -125,7 +125,7 @@ fn scalar_vectors_match_kotlin_jvm_semantics() {
         let image = ExecutionImage::admit(case.artifact, profile).unwrap();
         let mut machine = Machine::new(image).unwrap();
         machine.start(&case.args).unwrap();
-        let outcome = machine.run_slice(budget).unwrap();
+        let outcome = machine.run_slice(budget, 0).unwrap();
         match case.expected {
             Ok(value) => assert_eq!(Outcome::Halted(Some(value)), outcome, "{}", case.name),
             Err(trap) => assert_eq!(Outcome::Crashed(trap), outcome, "{}", case.name),
@@ -143,7 +143,7 @@ fn scalar_vectors_match_kotlin_jvm_semantics() {
 fn block_boundary_trace_digests_are_stable() {
     for case in fixtures::trace_cases() {
         let mut machine = fixtures::started(case.artifact, &case.args);
-        let outcome = machine.run_slice(case.budget).unwrap();
+        let outcome = machine.run_slice(case.budget, 0).unwrap();
         assert_eq!(case.outcome, outcome, "{}", case.name);
         assert_eq!(case.digest, machine.trace_digest(), "{}", case.name);
         assert_eq!(
@@ -190,7 +190,7 @@ fn scalar_control_steady_state_allocates_nothing() {
         allocation_counter::reset_and_enable();
         for _ in 0..1_000 {
             assert!(matches!(
-                machine.run_slice(4_096).unwrap(),
+                machine.run_slice(4_096, 0).unwrap(),
                 Outcome::SliceExhausted
             ));
         }
@@ -225,13 +225,19 @@ fn tier0_performance_baseline() {
         let hash = workload.artifact.content_hash();
         let mut machine = fixtures::started_zero_arg(workload.artifact);
         for _ in 0..WARMUP_SLICES {
-            assert_eq!(Outcome::SliceExhausted, machine.run_slice(BUDGET).unwrap());
+            assert_eq!(
+                Outcome::SliceExhausted,
+                machine.run_slice(BUDGET, 0).unwrap()
+            );
         }
         let blocks_before = machine.entered_blocks();
         let instructions_before = machine.executed_instructions();
         let started = Instant::now();
         for _ in 0..MEASURED_SLICES {
-            assert_eq!(Outcome::SliceExhausted, machine.run_slice(BUDGET).unwrap());
+            assert_eq!(
+                Outcome::SliceExhausted,
+                machine.run_slice(BUDGET, 0).unwrap()
+            );
         }
         let elapsed = started.elapsed();
         let blocks = machine.entered_blocks() - blocks_before;
@@ -262,23 +268,23 @@ fn tier0_performance_baseline() {
 #[test]
 fn block_cost_is_atomic_and_slice_remainder_is_discarded() {
     let mut exact = fixtures::started_zero_arg(fixtures::two_block_artifact(3, 5));
-    assert_eq!(Outcome::Halted(None), exact.run_slice(8).unwrap());
+    assert_eq!(Outcome::Halted(None), exact.run_slice(8, 0).unwrap());
     assert_eq!(8, exact.consumed_fixed_cost());
 
     let mut short = fixtures::started_zero_arg(fixtures::two_block_artifact(3, 5));
-    assert_eq!(Outcome::SliceExhausted, short.run_slice(7).unwrap());
+    assert_eq!(Outcome::SliceExhausted, short.run_slice(7, 0).unwrap());
     assert_eq!(3, short.consumed_fixed_cost());
-    assert_eq!(Outcome::Halted(None), short.run_slice(5).unwrap());
+    assert_eq!(Outcome::Halted(None), short.run_slice(5, 0).unwrap());
     assert_eq!(8, short.consumed_fixed_cost());
 }
 
 #[test]
 fn while_true_executes_floor_budget_over_block_cost_iterations() {
     let mut machine = fixtures::started_zero_arg(fixtures::empty_loop_artifact(3));
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(10).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(10, 0).unwrap());
     assert_eq!(9, machine.consumed_fixed_cost());
     assert_eq!(3, machine.entered_blocks());
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(4).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(4, 0).unwrap());
     assert_eq!(12, machine.consumed_fixed_cost());
     assert_eq!(4, machine.entered_blocks());
 }
@@ -288,7 +294,7 @@ fn trap_keeps_the_full_containing_block_charge() {
     let mut machine = fixtures::started_zero_arg(fixtures::trap_after_write_artifact(7));
     assert_eq!(
         Outcome::Crashed(super::error::GuestTrap::DivisionByZero),
-        machine.run_slice(7).unwrap()
+        machine.run_slice(7, 0).unwrap()
     );
     assert_eq!(7, machine.consumed_fixed_cost());
     assert_eq!(
@@ -304,7 +310,7 @@ fn branch_and_switch_select_only_the_verified_target() {
         let mut machine = fixtures::started(artifact, &args);
         assert_eq!(
             Outcome::Halted(Some(RuntimeValue::I32(expected))),
-            machine.run_slice(64).unwrap()
+            machine.run_slice(64, 0).unwrap()
         );
     }
 }
