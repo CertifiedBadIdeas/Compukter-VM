@@ -3,8 +3,8 @@ use super::{
     fixtures,
     host::{
         AdvanceOutcome, CapabilityBinding, ExecutionProfile, HostFailure, HostFailureKind,
-        HostResponse, HostValueInput, HostValueType, HostValueView, OperationSchema, RequestId,
-        ResumeError,
+        HostResponse, HostValueInput, HostValueType, HostValueView, OperationSchema, QuotaKind,
+        RequestId, ResumeError,
     },
     session::Session,
 };
@@ -347,6 +347,113 @@ fn explicit_host_failure_is_a_stable_terminal_outcome() {
     );
     assert_eq!(
         AdvanceOutcome::HostFailed(failure),
+        session.advance(1, 1).unwrap()
+    );
+}
+
+fn string_session(
+    code_units: &[u16],
+    dynamic: bool,
+    duplicate_argument: bool,
+    mut execution_profile: ExecutionProfile,
+) -> Session {
+    execution_profile.maximum_host_arguments = 2;
+    let argument_types: &[HostValueType] = if duplicate_argument {
+        &[HostValueType::String, HostValueType::String]
+    } else {
+        &[HostValueType::String]
+    };
+    let operations = [OperationSchema::asynchronous(
+        argument_types,
+        HostValueType::Unit,
+    )];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::string_capability_artifact(code_units, dynamic, duplicate_argument),
+        execution_profile,
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    session
+}
+
+fn advance_to_request(session: &mut Session) -> (RequestId, Vec<Vec<u16>>) {
+    assert_eq!(
+        AdvanceOutcome::SliceExhausted,
+        session.advance(64, 1).unwrap()
+    );
+    loop {
+        match session.advance(1, 1).unwrap() {
+            AdvanceOutcome::SliceExhausted => {}
+            AdvanceOutcome::HostRequest(request) => {
+                let values = (0..request.arguments().len())
+                    .map(|index| match request.arguments().get(index).unwrap() {
+                        HostValueView::String(value) => value.to_vec(),
+                        other => panic!("unexpected argument: {other:?}"),
+                    })
+                    .collect();
+                return (request.id(), values);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn outbound_string_preserves_literal_utf16_without_prefix_publication() {
+    let units = [
+        0x0041, 0xd83d, 0xde00, 0xd800, 0x00ff, 0x0100, 0xdc00, 0x0042, 0x0043,
+    ];
+    let mut session = string_session(&units, false, false, profile());
+    let (id, arguments) = advance_to_request(&mut session);
+    assert_eq!(vec![units.to_vec()], arguments);
+    session
+        .resume(id, HostResponse::Success(HostValueInput::Unit))
+        .unwrap();
+    assert_eq!(
+        AdvanceOutcome::Halted(None),
+        session.advance(64, 0).unwrap()
+    );
+}
+
+#[test]
+fn outbound_string_reads_compact_latin1_and_utf16_dynamic_backings() {
+    for units in [&[0x0041, 0x00ff][..], &[0x0100, 0xd800][..]] {
+        let mut session = string_session(units, true, true, profile());
+        let (id, arguments) = advance_to_request(&mut session);
+        let doubled = units
+            .iter()
+            .chain(units.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(vec![doubled.clone(), doubled], arguments);
+        session
+            .resume(id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+        assert_eq!(
+            AdvanceOutcome::Halted(None),
+            session.advance(64, 0).unwrap()
+        );
+    }
+}
+
+#[test]
+fn outbound_string_limit_exhausts_before_request_publication() {
+    let units = [0x0041; 9];
+    let mut limited = profile();
+    limited.maximum_outbound_utf16_code_units = 8;
+    let mut session = string_session(&units, false, false, limited);
+    let outcome = session.advance(64, 0).unwrap();
+    let AdvanceOutcome::QuotaExhausted(exhaustion) = outcome else {
+        panic!("unexpected outcome: {outcome:?}");
+    };
+    assert_eq!(QuotaKind::HostRequestCodeUnits, exhaustion.kind);
+    assert_eq!(8, exhaustion.limit);
+    assert_eq!(9, exhaustion.consumed);
+    let expected = exhaustion;
+    assert_eq!(
+        AdvanceOutcome::QuotaExhausted(expected),
         session.advance(1, 1).unwrap()
     );
 }

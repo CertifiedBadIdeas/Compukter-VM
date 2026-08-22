@@ -1331,6 +1331,24 @@ fn literal_string_program_blocks(
     literal_code_units: &[u16],
     programs: Vec<Vec<Instruction>>,
 ) -> VerifiedArtifact {
+    literal_string_program_blocks_configured(
+        result,
+        registers,
+        extra_constants,
+        literal_code_units,
+        programs,
+        |_| {},
+    )
+}
+
+fn literal_string_program_blocks_configured(
+    result: ValueType,
+    registers: Vec<ValueType>,
+    extra_constants: Vec<Constant>,
+    literal_code_units: &[u16],
+    programs: Vec<Vec<Instruction>>,
+    configure: impl FnOnce(&mut crate::artifact::DecodedArtifact),
+) -> VerifiedArtifact {
     let mut decoded = crate::decode::records::decode_artifact(
         Arc::from(crate::test_support::two_module_vector()),
         &ArtifactLimits::default(),
@@ -1448,9 +1466,114 @@ fn literal_string_program_blocks(
     decoded.manifest.minimum_slice_cost = maximum_block_cost;
     decoded.manifest.required_stack_bytes =
         super::image::frame_charge(register_count as u64).unwrap() as u32;
+    configure(&mut decoded);
 
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+pub(super) fn string_capability_artifact(
+    code_units: &[u16],
+    dynamic: bool,
+    duplicate_argument: bool,
+) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let (registers, programs, argument_register) = if dynamic {
+        (
+            vec![string, string, string],
+            vec![
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::StringConcat {
+                        dst: 2,
+                        lhs: 0,
+                        rhs: 1,
+                    },
+                    Instruction::Jump { target: 2 },
+                ],
+                vec![Instruction::CapabilityCallAsync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 0,
+                    args: if duplicate_argument {
+                        vec![2, 2]
+                    } else {
+                        vec![2]
+                    }
+                    .into_boxed_slice(),
+                    resume_block: 3,
+                }],
+                vec![Instruction::Return { value: u16::MAX }],
+            ],
+            2,
+        )
+    } else {
+        (
+            vec![string],
+            vec![
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::CapabilityCallAsync {
+                        dst: u16::MAX,
+                        capability: 0,
+                        operation: 0,
+                        args: if duplicate_argument {
+                            vec![0, 0]
+                        } else {
+                            vec![0]
+                        }
+                        .into_boxed_slice(),
+                        resume_block: 1,
+                    },
+                ],
+                vec![Instruction::Return { value: u16::MAX }],
+            ],
+            0,
+        )
+    };
+    let _ = argument_register;
+    literal_string_program_blocks_configured(
+        primitive(0),
+        registers,
+        Vec::new(),
+        code_units,
+        programs,
+        |artifact| {
+            artifact.header.semantic_features = 0b1110;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 1,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+            let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+                unreachable!();
+            };
+            *flags = 1;
+            artifact.modules[0].functions[0].flags = 1;
+        },
+    )
 }
 
 pub(super) fn portable_layout_artifact() -> VerifiedArtifact {

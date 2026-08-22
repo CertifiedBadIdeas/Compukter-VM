@@ -1531,6 +1531,31 @@ impl Machine {
         self.read_register(frame_index, register)
     }
 
+    pub(super) fn capability_string_length(&self, register: u16) -> Result<u32, VmFault> {
+        let value = self.capability_argument(register)?;
+        text::length(&self.image, &self.heap, value)
+            .map_err(text_fault)
+            .and_then(|length| u32::try_from(length).map_err(|_| VmFault::InvalidReference))
+    }
+
+    pub(super) fn capability_string_code_unit(
+        &self,
+        register: u16,
+        index: u32,
+    ) -> Result<u16, VmFault> {
+        let value = self.capability_argument(register)?;
+        let index = i32::try_from(index).map_err(|_| VmFault::InvalidReference)?;
+        text::get(&self.image, &self.heap, value, index).map_err(text_fault)
+    }
+
+    pub(super) fn charge_capability_dynamic(&mut self, units: u32) -> Result<(), VmFault> {
+        self.consumed_dynamic_cost = self
+            .consumed_dynamic_cost
+            .checked_add(u64::from(units))
+            .ok_or(VmFault::AccountingOverflow)?;
+        Ok(())
+    }
+
     pub(super) fn complete_capability(
         &mut self,
         value: Option<RuntimeValue>,
@@ -1873,6 +1898,13 @@ fn array_element_offset(index: i32, length: i32, element: ValueWidth) -> Result<
 fn trace_field(trace: &mut Sha256, bytes: &[u8]) {
     trace.update((bytes.len() as u32).to_le_bytes());
     trace.update(bytes);
+}
+
+fn text_fault(error: text::TextError) -> VmFault {
+    match error {
+        text::TextError::Fault(fault) => fault,
+        text::TextError::Trap(_) | text::TextError::Exhausted { .. } => VmFault::InvalidReference,
+    }
 }
 
 fn trace_register(
