@@ -2,7 +2,7 @@
 
 > Issue: [#39](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/39)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Build the crate-private, block-atomic Tier 0 semantic oracle for admitted scalar/control artifacts, including deterministic accounting, conformance traces, allocation checks, and reproducible performance workloads.
 
@@ -33,7 +33,7 @@
 - Create: `src/execution/error.rs`
 - Create: `src/execution/value.rs`
 
-- [ ] **Step 1: Write compile-time boundary and value-shape tests**
+- [x] **Step 1: Write compile-time boundary and value-shape tests**
 
 Add unit tests at the bottom of `src/execution/error.rs`:
 
@@ -60,13 +60,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify the missing module failure**
+- [x] **Step 2: Run the focused test and verify the missing module failure**
 
 Run: `cargo test --locked --offline execution::error::tests -- --nocapture`
 
 Expected: FAIL because `execution` and its error types do not exist.
 
-- [ ] **Step 3: Add the private module and exact error/lifecycle types**
+- [x] **Step 3: Add the private module and exact error/lifecycle types**
 
 Add only `mod execution;` to `src/lib.rs`; do not add a `pub use`. Create `src/execution/mod.rs`:
 
@@ -174,19 +174,19 @@ pub(super) enum RuntimeValue {
 
 `UnsupportedInstruction` is an internal invariant guard only: admission in Task 3 rejects an image containing any opcode outside this issue before a `Machine` can be constructed. It is never a public or guest-visible “unimplemented” result.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test --locked --offline execution::error::tests -- --nocapture`
 
 Expected: PASS, 2 tests.
 
-- [ ] **Step 5: Confirm no execution API escaped the crate**
+- [x] **Step 5: Confirm no execution API escaped the crate**
 
 Run: `cargo doc --no-deps --locked --offline`
 
 Expected: PASS; generated public docs list `verify_artifact`, artifact limits, diagnostics, `EntryPoint`, and `VerifiedArtifact`, but no execution type.
 
-- [ ] **Step 6: Commit the boundary**
+- [x] **Step 6: Commit the boundary**
 
 ```bash
 git add src/lib.rs src/execution/mod.rs src/execution/error.rs src/execution/value.rs
@@ -202,7 +202,7 @@ git commit -m "feat(vm): define private Tier 0 execution boundary (#39)"
 - Modify: `src/verify/functions.rs`
 - Modify: `src/verify/tests.rs`
 
-- [ ] **Step 1: Write exhaustive numeric table tests**
+- [x] **Step 1: Write exhaustive numeric table tests**
 
 In `src/execution/numeric.rs`, add table-driven tests covering both widths and all special cases:
 
@@ -248,13 +248,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the numeric tests and verify they fail**
+- [x] **Step 2: Run the numeric tests and verify they fail**
 
 Run: `cargo test --locked --offline execution::numeric::tests -- --nocapture`
 
 Expected: FAIL with missing constants/functions and `RuntimeValue`.
 
-- [ ] **Step 2a: Write and run verifier tests for character conversions**
+- [x] **Step 2a: Write and run verifier tests for character conversions**
 
 Add verifier cases that accept `Convert` from `i32` to `char` and from `char`
 to `i32`, while still rejecting `char` conversions involving `i64`, `f32`, or
@@ -265,7 +265,7 @@ Run: `cargo test --locked --offline verify::tests::cfg_accepts_i32_char_conversi
 Expected: FAIL with `Code::BadType` because the current verifier limits
 `Convert` to kinds `1..=4`.
 
-- [ ] **Step 3: Implement the fixed-size runtime value model**
+- [x] **Step 3: Implement the fixed-size runtime value model**
 
 Add `mod numeric;` to `src/execution/mod.rs`. Replace the initial enum in
 `src/execution/value.rs` with:
@@ -320,7 +320,7 @@ pub(super) enum RegisterValue {
 
 Keep reference identity comparison on `(image, handle, generation)`, never on a Rust address or integer conversion.
 
-- [ ] **Step 4: Implement numeric helpers without unchecked Rust arithmetic**
+- [x] **Step 4: Implement numeric helpers without unchecked Rust arithmetic**
 
 In `src/execution/numeric.rs`, define `CANONICAL_F32_NAN = 0x7fc0_0000` and `CANONICAL_F64_NAN = 0x7ff8_0000_0000_0000`. Implement integer helpers exclusively with `wrapping_*`, shift counts `& 31`/`& 63`, explicit zero-divisor checks, and explicit `MIN / -1` branches. Implement float arithmetic by converting raw bits to `f32`/`f64`, applying one operation, and passing every produced result through:
 
@@ -345,7 +345,7 @@ and `char -> i32`; do not alter encoding or fixed cost. Implement equality and
 ordered comparison as primitive Rust float comparisons, then canonicalize only
 values, not boolean results.
 
-- [ ] **Step 5: Run numeric tests in debug and release modes**
+- [x] **Step 5: Run numeric tests in debug and release modes**
 
 Run: `cargo test --locked --offline execution::numeric::tests -- --nocapture`
 
@@ -355,7 +355,7 @@ Run: `cargo test --release --locked --offline execution::numeric::tests -- --noc
 
 Expected: PASS with identical assertions.
 
-- [ ] **Step 6: Commit numeric semantics**
+- [x] **Step 6: Commit numeric semantics**
 
 ```bash
 git add src/execution/mod.rs src/execution/value.rs src/execution/numeric.rs src/verify/functions.rs src/verify/tests.rs docs/superpowers/specs/2026-08-22-issue-38-deterministic-tier0-execution-semantics-design.md docs/superpowers/plans/2026-08-22-issue-39-tier0-scalar-control-interpreter.md
@@ -369,7 +369,7 @@ git commit -m "feat(vm): implement Kotlin scalar semantics (#39)"
 - Create: `src/execution/image.rs`
 - Modify: `src/execution/mod.rs`
 
-- [ ] **Step 1: Write admission and portable-storage tests**
+- [x] **Step 1: Write admission and portable-storage tests**
 
 Add tests in `src/execution/image.rs` using `fixtures::scalar_artifact()`:
 
@@ -407,13 +407,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the admission tests and verify they fail**
+- [x] **Step 2: Run the admission tests and verify they fail**
 
 Run: `cargo test --locked --offline execution::image::tests -- --nocapture`
 
 Expected: FAIL because `ExecutionImage`, fixtures, and profile types are absent.
 
-- [ ] **Step 3: Expose immutable verified data only inside the crate**
+- [x] **Step 3: Expose immutable verified data only inside the crate**
 
 Add to `impl VerifiedArtifact` in `src/artifact/mod.rs`:
 
@@ -425,7 +425,7 @@ pub(crate) fn decoded(&self) -> &DecodedArtifact {
 
 Do not expose `DecodedArtifact` or this accessor publicly.
 
-- [ ] **Step 4: Define profile and resolved image metadata**
+- [x] **Step 4: Define profile and resolved image metadata**
 
 In `src/execution/image.rs`, define `ExecutionProfile`, `ExecutionImage`,
 `ResolvedFunction`, `ResolvedBlock`, `ResolvedInstruction`, and
@@ -460,11 +460,11 @@ table rather than trusting liveness supplied by a caller.
 
 Resolve local/imported type and function references once during admission. Copy constants into `RuntimeValue`. Convert block targets to absolute `(function, local_block)` identities. Convert `call_direct` targets to absolute `FunctionKey`. Return `AdmissionError::InvalidEntry` for abstract/suspending entries, inconsistent resolved IDs, or any instruction outside scalar/control/direct-call families. This makes `UnsupportedInstruction` unreachable for every admitted image.
 
-- [ ] **Step 5: Implement portable storage planning and reservation**
+- [x] **Step 5: Implement portable storage planning and reservation**
 
 Implement `frame_charge(registers) = align16(32 + registers * 16)` with checked `u64` operations. Compute the largest executable frame, multiply by admitted `maximum_call_depth`, and require both the manifest `required_stack_bytes` and profile storage ceiling to cover it. Convert the resulting register slot count and frame count to `usize`, reserve every image vector with `try_reserve_exact`, and map failures to `AllocationFailed`.
 
-- [ ] **Step 6: Create the fixture builder required by these tests**
+- [x] **Step 6: Create the fixture builder required by these tests**
 
 Add `mod image;` plus `#[cfg(test)] mod fixtures;` to
 `src/execution/mod.rs`. Create `src/execution/fixtures.rs` with helpers that
@@ -476,7 +476,7 @@ coroutine, maximum block cost 64, minimum slice cost 64, and sufficient stack
 storage. Every helper must therefore exercise the real decoder and verifier
 rather than constructing `VerifiedArtifact` directly.
 
-- [ ] **Step 7: Run admission and existing verification tests**
+- [x] **Step 7: Run admission and existing verification tests**
 
 Run: `cargo test --locked --offline execution::image::tests -- --nocapture`
 
@@ -486,7 +486,7 @@ Run: `cargo test --locked --offline verify::tests -- --nocapture`
 
 Expected: all existing verifier tests PASS.
 
-- [ ] **Step 8: Commit admission**
+- [x] **Step 8: Commit admission**
 
 ```bash
 git add src/artifact/mod.rs src/execution/mod.rs src/execution/image.rs src/execution/fixtures.rs
@@ -502,7 +502,7 @@ git commit -m "feat(vm): admit bounded Tier 0 execution images (#39)"
 - Modify: `src/execution/mod.rs`
 - Create: `src/execution/tests.rs`
 
-- [ ] **Step 1: Write typed-entry and one-shot lifecycle tests**
+- [x] **Step 1: Write typed-entry and one-shot lifecycle tests**
 
 Create `src/execution/tests.rs`:
 
@@ -540,13 +540,13 @@ fn failed_start_is_retryable_but_successful_start_is_one_shot() {
 }
 ```
 
-- [ ] **Step 2: Run the entry tests and verify they fail**
+- [x] **Step 2: Run the entry tests and verify they fail**
 
 Run: `cargo test --locked --offline execution::tests -- --nocapture`
 
 Expected: FAIL with missing `Machine` and fixture helpers. If Cargo accepts only one filter, run the whole `execution::tests` module.
 
-- [ ] **Step 3: Implement preallocated mutable state**
+- [x] **Step 3: Implement preallocated mutable state**
 
 Add `mod machine;` plus `#[cfg(test)] mod tests;` to `src/execution/mod.rs`.
 Define `Machine` with an owned `ExecutionImage`, lifecycle enum,
@@ -557,17 +557,17 @@ state. `Machine::new` uses fallible reservation before publishing the machine.
 optional caller destination, and the fixed register-window base. Neither start
 nor later dispatch may push or resize a `Vec`.
 
-- [ ] **Step 4: Implement atomic typed start**
+- [x] **Step 4: Implement atomic typed start**
 
 Validate arity and every argument into an index-only validation pass. Primitive kinds must match exactly; null requires a nullable reference; non-null references require the same image digest, a live handle/generation registered by the test host table, and nominal assignability through image supertype metadata. Only after all arguments pass, initialize frame zero and copy parameters to registers `0..parameter_count`; keep other slots `Uninitialized`. Set lifecycle to runnable. Preserve the pristine machine after any error.
 
-- [ ] **Step 5: Run entry/lifecycle tests**
+- [x] **Step 5: Run entry/lifecycle tests**
 
 Run: `cargo test --locked --offline execution::tests -- --nocapture`
 
 Expected: entry/lifecycle tests PASS; execution tests added later are not present yet.
 
-- [ ] **Step 6: Commit machine construction**
+- [x] **Step 6: Commit machine construction**
 
 ```bash
 git add src/execution/mod.rs src/execution/machine.rs src/execution/value.rs src/execution/error.rs src/execution/tests.rs src/execution/fixtures.rs
@@ -581,7 +581,7 @@ git commit -m "feat(vm): start preallocated Tier 0 machines (#39)"
 - Modify: `src/execution/fixtures.rs`
 - Modify: `src/execution/tests.rs`
 
-- [ ] **Step 1: Add scalar conformance vectors**
+- [x] **Step 1: Add scalar conformance vectors**
 
 Add fixture cases for every form mapping (`1=i32`, `2=i64`, `3=f32`, `4=f64`, `5=bool`, `6=char`, `7=reference`) and assert exact raw-bit results. Include wrapping boundaries, shift counts 31/32/63/64/negative, integer zero division/remainder, `MIN/-1`, signed zero, infinities, raw NaN constants versus produced canonical NaNs, float remainder special cases, conversion rounding/saturation/NaN-to-zero, every comparison family, source/destination aliasing, null equality, and two symbolic reference identities.
 
@@ -610,21 +610,21 @@ fn scalar_vectors_match_kotlin_jvm_semantics() {
 }
 ```
 
-- [ ] **Step 2: Run the scalar vector test and verify it fails**
+- [x] **Step 2: Run the scalar vector test and verify it fails**
 
 Run: `cargo test --locked --offline execution::tests::scalar_vectors_match_kotlin_jvm_semantics -- --nocapture`
 
 Expected: FAIL because `run_slice` and scalar dispatch are absent.
 
-- [ ] **Step 3: Implement read-before-write scalar dispatch**
+- [x] **Step 3: Implement read-before-write scalar dispatch**
 
 For each instruction, copy all source `RuntimeValue`s to locals before touching the destination. Match the verified form and value variants; delegate every numeric operation to `numeric.rs`. Load constants without rewriting their stored raw NaN bits. On a successful operation, write one destination. On division by zero or invalid character conversion, return `GuestTrap` before destination publication. Any form/value mismatch is `VmFault::InvalidValueType`.
 
-- [ ] **Step 4: Implement root return and terminal stability**
+- [x] **Step 4: Implement root return and terminal stability**
 
 Read the optional return register before clearing the frame. Root return stores `Outcome::Halted(value)` in lifecycle. Guest traps store `Outcome::Crashed(trap)`. Repeated `run_slice` on a terminal machine returns the same stored outcome without dispatch or counter changes.
 
-- [ ] **Step 5: Run scalar vectors in debug and release**
+- [x] **Step 5: Run scalar vectors in debug and release**
 
 Run: `cargo test --locked --offline execution::tests::scalar_vectors_match_kotlin_jvm_semantics -- --nocapture`
 
@@ -634,7 +634,7 @@ Run: `cargo test --release --locked --offline execution::tests::scalar_vectors_m
 
 Expected: PASS with identical results and costs.
 
-- [ ] **Step 6: Commit scalar dispatch**
+- [x] **Step 6: Commit scalar dispatch**
 
 ```bash
 git add src/execution/machine.rs src/execution/fixtures.rs src/execution/tests.rs
@@ -648,7 +648,7 @@ git commit -m "feat(vm): execute Tier 0 scalar bytecode (#39)"
 - Modify: `src/execution/fixtures.rs`
 - Modify: `src/execution/tests.rs`
 
-- [ ] **Step 1: Write quota/control/lifecycle vectors**
+- [x] **Step 1: Write quota/control/lifecycle vectors**
 
 Add exact-fit, insufficient-first-block, discarded-remainder, trap-after-charge, branch-both-ways, sparse/dense switch, multi-block loop, and one-block infinite-loop cases:
 
@@ -686,21 +686,21 @@ fn trap_keeps_the_full_containing_block_charge() {
 }
 ```
 
-- [ ] **Step 2: Run the quota/control tests and verify they fail**
+- [x] **Step 2: Run the quota/control tests and verify they fail**
 
 Run: `cargo test --locked --offline execution::tests -- --nocapture`
 
 Expected: at least one FAIL because slicing is not block-atomic yet; use the module filter if Cargo accepts only one substring.
 
-- [ ] **Step 3: Implement `run_slice` validation and charging**
+- [x] **Step 3: Implement `run_slice` validation and charging**
 
 Validate runnable lifecycle and require `budget > 0`, `budget >= image.minimum_slice_cost`, and `budget <= image.maximum_slice_budget` before mutation. At every block boundary, compare the complete verified block cost with remaining credit. If it does not fit, discard the local remainder, preserve the current block, and return `SliceExhausted`. Otherwise subtract and add the full cost with checked arithmetic before dispatching any instruction. Count entered blocks and bytecode instructions with checked `u64`; overflow is `VmFault::AccountingOverflow`.
 
-- [ ] **Step 4: Implement deterministic targets**
+- [x] **Step 4: Implement deterministic targets**
 
 Implement `jump`, canonical-boolean `branch`, and binary search over the already sorted unique `switch_i32` cases. Store only the chosen block; search strategy must not enter the trace. Executed `unreachable` terminates with `VmFault::ReachedUnreachable`. A resolved-ID miss becomes `VmFault::InvalidResolvedId` and never indexes unchecked.
 
-- [ ] **Step 5: Run all quota/control vectors in debug and release**
+- [x] **Step 5: Run all quota/control vectors in debug and release**
 
 Run: `cargo test --locked --offline execution::tests -- --nocapture`
 
@@ -710,7 +710,7 @@ Run: `cargo test --release --locked --offline execution::tests -- --nocapture`
 
 Expected: identical outcomes, register state, and costs.
 
-- [ ] **Step 6: Commit slicing and control flow**
+- [x] **Step 6: Commit slicing and control flow**
 
 ```bash
 git add src/execution/machine.rs src/execution/fixtures.rs src/execution/tests.rs
@@ -724,7 +724,7 @@ git commit -m "feat(vm): enforce block-atomic Tier 0 slices (#39)"
 - Modify: `src/execution/fixtures.rs`
 - Modify: `src/execution/tests.rs`
 
-- [ ] **Step 1: Write nested-call, aliasing, and stack-overflow tests**
+- [x] **Step 1: Write nested-call, aliasing, and stack-overflow tests**
 
 ```rust
 #[test]
@@ -749,27 +749,27 @@ The observed-depth value counts the root as depth one, so the assertion records
 the root plus two nested callees. Use that convention consistently across
 admission, dispatch, and tests.
 
-- [ ] **Step 2: Run direct-call tests and verify they fail**
+- [x] **Step 2: Run direct-call tests and verify they fail**
 
 Run: `cargo test --locked --offline execution::tests -- --nocapture`
 
 Expected: FAIL because direct call dispatch is not implemented.
 
-- [ ] **Step 3: Implement atomic call entry**
+- [x] **Step 3: Implement atomic call entry**
 
 Resolve the already admitted target, copy every source argument to fixed local scratch slots before changing frame depth, and check maximum depth before reserving the callee slot. On overflow, produce `GuestTrap::StackOverflow` with the caller unchanged. Initialize callee parameters, clear its remaining fixed register window to `Uninitialized`, save caller continuation and optional destination, then increment active depth. Premature arena exhaustion becomes `VmFault::InvalidStoragePlan`.
 
-- [ ] **Step 4: Implement callee return publication**
+- [x] **Step 4: Implement callee return publication**
 
 Read the result before clearing the callee. Decrement depth, restore the saved caller continuation, and only then initialize its destination. Unit calls never have a destination. Value calls always do; any mismatch is `VmFault::InvalidValueType` because the verifier/admission invariant was broken.
 
-- [ ] **Step 5: Run call and full execution suites**
+- [x] **Step 5: Run call and full execution suites**
 
 Run: `cargo test --locked --offline execution::tests -- --nocapture`
 
 Expected: all execution tests PASS, including recursion limit before frame mutation.
 
-- [ ] **Step 6: Commit calls**
+- [x] **Step 6: Commit calls**
 
 ```bash
 git add src/execution/machine.rs src/execution/fixtures.rs src/execution/tests.rs
@@ -784,7 +784,7 @@ git commit -m "feat(vm): execute bounded Tier 0 direct calls (#39)"
 - Modify: `src/execution/fixtures.rs`
 - Modify: `src/execution/tests.rs`
 
-- [ ] **Step 1: Write trace digest golden-vector tests**
+- [x] **Step 1: Write trace digest golden-vector tests**
 
 Define a stable trace record containing version byte, artifact content hash, entered module/function/block, frame depth, remaining slice budget, cumulative fixed/dynamic cost, and canonical active-register encodings. Hash length-prefixed little-endian fields with SHA-256. Add explicit expected 32-byte digests for straight-line, branch, switch, nested call, trap, exact-fit, discarded-remainder, and infinite-loop vectors:
 
@@ -802,7 +802,7 @@ fn block_boundary_trace_digests_are_stable() {
 }
 ```
 
-- [ ] **Step 2: Run trace tests with zero placeholders and verify failure**
+- [x] **Step 2: Run trace tests with zero placeholders and verify failure**
 
 Initially give each expected digest `[0; 32]`.
 
@@ -810,15 +810,15 @@ Run: `cargo test --locked --offline execution::tests::block_boundary_trace_diges
 
 Expected: FAIL and print actual non-zero digest values.
 
-- [ ] **Step 3: Implement allocation-free incremental tracing**
+- [x] **Step 3: Implement allocation-free incremental tracing**
 
 Store a `Sha256` state in `Machine`, initialized during `Machine::new`. At each successfully charged block entry, feed the canonical record directly through fixed stack byte arrays; never build a `Vec` or format a string. Encode runtime discriminant, primitive little-endian bits, null, and symbolic `(type module, type id, handle, generation)` reference identity. Include initialized/uninitialized register markers. Exclude wall time, addresses, native enum layout, allocator state, and switch search steps.
 
-- [ ] **Step 4: Replace zero digests with reviewed golden values**
+- [x] **Step 4: Replace zero digests with reviewed golden values**
 
 Copy the actual digest values printed by the failing test into `fixtures::trace_cases()`, rerun once, then independently compute one straight-line digest in the test by feeding the documented bytes to a fresh `Sha256` and assert it equals the committed value.
 
-- [ ] **Step 5: Run trace tests in debug and release**
+- [x] **Step 5: Run trace tests in debug and release**
 
 Run: `cargo test --locked --offline execution::tests::block_boundary_trace_digests_are_stable -- --nocapture`
 
@@ -828,7 +828,7 @@ Run: `cargo test --release --locked --offline execution::tests::block_boundary_t
 
 Expected: PASS with the same committed digests.
 
-- [ ] **Step 6: Commit conformance traces**
+- [x] **Step 6: Commit conformance traces**
 
 ```bash
 git add src/execution/machine.rs src/execution/value.rs src/execution/fixtures.rs src/execution/tests.rs
@@ -842,11 +842,11 @@ git commit -m "test(vm): lock Tier 0 conformance traces (#39)"
 - Modify: `src/execution/fixtures.rs`
 - Create: `docs/performance/tier0-baseline.md`
 
-- [ ] **Step 1: Add a thread-local counting allocator test harness**
+- [x] **Step 1: Add a thread-local counting allocator test harness**
 
 Define one test-only global allocator wrapper around `std::alloc::System`. Use thread-local `Cell<bool>` and `Cell<u64>` so allocations from parallel test threads do not contaminate the active measurement. Count `alloc`, `alloc_zeroed`, and growing `realloc` only while the current thread's flag is enabled. Keep allocator method bodies limited to counter update plus direct delegation to `System`.
 
-- [ ] **Step 2: Write the steady-state allocation test**
+- [x] **Step 2: Write the steady-state allocation test**
 
 ```rust
 #[test]
@@ -865,13 +865,13 @@ fn scalar_control_steady_state_allocates_nothing() {
 
 Use only non-terminal looping workloads so setup, admission, start, outcome formatting, and teardown occur outside the measured region.
 
-- [ ] **Step 3: Run the allocation test and remove every lazy allocation**
+- [x] **Step 3: Run the allocation test and remove every lazy allocation**
 
 Run: `cargo test --release --locked --offline execution::tests::scalar_control_steady_state_allocates_nothing -- --nocapture --test-threads=1`
 
 Expected: PASS with zero counted allocations. If it fails, replace lazy metadata, capacity growth, trace buffers, or dispatch scratch collections with admission/start-time fixed storage; do not exempt allocations from the counter.
 
-- [ ] **Step 4: Add ignored release performance workloads**
+- [x] **Step 4: Add ignored release performance workloads**
 
 Add one ignored test `tier0_performance_baseline` that runs hot integer
 arithmetic, mixed branch/switch, nested direct calls, and empty quota loop for a
@@ -882,7 +882,7 @@ workload name, blocks, instructions, elapsed nanoseconds, blocks/s,
 instructions/s, compiler release/host target, and CPU text accepted from
 `COMPUKTER_BENCH_CPU`. Do not feed timing into VM state or assertions.
 
-- [ ] **Step 5: Run and record the release baseline**
+- [x] **Step 5: Run and record the release baseline**
 
 Run:
 
@@ -894,7 +894,7 @@ Expected: PASS and four TSV workload rows with non-zero block/instruction rates.
 
 Create `docs/performance/tier0-baseline.md` describing the exact command, build profile, workload parameters, reported fields, and the four observed rows. State explicitly that CI has no absolute hardware-specific throughput threshold; semantic, accounting, and allocation regressions remain hard failures.
 
-- [ ] **Step 6: Run the complete quality gate**
+- [x] **Step 6: Run the complete quality gate**
 
 Run: `cargo fmt --check`
 
@@ -916,14 +916,14 @@ Run: `cargo tree --locked --offline`
 
 Expected: no new runtime dependency beyond the existing `sha2` stack.
 
-- [ ] **Step 7: Inspect the public API boundary**
+- [x] **Step 7: Inspect the public API boundary**
 
 Run: `cargo doc --no-deps --locked --offline` and
 `rg -n "ExecutionImage|ExecutionProfile|Machine|RuntimeValue|Outcome|GuestTrap" target/doc/compukter_vm/index.html`
 
 Expected: documentation succeeds and `rg` returns no public execution symbol matches.
 
-- [ ] **Step 8: Commit performance and final verification assets**
+- [x] **Step 8: Commit performance and final verification assets**
 
 ```bash
 git add src/execution/fixtures.rs src/execution/tests.rs docs/performance/tier0-baseline.md
@@ -936,11 +936,11 @@ git commit -m "test(vm): verify Tier 0 allocation and throughput (#39)"
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-08-22-issue-39-tier0-scalar-control-interpreter.md`
 
-- [ ] **Step 1: Document the implemented private boundary**
+- [x] **Step 1: Document the implemented private boundary**
 
 Add a concise README development-status paragraph: artifacts can be decoded, verified, and exercised by a crate-private scalar/control semantic oracle; public execution remains intentionally unavailable until mandatory v1 families exist. Link #38, #39, the accepted design, this plan, and `docs/performance/tier0-baseline.md`.
 
-- [ ] **Step 2: Mark completed plan checkboxes and run diff hygiene**
+- [x] **Step 2: Mark completed plan checkboxes and run diff hygiene**
 
 Change each executed `- [ ]` in this plan to `- [x]` only after its command has passed.
 
@@ -948,7 +948,7 @@ Run: `git diff --check`
 
 Expected: PASS with no whitespace errors.
 
-- [ ] **Step 3: Run the final fresh gate**
+- [x] **Step 3: Run the final fresh gate**
 
 Run:
 
@@ -961,7 +961,7 @@ cargo test --release --locked --offline execution::tests -- --nocapture --test-t
 
 Expected: every command exits zero; record exact test counts and ignored tests in the #39 completion comment.
 
-- [ ] **Step 4: Commit documentation**
+- [x] **Step 4: Commit documentation**
 
 ```bash
 git add README.md docs/superpowers/plans/2026-08-22-issue-39-tier0-scalar-control-interpreter.md

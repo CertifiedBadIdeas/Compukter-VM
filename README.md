@@ -1,7 +1,7 @@
 # Compukter VM
 
 Compukter VM is the standalone managed Rust runtime used by
-[Compukter Kraft](https://github.com/CertifiedBadIdeas/Compukter-Kraft).
+[Compukters](https://github.com/CertifiedBadIdeas/Compukters).
 
 The project is in an intentional clean-break interval. The retired RISC-V
 machine, ELF runtime, and native-code backends have been removed. The new
@@ -9,9 +9,19 @@ platform compiles Kotlin scripts through a pinned K2/Kotlin IR target into a
 versioned Compukter bytecode executed only inside this resource-bounded VM.
 
 The accepted architecture is tracked by
-[Compukter-Kraft issue #500](https://github.com/CertifiedBadIdeas/Compukter-Kraft/issues/500).
+[Compukters issue #500](https://github.com/CertifiedBadIdeas/Compukters/issues/500).
 Artifact, verifier, interpreter, heap, scheduler, snapshot, and optimization
 contracts will be introduced through independently verified roadmap slices.
+
+Artifacts can currently be decoded, verified, and exercised by a crate-private
+Tier 0 scalar/control semantic oracle. Public execution remains intentionally
+unavailable until the mandatory artifact v1 runtime families are implemented.
+The accepted semantics and implementation evidence are tracked in
+[#38](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/38),
+[#39](https://github.com/CertifiedBadIdeas/Compukter-VM/issues/39), the
+[execution design](docs/superpowers/specs/2026-08-22-issue-38-deterministic-tier0-execution-semantics-design.md),
+[implementation plan](docs/superpowers/plans/2026-08-22-issue-39-tier0-scalar-control-interpreter.md),
+and [release baseline](docs/performance/tier0-baseline.md).
 
 ## Verified artifact loading
 
@@ -75,9 +85,9 @@ cargo test --test golden_fixtures regenerate_committed_fixtures --locked --offli
 Review regenerated binaries and their manifests together before committing
 them. CI intentionally runs only the read-only golden suite.
 
-## Compukter Kraft integration
+## Compukters integration
 
-Compukter Kraft consumes this repository as its pinned
+Compukters consumes this repository as its pinned
 `host/compukter-vm` submodule. Runtime changes are committed in the submodule
 repository first; the consuming repository then records the selected submodule
 commit.
