@@ -39,6 +39,7 @@
 mod artifact;
 #[cfg_attr(not(test), allow(dead_code))]
 mod bytes;
+mod computer;
 #[cfg_attr(not(test), allow(dead_code))]
 mod decode;
 pub mod diagnostic;
@@ -55,6 +56,10 @@ mod test_support;
 mod verify;
 
 pub use artifact::{EntryPoint, VerifiedArtifact};
+pub use computer::{
+    ComputerAdvanceOutcome, ComputerError, ComputerHostRequest, ComputerMachine,
+    ComputerStartError, ComputerValue,
+};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{
     AccountingSnapshot, AdmissionError, AdvanceOutcome, CapabilityBinding, EntryValue,
