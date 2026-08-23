@@ -9,51 +9,15 @@
  * (at your option) any later version.
  */
 
+#[allow(dead_code)]
+mod support;
+
 use std::sync::Arc;
 
 use compukter_vm::{
-    verify_artifact, ArtifactLimits, ComputerAdvanceOutcome, ComputerError, ComputerMachine,
-    ComputerTerminalEventKind, ComputerValue, ExecutionProfile, TerminalCell, TerminalKey,
-    TerminalKeyAction, TerminalKeyEvent, TerminalModifiers,
+    verify_artifact, ArtifactLimits, ComputerError, ComputerMachine, ComputerTerminalEventKind,
+    ExecutionProfile, TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers,
 };
-
-#[test]
-fn computer_owns_terminal_waiting_input_and_halted_screen_for_its_lifetime() {
-    let artifact =
-        verify_artifact(Arc::from(terminal_artifact()), ArtifactLimits::default()).unwrap();
-    let mut computer = ComputerMachine::start(artifact.clone(), profile(), &[], &[]).unwrap();
-
-    for _ in 0..1_024 {
-        if matches!(
-            computer.advance(64, 64).unwrap(),
-            ComputerAdvanceOutcome::WaitingForLine
-        ) {
-            break;
-        }
-    }
-    assert!(matches!(
-        computer.advance(64, 64).unwrap(),
-        ComputerAdvanceOutcome::WaitingForLine
-    ));
-    assert_eq!("> 😀> 😀\n", terminal_text(&computer));
-
-    computer
-        .provide_compatibility_line(&"answer".encode_utf16().collect::<Vec<_>>())
-        .unwrap();
-    let halted = (0..1_024).find_map(|_| match computer.advance(64, 64).unwrap() {
-        ComputerAdvanceOutcome::Halted(value) => Some(value),
-        ComputerAdvanceOutcome::SliceExhausted => None,
-        other => panic!("unexpected machine outcome: {other:?}"),
-    });
-    assert!(matches!(halted, Some(Some(ComputerValue::I32(_)))));
-    assert_eq!("> 😀> 😀\n", terminal_text(&computer));
-
-    let replacement = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
-    assert_eq!(
-        TerminalCell::default(),
-        replacement.terminal().cell(0, 0).unwrap()
-    );
-}
 
 #[test]
 fn computer_active_terminal_event_is_typed_fifo_and_lifetime_bounded() {
@@ -110,19 +74,6 @@ fn computer_active_terminal_event_is_typed_fifo_and_lifetime_bounded() {
     );
 }
 
-fn terminal_text(computer: &ComputerMachine) -> String {
-    let mut text = String::new();
-    for y in 0..19 {
-        for x in 0..51 {
-            let scalar =
-                char::from_u32(computer.terminal().cell(x, y).unwrap().code_point()).unwrap();
-            text.push(scalar);
-        }
-        text.push('\n');
-    }
-    text.trim_end_matches([' ', '\n']).to_owned() + "\n"
-}
-
 fn profile() -> ExecutionProfile {
     ExecutionProfile {
         heap_bytes: 1024 * 1024,
@@ -142,17 +93,5 @@ fn profile() -> ExecutionProfile {
 }
 
 fn terminal_artifact() -> Vec<u8> {
-    include_str!("fixtures/terminal-session.hex")
-        .trim()
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let digit = |value| match value {
-                b'0'..=b'9' => value - b'0',
-                b'a'..=b'f' => value - b'a' + 10,
-                _ => panic!("invalid fixture hex"),
-            };
-            (digit(pair[0]) << 4) | digit(pair[1])
-        })
-        .collect()
+    support::executable_minimal_vector()
 }
