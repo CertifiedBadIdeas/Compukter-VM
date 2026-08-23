@@ -27,6 +27,11 @@ pub struct FileSystemLimits {
     pub maximum_open_handles: u32,
     pub maximum_io_bytes: usize,
     pub maximum_rom_bytes: usize,
+    pub maximum_journal_record_bytes: usize,
+    pub maximum_journal_payload_bytes: usize,
+    pub maximum_checkpoint_bytes: usize,
+    pub maximum_recovery_records: usize,
+    pub maximum_recovery_bytes: usize,
 }
 
 impl FileSystemLimits {
@@ -43,6 +48,11 @@ impl FileSystemLimits {
             maximum_open_handles: 32,
             maximum_io_bytes: 4_096,
             maximum_rom_bytes: 1 << 20,
+            maximum_journal_record_bytes: 1 << 16,
+            maximum_journal_payload_bytes: 1 << 15,
+            maximum_checkpoint_bytes: 1 << 20,
+            maximum_recovery_records: 1_024,
+            maximum_recovery_bytes: 4 << 20,
         }
     }
 }
@@ -60,6 +70,11 @@ impl Default for FileSystemLimits {
             maximum_open_handles: 256,
             maximum_io_bytes: 64 << 10,
             maximum_rom_bytes: 16 << 20,
+            maximum_journal_record_bytes: 1 << 20,
+            maximum_journal_payload_bytes: 512 << 10,
+            maximum_checkpoint_bytes: 128 << 20,
+            maximum_recovery_records: 65_536,
+            maximum_recovery_bytes: 512 << 20,
         }
     }
 }

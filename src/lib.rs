@@ -70,9 +70,11 @@ pub use execution::{
     VmFault,
 };
 pub use filesystem::{
-    ComputerFileSystem, FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits,
-    FileSystemSnapshot, HandleTable, NodeKind, NodeMetadata, OpenFile, OpenMode, RomImage,
-    RomImageError, StoreHealth, VirtualPath,
+    recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, FileCapability,
+    FileHandle, FileRights, FileSystemError, FileSystemLimits, FileSystemSnapshot, HandleTable,
+    JournalOperation, JournalRecord, NodeKind, NodeMetadata, OpenFile, OpenMode,
+    PersistenceCodecError, RecoveredState, RecoveryCheckpoint, RecoveryError, RecoveryInput,
+    RecoveryJournalRecord, RomImage, RomImageError, StoreHealth, VirtualPath,
 };
 pub use limits::ArtifactLimits;
 pub use terminal::{
