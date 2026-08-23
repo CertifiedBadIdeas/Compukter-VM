@@ -89,4 +89,8 @@ impl FileCapability {
             handle_limit: self.handle_limit,
         })
     }
+
+    pub(crate) fn handle_limit(&self) -> u32 {
+        self.handle_limit
+    }
 }
