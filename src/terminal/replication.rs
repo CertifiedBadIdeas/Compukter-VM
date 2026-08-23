@@ -166,6 +166,12 @@ impl ReplicationState {
         }
     }
 
+    pub(super) fn record_reset(&mut self) {
+        self.pending.clear();
+        self.requires_full_replacement = false;
+        self.pending.push(TerminalChange::Reset);
+    }
+
     pub(super) const fn requires_full_replacement(&self) -> bool {
         self.requires_full_replacement
     }

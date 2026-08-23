@@ -23,7 +23,7 @@ pub use host::{
 pub use session::Session;
 
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 #[cfg(test)]
 mod gc_tests;
 #[cfg(test)]

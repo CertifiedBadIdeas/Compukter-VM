@@ -1071,7 +1071,8 @@ impl Machine {
                         }
                         self.frames[frame_index].instruction += 1;
                     }
-                    ResolvedInstruction::CapabilityCallAsync { .. } => {
+                    ResolvedInstruction::CapabilityCallSync { .. }
+                    | ResolvedInstruction::CapabilityCallAsync { .. } => {
                         return Ok(Outcome::HostRequest);
                     }
                     ResolvedInstruction::Unreachable => {
@@ -1540,19 +1541,25 @@ impl Machine {
             .block(frame.block)
             .and_then(|block| block.instructions.get(frame.instruction))
             .ok_or(VmFault::CorruptLifecycle)?;
-        let ResolvedInstruction::CapabilityCallAsync {
-            capability,
-            operation,
-            args,
-            ..
-        } = instruction
-        else {
-            return Err(VmFault::CorruptLifecycle);
+        let (capability, operation, arguments) = match instruction {
+            ResolvedInstruction::CapabilityCallSync {
+                capability,
+                operation,
+                args,
+                ..
+            }
+            | ResolvedInstruction::CapabilityCallAsync {
+                capability,
+                operation,
+                args,
+                ..
+            } => (*capability, *operation, args.as_ref()),
+            _ => return Err(VmFault::CorruptLifecycle),
         };
         Ok(CapabilitySuspension {
-            capability: *capability,
-            operation: *operation,
-            arguments: args,
+            capability,
+            operation,
+            arguments,
         })
     }
 
@@ -1601,14 +1608,15 @@ impl Machine {
             .frames
             .get(frame_index)
             .ok_or(VmFault::CorruptLifecycle)?;
-        let (destination, resume_block) = match self
+        let (destination, continuation) = match self
             .image
             .block(frame.block)
             .and_then(|block| block.instructions.get(frame.instruction))
         {
             Some(ResolvedInstruction::CapabilityCallAsync {
                 dst, resume_block, ..
-            }) => (*dst, *resume_block),
+            }) => (*dst, Some(*resume_block)),
+            Some(ResolvedInstruction::CapabilityCallSync { dst, .. }) => (*dst, None),
             _ => return Err(VmFault::CorruptLifecycle),
         };
         if (destination == u16::MAX) != value.is_none() {
@@ -1639,8 +1647,12 @@ impl Machine {
             .frames
             .get_mut(frame_index)
             .ok_or(VmFault::CorruptLifecycle)?;
-        frame.block = resume_block;
-        frame.instruction = 0;
+        if let Some(resume_block) = continuation {
+            frame.block = resume_block;
+            frame.instruction = 0;
+        } else {
+            frame.instruction += 1;
+        }
         Ok(())
     }
 
@@ -1658,7 +1670,12 @@ impl Machine {
             .block(frame.block)
             .and_then(|block| block.instructions.get(frame.instruction))
         {
-            Some(ResolvedInstruction::CapabilityCallAsync { dst, .. }) if *dst != u16::MAX => *dst,
+            Some(ResolvedInstruction::CapabilityCallAsync { dst, .. })
+            | Some(ResolvedInstruction::CapabilityCallSync { dst, .. })
+                if *dst != u16::MAX =>
+            {
+                *dst
+            }
             _ => return Err(VmFault::CorruptLifecycle),
         };
         if empty {

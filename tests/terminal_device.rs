@@ -110,6 +110,46 @@ fn stream_writes_replace_each_malformed_utf16_sequence() {
 }
 
 #[test]
+fn erase_previous_blanks_one_logical_cell_across_wrapped_rows() {
+    let mut terminal = TerminalDevice::default();
+    terminal.set_cursor(TerminalPosition::new(50, 0).unwrap());
+    terminal.write_utf16(&['A' as u16, 0xd83d, 0xde00]).unwrap();
+    terminal.erase_previous();
+
+    assert_eq!(TerminalCell::default(), terminal.cell(0, 1).unwrap());
+    assert_eq!(
+        TerminalPosition::new(0, 1).unwrap(),
+        terminal.cursor_position()
+    );
+
+    terminal.erase_previous();
+    assert_eq!(TerminalCell::default(), terminal.cell(50, 0).unwrap());
+    assert_eq!(
+        TerminalPosition::new(50, 0).unwrap(),
+        terminal.cursor_position()
+    );
+}
+
+#[test]
+fn clear_resets_cells_cursor_and_replication_as_one_authoritative_change() {
+    let mut terminal = TerminalDevice::default();
+    terminal.write_utf16(&['A' as u16]).unwrap();
+    terminal.commit();
+
+    terminal.clear();
+
+    assert_eq!(
+        TerminalPosition::new(0, 0).unwrap(),
+        terminal.cursor_position()
+    );
+    assert_eq!(TerminalCell::default(), terminal.cell(0, 0).unwrap());
+    let TerminalCommit::Committed(delta) = terminal.commit() else {
+        panic!("clear must commit");
+    };
+    assert_eq!([TerminalChange::Reset], delta.changes());
+}
+
+#[test]
 fn explicit_scroll_keeps_logical_coordinates_and_clears_reclaimed_rows() {
     let mut terminal = TerminalDevice::default();
     let marked = TerminalCell::new('X' as u32, 1, 2).unwrap();
