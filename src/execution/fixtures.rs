@@ -1782,7 +1782,10 @@ pub(super) fn terminal_conformance_artifact(output: &[u16]) -> VerifiedArtifact 
     )
 }
 
-pub(crate) fn raw_terminal_conformance_artifact(output: &[u16]) -> VerifiedArtifact {
+pub(crate) fn raw_terminal_conformance_artifact(
+    output: &[u16],
+    maximum_host_requests: u32,
+) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
         flags: 0,
@@ -1896,7 +1899,7 @@ pub(crate) fn raw_terminal_conformance_artifact(output: &[u16]) -> VerifiedArtif
                 operation_count: 9,
             });
             artifact.manifest.required_capabilities = 1;
-            artifact.manifest.maximum_host_requests = 9;
+            artifact.manifest.maximum_host_requests = maximum_host_requests;
             let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
                 unreachable!();
             };

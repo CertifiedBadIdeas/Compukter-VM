@@ -300,6 +300,23 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn resume_internal(
+        &mut self,
+        request_id: RequestId,
+        response: HostResponse<'_>,
+    ) -> Result<(), ResumeError> {
+        self.resume(request_id, response)?;
+        self.published_requests = self
+            .published_requests
+            .checked_sub(1)
+            .expect("an internal response always follows a published request");
+        self.accepted_responses = self
+            .accepted_responses
+            .checked_sub(1)
+            .expect("an internal response is always accepted");
+        Ok(())
+    }
+
     pub fn accounting(&self) -> AccountingSnapshot {
         AccountingSnapshot {
             fixed_guest_units: self.machine.consumed_fixed_cost(),
