@@ -71,7 +71,8 @@ pub use execution::{
 };
 pub use filesystem::{
     ComputerFileSystem, FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits,
-    HandleTable, NodeKind, NodeMetadata, OpenFile, StoreHealth, VirtualPath,
+    FileSystemSnapshot, HandleTable, NodeKind, NodeMetadata, OpenFile, OpenMode, StoreHealth,
+    VirtualPath,
 };
 pub use limits::ArtifactLimits;
 pub use terminal::{

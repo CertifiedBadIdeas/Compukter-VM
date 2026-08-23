@@ -20,6 +20,12 @@ pub struct FileSystemLimits {
     pub maximum_path_bytes: usize,
     pub maximum_component_bytes: usize,
     pub maximum_components: usize,
+    pub maximum_logical_bytes: u64,
+    pub maximum_file_bytes: u64,
+    pub maximum_nodes: u32,
+    pub maximum_directory_entries: u32,
+    pub maximum_open_handles: u32,
+    pub maximum_io_bytes: usize,
 }
 
 impl FileSystemLimits {
@@ -29,6 +35,12 @@ impl FileSystemLimits {
             maximum_path_bytes: 256,
             maximum_component_bytes: 64,
             maximum_components: 16,
+            maximum_logical_bytes: 1 << 20,
+            maximum_file_bytes: 1 << 16,
+            maximum_nodes: 1_024,
+            maximum_directory_entries: 256,
+            maximum_open_handles: 32,
+            maximum_io_bytes: 4_096,
         }
     }
 }
@@ -39,6 +51,12 @@ impl Default for FileSystemLimits {
             maximum_path_bytes: 4_096,
             maximum_component_bytes: 255,
             maximum_components: 64,
+            maximum_logical_bytes: 64 << 20,
+            maximum_file_bytes: 8 << 20,
+            maximum_nodes: 65_536,
+            maximum_directory_entries: 4_096,
+            maximum_open_handles: 256,
+            maximum_io_bytes: 64 << 10,
         }
     }
 }

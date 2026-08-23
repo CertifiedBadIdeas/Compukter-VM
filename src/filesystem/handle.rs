@@ -25,17 +25,44 @@ pub struct FileHandle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenFile {
     path: VirtualPath,
-    readable: bool,
-    writable: bool,
+    mode: OpenMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl OpenMode {
+    pub(crate) fn readable(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
+    pub(crate) fn writable(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
 }
 
 impl OpenFile {
+    pub(crate) fn new(path: VirtualPath, mode: OpenMode) -> Self {
+        Self { path, mode }
+    }
+
+    pub(crate) fn path(&self) -> &VirtualPath {
+        &self.path
+    }
+
+    pub(crate) fn mode(&self) -> OpenMode {
+        self.mode
+    }
+
     #[doc(hidden)]
     pub fn testing() -> Self {
         Self {
             path: VirtualPath::root(),
-            readable: true,
-            writable: true,
+            mode: OpenMode::ReadWrite,
         }
     }
 }
@@ -116,5 +143,9 @@ impl HandleTable {
             slot.retired = true;
         }
         Ok(())
+    }
+
+    pub(crate) fn open_count(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.file.is_some()).count()
     }
 }
