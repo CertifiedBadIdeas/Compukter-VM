@@ -44,6 +44,7 @@ mod computer;
 mod decode;
 pub mod diagnostic;
 mod execution;
+pub mod filesystem;
 pub mod limits;
 pub mod terminal;
 
@@ -68,6 +69,7 @@ pub use execution::{
     OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError, RunError, Session,
     VmFault,
 };
+pub use filesystem::{FileSystemError, FileSystemLimits, StoreHealth, VirtualPath};
 pub use limits::ArtifactLimits;
 pub use terminal::{
     TerminalCell, TerminalChange, TerminalCommit, TerminalConfig, TerminalDelta, TerminalDevice,
