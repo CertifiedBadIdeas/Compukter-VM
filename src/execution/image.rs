@@ -285,6 +285,12 @@ pub(super) enum ResolvedInstruction {
         target: usize,
         args: Box<[u16]>,
     },
+    CapabilityCallSync {
+        dst: u16,
+        capability: u32,
+        operation: u32,
+        args: Box<[u16]>,
+    },
     CapabilityCallAsync {
         dst: u16,
         capability: u32,
@@ -1693,8 +1699,27 @@ fn resolve_instruction(
                 args: args.clone(),
             }
         }
-        Instruction::CapabilityCallSync { .. } => {
-            return Err(AdmissionError::SynchronousCapabilityUnsupported);
+        Instruction::CapabilityCallSync {
+            dst,
+            capability,
+            operation,
+            args,
+        } => {
+            validate_capability_call(
+                resolution,
+                function,
+                *dst,
+                *capability,
+                *operation,
+                args,
+                false,
+            )?;
+            ResolvedInstruction::CapabilityCallSync {
+                dst: *dst,
+                capability: *capability,
+                operation: *operation,
+                args: args.clone(),
+            }
         }
         Instruction::CapabilityCallAsync {
             dst,
@@ -1703,56 +1728,15 @@ fn resolve_instruction(
             args,
             resume_block,
         } => {
-            let resolved_capability = resolution
-                .capabilities
-                .get(*capability as usize)
-                .and_then(Option::as_ref)
-                .ok_or(AdmissionError::MissingCapability {
-                    index: u8::try_from(*capability).unwrap_or(u8::MAX),
-                })?;
-            let schema = resolved_capability
-                .operations
-                .get(*operation as usize)
-                .ok_or(AdmissionError::CapabilityOperationCount {
-                    capability: *capability,
-                    required: operation.saturating_add(1),
-                    available: u32::try_from(resolved_capability.operations.len())
-                        .unwrap_or(u32::MAX),
-                })?;
-            let resolved_function = resolution
-                .functions
-                .get(function)
-                .ok_or(AdmissionError::InvalidEntry)?;
-            let arguments_match = args.len() == schema.arguments.len()
-                && args
-                    .iter()
-                    .zip(schema.arguments.iter())
-                    .all(|(register, expected)| {
-                        resolved_function
-                            .registers
-                            .get(*register as usize)
-                            .is_some_and(|actual| {
-                                host_type_matches(*actual, *expected, resolution.string_type)
-                            })
-                    });
-            let result_matches = match schema.result {
-                HostValueType::Unit => *dst == u16::MAX,
-                expected => {
-                    *dst != u16::MAX
-                        && resolved_function
-                            .registers
-                            .get(*dst as usize)
-                            .is_some_and(|actual| {
-                                host_type_matches(*actual, expected, resolution.string_type)
-                            })
-                }
-            };
-            if !schema.asynchronous || !arguments_match || !result_matches {
-                return Err(AdmissionError::CapabilitySchema {
-                    capability: *capability,
-                    operation: *operation,
-                });
-            }
+            validate_capability_call(
+                resolution,
+                function,
+                *dst,
+                *capability,
+                *operation,
+                args,
+                true,
+            )?;
             ResolvedInstruction::CapabilityCallAsync {
                 dst: *dst,
                 capability: *capability,
@@ -1795,6 +1779,67 @@ fn resolve_instruction(
         Instruction::Unreachable => ResolvedInstruction::Unreachable,
         _ => return Err(AdmissionError::InvalidEntry),
     })
+}
+
+fn validate_capability_call(
+    resolution: &InstructionResolution<'_>,
+    function: usize,
+    destination: u16,
+    capability: u32,
+    operation: u32,
+    arguments: &[u16],
+    asynchronous: bool,
+) -> Result<(), AdmissionError> {
+    let resolved_capability = resolution
+        .capabilities
+        .get(capability as usize)
+        .and_then(Option::as_ref)
+        .ok_or(AdmissionError::MissingCapability {
+            index: u8::try_from(capability).unwrap_or(u8::MAX),
+        })?;
+    let schema = resolved_capability
+        .operations
+        .get(operation as usize)
+        .ok_or(AdmissionError::CapabilityOperationCount {
+            capability,
+            required: operation.saturating_add(1),
+            available: u32::try_from(resolved_capability.operations.len()).unwrap_or(u32::MAX),
+        })?;
+    let resolved_function = resolution
+        .functions
+        .get(function)
+        .ok_or(AdmissionError::InvalidEntry)?;
+    let arguments_match = arguments.len() == schema.arguments.len()
+        && arguments
+            .iter()
+            .zip(schema.arguments.iter())
+            .all(|(register, expected)| {
+                resolved_function
+                    .registers
+                    .get(*register as usize)
+                    .is_some_and(|actual| {
+                        host_type_matches(*actual, *expected, resolution.string_type)
+                    })
+            });
+    let result_matches = match schema.result {
+        HostValueType::Unit => destination == u16::MAX,
+        expected => {
+            destination != u16::MAX
+                && resolved_function
+                    .registers
+                    .get(destination as usize)
+                    .is_some_and(|actual| {
+                        host_type_matches(*actual, expected, resolution.string_type)
+                    })
+        }
+    };
+    if schema.asynchronous != asynchronous || !arguments_match || !result_matches {
+        return Err(AdmissionError::CapabilitySchema {
+            capability,
+            operation,
+        });
+    }
+    Ok(())
 }
 
 fn host_type_matches(

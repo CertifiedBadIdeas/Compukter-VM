@@ -12,8 +12,9 @@
 use std::sync::Arc;
 
 use compukter_vm::{
-    verify_artifact, ArtifactLimits, ComputerAdvanceOutcome, ComputerMachine, ComputerValue,
-    ExecutionProfile, TerminalCell,
+    verify_artifact, ArtifactLimits, ComputerAdvanceOutcome, ComputerError, ComputerMachine,
+    ComputerTerminalEventKind, ComputerValue, ExecutionProfile, TerminalCell, TerminalKey,
+    TerminalKeyAction, TerminalKeyEvent, TerminalModifiers,
 };
 
 #[test]
@@ -51,6 +52,61 @@ fn computer_owns_terminal_waiting_input_and_halted_screen_for_its_lifetime() {
     assert_eq!(
         TerminalCell::default(),
         replacement.terminal().cell(0, 0).unwrap()
+    );
+}
+
+#[test]
+fn computer_active_terminal_event_is_typed_fifo_and_lifetime_bounded() {
+    let artifact =
+        verify_artifact(Arc::from(terminal_artifact()), ArtifactLimits::default()).unwrap();
+    let mut computer = ComputerMachine::start(artifact.clone(), profile(), &[], &[]).unwrap();
+    let key = TerminalKeyEvent::new(
+        TerminalKey::Enter,
+        TerminalKeyAction::Press,
+        TerminalModifiers::new(TerminalModifiers::CONTROL).unwrap(),
+    );
+    computer.terminal_mut().push_text("😀ab").unwrap();
+    computer.terminal_mut().push_key(key).unwrap();
+
+    assert_eq!(
+        Some(ComputerTerminalEventKind::Text),
+        computer.terminal_await_event().unwrap()
+    );
+    assert_eq!("😀ab", computer.terminal_event_text().unwrap());
+    assert_eq!(
+        ComputerError::WrongTerminalEventKind,
+        computer.terminal_event_key().unwrap_err()
+    );
+    assert_eq!(
+        ComputerError::ActiveTerminalEvent,
+        computer.terminal_await_event().unwrap_err()
+    );
+    computer.terminal_finish_event().unwrap();
+
+    assert_eq!(
+        Some(ComputerTerminalEventKind::Key),
+        computer.terminal_await_event().unwrap()
+    );
+    assert_eq!(
+        TerminalKey::Enter.code(),
+        computer.terminal_event_key().unwrap()
+    );
+    assert_eq!(1, computer.terminal_event_action().unwrap());
+    assert_eq!(
+        TerminalModifiers::CONTROL,
+        computer.terminal_event_modifiers().unwrap()
+    );
+    computer.terminal_finish_event().unwrap();
+    assert_eq!(None, computer.terminal_await_event().unwrap());
+    assert_eq!(
+        ComputerError::NoActiveTerminalEvent,
+        computer.terminal_finish_event().unwrap_err()
+    );
+
+    let replacement = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+    assert_eq!(
+        ComputerError::NoActiveTerminalEvent,
+        replacement.terminal_event_text().unwrap_err()
     );
 }
 

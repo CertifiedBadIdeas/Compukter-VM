@@ -58,7 +58,7 @@ mod verify;
 pub use artifact::{EntryPoint, VerifiedArtifact};
 pub use computer::{
     ComputerAdvanceOutcome, ComputerError, ComputerHostRequest, ComputerMachine,
-    ComputerStartError, ComputerValue,
+    ComputerStartError, ComputerTerminalEventKind, ComputerValue,
 };
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{

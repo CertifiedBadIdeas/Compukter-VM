@@ -18,6 +18,14 @@ pub struct OperationSchema<'a> {
 }
 
 impl<'a> OperationSchema<'a> {
+    pub const fn synchronous(arguments: &'a [HostValueType], result: HostValueType) -> Self {
+        Self {
+            arguments,
+            result,
+            asynchronous: false,
+        }
+    }
+
     pub const fn asynchronous(arguments: &'a [HostValueType], result: HostValueType) -> Self {
         Self {
             arguments,
@@ -289,6 +297,13 @@ impl<'a> HostRequestView<'a> {
     }
     pub const fn arguments(self) -> HostArguments<'a> {
         self.arguments
+    }
+
+    pub fn asynchronous(self) -> bool {
+        self.capability
+            .operations
+            .get(self.operation as usize)
+            .is_some_and(|operation| operation.asynchronous)
     }
 }
 

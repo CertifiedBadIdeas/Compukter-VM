@@ -324,6 +324,36 @@ impl TerminalDevice {
         Ok(())
     }
 
+    pub fn erase_previous(&mut self) {
+        if self.cursor.x > 0 {
+            self.cursor.x -= 1;
+        } else if self.cursor.y > 0 {
+            self.cursor.x = TERMINAL_WIDTH - 1;
+            self.cursor.y -= 1;
+        } else {
+            return;
+        }
+        let logical = self.cursor.y as usize * TERMINAL_WIDTH as usize + self.cursor.x as usize;
+        let index = self.physical_index(self.cursor);
+        let blank = TerminalCell::blank(self.foreground, self.background);
+        self.cells[index] = blank;
+        self.replication.record(TerminalChange::Patch {
+            start: logical as u16,
+            cells: vec![blank].into_boxed_slice(),
+        });
+        self.record_cursor();
+    }
+
+    pub fn clear(&mut self) {
+        self.cells.fill(TerminalCell::default());
+        self.row_head = 0;
+        self.cursor = TerminalPosition { x: 0, y: 0 };
+        self.cursor_visible = true;
+        self.foreground = DEFAULT_FOREGROUND;
+        self.background = DEFAULT_BACKGROUND;
+        self.replication.record_reset();
+    }
+
     pub fn push_key(&mut self, event: TerminalKeyEvent) -> Result<(), TerminalInputError> {
         self.input.push_key(event)
     }

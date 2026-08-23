@@ -93,7 +93,7 @@ fn admission_rejects_duplicate_bindings_and_short_operation_tables() {
 }
 
 #[test]
-fn admission_rejects_invoked_unbound_optional_and_sync_calls() {
+fn admission_rejects_invoked_unbound_optional_calls_and_runs_sync_calls() {
     assert!(matches!(
         Session::admit(
             fixtures::capability_artifact(true, false, 1, 0),
@@ -103,16 +103,29 @@ fn admission_rejects_invoked_unbound_optional_and_sync_calls() {
         Err(AdmissionError::MissingCapability { index: 0 })
     ));
 
-    let operations = operation();
+    let operations = [OperationSchema::synchronous(&[], HostValueType::Unit)];
     let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+    let mut session = Session::admit(
+        fixtures::capability_artifact(false, true, 1, 0),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+
+    let request_id = match session.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(request) => {
+            assert!(!request.asynchronous());
+            request.id()
+        }
+        other => panic!("synchronous capability did not publish a request: {other:?}"),
+    };
+    session
+        .resume(request_id, HostResponse::Success(HostValueInput::Unit))
+        .unwrap();
     assert_eq!(
-        AdmissionError::SynchronousCapabilityUnsupported,
-        Session::admit(
-            fixtures::capability_artifact(false, true, 1, 0),
-            profile(),
-            &[binding],
-        )
-        .unwrap_err()
+        AdvanceOutcome::Halted(None),
+        session.advance(64, 0).unwrap()
     );
 }
 
