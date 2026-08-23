@@ -26,6 +26,7 @@ pub struct FileSystemLimits {
     pub maximum_directory_entries: u32,
     pub maximum_open_handles: u32,
     pub maximum_io_bytes: usize,
+    pub maximum_rom_bytes: usize,
 }
 
 impl FileSystemLimits {
@@ -41,6 +42,7 @@ impl FileSystemLimits {
             maximum_directory_entries: 256,
             maximum_open_handles: 32,
             maximum_io_bytes: 4_096,
+            maximum_rom_bytes: 1 << 20,
         }
     }
 }
@@ -57,6 +59,7 @@ impl Default for FileSystemLimits {
             maximum_directory_entries: 4_096,
             maximum_open_handles: 256,
             maximum_io_bytes: 64 << 10,
+            maximum_rom_bytes: 16 << 20,
         }
     }
 }

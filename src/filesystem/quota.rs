@@ -73,5 +73,4 @@ impl QuotaLedger {
     pub fn logical_bytes(&self) -> u64 {
         self.logical_bytes
     }
-
 }
