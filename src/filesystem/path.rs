@@ -23,6 +23,10 @@ use super::{FileSystemError, FileSystemLimits};
 pub struct VirtualPath(Box<[Box<str>]>);
 
 impl VirtualPath {
+    pub fn root() -> Self {
+        Self(Box::new([]))
+    }
+
     pub fn parse_utf16(units: &[u16], limits: &FileSystemLimits) -> Result<Self, FileSystemError> {
         let mut decoded = String::new();
         for scalar in char::decode_utf16(units.iter().copied()) {
@@ -79,6 +83,10 @@ impl VirtualPath {
 
     pub fn file_name(&self) -> Option<&str> {
         self.0.last().map(Box::as_ref)
+    }
+
+    pub(crate) fn component_slice(&self) -> &[Box<str>] {
+        &self.0
     }
 }
 

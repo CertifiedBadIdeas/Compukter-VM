@@ -69,7 +69,10 @@ pub use execution::{
     OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError, RunError, Session,
     VmFault,
 };
-pub use filesystem::{FileSystemError, FileSystemLimits, StoreHealth, VirtualPath};
+pub use filesystem::{
+    ComputerFileSystem, FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits,
+    HandleTable, NodeKind, NodeMetadata, OpenFile, StoreHealth, VirtualPath,
+};
 pub use limits::ArtifactLimits;
 pub use terminal::{
     TerminalCell, TerminalChange, TerminalCommit, TerminalConfig, TerminalDelta, TerminalDevice,
