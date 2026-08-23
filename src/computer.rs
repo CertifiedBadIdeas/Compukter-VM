@@ -227,7 +227,7 @@ impl ComputerMachine {
                 return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
             };
             self.session
-                .resume(
+                .resume_internal(
                     request,
                     HostResponse::Success(HostValueInput::I32(kind as i32)),
                 )
@@ -286,7 +286,7 @@ impl ComputerMachine {
                         .map_err(|_| ComputerError::InvalidTerminalRequest)?;
                 }
                 self.session
-                    .resume(id, HostResponse::Success(HostValueInput::Unit))
+                    .resume_internal(id, HostResponse::Success(HostValueInput::Unit))
                     .map_err(ComputerError::Resume)?;
                 Ok(ComputerAdvanceOutcome::SliceExhausted)
             }
@@ -333,7 +333,7 @@ impl ComputerMachine {
                     .encode_utf16()
                     .collect::<Vec<_>>();
                 self.session
-                    .resume(id, HostResponse::Success(HostValueInput::String(&units)))
+                    .resume_internal(id, HostResponse::Success(HostValueInput::String(&units)))
                     .map_err(ComputerError::Resume)?;
                 return Ok(ComputerAdvanceOutcome::SliceExhausted);
             }
@@ -350,7 +350,7 @@ impl ComputerMachine {
             }
         };
         self.session
-            .resume(id, HostResponse::Success(response))
+            .resume_internal(id, HostResponse::Success(response))
             .map_err(ComputerError::Resume)?;
         Ok(ComputerAdvanceOutcome::SliceExhausted)
     }
@@ -360,7 +360,7 @@ impl ComputerMachine {
             .pending_compatibility_line
             .ok_or(ComputerError::NoPendingCompatibilityLine)?;
         self.session
-            .resume(
+            .resume_internal(
                 request,
                 HostResponse::Success(HostValueInput::String(units)),
             )
@@ -517,10 +517,14 @@ mod tests {
 
     #[test]
     fn raw_terminal_capability_waits_and_consumes_typed_events() {
-        let artifact = crate::execution::fixtures::raw_terminal_conformance_artifact(&[
-            '>' as u16, ' ' as u16,
-        ]);
-        let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+        let artifact = crate::execution::fixtures::raw_terminal_conformance_artifact(
+            &['>' as u16, ' ' as u16],
+            1,
+        );
+        let mut constrained_profile = profile();
+        constrained_profile.maximum_host_requests = 1;
+        constrained_profile.maximum_accepted_responses = 1;
+        let mut computer = ComputerMachine::start(artifact, constrained_profile, &[], &[]).unwrap();
 
         while !matches!(
             computer.advance(64, 64).unwrap(),
