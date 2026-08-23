@@ -14,6 +14,8 @@ use std::collections::VecDeque;
 use super::{TerminalCell, TerminalPosition};
 
 const MAXIMUM_PENDING_CHANGES: usize = 256;
+const MAXIMUM_ACCUMULATED_CHANGES: usize = 4_096;
+const MAXIMUM_ACCUMULATED_CELLS: usize = 8_192;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalChange {
@@ -220,11 +222,19 @@ impl ReplicationState {
         }
         let mut expected = base_revision;
         let mut changes = Vec::new();
+        let mut encoded_cells = 0;
         for delta in &self.journal {
             if delta.target_revision <= expected {
                 continue;
             }
             if delta.base_revision != expected {
+                return None;
+            }
+            if changes.len() + delta.changes.len() > MAXIMUM_ACCUMULATED_CHANGES {
+                return None;
+            }
+            encoded_cells += delta.changes.iter().map(encoded_cell_count).sum::<usize>();
+            if encoded_cells > MAXIMUM_ACCUMULATED_CELLS {
                 return None;
             }
             changes.extend_from_slice(&delta.changes);
@@ -238,5 +248,13 @@ impl ReplicationState {
             }
         }
         None
+    }
+}
+
+fn encoded_cell_count(change: &TerminalChange) -> usize {
+    match change {
+        TerminalChange::Patch { cells, .. } => cells.len(),
+        TerminalChange::Fill { .. } | TerminalChange::Scroll { .. } => 1,
+        TerminalChange::Cursor { .. } | TerminalChange::Reset => 0,
     }
 }

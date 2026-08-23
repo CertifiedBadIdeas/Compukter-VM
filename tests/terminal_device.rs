@@ -285,3 +285,35 @@ fn oversized_pending_journal_compacts_to_one_bounded_full_replacement() {
     ));
     assert!(matches!(delta.changes()[2], TerminalChange::Cursor { .. }));
 }
+
+#[test]
+fn oversized_accumulated_journal_resyncs_with_a_bounded_full_state() {
+    let mut terminal = TerminalDevice::default();
+    let cell = TerminalCell::new('Z' as u32, 3, 4).unwrap();
+    for _ in 0..17 {
+        for _ in 0..256 {
+            terminal
+                .patch(TerminalPosition::new(0, 0).unwrap(), &[cell])
+                .unwrap();
+        }
+        terminal.commit();
+    }
+
+    assert!(matches!(
+        terminal.changes_since(0),
+        TerminalUpdate::Full(snapshot) if snapshot.revision() == 17
+    ));
+
+    let mut cell_heavy = TerminalDevice::default();
+    let full_grid = vec![cell; 51 * 19];
+    for _ in 0..9 {
+        cell_heavy
+            .patch(TerminalPosition::new(0, 0).unwrap(), &full_grid)
+            .unwrap();
+        cell_heavy.commit();
+    }
+    assert!(matches!(
+        cell_heavy.changes_since(0),
+        TerminalUpdate::Full(snapshot) if snapshot.revision() == 9
+    ));
+}
