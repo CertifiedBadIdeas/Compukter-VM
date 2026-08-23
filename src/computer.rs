@@ -18,7 +18,6 @@ use crate::{
 
 const TERMINAL_NAMESPACE: &str = "compukter";
 const TERMINAL_NAME: &str = "terminal";
-const TERMINAL_ABI_MAJOR: u16 = 1;
 const RAW_TERMINAL_ABI_MAJOR: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +32,6 @@ pub enum ComputerError {
     Resume(ResumeError),
     InvalidRequestId,
     InvalidTerminalRequest,
-    NoPendingCompatibilityLine,
     ActiveTerminalEvent,
     NoActiveTerminalEvent,
     WrongTerminalEventKind,
@@ -71,7 +69,6 @@ pub struct ComputerHostRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComputerAdvanceOutcome {
     SliceExhausted,
-    WaitingForLine,
     WaitingForTerminalEvent,
     HostRequest(ComputerHostRequest),
     AllocationExhausted(ManagedAllocationFailure),
@@ -86,7 +83,6 @@ pub enum ComputerAdvanceOutcome {
 pub struct ComputerMachine {
     session: Session,
     terminal: TerminalDevice,
-    pending_compatibility_line: Option<RequestId>,
     pending_terminal_event: Option<RequestId>,
     active_terminal_event: Option<TerminalInputEvent>,
 }
@@ -99,11 +95,6 @@ impl ComputerMachine {
         arguments: &[EntryValue],
     ) -> Result<Self, ComputerStartError> {
         let string_argument = [HostValueType::String];
-        let terminal_operations = [
-            OperationSchema::asynchronous(&string_argument, HostValueType::Unit),
-            OperationSchema::asynchronous(&string_argument, HostValueType::Unit),
-            OperationSchema::asynchronous(&[], HostValueType::String),
-        ];
         let raw_terminal_operations = [
             OperationSchema::synchronous(&string_argument, HostValueType::Unit),
             OperationSchema::synchronous(&[], HostValueType::Unit),
@@ -115,13 +106,6 @@ impl ComputerMachine {
             OperationSchema::synchronous(&[], HostValueType::I32),
             OperationSchema::synchronous(&[], HostValueType::Unit),
         ];
-        let terminal_binding = CapabilityBinding::new(
-            TERMINAL_NAMESPACE,
-            TERMINAL_NAME,
-            TERMINAL_ABI_MAJOR,
-            0,
-            &terminal_operations,
-        );
         let raw_terminal_binding = CapabilityBinding::new(
             TERMINAL_NAMESPACE,
             TERMINAL_NAME,
@@ -129,9 +113,8 @@ impl ComputerMachine {
             0,
             &raw_terminal_operations,
         );
-        let mut bindings = Vec::with_capacity(addon_bindings.len() + 2);
+        let mut bindings = Vec::with_capacity(addon_bindings.len() + 1);
         bindings.extend_from_slice(addon_bindings);
-        bindings.push(terminal_binding);
         bindings.push(raw_terminal_binding);
         let mut session =
             Session::admit(artifact, profile, &bindings).map_err(ComputerStartError::Admission)?;
@@ -141,7 +124,6 @@ impl ComputerMachine {
         Ok(Self {
             session,
             terminal: TerminalDevice::default(),
-            pending_compatibility_line: None,
             pending_terminal_event: None,
             active_terminal_event: None,
         })
@@ -219,9 +201,6 @@ impl ComputerMachine {
         guest_budget: u32,
         maintenance_budget: u32,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
-        if self.pending_compatibility_line.is_some() {
-            return Ok(ComputerAdvanceOutcome::WaitingForLine);
-        }
         if let Some(request) = self.pending_terminal_event {
             let Some(kind) = self.terminal_await_event()? else {
                 return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
@@ -241,9 +220,6 @@ impl ComputerMachine {
                 .advance(guest_budget, maintenance_budget)
                 .map_err(ComputerError::Run)?;
             match outcome {
-                AdvanceOutcome::HostRequest(request) if is_compatibility_terminal(request) => {
-                    Some(copy_terminal_request(request)?)
-                }
                 AdvanceOutcome::HostRequest(request) if is_raw_terminal(request) => {
                     Some(copy_raw_terminal_request(request)?)
                 }
@@ -276,24 +252,6 @@ impl ComputerMachine {
             }
         };
         match internal.expect("terminal request branch always publishes an action") {
-            TerminalRequest::Write { id, units, newline } => {
-                self.terminal
-                    .write_utf16(&units)
-                    .map_err(|_| ComputerError::InvalidTerminalRequest)?;
-                if newline {
-                    self.terminal
-                        .write_utf16(&['\n' as u16])
-                        .map_err(|_| ComputerError::InvalidTerminalRequest)?;
-                }
-                self.session
-                    .resume_internal(id, HostResponse::Success(HostValueInput::Unit))
-                    .map_err(ComputerError::Resume)?;
-                Ok(ComputerAdvanceOutcome::SliceExhausted)
-            }
-            TerminalRequest::ReadLine { id } => {
-                self.pending_compatibility_line = Some(id);
-                Ok(ComputerAdvanceOutcome::WaitingForLine)
-            }
             TerminalRequest::Raw { id, operation } => {
                 self.handle_raw_terminal_request(id, operation)
             }
@@ -355,20 +313,6 @@ impl ComputerMachine {
         Ok(ComputerAdvanceOutcome::SliceExhausted)
     }
 
-    pub fn provide_compatibility_line(&mut self, units: &[u16]) -> Result<(), ComputerError> {
-        let request = self
-            .pending_compatibility_line
-            .ok_or(ComputerError::NoPendingCompatibilityLine)?;
-        self.session
-            .resume_internal(
-                request,
-                HostResponse::Success(HostValueInput::String(units)),
-            )
-            .map_err(ComputerError::Resume)?;
-        self.pending_compatibility_line = None;
-        Ok(())
-    }
-
     pub fn resume_host_request(
         &mut self,
         request_id: u64,
@@ -382,14 +326,6 @@ impl ComputerMachine {
 }
 
 enum TerminalRequest {
-    Write {
-        id: RequestId,
-        units: Vec<u16>,
-        newline: bool,
-    },
-    ReadLine {
-        id: RequestId,
-    },
     Raw {
         id: RequestId,
         operation: RawTerminalOperation,
@@ -408,36 +344,10 @@ enum RawTerminalOperation {
     FinishEvent,
 }
 
-fn is_compatibility_terminal(request: HostRequestView<'_>) -> bool {
-    request.namespace() == TERMINAL_NAMESPACE
-        && request.name() == TERMINAL_NAME
-        && request.abi_major() == TERMINAL_ABI_MAJOR
-}
-
 fn is_raw_terminal(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == TERMINAL_NAME
         && request.abi_major() == RAW_TERMINAL_ABI_MAJOR
-}
-
-fn copy_terminal_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
-    match request.operation() {
-        operation @ 0..=1 => {
-            if request.arguments().len() != 1 {
-                return Err(ComputerError::InvalidTerminalRequest);
-            }
-            let Some(HostValueView::String(units)) = request.arguments().get(0) else {
-                return Err(ComputerError::InvalidTerminalRequest);
-            };
-            Ok(TerminalRequest::Write {
-                id: request.id(),
-                units: units.to_vec(),
-                newline: operation == 1,
-            })
-        }
-        2 if request.arguments().is_empty() => Ok(TerminalRequest::ReadLine { id: request.id() }),
-        _ => Err(ComputerError::InvalidTerminalRequest),
-    }
 }
 
 fn copy_raw_terminal_request(
