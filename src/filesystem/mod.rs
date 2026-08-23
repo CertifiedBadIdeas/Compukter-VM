@@ -14,10 +14,16 @@
  * GNU General Public License for more details.
  */
 
+mod capability;
 mod error;
+mod handle;
 mod limits;
 mod path;
+mod tree;
 
+pub use capability::{FileCapability, FileRights};
 pub use error::{FileSystemError, StoreHealth};
+pub use handle::{FileHandle, HandleTable, OpenFile};
 pub use limits::FileSystemLimits;
 pub use path::VirtualPath;
+pub use tree::{ComputerFileSystem, NodeKind, NodeMetadata};
