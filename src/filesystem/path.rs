@@ -40,7 +40,15 @@ impl VirtualPath {
             }
         }
 
-        if !decoded.starts_with('/') || decoded.is_empty() {
+        Self::parse_utf8(&decoded, limits)
+    }
+
+    pub fn parse_utf8(decoded: &str, limits: &FileSystemLimits) -> Result<Self, FileSystemError> {
+        if decoded.len() > limits.maximum_path_bytes
+            || !decoded.starts_with('/')
+            || decoded.is_empty()
+            || decoded.contains('\0')
+        {
             return Err(FileSystemError::InvalidPath);
         }
         if decoded == "/" {

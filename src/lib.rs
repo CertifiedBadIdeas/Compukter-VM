@@ -71,8 +71,8 @@ pub use execution::{
 };
 pub use filesystem::{
     ComputerFileSystem, FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits,
-    FileSystemSnapshot, HandleTable, NodeKind, NodeMetadata, OpenFile, OpenMode, StoreHealth,
-    VirtualPath,
+    FileSystemSnapshot, HandleTable, NodeKind, NodeMetadata, OpenFile, OpenMode, RomImage,
+    RomImageError, StoreHealth, VirtualPath,
 };
 pub use limits::ArtifactLimits;
 pub use terminal::{

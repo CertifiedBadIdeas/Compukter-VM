@@ -20,9 +20,10 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::quota::{MutationCost, QuotaLedger};
+use super::rom::RomEntryKind;
 use super::{
     FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits, HandleTable,
-    OpenFile, OpenMode, VirtualPath,
+    OpenFile, OpenMode, RomImage, RomImageError, VirtualPath,
 };
 
 type Directory = BTreeMap<Box<str>, Node>;
@@ -175,6 +176,37 @@ impl ComputerFileSystem {
             limits,
             generation: 0,
         }
+    }
+
+    pub fn with_rom(limits: FileSystemLimits, image: RomImage) -> Result<Self, RomImageError> {
+        let mut filesystem = Self::with_limits(limits);
+        for entry in image.entries() {
+            let components = entry.path.component_slice();
+            let (_, relative) = components
+                .split_first()
+                .ok_or(RomImageError::NonCanonical)?;
+            let (name, parent) = split_name(relative).map_err(|_| RomImageError::NonCanonical)?;
+            match entry.kind {
+                RomEntryKind::Directory => {
+                    find_directory_mut(&mut filesystem.rom, parent)
+                        .map_err(|_| RomImageError::NonCanonical)?
+                        .insert(Box::from(name), Node::directory(0));
+                }
+                RomEntryKind::File => {
+                    let object = object_id(&entry.content);
+                    find_directory_mut(&mut filesystem.rom, parent)
+                        .map_err(|_| RomImageError::NonCanonical)?
+                        .insert(
+                            Box::from(name),
+                            Node::file(object, entry.content.len() as u64, 0, entry.executable),
+                        );
+                    filesystem
+                        .objects
+                        .replace(None, object, Arc::clone(&entry.content));
+                }
+            }
+        }
+        Ok(filesystem)
     }
 
     #[doc(hidden)]
