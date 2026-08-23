@@ -19,6 +19,7 @@ mod error;
 mod handle;
 mod limits;
 mod path;
+mod persistence;
 mod quota;
 mod rom;
 mod tree;
@@ -28,5 +29,10 @@ pub use error::{FileSystemError, StoreHealth};
 pub use handle::{FileHandle, HandleTable, OpenFile, OpenMode};
 pub use limits::FileSystemLimits;
 pub use path::VirtualPath;
+pub use persistence::{
+    recover, Checkpoint, CheckpointNode, ComputerId, JournalOperation, JournalRecord,
+    PersistenceCodecError, RecoveredState, RecoveryCheckpoint, RecoveryError, RecoveryInput,
+    RecoveryJournalRecord,
+};
 pub use rom::{RomImage, RomImageError};
 pub use tree::{ComputerFileSystem, FileSystemSnapshot, NodeKind, NodeMetadata};

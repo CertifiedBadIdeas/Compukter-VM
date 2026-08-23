@@ -96,6 +96,15 @@ impl VirtualPath {
     pub(crate) fn component_slice(&self) -> &[Box<str>] {
         &self.0
     }
+
+    pub(crate) fn encoded_len(&self) -> usize {
+        1 + self
+            .0
+            .iter()
+            .map(|component| component.len())
+            .sum::<usize>()
+            + self.0.len().saturating_sub(1)
+    }
 }
 
 impl fmt::Display for VirtualPath {
