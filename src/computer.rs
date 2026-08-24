@@ -899,6 +899,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn filesystem_game_test_artifacts_are_committed_and_reproducible() {
+        for (name, artifact) in filesystem_game_test_artifacts() {
+            let generated = crate::test_encode::encode_artifact(artifact.decoded()).unwrap();
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name);
+            assert_eq!(std::fs::read(path).unwrap(), generated, "{name} changed");
+        }
+    }
+
+    #[test]
+    #[ignore = "explicitly rewrites committed GameTest artifacts"]
+    fn regenerate_filesystem_game_test_artifacts() {
+        for (name, artifact) in filesystem_game_test_artifacts() {
+            let generated = crate::test_encode::encode_artifact(artifact.decoded()).unwrap();
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name);
+            std::fs::write(path, generated).unwrap();
+        }
+    }
+
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 2] {
+        [
+            (
+                "filesystem-write.cpkt",
+                crate::execution::fixtures::filesystem_conformance_artifact(),
+            ),
+            (
+                "filesystem-read.cpkt",
+                crate::execution::fixtures::filesystem_recovery_reader_artifact(),
+            ),
+        ]
+    }
+
     fn path(value: &str, limits: &FileSystemLimits) -> VirtualPath {
         VirtualPath::parse_utf8(value, limits).unwrap()
     }
