@@ -2451,6 +2451,124 @@ mod tests {
         }
     }
 
+    fn run_filesystem_artifact(
+        artifact: crate::VerifiedArtifact,
+        filesystem: ComputerFileSystem,
+        capability: FileCapability,
+    ) -> (ComputerMachine, i32) {
+        let mut computer = ComputerMachine::start_in_filesystem(
+            artifact,
+            profile(),
+            &[],
+            &[],
+            filesystem,
+            capability,
+        )
+        .unwrap();
+        let result = loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(result))) => break result,
+                other => panic!("unexpected filesystem text outcome: {other:?}"),
+            }
+        };
+        (computer, result)
+    }
+
+    #[test]
+    fn filesystem_text_write_creates_utf8_through_the_machine() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let filesystem = ComputerFileSystem::with_limits(limits);
+        let artifact =
+            crate::execution::fixtures::filesystem_write_text_artifact("/home/note", "λ😀");
+
+        let (computer, result) = run_filesystem_artifact(artifact, filesystem, owner);
+
+        assert_eq!(0, result);
+        assert_eq!(
+            "λ😀".as_bytes(),
+            computer
+                .filesystem
+                .read_file_for_test(&path("/home/note", &limits))
+                .unwrap()
+                .as_slice(),
+        );
+    }
+
+    #[test]
+    fn filesystem_text_write_replaces_existing_bytes_through_the_machine() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let note = path("/home/note", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem.write_file(&owner, &note, b"old", false).unwrap();
+        let artifact =
+            crate::execution::fixtures::filesystem_write_text_artifact("/home/note", "new");
+
+        let (computer, result) = run_filesystem_artifact(artifact, filesystem, owner);
+
+        assert_eq!(0, result);
+        assert_eq!(
+            b"new",
+            computer
+                .filesystem
+                .read_file_for_test(&note)
+                .unwrap()
+                .as_slice(),
+        );
+    }
+
+    #[test]
+    fn filesystem_text_write_preserves_previous_bytes_on_quota_failure() {
+        let mut limits = FileSystemLimits::testing();
+        limits.maximum_file_bytes = 4;
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let note = path("/home/note", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem.write_file(&owner, &note, b"old", false).unwrap();
+        let artifact =
+            crate::execution::fixtures::filesystem_write_text_artifact("/home/note", "larger");
+
+        let (computer, result) = run_filesystem_artifact(artifact, filesystem, owner);
+
+        assert_eq!(-10, result);
+        assert_eq!(
+            b"old",
+            computer
+                .filesystem
+                .read_file_for_test(&note)
+                .unwrap()
+                .as_slice(),
+        );
+    }
+
+    #[test]
+    fn filesystem_text_write_reports_rom_as_read_only_without_mutation() {
+        let limits = FileSystemLimits::testing();
+        let capability = FileCapability::new(path("/", &limits), FileRights::OWNER);
+        let boot = path("/rom/boot", &limits);
+        let filesystem = ComputerFileSystem::with_rom(
+            limits,
+            rom_with_executable("/rom/boot", b"original", &limits),
+        )
+        .unwrap();
+        let artifact =
+            crate::execution::fixtures::filesystem_write_text_artifact("/rom/boot", "changed");
+
+        let (computer, result) = run_filesystem_artifact(artifact, filesystem, capability);
+
+        assert_eq!(-7, result);
+        assert_eq!(
+            b"original",
+            computer
+                .filesystem
+                .read_file_for_test(&boot)
+                .unwrap()
+                .as_slice(),
+        );
+    }
+
     #[test]
     fn filesystem_capability_persists_text_and_isolates_computer_identities() {
         static NEXT: AtomicU64 = AtomicU64::new(1);
