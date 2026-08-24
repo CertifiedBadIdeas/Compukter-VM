@@ -214,6 +214,26 @@ fn direct_calls_copy_arguments_and_publish_results_on_return() {
 }
 
 #[test]
+fn suspend_call_returns_through_the_encoded_resume_block() {
+    let mut machine = fixtures::started_zero_arg(fixtures::suspend_value_call_artifact());
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::I32(42))),
+        machine.run_slice(128, 0).unwrap()
+    );
+    assert_eq!(2, machine.maximum_observed_frame_depth_for_test());
+}
+
+#[test]
+fn suspend_call_obeys_the_existing_call_depth_limit() {
+    let mut machine = fixtures::started_zero_arg(fixtures::recursive_suspend_artifact(3));
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::StackOverflow),
+        machine.run_slice(128, 0).unwrap()
+    );
+    assert_eq!(3, machine.frame_depth());
+}
+
+#[test]
 fn stack_overflow_happens_before_a_new_frame_exists() {
     let mut profile = fixtures::profile();
     profile.maximum_call_depth = 3;

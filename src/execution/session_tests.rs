@@ -241,6 +241,34 @@ fn scalar_requests_round_trip_every_primitive_type() {
 }
 
 #[test]
+fn suspend_callee_can_wait_for_and_return_a_host_response() {
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::I32)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::suspend_scalar_capability_artifact(),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+
+    let request_id = match session.advance(128, 0).unwrap() {
+        AdvanceOutcome::HostRequest(request) => {
+            assert!(request.asynchronous());
+            request.id()
+        }
+        other => panic!("expected host request, got {other:?}"),
+    };
+    session
+        .resume(request_id, HostResponse::Success(HostValueInput::I32(7)))
+        .unwrap();
+    assert_eq!(
+        AdvanceOutcome::Halted(Some(HostValueView::I32(7))),
+        session.advance(128, 0).unwrap()
+    );
+}
+
+#[test]
 fn waiting_poll_is_stable_and_invalid_responses_are_atomic() {
     let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
     let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
