@@ -186,6 +186,10 @@ impl ComputerMachine {
         &self.terminal
     }
 
+    pub fn filesystem_generation(&self) -> u64 {
+        self.filesystem.generation()
+    }
+
     pub fn terminal_mut(&mut self) -> &mut TerminalDevice {
         &mut self.terminal
     }
