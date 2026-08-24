@@ -1909,6 +1909,139 @@ pub(crate) fn raw_terminal_conformance_artifact(
     )
 }
 
+pub(crate) fn process_terminal_child_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let marker = "nested child ran\n".encode_utf16().collect::<Vec<_>>();
+    literal_string_program_blocks_configured(
+        primitive(0),
+        vec![string],
+        Vec::new(),
+        &marker,
+        vec![vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::CapabilityCallSync {
+                dst: u16::MAX,
+                capability: 0,
+                operation: 0,
+                args: Box::new([0]),
+            },
+            Instruction::Return { value: u16::MAX },
+        ]],
+        |artifact| {
+            let mut bytes = artifact.bytes.to_vec();
+            let namespace_start = bytes.len();
+            bytes.extend_from_slice(b"compukter");
+            let namespace_end = bytes.len();
+            let name_start = bytes.len();
+            bytes.extend_from_slice(b"terminal");
+            let name_end = bytes.len();
+            artifact.bytes = Arc::from(bytes);
+            artifact.modules[0].strings[0] = ByteRange {
+                start: namespace_start,
+                end: namespace_end,
+            };
+            artifact.modules[0].strings[1] = ByteRange {
+                start: name_start,
+                end: name_end,
+            };
+            artifact.header.semantic_features = 0b1100;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 2,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 9,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+        },
+    )
+}
+
+pub(crate) fn process_install_rom_executable_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let destination = "/home/hello".encode_utf16().collect::<Vec<_>>();
+    let source = "/rom/hello".encode_utf16().collect::<Vec<_>>();
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![string, string, primitive(1)],
+        Vec::new(),
+        &destination,
+        vec![vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::Const {
+                dst: 1,
+                constant: 1,
+            },
+            Instruction::CapabilityCallSync {
+                dst: 2,
+                capability: 0,
+                operation: 7,
+                args: Box::new([1, 0]),
+            },
+            Instruction::Return { value: 2 },
+        ]],
+        |artifact| {
+            let mut bytes = artifact.bytes.to_vec();
+            let namespace_start = bytes.len();
+            bytes.extend_from_slice(b"compukter");
+            let namespace_end = bytes.len();
+            let name_start = bytes.len();
+            bytes.extend_from_slice(b"filesystem");
+            let name_end = bytes.len();
+            let source_start = bytes.len();
+            for unit in &source {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            let source_end = bytes.len();
+            artifact.bytes = Arc::from(bytes);
+
+            let application = &mut artifact.modules[0];
+            application.strings[0] = ByteRange {
+                start: namespace_start,
+                end: namespace_end,
+            };
+            application.strings[1] = ByteRange {
+                start: name_start,
+                end: name_end,
+            };
+            application.utf16_literals.push(ByteRange {
+                start: source_start,
+                end: source_end,
+            });
+            application
+                .constants
+                .push(Constant::String(Utf16LiteralId(1)));
+            artifact.header.semantic_features = 0b1100;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 8,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+        },
+    )
+}
+
 pub(crate) fn process_run_artifact(path: &[u16], capabilities: i32) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,

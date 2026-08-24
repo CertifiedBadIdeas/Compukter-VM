@@ -620,6 +620,21 @@ impl ComputerMachine {
                     HostResponse::Success(HostValueInput::I32(status_code(result))),
                 )?;
             }
+            FileSystemOperation::InstallExecutableFromRom(source, destination) => {
+                let result = self.parse_path(&source).and_then(|source| {
+                    self.parse_path(&destination).and_then(|destination| {
+                        self.filesystem.install_executable_from_rom(
+                            &self.initial_file_capability,
+                            &source,
+                            &destination,
+                        )
+                    })
+                });
+                self.resume_filesystem(
+                    id,
+                    HostResponse::Success(HostValueInput::I32(status_code(result))),
+                )?;
+            }
         }
         Ok(ComputerAdvanceOutcome::SliceExhausted)
     }
@@ -857,6 +872,7 @@ enum FileSystemOperation {
     CreateDirectory(Vec<u16>),
     Remove(Vec<u16>),
     Rename(Vec<u16>, Vec<u16>),
+    InstallExecutableFromRom(Vec<u16>, Vec<u16>),
 }
 
 enum ProcessOperation {
@@ -890,6 +906,7 @@ fn admit_session(
         OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
         OperationSchema::synchronous(&string_argument, HostValueType::I32),
         OperationSchema::synchronous(&string_argument, HostValueType::I32),
+        OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
         OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
     ];
     let process_operations = [OperationSchema::asynchronous(
@@ -1022,6 +1039,7 @@ fn copy_filesystem_request(request: HostRequestView<'_>) -> Result<TerminalReque
         (4, 1) => FileSystemOperation::CreateDirectory(string(0)?),
         (5, 1) => FileSystemOperation::Remove(string(0)?),
         (6, 2) => FileSystemOperation::Rename(string(0)?, string(1)?),
+        (7, 2) => FileSystemOperation::InstallExecutableFromRom(string(0)?, string(1)?),
         _ => return Err(ComputerError::InvalidFileSystemRequest),
     };
     Ok(TerminalRequest::FileSystem {
@@ -1235,6 +1253,59 @@ mod tests {
             halted
         );
         assert_eq!(1, computer.sessions.len());
+    }
+
+    #[test]
+    fn filesystem_installs_an_executable_from_rom_without_host_file_access() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let child_bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        let filesystem = ComputerFileSystem::with_rom(
+            limits,
+            rom_with_executable("/rom/hello", &child_bytes, &limits),
+        )
+        .unwrap();
+        let installer = crate::execution::fixtures::process_install_rom_executable_artifact();
+        let mut computer =
+            ComputerMachine::start_in_filesystem(installer, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+
+        let halted = loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::Halted(value) => break value,
+                other => panic!("unexpected ROM installer outcome: {other:?}"),
+            }
+        };
+
+        assert_eq!(Some(ComputerValue::I32(0)), halted);
+        assert_eq!(
+            child_bytes,
+            computer
+                .filesystem
+                .read_executable(
+                    &computer.initial_file_capability,
+                    &path("/home/hello", &limits),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            Err(FileSystemError::AlreadyExists),
+            computer.filesystem.install_executable_from_rom(
+                &computer.initial_file_capability,
+                &path("/rom/hello", &limits),
+                &path("/home/hello", &limits),
+            ),
+        );
+        assert_eq!(
+            Err(FileSystemError::PermissionDenied),
+            computer.filesystem.install_executable_from_rom(
+                &computer.initial_file_capability,
+                &path("/home/hello", &limits),
+                &path("/home/copy", &limits),
+            ),
+        );
     }
 
     #[test]
@@ -1670,7 +1741,7 @@ mod tests {
         }
     }
 
-    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 3] {
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 5] {
         [
             (
                 "filesystem-write.cpkt",
@@ -1683,6 +1754,14 @@ mod tests {
             (
                 "filesystem-read.cpkt",
                 crate::execution::fixtures::filesystem_recovery_reader_artifact(),
+            ),
+            (
+                "process-terminal-child.cpkt",
+                crate::execution::fixtures::process_terminal_child_artifact(),
+            ),
+            (
+                "process-install-rom-executable.cpkt",
+                crate::execution::fixtures::process_install_rom_executable_artifact(),
             ),
         ]
     }
@@ -1697,6 +1776,25 @@ mod tests {
         bytes.extend_from_slice(&1_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let digest = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&digest);
+        RomImage::admit(bytes.into(), limits).unwrap()
+    }
+
+    fn rom_with_executable(path: &str, content: &[u8], limits: &FileSystemLimits) -> RomImage {
+        let path = path.as_bytes();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"CPKTROM\0");
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path);
+        bytes.push(2);
+        bytes.push(1);
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(content);
         let digest = Sha256::digest(&bytes);
         bytes.extend_from_slice(&digest);
         RomImage::admit(bytes.into(), limits).unwrap()
