@@ -2375,7 +2375,7 @@ mod tests {
         }
     }
 
-    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 5] {
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 6] {
         [
             (
                 "filesystem-write.cpkt",
@@ -2384,6 +2384,10 @@ mod tests {
             (
                 "filesystem-write-alternate.cpkt",
                 crate::execution::fixtures::filesystem_alternate_marker_artifact(),
+            ),
+            (
+                "filesystem-compilation-source.cpkt",
+                crate::execution::fixtures::filesystem_compilation_source_artifact(),
             ),
             (
                 "filesystem-read.cpkt",

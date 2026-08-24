@@ -2366,6 +2366,10 @@ pub(crate) fn filesystem_alternate_marker_artifact() -> VerifiedArtifact {
     filesystem_marker_artifact("fun main() = 7\n")
 }
 
+pub(crate) fn filesystem_compilation_source_artifact() -> VerifiedArtifact {
+    filesystem_marker_artifact("fun main() {}\n")
+}
+
 fn filesystem_marker_artifact(content: &str) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
