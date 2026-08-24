@@ -46,6 +46,7 @@ pub mod diagnostic;
 mod execution;
 pub mod filesystem;
 pub mod limits;
+mod process;
 pub mod terminal;
 
 #[cfg(test)]
@@ -78,6 +79,7 @@ pub use filesystem::{
     VirtualPath, WorldFileSystemStore,
 };
 pub use limits::ArtifactLimits;
+pub use process::{ProcessCapabilityMask, ProcessContractError, ProcessLimits, ProcessResult};
 pub use terminal::{
     TerminalCell, TerminalChange, TerminalCommit, TerminalConfig, TerminalDelta, TerminalDevice,
     TerminalError, TerminalInputError, TerminalInputEvent, TerminalInputLimits, TerminalKey,
