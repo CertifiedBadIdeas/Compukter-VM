@@ -45,6 +45,12 @@ pub struct NodeMetadata {
     pub executable: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileRevision {
+    Absent,
+    Present(u64),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Node {
     metadata: NodeMetadata,
@@ -450,6 +456,44 @@ impl ComputerFileSystem {
             persistence.publish();
         }
         Ok(())
+    }
+
+    pub(crate) fn executable_install_revision(
+        &self,
+        capability: &FileCapability,
+        path: &VirtualPath,
+    ) -> Result<FileRevision, FileSystemError> {
+        let (mount, components) = writable_path(path)?;
+        let (name, parent_components) = split_name(components)?;
+        let parent = find_directory(self.directory(mount), parent_components)?;
+        match parent.get(name) {
+            Some(node) => {
+                require(capability, path, FileRights::WRITE)?;
+                if node.metadata.kind != NodeKind::File {
+                    return Err(FileSystemError::IsDirectory);
+                }
+                Ok(FileRevision::Present(node.metadata.generation))
+            }
+            None => {
+                require(capability, path, FileRights::CREATE | FileRights::WRITE)?;
+                self.check_directory_entry_limit(parent.len())?;
+                Ok(FileRevision::Absent)
+            }
+        }
+    }
+
+    pub(crate) fn install_executable(
+        &mut self,
+        capability: &FileCapability,
+        path: &VirtualPath,
+        bytes: &[u8],
+        expected: FileRevision,
+    ) -> Result<(), FileSystemError> {
+        let actual = self.executable_install_revision(capability, path)?;
+        if actual != expected {
+            return Err(FileSystemError::Busy);
+        }
+        self.write_file(capability, path, bytes, true)
     }
 
     pub(crate) fn install_executable_from_rom(
@@ -901,4 +945,65 @@ fn find_directory_mut<'a>(
         };
     }
     Ok(directory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(value: &str, limits: &FileSystemLimits) -> VirtualPath {
+        VirtualPath::parse_utf8(value, limits).unwrap()
+    }
+
+    #[test]
+    fn executable_install_is_atomic_for_absent_and_existing_outputs() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let output = path("/home/program", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+
+        filesystem
+            .install_executable(&owner, &output, b"first", FileRevision::Absent)
+            .unwrap();
+        let first = filesystem.stat(&owner, &output).unwrap();
+        assert!(first.executable);
+        assert_eq!(
+            b"first",
+            filesystem.read_file_for_test(&output).unwrap().as_slice()
+        );
+
+        filesystem
+            .install_executable(
+                &owner,
+                &output,
+                b"second",
+                FileRevision::Present(first.generation),
+            )
+            .unwrap();
+        let second = filesystem.stat(&owner, &output).unwrap();
+        assert!(second.executable);
+        assert!(second.generation > first.generation);
+        assert_eq!(
+            b"second",
+            filesystem.read_file_for_test(&output).unwrap().as_slice()
+        );
+    }
+
+    #[test]
+    fn executable_install_rejects_stale_preconditions_without_mutation() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let output = path("/home/program", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&owner, &output, b"old", false)
+            .unwrap();
+        let before = filesystem.snapshot_for_test();
+
+        assert_eq!(
+            filesystem.install_executable(&owner, &output, b"new", FileRevision::Absent),
+            Err(FileSystemError::Busy),
+        );
+        assert_eq!(before, filesystem.snapshot_for_test());
+    }
 }
