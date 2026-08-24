@@ -124,7 +124,8 @@ impl ProcessCapabilityMask {
     pub const TERMINAL: u32 = 1 << 0;
     pub const FILESYSTEM: u32 = 1 << 1;
     pub const PROCESS: u32 = 1 << 2;
-    pub const STANDARD: u32 = Self::TERMINAL | Self::FILESYSTEM | Self::PROCESS;
+    pub const COMPILER: u32 = 1 << 3;
+    pub const STANDARD: u32 = Self::TERMINAL | Self::FILESYSTEM | Self::PROCESS | Self::COMPILER;
 
     pub fn new(requested: i32, available: u32) -> Result<Self, ProcessContractError> {
         let requested =

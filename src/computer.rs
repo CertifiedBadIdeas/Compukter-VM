@@ -9,6 +9,9 @@
  * (at your option) any later version.
  */
 
+use std::sync::Arc;
+
+use crate::filesystem::FileRevision;
 use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
 use crate::{
     verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
@@ -27,6 +30,17 @@ const FILESYSTEM_NAME: &str = "filesystem";
 const FILESYSTEM_ABI_MAJOR: u16 = 1;
 const PROCESS_NAME: &str = "process";
 const PROCESS_ABI_MAJOR: u16 = 1;
+const PROCESS_ABI_MINOR: u16 = 1;
+const COMPILER_NAME: &str = "compiler";
+const COMPILER_ABI_MAJOR: u16 = 1;
+const COMPILER_ABI_MINOR: u16 = 0;
+const COMPILATION_WIRE_VERSION: u16 = 1;
+const MAXIMUM_COMPILER_SOURCE_BYTES: usize = 256 * 1024;
+const COMPILATION_STATUS_SUCCESS: i32 = 0;
+const COMPILATION_STATUS_REJECTED: i32 = 1;
+const COMPILATION_STATUS_STALE: i32 = 2;
+const COMPILATION_STATUS_INVALID_ARTIFACT: i32 = 3;
+const COMPILATION_STATUS_IO_FAILED: i32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComputerStartError {
@@ -43,6 +57,10 @@ pub enum ComputerError {
     InvalidTerminalRequest,
     InvalidFileSystemRequest,
     InvalidProcessRequest,
+    InvalidCompilerRequest,
+    ActiveCompilation,
+    NoActiveCompilation,
+    InvalidCompilationToken,
     ActiveTerminalEvent,
     NoActiveTerminalEvent,
     WrongTerminalEventKind,
@@ -82,12 +100,26 @@ pub enum ComputerAdvanceOutcome {
     SliceExhausted,
     WaitingForTerminalEvent,
     HostRequest(ComputerHostRequest),
+    CompilationRequested(CompilationRequest),
     AllocationExhausted(ManagedAllocationFailure),
     QuotaExhausted(QuotaExhaustion),
     Halted(Option<ComputerValue>),
     Crashed(GuestTrap),
     Faulted(VmFault),
     HostFailed(HostFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilationSource {
+    pub path: Box<str>,
+    pub utf8: Box<[u8]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilationRequest {
+    pub version: u16,
+    pub token: u64,
+    pub sources: Box<[CompilationSource]>,
 }
 
 #[derive(Debug)]
@@ -105,14 +137,29 @@ pub struct ComputerMachine {
     reserved_heap_bytes: u64,
     reserved_frame_storage_bytes: u64,
     maximum_text_code_units: usize,
+    pending_compilation: Option<CompilationTransaction>,
+    next_compilation_token: u64,
 }
 
 #[derive(Debug)]
 struct ProcessFrame {
     session: Session,
     capabilities: ProcessCapabilityMask,
+    command_line: Box<[u16]>,
+    compiler_diagnostics: Box<[u16]>,
     pending_terminal_event: Option<RequestId>,
     pending_process: Option<RequestId>,
+}
+
+#[derive(Debug)]
+struct CompilationTransaction {
+    token: u64,
+    request: RequestId,
+    owner_depth: usize,
+    source: VirtualPath,
+    source_revision: u64,
+    output: VirtualPath,
+    output_revision: FileRevision,
 }
 
 impl ComputerMachine {
@@ -220,7 +267,7 @@ impl ComputerMachine {
         let addon_mask = if owned_addon_bindings.is_empty() {
             0
         } else {
-            u32::MAX >> (32 - owned_addon_bindings.len()) << 3
+            u32::MAX >> (32 - owned_addon_bindings.len()) << 4
         };
         let available_capabilities = ProcessCapabilityMask::STANDARD | addon_mask;
         let reserved_heap_bytes = u64::from(profile.heap_bytes);
@@ -245,6 +292,8 @@ impl ComputerMachine {
             sessions: vec![ProcessFrame {
                 session,
                 capabilities: root_capabilities,
+                command_line: Box::new([]),
+                compiler_diagnostics: Box::new([]),
                 pending_terminal_event: None,
                 pending_process: None,
             }],
@@ -260,6 +309,8 @@ impl ComputerMachine {
             reserved_heap_bytes,
             reserved_frame_storage_bytes,
             maximum_text_code_units,
+            pending_compilation: None,
+            next_compilation_token: 1,
         })
     }
 
@@ -345,6 +396,9 @@ impl ComputerMachine {
         guest_budget: u32,
         maintenance_budget: u32,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        if self.pending_compilation.is_some() {
+            return Ok(ComputerAdvanceOutcome::SliceExhausted);
+        }
         if let Some(request) = self.active_frame().pending_terminal_event {
             let Some(kind) = self.terminal_await_event()? else {
                 return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
@@ -372,6 +426,9 @@ impl ComputerMachine {
                 }
                 AdvanceOutcome::HostRequest(request) if is_process(request) => {
                     Some(copy_process_request(request)?)
+                }
+                AdvanceOutcome::HostRequest(request) if is_compiler(request) => {
+                    Some(copy_compiler_request(request)?)
                 }
                 AdvanceOutcome::SliceExhausted => {
                     return Ok(ComputerAdvanceOutcome::SliceExhausted)
@@ -429,6 +486,9 @@ impl ComputerMachine {
             }
             TerminalRequest::Process { id, operation } => {
                 self.handle_process_request(id, operation)
+            }
+            TerminalRequest::Compiler { id, operation } => {
+                self.handle_compiler_request(id, operation)
             }
         }
     }
@@ -644,12 +704,20 @@ impl ComputerMachine {
     }
 
     fn read_file(&mut self, path: &VirtualPath) -> Result<Vec<u8>, FileSystemError> {
+        let maximum_utf8_bytes = self.maximum_text_code_units.saturating_mul(3);
+        self.read_file_bounded(path, maximum_utf8_bytes)
+    }
+
+    fn read_file_bounded(
+        &mut self,
+        path: &VirtualPath,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, FileSystemError> {
         let length = self
             .filesystem
             .stat(&self.initial_file_capability, path)?
             .logical_size;
-        let maximum_utf8_bytes = self.maximum_text_code_units.saturating_mul(3);
-        if length > maximum_utf8_bytes as u64 {
+        if length > maximum_bytes as u64 {
             return Err(FileSystemError::QuotaExceeded);
         }
         let handle = self
@@ -707,7 +775,25 @@ impl ComputerMachine {
         id: RequestId,
         operation: ProcessOperation,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
-        let ProcessOperation::Run(path, requested_capabilities) = operation;
+        let ProcessOperation::Run {
+            path,
+            requested_capabilities,
+            command_line,
+        } = operation
+        else {
+            let frame = self.active_frame_mut();
+            frame
+                .session
+                .resume_internal(
+                    id,
+                    HostResponse::Success(HostValueInput::String(&frame.command_line)),
+                )
+                .map_err(ComputerError::Resume)?;
+            return Ok(ComputerAdvanceOutcome::SliceExhausted);
+        };
+        if command_line.len() > self.maximum_text_code_units {
+            return self.resume_process_result(id, ProcessResult::QuotaExhausted);
+        }
         let capabilities = match self
             .active_frame()
             .capabilities
@@ -774,10 +860,194 @@ impl ComputerMachine {
         self.sessions.push(ProcessFrame {
             session: child,
             capabilities,
+            command_line,
+            compiler_diagnostics: Box::new([]),
             pending_terminal_event: None,
             pending_process: None,
         });
         Ok(ComputerAdvanceOutcome::SliceExhausted)
+    }
+
+    fn handle_compiler_request(
+        &mut self,
+        id: RequestId,
+        operation: CompilerOperation,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        let CompilerOperation::Compile(source, output) = operation else {
+            let frame = self.active_frame_mut();
+            frame
+                .session
+                .resume_internal(
+                    id,
+                    HostResponse::Success(HostValueInput::String(&frame.compiler_diagnostics)),
+                )
+                .map_err(ComputerError::Resume)?;
+            return Ok(ComputerAdvanceOutcome::SliceExhausted);
+        };
+        if self.pending_compilation.is_some() {
+            return Err(ComputerError::ActiveCompilation);
+        }
+        self.active_frame_mut().compiler_diagnostics = Box::new([]);
+        let source = match self.parse_path(&source) {
+            Ok(path) if path.file_name().is_some_and(|name| name.ends_with(".kt")) => path,
+            _ => return self.reject_compilation(id, "source must be a canonical .kt file"),
+        };
+        let output = match self.parse_path(&output) {
+            Ok(path) if path != source => path,
+            _ => return self.reject_compilation(id, "output must be a different canonical path"),
+        };
+        let source_metadata = match self.filesystem.stat(&self.initial_file_capability, &source) {
+            Ok(metadata) if metadata.kind == NodeKind::File => metadata,
+            Ok(_) => return self.reject_compilation(id, "source is not a regular file"),
+            Err(_) => return self.reject_compilation(id, "source is not readable"),
+        };
+        let source_bytes = match self.read_file_bounded(&source, MAXIMUM_COMPILER_SOURCE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return self.reject_compilation(id, "source exceeds limits or cannot be read")
+            }
+        };
+        if std::str::from_utf8(&source_bytes).is_err() {
+            return self.reject_compilation(id, "source is not strict UTF-8");
+        }
+        let output_revision = match self
+            .filesystem
+            .executable_install_revision(&self.initial_file_capability, &output)
+        {
+            Ok(revision) => revision,
+            Err(_) => return self.reject_compilation(id, "output is not writable"),
+        };
+        let token = self.next_compilation_token;
+        self.next_compilation_token = self
+            .next_compilation_token
+            .checked_add(1)
+            .ok_or(ComputerError::ActiveCompilation)?;
+        self.pending_compilation = Some(CompilationTransaction {
+            token,
+            request: id,
+            owner_depth: self.sessions.len(),
+            source: source.clone(),
+            source_revision: source_metadata.generation,
+            output,
+            output_revision,
+        });
+        Ok(ComputerAdvanceOutcome::CompilationRequested(
+            CompilationRequest {
+                version: COMPILATION_WIRE_VERSION,
+                token,
+                sources: vec![CompilationSource {
+                    path: source.to_string().into(),
+                    utf8: source_bytes.into(),
+                }]
+                .into_boxed_slice(),
+            },
+        ))
+    }
+
+    fn reject_compilation(
+        &mut self,
+        id: RequestId,
+        diagnostic: &str,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        self.finish_compilation_request(id, COMPILATION_STATUS_REJECTED, diagnostic)?;
+        Ok(ComputerAdvanceOutcome::SliceExhausted)
+    }
+
+    pub fn complete_compilation_success(
+        &mut self,
+        token: u64,
+        artifact: &[u8],
+    ) -> Result<(), ComputerError> {
+        let transaction = self.take_compilation(token)?;
+        let artifact_limits = ArtifactLimits::default();
+        if artifact.len() > artifact_limits.artifact_bytes
+            || verify_artifact(Arc::from(artifact), artifact_limits).is_err()
+        {
+            return self.finish_compilation_request(
+                transaction.request,
+                COMPILATION_STATUS_INVALID_ARTIFACT,
+                "compiler returned an invalid artifact",
+            );
+        }
+        let source_is_current = self
+            .filesystem
+            .stat(&self.initial_file_capability, &transaction.source)
+            .is_ok_and(|metadata| {
+                metadata.kind == NodeKind::File
+                    && metadata.generation == transaction.source_revision
+            });
+        if !source_is_current {
+            return self.finish_compilation_request(
+                transaction.request,
+                COMPILATION_STATUS_STALE,
+                "source changed while compilation was running",
+            );
+        }
+        match self.filesystem.install_executable(
+            &self.initial_file_capability,
+            &transaction.output,
+            artifact,
+            transaction.output_revision,
+        ) {
+            Ok(()) => {
+                self.finish_compilation_request(transaction.request, COMPILATION_STATUS_SUCCESS, "")
+            }
+            Err(FileSystemError::Busy) => self.finish_compilation_request(
+                transaction.request,
+                COMPILATION_STATUS_STALE,
+                "output changed while compilation was running",
+            ),
+            Err(_) => self.finish_compilation_request(
+                transaction.request,
+                COMPILATION_STATUS_IO_FAILED,
+                "compiled artifact could not be installed",
+            ),
+        }
+    }
+
+    pub fn complete_compilation_failure(
+        &mut self,
+        token: u64,
+        diagnostics: &str,
+    ) -> Result<(), ComputerError> {
+        let transaction = self.take_compilation(token)?;
+        self.finish_compilation_request(
+            transaction.request,
+            COMPILATION_STATUS_REJECTED,
+            diagnostics,
+        )
+    }
+
+    fn take_compilation(&mut self, token: u64) -> Result<CompilationTransaction, ComputerError> {
+        let transaction = self
+            .pending_compilation
+            .as_ref()
+            .ok_or(ComputerError::NoActiveCompilation)?;
+        if transaction.token != token {
+            return Err(ComputerError::InvalidCompilationToken);
+        }
+        if transaction.owner_depth != self.sessions.len() {
+            return Err(ComputerError::NoActiveCompilation);
+        }
+        Ok(self
+            .pending_compilation
+            .take()
+            .expect("the checked compilation transaction is present"))
+    }
+
+    fn finish_compilation_request(
+        &mut self,
+        request: RequestId,
+        status: i32,
+        diagnostic: &str,
+    ) -> Result<(), ComputerError> {
+        let diagnostics = bounded_utf16(diagnostic, self.maximum_text_code_units);
+        let frame = self.active_frame_mut();
+        frame.compiler_diagnostics = diagnostics;
+        frame
+            .session
+            .resume_internal(request, HostResponse::Success(HostValueInput::I32(status)))
+            .map_err(ComputerError::Resume)
     }
 
     fn finish_child(
@@ -850,6 +1120,10 @@ enum TerminalRequest {
         id: RequestId,
         operation: ProcessOperation,
     },
+    Compiler {
+        id: RequestId,
+        operation: CompilerOperation,
+    },
 }
 
 enum RawTerminalOperation {
@@ -876,7 +1150,17 @@ enum FileSystemOperation {
 }
 
 enum ProcessOperation {
-    Run(Vec<u16>, i32),
+    Run {
+        path: Vec<u16>,
+        requested_capabilities: i32,
+        command_line: Box<[u16]>,
+    },
+    CommandLine,
+}
+
+enum CompilerOperation {
+    Compile(Vec<u16>, Vec<u16>),
+    Diagnostics,
 }
 
 fn admit_session(
@@ -888,6 +1172,12 @@ fn admit_session(
     let string_argument = [HostValueType::String];
     let two_string_arguments = [HostValueType::String, HostValueType::String];
     let process_arguments = [HostValueType::String, HostValueType::I32];
+    let process_command_line_arguments = [
+        HostValueType::String,
+        HostValueType::I32,
+        HostValueType::String,
+    ];
+    let compiler_arguments = [HostValueType::String, HostValueType::String];
     let raw_terminal_operations = [
         OperationSchema::synchronous(&string_argument, HostValueType::Unit),
         OperationSchema::synchronous(&[], HostValueType::Unit),
@@ -909,10 +1199,15 @@ fn admit_session(
         OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
         OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
     ];
-    let process_operations = [OperationSchema::asynchronous(
-        &process_arguments,
-        HostValueType::I32,
-    )];
+    let process_operations = [
+        OperationSchema::asynchronous(&process_arguments, HostValueType::I32),
+        OperationSchema::asynchronous(&process_command_line_arguments, HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::String),
+    ];
+    let compiler_operations = [
+        OperationSchema::asynchronous(&compiler_arguments, HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::String),
+    ];
     let addon_operations = addon_bindings
         .iter()
         .map(|binding| {
@@ -929,7 +1224,7 @@ fn admit_session(
         .collect::<Box<[_]>>();
     let mut bindings = Vec::with_capacity(addon_bindings.len() + 3);
     for (index, binding) in addon_bindings.iter().enumerate() {
-        if capabilities.allows(1 << (index + 3)) {
+        if capabilities.allows(1 << (index + 4)) {
             bindings.push(CapabilityBinding::new(
                 binding.namespace(),
                 binding.name(),
@@ -962,8 +1257,17 @@ fn admit_session(
             TERMINAL_NAMESPACE,
             PROCESS_NAME,
             PROCESS_ABI_MAJOR,
-            0,
+            PROCESS_ABI_MINOR,
             &process_operations,
+        ));
+    }
+    if capabilities.allows(ProcessCapabilityMask::COMPILER) {
+        bindings.push(CapabilityBinding::new(
+            TERMINAL_NAMESPACE,
+            COMPILER_NAME,
+            COMPILER_ABI_MAJOR,
+            COMPILER_ABI_MINOR,
+            &compiler_operations,
         ));
     }
     Session::admit(artifact, profile, &bindings)
@@ -987,20 +1291,85 @@ fn is_process(request: HostRequestView<'_>) -> bool {
         && request.abi_major() == PROCESS_ABI_MAJOR
 }
 
+fn is_compiler(request: HostRequestView<'_>) -> bool {
+    request.namespace() == TERMINAL_NAMESPACE
+        && request.name() == COMPILER_NAME
+        && request.abi_major() == COMPILER_ABI_MAJOR
+}
+
 fn copy_process_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
-    if !request.asynchronous() || request.operation() != 0 || request.arguments().len() != 2 {
-        return Err(ComputerError::InvalidProcessRequest);
-    }
-    let Some(HostValueView::String(path)) = request.arguments().get(0) else {
-        return Err(ComputerError::InvalidProcessRequest);
-    };
-    let Some(HostValueView::I32(capabilities)) = request.arguments().get(1) else {
-        return Err(ComputerError::InvalidProcessRequest);
+    let arguments = request.arguments();
+    let operation = match (request.operation(), request.asynchronous(), arguments.len()) {
+        (0, true, 2) => {
+            let Some(HostValueView::String(path)) = arguments.get(0) else {
+                return Err(ComputerError::InvalidProcessRequest);
+            };
+            let Some(HostValueView::I32(capabilities)) = arguments.get(1) else {
+                return Err(ComputerError::InvalidProcessRequest);
+            };
+            ProcessOperation::Run {
+                path: path.to_vec(),
+                requested_capabilities: capabilities,
+                command_line: Box::new([]),
+            }
+        }
+        (1, true, 3) => {
+            let Some(HostValueView::String(path)) = arguments.get(0) else {
+                return Err(ComputerError::InvalidProcessRequest);
+            };
+            let Some(HostValueView::I32(capabilities)) = arguments.get(1) else {
+                return Err(ComputerError::InvalidProcessRequest);
+            };
+            let Some(HostValueView::String(command_line)) = arguments.get(2) else {
+                return Err(ComputerError::InvalidProcessRequest);
+            };
+            ProcessOperation::Run {
+                path: path.to_vec(),
+                requested_capabilities: capabilities,
+                command_line: command_line.into(),
+            }
+        }
+        (2, false, 0) => ProcessOperation::CommandLine,
+        _ => return Err(ComputerError::InvalidProcessRequest),
     };
     Ok(TerminalRequest::Process {
         id: request.id(),
-        operation: ProcessOperation::Run(path.to_vec(), capabilities),
+        operation,
     })
+}
+
+fn copy_compiler_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
+    let arguments = request.arguments();
+    let operation = match (request.operation(), request.asynchronous(), arguments.len()) {
+        (0, true, 2) => {
+            let Some(HostValueView::String(source)) = arguments.get(0) else {
+                return Err(ComputerError::InvalidCompilerRequest);
+            };
+            let Some(HostValueView::String(output)) = arguments.get(1) else {
+                return Err(ComputerError::InvalidCompilerRequest);
+            };
+            CompilerOperation::Compile(source.to_vec(), output.to_vec())
+        }
+        (1, false, 0) => CompilerOperation::Diagnostics,
+        _ => return Err(ComputerError::InvalidCompilerRequest),
+    };
+    Ok(TerminalRequest::Compiler {
+        id: request.id(),
+        operation,
+    })
+}
+
+fn bounded_utf16(value: &str, maximum_code_units: usize) -> Box<[u16]> {
+    let mut units = Vec::new();
+    for scalar in value.chars() {
+        let required = scalar.len_utf16();
+        if units.len().saturating_add(required) > maximum_code_units {
+            break;
+        }
+        let mut encoded = [0_u16; 2];
+        units.extend_from_slice(scalar.encode_utf16(&mut encoded));
+    }
+    units.into_boxed_slice()
 }
 
 fn process_filesystem_result(error: FileSystemError) -> ProcessResult {
@@ -1241,6 +1610,7 @@ mod tests {
             );
         }
         assert_eq!(2, computer.sessions.len());
+        assert!(computer.active_frame().command_line.is_empty());
         let halted = loop {
             match computer.advance(64, 64).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
@@ -1253,6 +1623,270 @@ mod tests {
             halted
         );
         assert_eq!(1, computer.sessions.len());
+    }
+
+    #[test]
+    fn process_run_passes_a_bounded_command_line_to_the_child() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        let child = crate::execution::fixtures::process_command_line_artifact();
+        let child_bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        if let Err(error) = admit_session(
+            child,
+            profile(),
+            &[],
+            ProcessCapabilityMask::from_bits(
+                ProcessCapabilityMask::TERMINAL | ProcessCapabilityMask::PROCESS,
+            ),
+        ) {
+            panic!("command-line child must admit: {error:?}");
+        }
+        filesystem
+            .write_file(&owner, &path("/home/child", &limits), &child_bytes, true)
+            .unwrap();
+        let expected = "child --flag λ".encode_utf16().collect::<Vec<_>>();
+        let parent = crate::execution::fixtures::process_run_with_command_line_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            (ProcessCapabilityMask::TERMINAL | ProcessCapabilityMask::PROCESS) as i32,
+            &expected,
+        );
+        let mut computer =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+
+        while computer.sessions.len() == 1 {
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                computer.advance(64, 64).unwrap()
+            );
+        }
+
+        assert_eq!(
+            expected.as_slice(),
+            computer.active_frame().command_line.as_ref()
+        );
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64).unwrap()
+        );
+        for _ in 0..8 {
+            if computer.terminal().cell(0, 0).unwrap().code_point() != u32::from(' ') {
+                break;
+            }
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                computer.advance(64, 64).unwrap()
+            );
+        }
+        for (column, unit) in expected.iter().enumerate() {
+            assert_eq!(
+                u32::from(*unit),
+                computer
+                    .terminal()
+                    .cell(column as u16, 0)
+                    .unwrap()
+                    .code_point()
+            );
+        }
+    }
+
+    #[test]
+    fn process_command_line_is_empty_for_the_root_process() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let artifact = crate::execution::fixtures::two_block_artifact(1, 1);
+        let computer = ComputerMachine::start_in_filesystem(
+            artifact,
+            profile(),
+            &[],
+            &[],
+            ComputerFileSystem::with_limits(limits),
+            owner,
+        )
+        .unwrap();
+
+        assert!(computer.active_frame().command_line.is_empty());
+    }
+
+    #[test]
+    fn process_run_rejects_an_excessive_command_line_without_starting_a_child() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        let child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let child = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        filesystem
+            .write_file(&owner, &path("/home/child", &limits), &child, true)
+            .unwrap();
+        let parent = crate::execution::fixtures::process_run_with_command_line_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            0,
+            &"too long".encode_utf16().collect::<Vec<_>>(),
+        );
+        let mut constrained = profile();
+        constrained.maximum_inbound_utf16_code_units = 2;
+        let mut computer =
+            ComputerMachine::start_in_filesystem(parent, constrained, &[], &[], filesystem, owner)
+                .unwrap();
+
+        assert_eq!(
+            Some(ComputerValue::I32(ProcessResult::QuotaExhausted.code())),
+            halt(&mut computer)
+        );
+        assert_eq!(1, computer.sessions.len());
+    }
+
+    #[test]
+    fn compiler_transaction_snapshots_and_atomically_installs_an_executable() {
+        let (mut computer, owner, source, output) = compiler_computer(b"fun main() = 42\n", None);
+        let request = next_compilation_request(&mut computer);
+        assert_eq!(COMPILATION_WIRE_VERSION, request.version);
+        assert_ne!(0, request.token);
+        assert_eq!(1, request.sources.len());
+        assert_eq!(
+            source.to_string().as_str(),
+            request.sources[0].path.as_ref()
+        );
+        assert_eq!(b"fun main() = 42\n", request.sources[0].utf8.as_ref());
+
+        let compiled = crate::execution::fixtures::two_block_artifact(1, 1);
+        let compiled = crate::test_encode::encode_artifact(compiled.decoded()).unwrap();
+        assert_eq!(
+            ComputerError::InvalidCompilationToken,
+            computer
+                .complete_compilation_success(request.token + 1, &compiled)
+                .unwrap_err()
+        );
+        computer
+            .complete_compilation_success(request.token, &compiled)
+            .unwrap();
+        assert_eq!(
+            Some(ComputerValue::I32(COMPILATION_STATUS_SUCCESS)),
+            halt(&mut computer)
+        );
+        let metadata = computer.filesystem.stat(&owner, &output).unwrap();
+        assert!(metadata.executable);
+        assert_eq!(
+            compiled,
+            computer.filesystem.read_file_for_test(&output).unwrap()
+        );
+        assert_eq!(
+            ComputerError::NoActiveCompilation,
+            computer
+                .complete_compilation_success(request.token, &compiled)
+                .unwrap_err()
+        );
+    }
+
+    #[test]
+    fn compiler_transaction_rejects_invalid_artifacts_without_creating_output() {
+        let (mut computer, owner, _, output) = compiler_computer(b"fun main() = 42\n", None);
+        let request = next_compilation_request(&mut computer);
+
+        computer
+            .complete_compilation_success(request.token, b"not an artifact")
+            .unwrap();
+
+        assert_eq!(
+            Some(ComputerValue::I32(COMPILATION_STATUS_INVALID_ARTIFACT)),
+            halt(&mut computer)
+        );
+        assert_eq!(
+            Err(FileSystemError::NotFound),
+            computer.filesystem.stat(&owner, &output)
+        );
+        assert!(!computer.active_frame().compiler_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn compiler_transaction_preserves_outputs_when_source_or_output_is_stale() {
+        let compiled = crate::execution::fixtures::two_block_artifact(1, 1);
+        let compiled = crate::test_encode::encode_artifact(compiled.decoded()).unwrap();
+
+        let (mut source_changed, owner, source, output) =
+            compiler_computer(b"fun main() = 1\n", None);
+        let request = next_compilation_request(&mut source_changed);
+        source_changed
+            .filesystem
+            .write_file(&owner, &source, b"fun main() = 2\n", false)
+            .unwrap();
+        source_changed
+            .complete_compilation_success(request.token, &compiled)
+            .unwrap();
+        assert_eq!(
+            Some(ComputerValue::I32(COMPILATION_STATUS_STALE)),
+            halt(&mut source_changed)
+        );
+        assert_eq!(
+            Err(FileSystemError::NotFound),
+            source_changed.filesystem.stat(&owner, &output)
+        );
+
+        let (mut output_changed, owner, _, output) =
+            compiler_computer(b"fun main() = 1\n", Some(b"old executable"));
+        let request = next_compilation_request(&mut output_changed);
+        output_changed
+            .filesystem
+            .write_file(&owner, &output, b"player edit", false)
+            .unwrap();
+        output_changed
+            .complete_compilation_success(request.token, &compiled)
+            .unwrap();
+        assert_eq!(
+            Some(ComputerValue::I32(COMPILATION_STATUS_STALE)),
+            halt(&mut output_changed)
+        );
+        assert_eq!(
+            b"player edit",
+            output_changed
+                .filesystem
+                .read_file_for_test(&output)
+                .unwrap()
+                .as_slice()
+        );
+    }
+
+    #[test]
+    fn compiler_rejects_non_utf8_sources_before_publishing_a_request() {
+        let (mut computer, _, _, _) = compiler_computer(&[0xff, 0xfe], None);
+
+        assert_eq!(
+            Some(ComputerValue::I32(COMPILATION_STATUS_REJECTED)),
+            halt(&mut computer)
+        );
+        assert!(computer.pending_compilation.is_none());
+        assert!(!computer.active_frame().compiler_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn compiler_failure_diagnostics_are_bounded_and_resume_once() {
+        let (mut computer, _, _, _) = compiler_computer(b"fun main() = 42\n", None);
+        let request = next_compilation_request(&mut computer);
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64).unwrap()
+        );
+        let oversized = "λ".repeat(computer.maximum_text_code_units + 1);
+
+        computer
+            .complete_compilation_failure(request.token, &oversized)
+            .unwrap();
+
+        assert_eq!(
+            Some(ComputerValue::I32(COMPILATION_STATUS_REJECTED)),
+            halt(&mut computer)
+        );
+        assert_eq!(
+            computer.maximum_text_code_units,
+            computer.active_frame().compiler_diagnostics.len()
+        );
+        assert_eq!(
+            ComputerError::NoActiveCompilation,
+            computer
+                .complete_compilation_failure(request.token, "again")
+                .unwrap_err()
+        );
     }
 
     #[test]
@@ -1326,7 +1960,7 @@ mod tests {
 
         assert_eq!(
             ProcessResult::InvalidCapabilities.code(),
-            process_result(None, 8, ProcessLimits::default(), profile()),
+            process_result(None, 1 << 4, ProcessLimits::default(), profile()),
         );
         assert_eq!(
             ProcessResult::InvalidCapabilities.code(),
@@ -1442,7 +2076,7 @@ mod tests {
             child.clone(),
             profile(),
             &owned,
-            ProcessCapabilityMask::from_bits(1 << 3),
+            ProcessCapabilityMask::from_bits(1 << 4),
         )
         .unwrap();
 
@@ -1454,7 +2088,7 @@ mod tests {
             ProcessResult::HostFailed.code(),
             process_result_with_addons(
                 &child_bytes,
-                1 << 3,
+                1 << 4,
                 &[addon],
                 Some(HostFailure::new(HostFailureKind::Unavailable, 17)),
             ),
@@ -1519,7 +2153,7 @@ mod tests {
             .unwrap();
         let parent = crate::execution::fixtures::process_run_artifact(
             &"/home/child".encode_utf16().collect::<Vec<_>>(),
-            1 << 3,
+            1 << 4,
         );
         let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
         let addon = CapabilityBinding::new("app", "entry", 1, 2, &operations);
@@ -1809,6 +2443,57 @@ mod tests {
             .wrapping_add("main.kt".encode_utf16().fold(0_i32, |hash, unit| {
                 hash.wrapping_mul(31).wrapping_add(i32::from(unit))
             }))
+    }
+
+    fn compiler_computer(
+        source_bytes: &[u8],
+        existing_output: Option<&[u8]>,
+    ) -> (ComputerMachine, FileCapability, VirtualPath, VirtualPath) {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let source = path("/home/main.kt", &limits);
+        let output = path("/home/main", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&owner, &source, source_bytes, false)
+            .unwrap();
+        if let Some(bytes) = existing_output {
+            filesystem.write_file(&owner, &output, bytes, true).unwrap();
+        }
+        let artifact = crate::execution::fixtures::compiler_compile_artifact(
+            &"/home/main.kt".encode_utf16().collect::<Vec<_>>(),
+            &"/home/main".encode_utf16().collect::<Vec<_>>(),
+        );
+        let computer = ComputerMachine::start_in_filesystem(
+            artifact,
+            profile(),
+            &[],
+            &[],
+            filesystem,
+            owner.clone(),
+        )
+        .unwrap();
+        (computer, owner, source, output)
+    }
+
+    fn next_compilation_request(computer: &mut ComputerMachine) -> CompilationRequest {
+        loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::CompilationRequested(request) => return request,
+                other => panic!("unexpected compiler outcome: {other:?}"),
+            }
+        }
+    }
+
+    fn halt(computer: &mut ComputerMachine) -> Option<ComputerValue> {
+        loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::Halted(value) => return value,
+                other => panic!("unexpected compiler completion outcome: {other:?}"),
+            }
+        }
     }
 
     fn profile() -> ExecutionProfile {
