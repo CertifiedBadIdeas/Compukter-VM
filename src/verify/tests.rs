@@ -391,6 +391,37 @@ fn cfg_accepts_typed_string_length() {
 }
 
 #[test]
+fn cfg_rejects_string_materialization_from_non_char_array() {
+    let mut artifact = string_artifact(
+        vec![
+            reference(2, false),
+            primitive(1),
+            primitive(1),
+            reference(1, false),
+        ],
+        3,
+        vec![
+            crate::artifact::Instruction::StringFromCharArray {
+                dst: 3,
+                array: 0,
+                start: 1,
+                end: 2,
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+    artifact.modules[0]
+        .types
+        .push(crate::artifact::NominalType::Array {
+            name: 0,
+            element: primitive(1),
+        });
+
+    let error = verify_cfg(&artifact).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
 fn cfg_requires_exact_standard_string_type_for_string_constants() {
     let mut accepted = string_artifact(
         vec![reference(1, false)],

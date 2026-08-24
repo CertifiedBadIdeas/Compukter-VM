@@ -535,6 +535,12 @@ pub(crate) enum Instruction {
         start: u16,
         end: u16,
     },
+    StringFromCharArray {
+        dst: u16,
+        array: u16,
+        start: u16,
+        end: u16,
+    },
     Jump {
         target: u32,
     },

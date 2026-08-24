@@ -14,6 +14,10 @@ pub(super) enum StringBacking {
         length: u32,
         encoding: StringEncoding,
     },
+    CharArray {
+        reference: ReferenceValue,
+        length: u32,
+    },
 }
 
 impl StringBacking {
@@ -21,6 +25,7 @@ impl StringBacking {
         match self {
             Self::Literal(literal) => literal.code_units,
             Self::Managed { length, .. } => length,
+            Self::CharArray { length, .. } => length,
         }
     }
 }
@@ -266,6 +271,37 @@ impl PendingConcat {
             written: 0,
             collection_attempted: false,
         }))
+    }
+
+    pub(super) fn char_array(
+        reference: ReferenceValue,
+        length: i32,
+        start: i32,
+        end: i32,
+        destination: u16,
+    ) -> Result<Self, TextError> {
+        if start < 0 || end < start || end > length {
+            return Err(TextError::Trap(GuestTrap::IndexOutOfBounds));
+        }
+        let source = StringBacking::CharArray {
+            reference,
+            length: length as u32,
+        };
+        Ok(Self {
+            lhs: source,
+            lhs_start: start as u32,
+            lhs_length: (end - start) as u32,
+            rhs: source,
+            rhs_start: 0,
+            rhs_length: 0,
+            destination,
+            scan: 0,
+            latin1: true,
+            reservation: None,
+            layout: None,
+            written: 0,
+            collection_attempted: false,
+        })
     }
 
     pub(super) fn resume(
@@ -917,6 +953,9 @@ pub(super) fn encoding(
     Ok(match backing(image, heap, value)? {
         StringBacking::Literal(_) => None,
         StringBacking::Managed { encoding, .. } => Some(encoding),
+        StringBacking::CharArray { .. } => {
+            return Err(TextError::Fault(VmFault::InvalidReference));
+        }
     })
 }
 
@@ -986,5 +1025,11 @@ fn code_unit(
                 Ok(u16::from_le_bytes(bytes[..2].try_into().unwrap()))
             }
         },
+        StringBacking::CharArray { reference, .. } => {
+            let bytes = heap
+                .read_payload(reference, 8 + index * 2, 2)
+                .map_err(TextError::Fault)?;
+            Ok(u16::from_le_bytes(bytes[..2].try_into().unwrap()))
+        }
     }
 }

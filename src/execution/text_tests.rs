@@ -210,6 +210,47 @@ fn string_substring_checks_order_and_utf16_bounds_before_allocation() {
 }
 
 #[test]
+fn string_from_char_array_preserves_exact_utf16_ranges() {
+    for (start, end, expected) in [
+        (0, 5, vec![0x41, 0xd83d, 0xde00, 0x5a, 0x21]),
+        (1, 3, vec![0xd83d, 0xde00]),
+    ] {
+        let mut machine =
+            fixtures::started_zero_arg(fixtures::char_array_string_artifact(start, end));
+        let reference = loop {
+            match machine.run_slice(64, 0).unwrap() {
+                Outcome::SliceExhausted => {}
+                Outcome::Halted(Some(RuntimeValue::Reference(reference))) => break reference,
+                outcome => panic!("unexpected char-array string outcome: {outcome:?}"),
+            }
+        };
+        assert_eq!(ReferenceDomain::Managed, reference.domain());
+        assert_eq!(expected.len() as i32, machine.string_length(reference));
+        assert_eq!(
+            expected,
+            (0..machine.string_length(reference))
+                .map(|index| machine.string_get(reference, index))
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn string_from_char_array_checks_ranges_before_allocation() {
+    for (start, end) in [(-1, 1), (2, 1), (0, 6)] {
+        let mut machine =
+            fixtures::started_zero_arg(fixtures::char_array_string_artifact(start, end));
+        loop {
+            match machine.run_slice(64, 0).unwrap() {
+                Outcome::SliceExhausted => {}
+                Outcome::Crashed(GuestTrap::IndexOutOfBounds) => break,
+                outcome => panic!("unexpected char-array range outcome: {outcome:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn empty_substring_returns_the_canonical_empty_literal() {
     let mut machine = fixtures::started_zero_arg(fixtures::literal_string_substring_artifact(1, 1));
     assert_eq!(Outcome::SliceExhausted, machine.run_slice(4, 0).unwrap());

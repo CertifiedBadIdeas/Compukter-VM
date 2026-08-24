@@ -1216,6 +1216,187 @@ pub(super) fn literal_string_substring_artifact(start: i32, end: i32) -> Verifie
     )
 }
 
+pub(super) fn char_array_string_artifact(start: i32, end: i32) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let character = primitive(6);
+    let array = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    let mut constants = vec![
+        Constant::I32(5),
+        Constant::I32(0),
+        Constant::I32(1),
+        Constant::I32(2),
+        Constant::I32(3),
+        Constant::I32(4),
+        Constant::I32(start),
+        Constant::I32(end),
+        Constant::Char('A' as u16),
+        Constant::Char(0xd83d),
+        Constant::Char(0xde00),
+        Constant::Char('Z' as u16),
+        Constant::Char('!' as u16),
+    ];
+    constants.sort_by_key(crate::test_encode::encode_constant);
+    constants.dedup_by(|left, right| left == right);
+    let constant_id = |value: &Constant| {
+        constants
+            .iter()
+            .position(|candidate| candidate == value)
+            .unwrap() as u32
+    };
+    let length_id = constant_id(&Constant::I32(5));
+    let index_ids = (0..5)
+        .map(|value| constant_id(&Constant::I32(value)))
+        .collect::<Vec<_>>();
+    let start_id = constant_id(&Constant::I32(start));
+    let end_id = constant_id(&Constant::I32(end));
+    let character_ids = [
+        constant_id(&Constant::Char('A' as u16)),
+        constant_id(&Constant::Char(0xd83d)),
+        constant_id(&Constant::Char(0xde00)),
+        constant_id(&Constant::Char('Z' as u16)),
+        constant_id(&Constant::Char('!' as u16)),
+    ];
+    literal_string_program_blocks_configured(
+        string,
+        vec![
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            character,
+            character,
+            character,
+            character,
+            character,
+            array,
+            string,
+            primitive(1),
+            primitive(1),
+        ],
+        constants,
+        &[],
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: length_id,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: index_ids[0],
+                },
+                Instruction::Const {
+                    dst: 2,
+                    constant: index_ids[1],
+                },
+                Instruction::Const {
+                    dst: 3,
+                    constant: index_ids[2],
+                },
+                Instruction::Const {
+                    dst: 4,
+                    constant: index_ids[3],
+                },
+                Instruction::Const {
+                    dst: 5,
+                    constant: index_ids[4],
+                },
+                Instruction::Const {
+                    dst: 6,
+                    constant: start_id,
+                },
+                Instruction::Const {
+                    dst: 7,
+                    constant: end_id,
+                },
+                Instruction::Const {
+                    dst: 8,
+                    constant: character_ids[0],
+                },
+                Instruction::Const {
+                    dst: 9,
+                    constant: character_ids[1],
+                },
+                Instruction::Const {
+                    dst: 10,
+                    constant: character_ids[2],
+                },
+                Instruction::Const {
+                    dst: 11,
+                    constant: character_ids[3],
+                },
+                Instruction::Const {
+                    dst: 12,
+                    constant: character_ids[4],
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::NewArray {
+                    dst: 13,
+                    type_ref: 1,
+                    length: 0,
+                },
+                Instruction::ArrayStore {
+                    array: 13,
+                    index: 1,
+                    value: 8,
+                },
+                Instruction::ArrayStore {
+                    array: 13,
+                    index: 2,
+                    value: 9,
+                },
+                Instruction::ArrayStore {
+                    array: 13,
+                    index: 3,
+                    value: 10,
+                },
+                Instruction::ArrayStore {
+                    array: 13,
+                    index: 4,
+                    value: 11,
+                },
+                Instruction::ArrayStore {
+                    array: 13,
+                    index: 5,
+                    value: 12,
+                },
+                Instruction::ArrayLength { dst: 15, array: 13 },
+                Instruction::Jump { target: 2 },
+            ],
+            vec![
+                Instruction::StringFromCharArray {
+                    dst: 14,
+                    array: 13,
+                    start: 6,
+                    end: 7,
+                },
+                Instruction::Return { value: 14 },
+            ],
+        ],
+        |artifact| {
+            artifact.modules[0].types.push(NominalType::Array {
+                name: 0,
+                element: character,
+            });
+            artifact.modules[0].declared_types = 2;
+        },
+    )
+}
+
 pub(super) fn repeated_concat_artifact(content_equality: bool) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
