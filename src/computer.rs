@@ -9,14 +9,15 @@
  * (at your option) any later version.
  */
 
+use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
 use crate::{
     verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
     ComputerFileSystem, EntryValue, ExecutionProfile, FileCapability, FileRights, FileSystemError,
     FileSystemLimits, GuestTrap, HostFailure, HostFailureKind, HostRequestView, HostResponse,
     HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, NodeKind, OpenMode,
-    OperationSchema, ProcessCapabilityMask, ProcessResult, QuotaExhaustion, RequestId, ResumeError,
-    RunError, Session, TerminalDevice, TerminalInputEvent, TerminalKeyAction, VerifiedArtifact,
-    VirtualPath, VmFault,
+    OperationSchema, ProcessCapabilityMask, ProcessLimits, ProcessResult, QuotaExhaustion,
+    RequestId, ResumeError, RunError, Session, TerminalDevice, TerminalInputEvent,
+    TerminalKeyAction, VerifiedArtifact, VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
@@ -31,6 +32,7 @@ const PROCESS_ABI_MAJOR: u16 = 1;
 pub enum ComputerStartError {
     Admission(AdmissionError),
     Start(RunError),
+    Process(ProcessResult),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,9 +95,15 @@ pub struct ComputerMachine {
     sessions: Vec<ProcessFrame>,
     terminal: TerminalDevice,
     active_terminal_event: Option<TerminalInputEvent>,
+    active_terminal_event_owner: Option<usize>,
     filesystem: ComputerFileSystem,
     initial_file_capability: FileCapability,
     profile: ExecutionProfile,
+    addon_bindings: Box<[OwnedCapabilityBinding]>,
+    process_limits: ProcessLimits,
+    process_starts: u64,
+    reserved_heap_bytes: u64,
+    reserved_frame_storage_bytes: u64,
     maximum_text_code_units: usize,
 }
 
@@ -114,14 +122,31 @@ impl ComputerMachine {
         addon_bindings: &[CapabilityBinding<'_>],
         arguments: &[EntryValue],
     ) -> Result<Self, ComputerStartError> {
+        Self::start_with_process_limits(
+            artifact,
+            profile,
+            ProcessLimits::default(),
+            addon_bindings,
+            arguments,
+        )
+    }
+
+    pub fn start_with_process_limits(
+        artifact: VerifiedArtifact,
+        profile: ExecutionProfile,
+        process_limits: ProcessLimits,
+        addon_bindings: &[CapabilityBinding<'_>],
+        arguments: &[EntryValue],
+    ) -> Result<Self, ComputerStartError> {
         let limits = FileSystemLimits::default();
         let initial_capability = FileCapability::new(
             VirtualPath::parse_utf8("/home", &limits).expect("fixed ephemeral filesystem path"),
             FileRights::OWNER,
         );
-        Self::start_in_filesystem(
+        Self::start_in_filesystem_with_process_limits(
             artifact,
             profile,
+            process_limits,
             addon_bindings,
             arguments,
             ComputerFileSystem::with_limits(limits),
@@ -137,15 +162,57 @@ impl ComputerMachine {
         filesystem: ComputerFileSystem,
         initial_capability: FileCapability,
     ) -> Result<Self, ComputerStartError> {
-        let maximum_text_code_units = profile.maximum_inbound_utf16_code_units as usize;
-        let root_capabilities = ProcessCapabilityMask::new(
-            ProcessCapabilityMask::STANDARD as i32,
-            ProcessCapabilityMask::STANDARD,
+        Self::start_in_filesystem_with_process_limits(
+            artifact,
+            profile,
+            ProcessLimits::default(),
+            addon_bindings,
+            arguments,
+            filesystem,
+            initial_capability,
         )
-        .expect("the standard capability mask delegates to itself");
-        let mut session =
-            admit_session(artifact, profile.clone(), addon_bindings, root_capabilities)
-                .map_err(ComputerStartError::Admission)?;
+    }
+
+    pub fn start_in_filesystem_with_process_limits(
+        artifact: VerifiedArtifact,
+        profile: ExecutionProfile,
+        process_limits: ProcessLimits,
+        addon_bindings: &[CapabilityBinding<'_>],
+        arguments: &[EntryValue],
+        filesystem: ComputerFileSystem,
+        initial_capability: FileCapability,
+    ) -> Result<Self, ComputerStartError> {
+        let maximum_text_code_units = profile.maximum_inbound_utf16_code_units as usize;
+        if addon_bindings.len() > MAXIMUM_ADDON_CAPABILITIES {
+            return Err(ComputerStartError::Process(
+                ProcessResult::InvalidCapabilities,
+            ));
+        }
+        let owned_addon_bindings = addon_bindings
+            .iter()
+            .map(OwnedCapabilityBinding::copy_from)
+            .collect::<Box<[_]>>();
+        let addon_mask = if owned_addon_bindings.is_empty() {
+            0
+        } else {
+            u32::MAX >> (32 - owned_addon_bindings.len()) << 3
+        };
+        let available_capabilities = ProcessCapabilityMask::STANDARD | addon_mask;
+        let reserved_heap_bytes = u64::from(profile.heap_bytes);
+        let reserved_frame_storage_bytes = profile.frame_storage_bytes;
+        if reserved_heap_bytes > process_limits.maximum_aggregate_heap_bytes
+            || reserved_frame_storage_bytes > process_limits.maximum_aggregate_frame_storage_bytes
+        {
+            return Err(ComputerStartError::Process(ProcessResult::QuotaExhausted));
+        }
+        let root_capabilities = ProcessCapabilityMask::from_bits(available_capabilities);
+        let mut session = admit_session(
+            artifact,
+            profile.clone(),
+            &owned_addon_bindings,
+            root_capabilities,
+        )
+        .map_err(ComputerStartError::Admission)?;
         session
             .start(arguments)
             .map_err(ComputerStartError::Start)?;
@@ -158,9 +225,15 @@ impl ComputerMachine {
             }],
             terminal: TerminalDevice::default(),
             active_terminal_event: None,
+            active_terminal_event_owner: None,
             filesystem,
             initial_file_capability: initial_capability,
             profile,
+            addon_bindings: owned_addon_bindings,
+            process_limits,
+            process_starts: 1,
+            reserved_heap_bytes,
+            reserved_frame_storage_bytes,
             maximum_text_code_units,
         })
     }
@@ -191,6 +264,7 @@ impl ComputerMachine {
             TerminalInputEvent::Key(_) => ComputerTerminalEventKind::Key,
         };
         self.active_terminal_event = Some(event);
+        self.active_terminal_event_owner = Some(self.sessions.len());
         Ok(Some(kind))
     }
 
@@ -230,10 +304,15 @@ impl ComputerMachine {
     }
 
     pub fn terminal_finish_event(&mut self) -> Result<(), ComputerError> {
-        self.active_terminal_event
+        let result = self
+            .active_terminal_event
             .take()
             .map(|_| ())
-            .ok_or(ComputerError::NoActiveTerminalEvent)
+            .ok_or(ComputerError::NoActiveTerminalEvent);
+        if result.is_ok() {
+            self.active_terminal_event_owner = None;
+        }
+        result
     }
 
     pub fn advance(
@@ -278,40 +357,41 @@ impl ComputerMachine {
                     )))
                 }
                 AdvanceOutcome::AllocationExhausted(value) => {
-                    return Ok(ComputerAdvanceOutcome::AllocationExhausted(value))
+                    if self.sessions.len() > 1 {
+                        return self.finish_child(ProcessResult::AllocationExhausted);
+                    }
+                    return Ok(ComputerAdvanceOutcome::AllocationExhausted(value));
                 }
                 AdvanceOutcome::QuotaExhausted(value) => {
-                    return Ok(ComputerAdvanceOutcome::QuotaExhausted(value))
+                    if self.sessions.len() > 1 {
+                        return self.finish_child(ProcessResult::QuotaExhausted);
+                    }
+                    return Ok(ComputerAdvanceOutcome::QuotaExhausted(value));
                 }
                 AdvanceOutcome::Halted(value) => {
                     let value = value.map(copy_value);
                     if self.sessions.len() > 1 {
-                        self.sessions.pop();
-                        let request = self
-                            .active_frame_mut()
-                            .pending_process
-                            .take()
-                            .expect("a child session always has a suspended parent request");
-                        self.active_session_mut()
-                            .resume_internal(
-                                request,
-                                HostResponse::Success(HostValueInput::I32(
-                                    ProcessResult::Exited.code(),
-                                )),
-                            )
-                            .map_err(ComputerError::Resume)?;
-                        return Ok(ComputerAdvanceOutcome::SliceExhausted);
+                        return self.finish_child(ProcessResult::Exited);
                     }
                     return Ok(ComputerAdvanceOutcome::Halted(value));
                 }
                 AdvanceOutcome::Crashed(value) => {
-                    return Ok(ComputerAdvanceOutcome::Crashed(value))
+                    if self.sessions.len() > 1 {
+                        return self.finish_child(ProcessResult::Trapped);
+                    }
+                    return Ok(ComputerAdvanceOutcome::Crashed(value));
                 }
                 AdvanceOutcome::Faulted(value) => {
-                    return Ok(ComputerAdvanceOutcome::Faulted(value))
+                    if self.sessions.len() > 1 {
+                        return self.finish_child(ProcessResult::Faulted);
+                    }
+                    return Ok(ComputerAdvanceOutcome::Faulted(value));
                 }
                 AdvanceOutcome::HostFailed(value) => {
-                    return Ok(ComputerAdvanceOutcome::HostFailed(value))
+                    if self.sessions.len() > 1 {
+                        return self.finish_child(ProcessResult::HostFailed);
+                    }
+                    return Ok(ComputerAdvanceOutcome::HostFailed(value));
                 }
             }
         };
@@ -611,7 +691,36 @@ impl ComputerMachine {
             Ok(artifact) => artifact,
             Err(_) => return self.resume_process_result(id, ProcessResult::InvalidArtifact),
         };
-        let mut child = match admit_session(artifact, self.profile.clone(), &[], capabilities) {
+        if self.sessions.len() >= self.process_limits.maximum_depth as usize {
+            return self.resume_process_result(id, ProcessResult::DepthLimit);
+        }
+        if self.process_starts >= self.process_limits.maximum_starts {
+            return self.resume_process_result(id, ProcessResult::StartLimit);
+        }
+        let Some(reserved_heap_bytes) = self
+            .reserved_heap_bytes
+            .checked_add(u64::from(self.profile.heap_bytes))
+        else {
+            return self.resume_process_result(id, ProcessResult::QuotaExhausted);
+        };
+        let Some(reserved_frame_storage_bytes) = self
+            .reserved_frame_storage_bytes
+            .checked_add(self.profile.frame_storage_bytes)
+        else {
+            return self.resume_process_result(id, ProcessResult::QuotaExhausted);
+        };
+        if reserved_heap_bytes > self.process_limits.maximum_aggregate_heap_bytes
+            || reserved_frame_storage_bytes
+                > self.process_limits.maximum_aggregate_frame_storage_bytes
+        {
+            return self.resume_process_result(id, ProcessResult::QuotaExhausted);
+        }
+        let mut child = match admit_session(
+            artifact,
+            self.profile.clone(),
+            &self.addon_bindings,
+            capabilities,
+        ) {
             Ok(session) => session,
             Err(_) => return self.resume_process_result(id, ProcessResult::AdmissionFailed),
         };
@@ -619,12 +728,41 @@ impl ComputerMachine {
             return self.resume_process_result(id, ProcessResult::StartFailed);
         }
         self.active_frame_mut().pending_process = Some(id);
+        self.process_starts += 1;
+        self.reserved_heap_bytes = reserved_heap_bytes;
+        self.reserved_frame_storage_bytes = reserved_frame_storage_bytes;
         self.sessions.push(ProcessFrame {
             session: child,
             capabilities,
             pending_terminal_event: None,
             pending_process: None,
         });
+        Ok(ComputerAdvanceOutcome::SliceExhausted)
+    }
+
+    fn finish_child(
+        &mut self,
+        result: ProcessResult,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        let child_depth = self.sessions.len();
+        self.sessions.pop();
+        self.reserved_heap_bytes -= u64::from(self.profile.heap_bytes);
+        self.reserved_frame_storage_bytes -= self.profile.frame_storage_bytes;
+        if self.active_terminal_event_owner == Some(child_depth) {
+            self.active_terminal_event = None;
+            self.active_terminal_event_owner = None;
+        }
+        let request = self
+            .active_frame_mut()
+            .pending_process
+            .take()
+            .expect("a child session always has a suspended parent request");
+        self.active_session_mut()
+            .resume_internal(
+                request,
+                HostResponse::Success(HostValueInput::I32(result.code())),
+            )
+            .map_err(ComputerError::Resume)?;
         Ok(ComputerAdvanceOutcome::SliceExhausted)
     }
 
@@ -703,7 +841,7 @@ enum ProcessOperation {
 fn admit_session(
     artifact: VerifiedArtifact,
     profile: ExecutionProfile,
-    addon_bindings: &[CapabilityBinding<'_>],
+    addon_bindings: &[OwnedCapabilityBinding],
     capabilities: ProcessCapabilityMask,
 ) -> Result<Session, AdmissionError> {
     let string_argument = [HostValueType::String];
@@ -733,8 +871,32 @@ fn admit_session(
         &process_arguments,
         HostValueType::I32,
     )];
+    let addon_operations = addon_bindings
+        .iter()
+        .map(|binding| {
+            binding
+                .operations()
+                .iter()
+                .map(|operation| OperationSchema {
+                    arguments: operation.arguments(),
+                    result: operation.result(),
+                    asynchronous: operation.asynchronous(),
+                })
+                .collect::<Box<[_]>>()
+        })
+        .collect::<Box<[_]>>();
     let mut bindings = Vec::with_capacity(addon_bindings.len() + 3);
-    bindings.extend_from_slice(addon_bindings);
+    for (index, binding) in addon_bindings.iter().enumerate() {
+        if capabilities.allows(1 << (index + 3)) {
+            bindings.push(CapabilityBinding::new(
+                binding.namespace(),
+                binding.name(),
+                binding.abi_major(),
+                binding.abi_minor(),
+                &addon_operations[index],
+            ));
+        }
+    }
     if capabilities.allows(ProcessCapabilityMask::TERMINAL) {
         bindings.push(CapabilityBinding::new(
             TERMINAL_NAMESPACE,
@@ -954,8 +1116,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits, ProcessResult,
-        RomImage, TerminalKey, TerminalKeyEvent, TerminalModifiers, VirtualPath,
+        ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits, ProcessLimits,
+        ProcessResult, RomImage, TerminalKey, TerminalKeyEvent, TerminalModifiers, VirtualPath,
         WorldFileSystemStore,
     };
 
@@ -1048,6 +1210,327 @@ mod tests {
             halted
         );
         assert_eq!(1, computer.sessions.len());
+    }
+
+    #[test]
+    fn process_result_matrix() {
+        let ordinary_child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let child_bytes = crate::test_encode::encode_artifact(ordinary_child.decoded()).unwrap();
+        let terminal_child = crate::execution::fixtures::raw_terminal_conformance_artifact(&[], 1);
+        let terminal_child_bytes =
+            crate::test_encode::encode_artifact(terminal_child.decoded()).unwrap();
+        let typed_child = crate::execution::fixtures::typed_entry_artifact();
+        let typed_child_bytes = crate::test_encode::encode_artifact(typed_child.decoded()).unwrap();
+        let trapped_child = crate::execution::fixtures::trap_after_write_artifact(7);
+        let trapped_child_bytes =
+            crate::test_encode::encode_artifact(trapped_child.decoded()).unwrap();
+        let allocating_child = crate::execution::fixtures::array_allocation_artifact(100);
+        let allocating_child_bytes =
+            crate::test_encode::encode_artifact(allocating_child.decoded()).unwrap();
+
+        assert_eq!(
+            ProcessResult::InvalidCapabilities.code(),
+            process_result(None, 8, ProcessLimits::default(), profile()),
+        );
+        assert_eq!(
+            ProcessResult::InvalidCapabilities.code(),
+            process_result(None, -1, ProcessLimits::default(), profile()),
+        );
+        assert_eq!(
+            ProcessResult::NotFound.code(),
+            process_result(None, 0, ProcessLimits::default(), profile()),
+        );
+        assert_eq!(
+            ProcessResult::NotExecutable.code(),
+            process_result(
+                Some((&child_bytes, false)),
+                0,
+                ProcessLimits::default(),
+                profile(),
+            ),
+        );
+        assert_eq!(
+            ProcessResult::InvalidArtifact.code(),
+            process_result(
+                Some((b"not an artifact", true)),
+                0,
+                ProcessLimits::default(),
+                profile(),
+            ),
+        );
+        assert_eq!(
+            ProcessResult::AdmissionFailed.code(),
+            process_result(
+                Some((&terminal_child_bytes, true)),
+                0,
+                ProcessLimits::default(),
+                profile(),
+            ),
+        );
+        assert_eq!(
+            ProcessResult::StartFailed.code(),
+            process_result(
+                Some((&typed_child_bytes, true)),
+                0,
+                ProcessLimits::default(),
+                profile(),
+            ),
+        );
+        assert_eq!(
+            ProcessResult::Trapped.code(),
+            process_result(
+                Some((&trapped_child_bytes, true)),
+                0,
+                ProcessLimits::default(),
+                profile(),
+            ),
+        );
+        assert_eq!(
+            ProcessResult::AllocationExhausted.code(),
+            process_result(
+                Some((&allocating_child_bytes, true)),
+                0,
+                ProcessLimits::default(),
+                ExecutionProfile {
+                    heap_bytes: 64,
+                    ..profile()
+                },
+            ),
+        );
+        assert_eq!(
+            ProcessResult::DepthLimit.code(),
+            process_result(
+                Some((&child_bytes, true)),
+                0,
+                ProcessLimits::new(1, 8, 8 << 20, 8 << 20).unwrap(),
+                profile(),
+            ),
+        );
+        assert_eq!(
+            ProcessResult::StartLimit.code(),
+            process_result(
+                Some((&child_bytes, true)),
+                0,
+                ProcessLimits::new(8, 1, 8 << 20, 8 << 20).unwrap(),
+                profile(),
+            ),
+        );
+        assert_eq!(
+            ProcessResult::QuotaExhausted.code(),
+            process_result(
+                Some((&child_bytes, true)),
+                0,
+                ProcessLimits::new(8, 8, 1024 * 1024, 8 << 20).unwrap(),
+                profile(),
+            ),
+        );
+        assert_eq!(
+            ProcessResult::QuotaExhausted.code(),
+            process_result(
+                Some((&child_bytes, true)),
+                0,
+                ProcessLimits::new(8, 8, 8 << 20, 1024 * 1024).unwrap(),
+                profile(),
+            ),
+        );
+    }
+
+    #[test]
+    fn process_addon_mask_filters_child_and_maps_host_failure() {
+        let child = crate::execution::fixtures::capability_artifact(true, true, 1, 0);
+        let child_bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+        let owned = [OwnedCapabilityBinding::copy_from(&addon)];
+        admit_session(
+            child.clone(),
+            profile(),
+            &owned,
+            ProcessCapabilityMask::from_bits(1 << 3),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ProcessResult::AdmissionFailed.code(),
+            process_result_with_addons(&child_bytes, 0, &[addon], None),
+        );
+        assert_eq!(
+            ProcessResult::HostFailed.code(),
+            process_result_with_addons(
+                &child_bytes,
+                1 << 3,
+                &[addon],
+                Some(HostFailure::new(HostFailureKind::Unavailable, 17)),
+            ),
+        );
+    }
+
+    #[test]
+    fn process_maps_child_quota_and_fault_without_terminating_parent() {
+        let quota_child = crate::execution::fixtures::two_unit_capability_calls_artifact();
+        let quota_bytes = crate::test_encode::encode_artifact(quota_child.decoded()).unwrap();
+        let mut constrained = profile();
+        constrained.maximum_accepted_responses = 1;
+        let mut quota_computer = addon_process_computer(&quota_bytes, constrained);
+        let quota_result = loop {
+            match quota_computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::HostRequest(request) => quota_computer
+                    .resume_host_request(request.id, HostResponse::Success(HostValueInput::Unit))
+                    .unwrap(),
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(result))) => break result,
+                other => panic!("unexpected quota process outcome: {other:?}"),
+            }
+        };
+        assert_eq!(ProcessResult::QuotaExhausted.code(), quota_result);
+
+        let fault_child = crate::execution::fixtures::capability_artifact(true, true, 1, 0);
+        let fault_bytes = crate::test_encode::encode_artifact(fault_child.decoded()).unwrap();
+        let mut fault_computer = addon_process_computer(&fault_bytes, profile());
+        while fault_computer.sessions.len() == 1 {
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                fault_computer.advance(64, 64).unwrap(),
+            );
+        }
+        fault_computer
+            .active_session_mut()
+            .test_set_next_request_id(u64::MAX);
+        let fault_result = loop {
+            match fault_computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(result))) => break result,
+                other => panic!("unexpected faulted process outcome: {other:?}"),
+            }
+        };
+        assert_eq!(ProcessResult::Faulted.code(), fault_result);
+    }
+
+    fn addon_process_computer(
+        child: &[u8],
+        execution_profile: ExecutionProfile,
+    ) -> ComputerMachine {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(
+                &owner,
+                &path("/home/child", filesystem.limits()),
+                child,
+                true,
+            )
+            .unwrap();
+        let parent = crate::execution::fixtures::process_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            1 << 3,
+        );
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+        ComputerMachine::start_in_filesystem(
+            parent,
+            execution_profile,
+            &[addon],
+            &[],
+            filesystem,
+            owner,
+        )
+        .unwrap()
+    }
+
+    fn process_result_with_addons(
+        child: &[u8],
+        capabilities: i32,
+        addons: &[CapabilityBinding<'_>],
+        failure: Option<HostFailure>,
+    ) -> i32 {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(
+                &owner,
+                &path("/home/child", filesystem.limits()),
+                child,
+                true,
+            )
+            .unwrap();
+        let parent = crate::execution::fixtures::process_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            capabilities,
+        );
+        let mut computer =
+            ComputerMachine::start_in_filesystem(parent, profile(), addons, &[], filesystem, owner)
+                .unwrap();
+        loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::HostRequest(request) => {
+                    assert_eq!(("app", "entry"), (&*request.namespace, &*request.name));
+                    computer.terminal_mut().push_text("x").unwrap();
+                    assert_eq!(
+                        Some(ComputerTerminalEventKind::Text),
+                        computer.terminal_await_event().unwrap(),
+                    );
+                    computer
+                        .resume_host_request(
+                            request.id,
+                            HostResponse::Failure(failure.expect("host failure is configured")),
+                        )
+                        .unwrap();
+                }
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(result))) => {
+                    assert_eq!(
+                        ComputerError::NoActiveTerminalEvent,
+                        computer.terminal_finish_event().unwrap_err(),
+                    );
+                    return result;
+                }
+                other => panic!("unexpected addon process outcome: {other:?}"),
+            }
+        }
+    }
+
+    fn process_result(
+        child: Option<(&[u8], bool)>,
+        capabilities: i32,
+        process_limits: ProcessLimits,
+        execution_profile: ExecutionProfile,
+    ) -> i32 {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        if let Some((bytes, executable)) = child {
+            filesystem
+                .write_file(
+                    &owner,
+                    &path("/home/child", filesystem.limits()),
+                    bytes,
+                    executable,
+                )
+                .unwrap();
+        }
+        let parent = crate::execution::fixtures::process_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            capabilities,
+        );
+        let mut computer = ComputerMachine::start_in_filesystem_with_process_limits(
+            parent,
+            execution_profile,
+            process_limits,
+            &[],
+            &[],
+            filesystem,
+            owner,
+        )
+        .unwrap();
+        loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(result))) => return result,
+                other => panic!("unexpected process result outcome: {other:?}"),
+            }
+        }
     }
 
     #[test]

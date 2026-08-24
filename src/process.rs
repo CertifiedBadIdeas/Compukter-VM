@@ -9,6 +9,80 @@
  * (at your option) any later version.
  */
 
+use crate::{CapabilityBinding, HostValueType};
+
+pub(crate) const MAXIMUM_ADDON_CAPABILITIES: usize = 28;
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedCapabilityBinding {
+    namespace: Box<str>,
+    name: Box<str>,
+    abi_major: u16,
+    abi_minor: u16,
+    operations: Box<[OwnedOperationSchema]>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedOperationSchema {
+    arguments: Box<[HostValueType]>,
+    result: HostValueType,
+    asynchronous: bool,
+}
+
+impl OwnedCapabilityBinding {
+    pub(crate) fn copy_from(binding: &CapabilityBinding<'_>) -> Self {
+        Self {
+            namespace: binding.namespace().into(),
+            name: binding.name().into(),
+            abi_major: binding.abi_major(),
+            abi_minor: binding.abi_minor(),
+            operations: binding
+                .operations()
+                .iter()
+                .map(|operation| OwnedOperationSchema {
+                    arguments: operation.arguments.into(),
+                    result: operation.result,
+                    asynchronous: operation.asynchronous,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) const fn abi_major(&self) -> u16 {
+        self.abi_major
+    }
+
+    pub(crate) const fn abi_minor(&self) -> u16 {
+        self.abi_minor
+    }
+
+    pub(crate) fn operations(&self) -> &[OwnedOperationSchema] {
+        &self.operations
+    }
+}
+
+impl OwnedOperationSchema {
+    pub(crate) fn arguments(&self) -> &[HostValueType] {
+        &self.arguments
+    }
+
+    pub(crate) const fn result(&self) -> HostValueType {
+        self.result
+    }
+
+    pub(crate) const fn asynchronous(&self) -> bool {
+        self.asynchronous
+    }
+}
+
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessResult {
@@ -59,6 +133,10 @@ impl ProcessCapabilityMask {
             return Err(ProcessContractError::InvalidCapabilities);
         }
         Ok(Self(requested))
+    }
+
+    pub(crate) const fn from_bits(bits: u32) -> Self {
+        Self(bits)
     }
 
     pub const fn bits(self) -> u32 {

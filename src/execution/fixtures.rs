@@ -158,7 +158,7 @@ pub(super) fn empty_loop_artifact(cost: u32) -> VerifiedArtifact {
     )
 }
 
-pub(super) fn capability_artifact(
+pub(crate) fn capability_artifact(
     asynchronous: bool,
     required: bool,
     operation_count: u32,
@@ -314,7 +314,7 @@ pub(super) fn scalar_capability_artifact(
     })
 }
 
-pub(super) fn two_unit_capability_calls_artifact() -> VerifiedArtifact {
+pub(crate) fn two_unit_capability_calls_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         artifact.header.semantic_features = 0b110;
         artifact.capabilities.push(crate::artifact::Capability {
@@ -575,7 +575,7 @@ fn nested_call_loop_artifact() -> VerifiedArtifact {
     })
 }
 
-pub(super) fn trap_after_write_artifact(cost: u32) -> VerifiedArtifact {
+pub(crate) fn trap_after_write_artifact(cost: u32) -> VerifiedArtifact {
     let instructions = vec![
         Instruction::Const {
             dst: 0,
@@ -2515,7 +2515,7 @@ pub(super) fn gc_graph_artifact() -> VerifiedArtifact {
     })
 }
 
-pub(super) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
+pub(crate) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
     let reference = ValueType {
         kind: 7,
         flags: 0,
@@ -3277,7 +3277,7 @@ pub(super) fn artifact_with_new_object() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::language_runtime_vector(), 160)
 }
 
-pub(super) fn typed_entry_artifact() -> VerifiedArtifact {
+pub(crate) fn typed_entry_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         artifact.modules[0].types[0] = NominalType::Function {
             name: 1,
