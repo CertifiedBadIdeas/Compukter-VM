@@ -452,6 +452,35 @@ impl ComputerFileSystem {
         Ok(())
     }
 
+    pub(crate) fn install_executable_from_rom(
+        &mut self,
+        capability: &FileCapability,
+        source: &VirtualPath,
+        destination: &VirtualPath,
+    ) -> Result<(), FileSystemError> {
+        let (source_mount, source_components) = split_mount(source)?;
+        if source_mount != Mount::Rom {
+            return Err(FileSystemError::PermissionDenied);
+        }
+        let source_node = find_node(self.directory(source_mount), source_components)?;
+        if source_node.metadata.kind != NodeKind::File || !source_node.metadata.executable {
+            return Err(FileSystemError::NotExecutable);
+        }
+        let source_bytes = match source_node.contents {
+            NodeContents::File(object) => self.objects.bytes(&object).to_vec(),
+            NodeContents::Directory(_) => return Err(FileSystemError::NotExecutable),
+        };
+
+        let (destination_mount, destination_components) = writable_path(destination)?;
+        let (name, parent_components) = split_name(destination_components)?;
+        let parent = find_directory(self.directory(destination_mount), parent_components)?;
+        if parent.contains_key(name) {
+            return Err(FileSystemError::AlreadyExists);
+        }
+
+        self.write_file(capability, destination, &source_bytes, true)
+    }
+
     pub fn open(
         &mut self,
         capability: &FileCapability,
