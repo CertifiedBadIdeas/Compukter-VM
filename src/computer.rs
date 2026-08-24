@@ -116,6 +116,31 @@ struct ProcessFrame {
 }
 
 impl ComputerMachine {
+    pub fn boot_in_filesystem(
+        profile: ExecutionProfile,
+        process_limits: ProcessLimits,
+        addon_bindings: &[CapabilityBinding<'_>],
+        mut filesystem: ComputerFileSystem,
+        initial_capability: FileCapability,
+    ) -> Result<Self, ComputerStartError> {
+        let path = VirtualPath::parse_utf8("/rom/boot", filesystem.limits())
+            .expect("the fixed boot path is canonical");
+        let bytes = filesystem
+            .read_executable(&initial_capability, &path)
+            .map_err(|error| ComputerStartError::Process(process_filesystem_result(error)))?;
+        let artifact = verify_artifact(bytes.into(), ArtifactLimits::default())
+            .map_err(|_| ComputerStartError::Process(ProcessResult::InvalidArtifact))?;
+        Self::start_in_filesystem_with_process_limits(
+            artifact,
+            profile,
+            process_limits,
+            addon_bindings,
+            &[],
+            filesystem,
+            initial_capability,
+        )
+    }
+
     pub fn start(
         artifact: VerifiedArtifact,
         profile: ExecutionProfile,
