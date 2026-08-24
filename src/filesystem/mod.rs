@@ -22,7 +22,9 @@ mod path;
 mod persistence;
 mod quota;
 mod rom;
+mod store;
 mod tree;
+mod worker;
 
 pub use capability::{FileCapability, FileRights};
 pub use error::{FileSystemError, StoreHealth};
@@ -35,4 +37,5 @@ pub use persistence::{
     RecoveryJournalRecord,
 };
 pub use rom::{RomImage, RomImageError};
+pub use store::{StoreError, StoreOpenError, WorldFileSystemStore};
 pub use tree::{ComputerFileSystem, FileSystemSnapshot, NodeKind, NodeMetadata};

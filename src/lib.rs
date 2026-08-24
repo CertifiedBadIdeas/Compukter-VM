@@ -74,7 +74,8 @@ pub use filesystem::{
     FileHandle, FileRights, FileSystemError, FileSystemLimits, FileSystemSnapshot, HandleTable,
     JournalOperation, JournalRecord, NodeKind, NodeMetadata, OpenFile, OpenMode,
     PersistenceCodecError, RecoveredState, RecoveryCheckpoint, RecoveryError, RecoveryInput,
-    RecoveryJournalRecord, RomImage, RomImageError, StoreHealth, VirtualPath,
+    RecoveryJournalRecord, RomImage, RomImageError, StoreError, StoreHealth, StoreOpenError,
+    VirtualPath, WorldFileSystemStore,
 };
 pub use limits::ArtifactLimits;
 pub use terminal::{
