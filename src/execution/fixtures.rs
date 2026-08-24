@@ -2039,6 +2039,66 @@ pub(crate) fn filesystem_conformance_artifact() -> VerifiedArtifact {
     )
 }
 
+pub(crate) fn filesystem_recovery_reader_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let file = "/home/project/main.kt".encode_utf16().collect::<Vec<_>>();
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![string, string, primitive(1)],
+        Vec::new(),
+        &file,
+        vec![vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::CapabilityCallSync {
+                dst: 1,
+                capability: 0,
+                operation: 2,
+                args: Box::new([0]),
+            },
+            Instruction::StringHash { dst: 2, string: 1 },
+            Instruction::Return { value: 2 },
+        ]],
+        |artifact| {
+            let mut bytes = artifact.bytes.to_vec();
+            let namespace_start = bytes.len();
+            bytes.extend_from_slice(b"compukter");
+            let namespace_end = bytes.len();
+            let name_start = bytes.len();
+            bytes.extend_from_slice(b"filesystem");
+            let name_end = bytes.len();
+            artifact.bytes = Arc::from(bytes);
+
+            let application = &mut artifact.modules[0];
+            application.strings[0] = ByteRange {
+                start: namespace_start,
+                end: namespace_end,
+            };
+            application.strings[1] = ByteRange {
+                start: name_start,
+                end: name_end,
+            };
+            artifact.header.semantic_features = 0b1100;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 7,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+        },
+    )
+}
+
 pub(super) fn string_response_gc_retry_artifact() -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
