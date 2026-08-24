@@ -182,6 +182,10 @@ impl ComputerFileSystem {
         }
     }
 
+    pub const fn limits(&self) -> &FileSystemLimits {
+        &self.limits
+    }
+
     pub fn with_rom(limits: FileSystemLimits, image: RomImage) -> Result<Self, RomImageError> {
         let mut filesystem = Self::with_limits(limits);
         for entry in image.entries() {

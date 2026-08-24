@@ -109,6 +109,10 @@ impl WorldFileSystemStore {
         self.persistence.health()
     }
 
+    pub const fn limits(&self) -> &FileSystemLimits {
+        &self.limits
+    }
+
     pub fn open_computer(
         &self,
         id: ComputerId,

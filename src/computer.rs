@@ -10,15 +10,19 @@
  */
 
 use crate::{
-    AdmissionError, AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile, GuestTrap,
-    HostFailure, HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView,
-    ManagedAllocationFailure, OperationSchema, QuotaExhaustion, RequestId, ResumeError, RunError,
-    Session, TerminalDevice, TerminalInputEvent, TerminalKeyAction, VerifiedArtifact, VmFault,
+    AdmissionError, AdvanceOutcome, CapabilityBinding, ComputerFileSystem, EntryValue,
+    ExecutionProfile, FileCapability, FileRights, FileSystemError, FileSystemLimits, GuestTrap,
+    HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType,
+    HostValueView, ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, QuotaExhaustion,
+    RequestId, ResumeError, RunError, Session, TerminalDevice, TerminalInputEvent,
+    TerminalKeyAction, VerifiedArtifact, VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
 const TERMINAL_NAME: &str = "terminal";
 const RAW_TERMINAL_ABI_MAJOR: u16 = 2;
+const FILESYSTEM_NAME: &str = "filesystem";
+const FILESYSTEM_ABI_MAJOR: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComputerStartError {
@@ -32,6 +36,7 @@ pub enum ComputerError {
     Resume(ResumeError),
     InvalidRequestId,
     InvalidTerminalRequest,
+    InvalidFileSystemRequest,
     ActiveTerminalEvent,
     NoActiveTerminalEvent,
     WrongTerminalEventKind,
@@ -85,6 +90,9 @@ pub struct ComputerMachine {
     terminal: TerminalDevice,
     pending_terminal_event: Option<RequestId>,
     active_terminal_event: Option<TerminalInputEvent>,
+    filesystem: ComputerFileSystem,
+    initial_file_capability: FileCapability,
+    maximum_text_code_units: usize,
 }
 
 impl ComputerMachine {
@@ -94,7 +102,32 @@ impl ComputerMachine {
         addon_bindings: &[CapabilityBinding<'_>],
         arguments: &[EntryValue],
     ) -> Result<Self, ComputerStartError> {
+        let limits = FileSystemLimits::default();
+        let initial_capability = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).expect("fixed ephemeral filesystem path"),
+            FileRights::OWNER,
+        );
+        Self::start_in_filesystem(
+            artifact,
+            profile,
+            addon_bindings,
+            arguments,
+            ComputerFileSystem::with_limits(limits),
+            initial_capability,
+        )
+    }
+
+    pub fn start_in_filesystem(
+        artifact: VerifiedArtifact,
+        profile: ExecutionProfile,
+        addon_bindings: &[CapabilityBinding<'_>],
+        arguments: &[EntryValue],
+        filesystem: ComputerFileSystem,
+        initial_capability: FileCapability,
+    ) -> Result<Self, ComputerStartError> {
+        let maximum_text_code_units = profile.maximum_inbound_utf16_code_units as usize;
         let string_argument = [HostValueType::String];
+        let two_string_arguments = [HostValueType::String, HostValueType::String];
         let raw_terminal_operations = [
             OperationSchema::synchronous(&string_argument, HostValueType::Unit),
             OperationSchema::synchronous(&[], HostValueType::Unit),
@@ -113,9 +146,26 @@ impl ComputerMachine {
             0,
             &raw_terminal_operations,
         );
-        let mut bindings = Vec::with_capacity(addon_bindings.len() + 1);
+        let filesystem_operations = [
+            OperationSchema::synchronous(&string_argument, HostValueType::I32),
+            OperationSchema::synchronous(&string_argument, HostValueType::String),
+            OperationSchema::synchronous(&string_argument, HostValueType::String),
+            OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
+            OperationSchema::synchronous(&string_argument, HostValueType::I32),
+            OperationSchema::synchronous(&string_argument, HostValueType::I32),
+            OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
+        ];
+        let filesystem_binding = CapabilityBinding::new(
+            TERMINAL_NAMESPACE,
+            FILESYSTEM_NAME,
+            FILESYSTEM_ABI_MAJOR,
+            0,
+            &filesystem_operations,
+        );
+        let mut bindings = Vec::with_capacity(addon_bindings.len() + 2);
         bindings.extend_from_slice(addon_bindings);
         bindings.push(raw_terminal_binding);
+        bindings.push(filesystem_binding);
         let mut session =
             Session::admit(artifact, profile, &bindings).map_err(ComputerStartError::Admission)?;
         session
@@ -126,6 +176,9 @@ impl ComputerMachine {
             terminal: TerminalDevice::default(),
             pending_terminal_event: None,
             active_terminal_event: None,
+            filesystem,
+            initial_file_capability: initial_capability,
+            maximum_text_code_units,
         })
     }
 
@@ -223,6 +276,9 @@ impl ComputerMachine {
                 AdvanceOutcome::HostRequest(request) if is_raw_terminal(request) => {
                     Some(copy_raw_terminal_request(request)?)
                 }
+                AdvanceOutcome::HostRequest(request) if is_filesystem(request) => {
+                    Some(copy_filesystem_request(request)?)
+                }
                 AdvanceOutcome::SliceExhausted => {
                     return Ok(ComputerAdvanceOutcome::SliceExhausted)
                 }
@@ -251,9 +307,12 @@ impl ComputerMachine {
                 }
             }
         };
-        match internal.expect("terminal request branch always publishes an action") {
+        match internal.expect("internal request branch always publishes an action") {
             TerminalRequest::Raw { id, operation } => {
                 self.handle_raw_terminal_request(id, operation)
+            }
+            TerminalRequest::FileSystem { id, operation } => {
+                self.handle_filesystem_request(id, operation)
             }
         }
     }
@@ -313,6 +372,194 @@ impl ComputerMachine {
         Ok(ComputerAdvanceOutcome::SliceExhausted)
     }
 
+    fn handle_filesystem_request(
+        &mut self,
+        id: RequestId,
+        operation: FileSystemOperation,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        match operation {
+            FileSystemOperation::Stat(path) => {
+                let result = self
+                    .parse_path(&path)
+                    .and_then(|path| self.filesystem.stat(&self.initial_file_capability, &path))
+                    .map(|metadata| match metadata.kind {
+                        NodeKind::File => 1,
+                        NodeKind::Directory => 2,
+                    })
+                    .unwrap_or_else(filesystem_error_code);
+                self.resume_filesystem(id, HostResponse::Success(HostValueInput::I32(result)))?;
+            }
+            FileSystemOperation::List(path) => {
+                let result = self
+                    .parse_path(&path)
+                    .and_then(|path| self.filesystem.list(&self.initial_file_capability, &path));
+                match result {
+                    Ok(names) => {
+                        let units = names
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(index, name)| {
+                                (index != 0)
+                                    .then_some(0)
+                                    .into_iter()
+                                    .chain(name.encode_utf16())
+                            })
+                            .collect::<Vec<_>>();
+                        if units.len() > self.maximum_text_code_units {
+                            self.resume_filesystem(
+                                id,
+                                filesystem_failure(FileSystemError::QuotaExceeded),
+                            )?;
+                        } else {
+                            self.resume_filesystem(
+                                id,
+                                HostResponse::Success(HostValueInput::String(&units)),
+                            )?;
+                        }
+                    }
+                    Err(error) => self.resume_filesystem(id, filesystem_failure(error))?,
+                }
+            }
+            FileSystemOperation::ReadText(path) => {
+                match self
+                    .parse_path(&path)
+                    .and_then(|path| self.read_file(&path))
+                {
+                    Ok(bytes) => match std::str::from_utf8(&bytes) {
+                        Ok(text) => {
+                            let units = text.encode_utf16().collect::<Vec<_>>();
+                            if units.len() > self.maximum_text_code_units {
+                                self.resume_filesystem(
+                                    id,
+                                    filesystem_failure(FileSystemError::QuotaExceeded),
+                                )?;
+                            } else {
+                                self.resume_filesystem(
+                                    id,
+                                    HostResponse::Success(HostValueInput::String(&units)),
+                                )?;
+                            }
+                        }
+                        Err(_) => self.resume_filesystem(
+                            id,
+                            HostResponse::Failure(HostFailure::new(
+                                HostFailureKind::InputOutput,
+                                INVALID_UTF8_ERROR_CODE,
+                            )),
+                        )?,
+                    },
+                    Err(error) => self.resume_filesystem(id, filesystem_failure(error))?,
+                }
+            }
+            FileSystemOperation::WriteText(path, value) => {
+                let result = self.parse_path(&path).and_then(|path| {
+                    String::from_utf16(&value)
+                        .map_err(|_| FileSystemError::InvalidPath)
+                        .and_then(|value| {
+                            self.filesystem.write_file(
+                                &self.initial_file_capability,
+                                &path,
+                                value.as_bytes(),
+                                false,
+                            )
+                        })
+                });
+                self.resume_filesystem(
+                    id,
+                    HostResponse::Success(HostValueInput::I32(status_code(result))),
+                )?;
+            }
+            FileSystemOperation::CreateDirectory(path) => {
+                let result = self.parse_path(&path).and_then(|path| {
+                    self.filesystem
+                        .create_directory(&self.initial_file_capability, &path)
+                });
+                self.resume_filesystem(
+                    id,
+                    HostResponse::Success(HostValueInput::I32(status_code(result))),
+                )?;
+            }
+            FileSystemOperation::Remove(path) => {
+                let result = self
+                    .parse_path(&path)
+                    .and_then(|path| self.filesystem.remove(&self.initial_file_capability, &path));
+                self.resume_filesystem(
+                    id,
+                    HostResponse::Success(HostValueInput::I32(status_code(result))),
+                )?;
+            }
+            FileSystemOperation::Rename(source, destination) => {
+                let result = self.parse_path(&source).and_then(|source| {
+                    self.parse_path(&destination).and_then(|destination| {
+                        self.filesystem.rename(
+                            &self.initial_file_capability,
+                            &source,
+                            &destination,
+                            false,
+                        )
+                    })
+                });
+                self.resume_filesystem(
+                    id,
+                    HostResponse::Success(HostValueInput::I32(status_code(result))),
+                )?;
+            }
+        }
+        Ok(ComputerAdvanceOutcome::SliceExhausted)
+    }
+
+    fn parse_path(&self, units: &[u16]) -> Result<VirtualPath, FileSystemError> {
+        VirtualPath::parse_utf16(units, self.filesystem.limits())
+    }
+
+    fn read_file(&mut self, path: &VirtualPath) -> Result<Vec<u8>, FileSystemError> {
+        let length = self
+            .filesystem
+            .stat(&self.initial_file_capability, path)?
+            .logical_size;
+        let maximum_utf8_bytes = self.maximum_text_code_units.saturating_mul(3);
+        if length > maximum_utf8_bytes as u64 {
+            return Err(FileSystemError::QuotaExceeded);
+        }
+        let handle = self
+            .filesystem
+            .open(&self.initial_file_capability, path, OpenMode::Read)?;
+        let result = (|| {
+            let capacity = usize::try_from(length).map_err(|_| FileSystemError::QuotaExceeded)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(capacity)
+                .map_err(|_| FileSystemError::QuotaExceeded)?;
+            let mut offset = 0_u64;
+            while offset < length {
+                let chunk = self.filesystem.read(handle, offset, usize::MAX)?;
+                if chunk.is_empty() {
+                    return Err(FileSystemError::StorageFaulted);
+                }
+                offset = offset
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(FileSystemError::StorageFaulted)?;
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
+        })();
+        let close = self.filesystem.close(handle);
+        match (result, close) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(bytes), Ok(())) => Ok(bytes),
+        }
+    }
+
+    fn resume_filesystem(
+        &mut self,
+        id: RequestId,
+        response: HostResponse<'_>,
+    ) -> Result<(), ComputerError> {
+        self.session
+            .resume_internal(id, response)
+            .map_err(ComputerError::Resume)
+    }
+
     pub fn resume_host_request(
         &mut self,
         request_id: u64,
@@ -330,6 +577,10 @@ enum TerminalRequest {
         id: RequestId,
         operation: RawTerminalOperation,
     },
+    FileSystem {
+        id: RequestId,
+        operation: FileSystemOperation,
+    },
 }
 
 enum RawTerminalOperation {
@@ -344,11 +595,82 @@ enum RawTerminalOperation {
     FinishEvent,
 }
 
+enum FileSystemOperation {
+    Stat(Vec<u16>),
+    List(Vec<u16>),
+    ReadText(Vec<u16>),
+    WriteText(Vec<u16>, Vec<u16>),
+    CreateDirectory(Vec<u16>),
+    Remove(Vec<u16>),
+    Rename(Vec<u16>, Vec<u16>),
+}
+
 fn is_raw_terminal(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == TERMINAL_NAME
         && request.abi_major() == RAW_TERMINAL_ABI_MAJOR
 }
+
+fn is_filesystem(request: HostRequestView<'_>) -> bool {
+    request.namespace() == TERMINAL_NAMESPACE
+        && request.name() == FILESYSTEM_NAME
+        && request.abi_major() == FILESYSTEM_ABI_MAJOR
+}
+
+fn copy_filesystem_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
+    if request.asynchronous() {
+        return Err(ComputerError::InvalidFileSystemRequest);
+    }
+    let string = |index| match request.arguments().get(index) {
+        Some(HostValueView::String(units)) => Ok(units.to_vec()),
+        _ => Err(ComputerError::InvalidFileSystemRequest),
+    };
+    let operation = match (request.operation(), request.arguments().len()) {
+        (0, 1) => FileSystemOperation::Stat(string(0)?),
+        (1, 1) => FileSystemOperation::List(string(0)?),
+        (2, 1) => FileSystemOperation::ReadText(string(0)?),
+        (3, 2) => FileSystemOperation::WriteText(string(0)?, string(1)?),
+        (4, 1) => FileSystemOperation::CreateDirectory(string(0)?),
+        (5, 1) => FileSystemOperation::Remove(string(0)?),
+        (6, 2) => FileSystemOperation::Rename(string(0)?, string(1)?),
+        _ => return Err(ComputerError::InvalidFileSystemRequest),
+    };
+    Ok(TerminalRequest::FileSystem {
+        id: request.id(),
+        operation,
+    })
+}
+
+fn status_code(result: Result<(), FileSystemError>) -> i32 {
+    result.map_or_else(filesystem_error_code, |()| 0)
+}
+
+fn filesystem_error_code(error: FileSystemError) -> i32 {
+    -(match error {
+        FileSystemError::InvalidPath => 1,
+        FileSystemError::NotFound => 2,
+        FileSystemError::AlreadyExists => 3,
+        FileSystemError::NotDirectory => 4,
+        FileSystemError::IsDirectory => 5,
+        FileSystemError::NotEmpty => 6,
+        FileSystemError::ReadOnly => 7,
+        FileSystemError::PermissionDenied => 8,
+        FileSystemError::StaleHandle => 9,
+        FileSystemError::QuotaExceeded => 10,
+        FileSystemError::Busy => 11,
+        FileSystemError::StorageFaulted => 12,
+        FileSystemError::Closed => 13,
+    })
+}
+
+fn filesystem_failure(error: FileSystemError) -> HostResponse<'static> {
+    HostResponse::Failure(HostFailure::new(
+        HostFailureKind::InputOutput,
+        filesystem_error_code(error).unsigned_abs(),
+    ))
+}
+
+const INVALID_UTF8_ERROR_CODE: u32 = 14;
 
 fn copy_raw_terminal_request(
     request: HostRequestView<'_>,
@@ -422,8 +744,16 @@ fn copy_value(value: HostValueView<'_>) -> ComputerValue {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use sha2::{Digest, Sha256};
+
     use super::*;
-    use crate::{ExecutionProfile, TerminalKey, TerminalKeyEvent, TerminalModifiers};
+    use crate::{
+        ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits, RomImage,
+        TerminalKey, TerminalKeyEvent, TerminalModifiers, VirtualPath, WorldFileSystemStore,
+    };
 
     #[test]
     fn raw_terminal_capability_waits_and_consumes_typed_events() {
@@ -474,6 +804,121 @@ mod tests {
             ComputerError::NoActiveTerminalEvent,
             computer.terminal_finish_event().unwrap_err()
         );
+    }
+
+    #[test]
+    fn filesystem_capability_persists_text_and_isolates_computer_identities() {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let root = std::env::temp_dir()
+            .join("compukters-computer-filesystem-tests")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let limits = FileSystemLimits::testing();
+        let store = WorldFileSystemStore::open(&root, limits).unwrap();
+        let first_id = ComputerId::from_bytes([1; 16]);
+        let second_id = ComputerId::from_bytes([2; 16]);
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let filesystem = store
+            .open_computer(first_id, Arc::new(empty_rom(&limits)))
+            .unwrap();
+        let artifact = crate::execution::fixtures::filesystem_conformance_artifact();
+        let mut computer = ComputerMachine::start_in_filesystem(
+            artifact,
+            profile(),
+            &[],
+            &[],
+            filesystem,
+            owner.clone(),
+        )
+        .unwrap();
+
+        let result = loop {
+            match computer.advance(128, 128).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(value))) => break value,
+                other => panic!("unexpected filesystem conformance outcome: {other:?}"),
+            }
+        };
+        assert_eq!(filesystem_status(), result);
+        let generation = computer.filesystem.generation();
+        drop(computer);
+        store.flush(first_id, generation).unwrap();
+
+        let first = store
+            .open_computer(first_id, Arc::new(empty_rom(&limits)))
+            .unwrap();
+        assert_eq!(
+            b"fun main() = 42\n",
+            first
+                .read_file_for_test(&path("/home/project/main.kt", &limits))
+                .unwrap()
+                .as_slice(),
+        );
+        let second = store
+            .open_computer(second_id, Arc::new(empty_rom(&limits)))
+            .unwrap();
+        assert_eq!(
+            Err(FileSystemError::NotFound),
+            second.stat(&owner, &path("/home/project/main.kt", &limits))
+        );
+        store.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_text_response_is_bounded_before_guest_materialization() {
+        let mut constrained = profile();
+        constrained.maximum_inbound_utf16_code_units = 2;
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::filesystem_conformance_artifact(),
+            constrained,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        loop {
+            match computer.advance(128, 128).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::HostFailed(failure) => {
+                    assert_eq!(HostFailureKind::InputOutput, failure.kind());
+                    assert_eq!(10, failure.code());
+                    break;
+                }
+                other => panic!("unexpected bounded filesystem outcome: {other:?}"),
+            }
+        }
+    }
+
+    fn path(value: &str, limits: &FileSystemLimits) -> VirtualPath {
+        VirtualPath::parse_utf8(value, limits).unwrap()
+    }
+
+    fn empty_rom(limits: &FileSystemLimits) -> RomImage {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"CPKTROM\0");
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let digest = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&digest);
+        RomImage::admit(bytes.into(), limits).unwrap()
+    }
+
+    fn filesystem_status() -> i32 {
+        "fun main() = 42\n"
+            .encode_utf16()
+            .fold(0_i32, |hash, unit| {
+                hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+            })
+            .wrapping_add("main.kt".encode_utf16().fold(0_i32, |hash, unit| {
+                hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+            }))
     }
 
     fn profile() -> ExecutionProfile {
