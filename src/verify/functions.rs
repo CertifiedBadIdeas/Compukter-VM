@@ -224,6 +224,7 @@ fn verify_dataflow(
                     | Instruction::NewArray { .. }
                     | Instruction::StringConcat { .. }
                     | Instruction::StringSubstring { .. }
+                    | Instruction::StringFromCharArray { .. }
             );
             if is_allocation && (instruction_index != 0 || allocation_seen) {
                 return Err(code_failure(
@@ -1115,6 +1116,36 @@ fn verify_instruction(
             read(function, state, *start, module_id, function_id, limits)?;
             read(function, state, *end, module_id, function_id, limits)?;
             require_string(artifact, function, *string, module_id, function_id, limits)?;
+            require_kind(function, *start, 1, module_id, function_id, limits)?;
+            require_kind(function, *end, 1, module_id, function_id, limits)?;
+            require_string(artifact, function, *dst, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::StringFromCharArray {
+            dst,
+            array,
+            start,
+            end,
+        } => {
+            let (_, element) = array_element(
+                artifact,
+                module_id,
+                function_id,
+                function,
+                state,
+                *array,
+                limits,
+            )?;
+            if element.kind != 6 {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "string source is not a CharArray",
+                ));
+            }
+            read(function, state, *start, module_id, function_id, limits)?;
+            read(function, state, *end, module_id, function_id, limits)?;
             require_kind(function, *start, 1, module_id, function_id, limits)?;
             require_kind(function, *end, 1, module_id, function_id, limits)?;
             require_string(artifact, function, *dst, module_id, function_id, limits)?;

@@ -229,6 +229,12 @@ pub(super) enum ResolvedInstruction {
         start: u16,
         end: u16,
     },
+    StringFromCharArray {
+        dst: u16,
+        array: u16,
+        start: u16,
+        end: u16,
+    },
     NewObject {
         dst: u16,
         ty: TypeKey,
@@ -1569,6 +1575,17 @@ fn resolve_instruction(
         } => ResolvedInstruction::StringSubstring {
             dst: *dst,
             string: *string,
+            start: *start,
+            end: *end,
+        },
+        Instruction::StringFromCharArray {
+            dst,
+            array,
+            start,
+            end,
+        } => ResolvedInstruction::StringFromCharArray {
+            dst: *dst,
+            array: *array,
             start: *start,
             end: *end,
         },

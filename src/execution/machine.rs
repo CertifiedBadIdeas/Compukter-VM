@@ -766,6 +766,52 @@ impl Machine {
                             Err(error) => return Ok(self.text_outcome(error)),
                         }
                     }
+                    ResolvedInstruction::StringFromCharArray {
+                        dst,
+                        array,
+                        start,
+                        end,
+                    } => {
+                        let array = match self.read_register(frame_index, *array) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let start = match self.read_register(frame_index, *start) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let end = match self.read_register(frame_index, *end) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let (reference, _, element, length) = match self.resolve_array(array) {
+                            Ok(array) => array,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
+                        };
+                        if element != ValueWidth::Char {
+                            return Ok(self.fault(VmFault::InvalidReference));
+                        }
+                        let pending = match text::PendingConcat::char_array(
+                            reference, length, start, end, *dst,
+                        ) {
+                            Ok(pending) => pending,
+                            Err(error) => return Ok(self.text_outcome(error)),
+                        };
+                        self.pending_concat_source = Some(self.allocation_source(frame_index));
+                        self.pending_concat = Some(pending);
+                        if let Some(outcome) =
+                            self.resume_pending_concat(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
                     ResolvedInstruction::StaticGet { dst, field } => {
                         let Some(static_slot) = field.static_slot else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));

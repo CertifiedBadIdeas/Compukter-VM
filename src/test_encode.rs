@@ -328,7 +328,7 @@ fn encode_classlike(
     }
 }
 
-fn encode_constant(value: &Constant) -> Vec<u8> {
+pub(crate) fn encode_constant(value: &Constant) -> Vec<u8> {
     let mut bytes = Vec::new();
     match value {
         Constant::I32(value) => {
@@ -766,6 +766,15 @@ fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeEr
         } => {
             regs(&mut operands, &[*dst, *string, *start, *end]);
             (0x66, 0)
+        }
+        Instruction::StringFromCharArray {
+            dst,
+            array,
+            start,
+            end,
+        } => {
+            regs(&mut operands, &[*dst, *array, *start, *end]);
+            (0x67, 0)
         }
         Instruction::Jump { target } => {
             id(&mut operands, *target);

@@ -272,6 +272,15 @@ fn decode_instruction(
                 end,
             }
         }
+        0x67 => {
+            let (dst, array, start, end) = regs4(&mut cursor, offset)?;
+            Instruction::StringFromCharArray {
+                dst,
+                array,
+                start,
+                end,
+            }
+        }
         0xe0 => Instruction::Jump {
             target: id(&mut cursor, offset)?,
         },
