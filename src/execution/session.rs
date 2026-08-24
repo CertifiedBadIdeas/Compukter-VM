@@ -545,7 +545,7 @@ impl Session {
     }
 
     #[cfg(test)]
-    pub(super) fn test_set_next_request_id(&mut self, value: u64) {
+    pub(crate) fn test_set_next_request_id(&mut self, value: u64) {
         self.next_request_id = value;
     }
 
