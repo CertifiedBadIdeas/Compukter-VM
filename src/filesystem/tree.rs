@@ -317,6 +317,53 @@ impl ComputerFileSystem {
         Ok(directory.keys().cloned().collect())
     }
 
+    pub fn read_executable(
+        &mut self,
+        capability: &FileCapability,
+        path: &VirtualPath,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        require(
+            capability,
+            path,
+            FileRights::INSPECT | FileRights::READ | FileRights::EXECUTE,
+        )?;
+        let metadata = self.stat(capability, path)?;
+        if metadata.kind != NodeKind::File || !metadata.executable {
+            return Err(FileSystemError::NotExecutable);
+        }
+        let length =
+            usize::try_from(metadata.logical_size).map_err(|_| FileSystemError::QuotaExceeded)?;
+        if metadata.logical_size > self.limits.maximum_file_bytes {
+            return Err(FileSystemError::QuotaExceeded);
+        }
+        let handle = self.open(capability, path, OpenMode::Read)?;
+        let result = (|| {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| FileSystemError::QuotaExceeded)?;
+            let mut offset = 0_u64;
+            while offset < metadata.logical_size {
+                let remaining = usize::try_from(metadata.logical_size - offset)
+                    .map_err(|_| FileSystemError::QuotaExceeded)?;
+                let chunk = self.read(handle, offset, remaining)?;
+                if chunk.is_empty() {
+                    return Err(FileSystemError::StorageFaulted);
+                }
+                offset = offset
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(FileSystemError::StorageFaulted)?;
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
+        })();
+        let close = self.close(handle);
+        match (result, close) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(bytes), Ok(())) => Ok(bytes),
+        }
+    }
+
     pub fn create_directory(
         &mut self,
         capability: &FileCapability,

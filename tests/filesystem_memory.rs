@@ -126,3 +126,46 @@ fn file_and_node_limits_are_checked_before_visible_mutation() {
     );
     assert_eq!(filesystem.snapshot_for_test(), before);
 }
+
+#[test]
+fn executable_reads_require_authority_and_executable_metadata() {
+    let mut filesystem = ComputerFileSystem::with_limits(FileSystemLimits::testing());
+    let owner = owner();
+    filesystem
+        .write_file(&owner, &path("/home/tool"), b"verified artifact", true)
+        .unwrap();
+    filesystem
+        .write_file(&owner, &path("/home/data"), b"ordinary data", false)
+        .unwrap();
+    filesystem
+        .create_directory(&owner, &path("/home/directory"))
+        .unwrap();
+    let reader = FileCapability::new(path("/home"), FileRights::INSPECT | FileRights::READ);
+    let executor = FileCapability::new(
+        path("/home"),
+        FileRights::INSPECT | FileRights::READ | FileRights::EXECUTE,
+    );
+
+    assert_eq!(
+        filesystem.read_executable(&reader, &path("/home/tool")),
+        Err(FileSystemError::PermissionDenied),
+    );
+    assert_eq!(
+        filesystem.read_executable(&executor, &path("/home/data")),
+        Err(FileSystemError::NotExecutable),
+    );
+    assert_eq!(
+        filesystem.read_executable(&executor, &path("/home/directory")),
+        Err(FileSystemError::NotExecutable),
+    );
+    assert_eq!(
+        filesystem.read_executable(&executor, &path("/home/missing")),
+        Err(FileSystemError::NotFound),
+    );
+    assert_eq!(
+        filesystem
+            .read_executable(&executor, &path("/home/tool"))
+            .unwrap(),
+        b"verified artifact",
+    );
+}

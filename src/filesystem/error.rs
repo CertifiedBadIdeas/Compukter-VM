@@ -22,6 +22,7 @@ pub enum FileSystemError {
     AlreadyExists,
     NotDirectory,
     IsDirectory,
+    NotExecutable,
     NotEmpty,
     ReadOnly,
     PermissionDenied,

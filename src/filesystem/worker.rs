@@ -682,6 +682,7 @@ fn filesystem_to_store(error: FileSystemError) -> StoreError {
         | FileSystemError::AlreadyExists
         | FileSystemError::NotDirectory
         | FileSystemError::IsDirectory
+        | FileSystemError::NotExecutable
         | FileSystemError::NotEmpty
         | FileSystemError::ReadOnly
         | FileSystemError::PermissionDenied

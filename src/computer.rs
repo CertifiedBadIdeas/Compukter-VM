@@ -664,6 +664,7 @@ fn filesystem_error_code(error: FileSystemError) -> i32 {
         FileSystemError::Busy => 11,
         FileSystemError::StorageFaulted => 12,
         FileSystemError::Closed => 13,
+        FileSystemError::NotExecutable => 14,
     })
 }
 

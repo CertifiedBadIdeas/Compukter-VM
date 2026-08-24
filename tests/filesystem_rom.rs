@@ -116,6 +116,12 @@ fn admitted_rom_is_hash_identified_mounted_and_immutable() {
             .executable
     );
     assert_eq!(
+        filesystem
+            .read_executable(&reader, &path("/rom/boot"))
+            .unwrap(),
+        b"boot artifact",
+    );
+    assert_eq!(
         filesystem.write_file(&reader, &path("/rom/boot"), b"changed", true),
         Err(FileSystemError::ReadOnly),
     );
