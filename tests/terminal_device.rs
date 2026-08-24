@@ -85,6 +85,48 @@ fn positional_patch_and_fill_do_not_move_the_stream_cursor() {
 }
 
 #[test]
+fn positional_terminal_write_clips_one_row_and_decodes_scalars() {
+    let mut terminal = TerminalDevice::default();
+    let cursor = TerminalPosition::new(7, 8).unwrap();
+    terminal.set_cursor(cursor);
+    terminal.set_colors(3, 4).unwrap();
+
+    terminal
+        .write_at(
+            TerminalPosition::new(49, 3).unwrap(),
+            &['A' as u16, 0xd83d, 0xde00, 'Z' as u16],
+        )
+        .unwrap();
+
+    assert_eq!('A' as u32, terminal.cell(49, 3).unwrap().code_point());
+    let supplementary = terminal.cell(50, 3).unwrap();
+    assert_eq!(0x1f600, supplementary.code_point());
+    assert_eq!(3, supplementary.foreground());
+    assert_eq!(4, supplementary.background());
+    assert_eq!(' ' as u32, terminal.cell(0, 4).unwrap().code_point());
+    assert_eq!(cursor, terminal.cursor_position());
+}
+
+#[test]
+fn positional_terminal_rejects_invalid_style_and_fill_atomically() {
+    let mut terminal = TerminalDevice::default();
+    terminal.set_colors(2, 3).unwrap();
+    assert!(terminal.set_colors(4, 16).is_err());
+    terminal
+        .write_at(TerminalPosition::new(0, 0).unwrap(), &['A' as u16])
+        .unwrap();
+    let styled = terminal.cell(0, 0).unwrap();
+    assert_eq!(2, styled.foreground());
+    assert_eq!(3, styled.background());
+
+    let before = terminal.cell(1, 1).unwrap();
+    assert!(terminal
+        .fill_with_current_colors(TerminalRectangle::new(1, 1, 1, 1).unwrap(), 0xd800)
+        .is_err());
+    assert_eq!(before, terminal.cell(1, 1).unwrap());
+}
+
+#[test]
 fn stream_writes_wrap_newline_and_scroll_the_ring_rows() {
     let mut terminal = TerminalDevice::default();
     terminal.set_cursor(TerminalPosition::new(50, 18).unwrap());

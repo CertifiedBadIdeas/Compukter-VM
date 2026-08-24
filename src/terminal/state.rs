@@ -296,6 +296,26 @@ impl TerminalDevice {
         Ok(())
     }
 
+    pub fn write_at(
+        &mut self,
+        start: TerminalPosition,
+        units: &[u16],
+    ) -> Result<(), TerminalError> {
+        let remaining = usize::from(TERMINAL_WIDTH - start.x);
+        let cells = char::decode_utf16(units.iter().copied())
+            .take(remaining)
+            .map(|decoded| {
+                let scalar = decoded.unwrap_or(char::REPLACEMENT_CHARACTER);
+                TerminalCell {
+                    code_point: scalar as u32,
+                    foreground: self.foreground,
+                    background: self.background,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.patch(start, &cells)
+    }
+
     pub fn fill(
         &mut self,
         rectangle: TerminalRectangle,
@@ -315,6 +335,15 @@ impl TerminalDevice {
             cell,
         });
         Ok(())
+    }
+
+    pub fn fill_with_current_colors(
+        &mut self,
+        rectangle: TerminalRectangle,
+        code_point: u32,
+    ) -> Result<(), TerminalError> {
+        let cell = TerminalCell::new(code_point, self.foreground, self.background)?;
+        self.fill(rectangle, cell)
     }
 
     pub fn scroll(&mut self, rows: u16) -> Result<(), TerminalError> {

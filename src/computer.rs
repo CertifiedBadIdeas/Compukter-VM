@@ -27,7 +27,7 @@ use crate::{
     HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, NodeKind, OpenMode,
     OperationSchema, ProcessCapabilityMask, ProcessLimits, ProcessResult, QuotaExhaustion,
     RequestId, ResumeError, RunError, Session, TerminalDevice, TerminalInputEvent,
-    TerminalKeyAction, VerifiedArtifact, VirtualPath, VmFault,
+    TerminalKeyAction, TerminalPosition, TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
@@ -546,6 +546,48 @@ impl ComputerMachine {
             }
             RawTerminalOperation::FinishEvent => {
                 self.terminal_finish_event()?;
+                HostValueInput::Unit
+            }
+            RawTerminalOperation::SetCursor { x, y } => {
+                let position = terminal_position(x, y)?;
+                self.terminal.set_cursor(position);
+                HostValueInput::Unit
+            }
+            RawTerminalOperation::SetCursorVisible(visible) => {
+                self.terminal.set_cursor_visible(visible);
+                HostValueInput::Unit
+            }
+            RawTerminalOperation::SetColors {
+                foreground,
+                background,
+            } => {
+                let foreground =
+                    u8::try_from(foreground).map_err(|_| ComputerError::InvalidTerminalRequest)?;
+                let background =
+                    u8::try_from(background).map_err(|_| ComputerError::InvalidTerminalRequest)?;
+                self.terminal
+                    .set_colors(foreground, background)
+                    .map_err(|_| ComputerError::InvalidTerminalRequest)?;
+                HostValueInput::Unit
+            }
+            RawTerminalOperation::WriteAt { x, y, units } => {
+                let position = terminal_position(x, y)?;
+                self.terminal
+                    .write_at(position, &units)
+                    .map_err(|_| ComputerError::InvalidTerminalRequest)?;
+                HostValueInput::Unit
+            }
+            RawTerminalOperation::Fill {
+                x,
+                y,
+                width,
+                height,
+                character,
+            } => {
+                let rectangle = terminal_rectangle(x, y, width, height)?;
+                self.terminal
+                    .fill_with_current_colors(rectangle, u32::from(character))
+                    .map_err(|_| ComputerError::InvalidTerminalRequest)?;
                 HostValueInput::Unit
             }
         };
@@ -1143,6 +1185,27 @@ enum RawTerminalOperation {
     EventAction,
     EventModifiers,
     FinishEvent,
+    SetCursor {
+        x: i32,
+        y: i32,
+    },
+    SetCursorVisible(bool),
+    SetColors {
+        foreground: i32,
+        background: i32,
+    },
+    WriteAt {
+        x: i32,
+        y: i32,
+        units: Vec<u16>,
+    },
+    Fill {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        character: u16,
+    },
 }
 
 enum FileSystemOperation {
@@ -1185,6 +1248,20 @@ fn admit_session(
         HostValueType::String,
     ];
     let compiler_arguments = [HostValueType::String, HostValueType::String];
+    let terminal_position_arguments = [HostValueType::I32, HostValueType::I32];
+    let terminal_visibility_arguments = [HostValueType::Bool];
+    let terminal_write_at_arguments = [
+        HostValueType::I32,
+        HostValueType::I32,
+        HostValueType::String,
+    ];
+    let terminal_fill_arguments = [
+        HostValueType::I32,
+        HostValueType::I32,
+        HostValueType::I32,
+        HostValueType::I32,
+        HostValueType::Char,
+    ];
     let raw_terminal_operations = [
         OperationSchema::synchronous(&string_argument, HostValueType::Unit),
         OperationSchema::synchronous(&[], HostValueType::Unit),
@@ -1195,6 +1272,11 @@ fn admit_session(
         OperationSchema::synchronous(&[], HostValueType::I32),
         OperationSchema::synchronous(&[], HostValueType::I32),
         OperationSchema::synchronous(&[], HostValueType::Unit),
+        OperationSchema::synchronous(&terminal_position_arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&terminal_visibility_arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&terminal_position_arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&terminal_write_at_arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&terminal_fill_arguments, HostValueType::Unit),
     ];
     let filesystem_operations = [
         OperationSchema::synchronous(&string_argument, HostValueType::I32),
@@ -1459,6 +1541,10 @@ const INVALID_UTF8_ERROR_CODE: u32 = 14;
 fn copy_raw_terminal_request(
     request: HostRequestView<'_>,
 ) -> Result<TerminalRequest, ComputerError> {
+    let integer = |index| match request.arguments().get(index) {
+        Some(HostValueView::I32(value)) => Ok(value),
+        _ => Err(ComputerError::InvalidTerminalRequest),
+    };
     let operation = match request.operation() {
         0 if !request.asynchronous() && request.arguments().len() == 1 => {
             let Some(HostValueView::String(units)) = request.arguments().get(0) else {
@@ -1490,12 +1576,71 @@ fn copy_raw_terminal_request(
         8 if !request.asynchronous() && request.arguments().is_empty() => {
             RawTerminalOperation::FinishEvent
         }
+        9 if !request.asynchronous() && request.arguments().len() == 2 => {
+            RawTerminalOperation::SetCursor {
+                x: integer(0)?,
+                y: integer(1)?,
+            }
+        }
+        10 if !request.asynchronous() && request.arguments().len() == 1 => {
+            let Some(HostValueView::Bool(visible)) = request.arguments().get(0) else {
+                return Err(ComputerError::InvalidTerminalRequest);
+            };
+            RawTerminalOperation::SetCursorVisible(visible)
+        }
+        11 if !request.asynchronous() && request.arguments().len() == 2 => {
+            RawTerminalOperation::SetColors {
+                foreground: integer(0)?,
+                background: integer(1)?,
+            }
+        }
+        12 if !request.asynchronous() && request.arguments().len() == 3 => {
+            let Some(HostValueView::String(units)) = request.arguments().get(2) else {
+                return Err(ComputerError::InvalidTerminalRequest);
+            };
+            RawTerminalOperation::WriteAt {
+                x: integer(0)?,
+                y: integer(1)?,
+                units: units.to_vec(),
+            }
+        }
+        13 if !request.asynchronous() && request.arguments().len() == 5 => {
+            let Some(HostValueView::Char(character)) = request.arguments().get(4) else {
+                return Err(ComputerError::InvalidTerminalRequest);
+            };
+            RawTerminalOperation::Fill {
+                x: integer(0)?,
+                y: integer(1)?,
+                width: integer(2)?,
+                height: integer(3)?,
+                character,
+            }
+        }
         _ => return Err(ComputerError::InvalidTerminalRequest),
     };
     Ok(TerminalRequest::Raw {
         id: request.id(),
         operation,
     })
+}
+
+fn terminal_position(x: i32, y: i32) -> Result<TerminalPosition, ComputerError> {
+    let x = u16::try_from(x).map_err(|_| ComputerError::InvalidTerminalRequest)?;
+    let y = u16::try_from(y).map_err(|_| ComputerError::InvalidTerminalRequest)?;
+    TerminalPosition::new(x, y).map_err(|_| ComputerError::InvalidTerminalRequest)
+}
+
+fn terminal_rectangle(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<TerminalRectangle, ComputerError> {
+    let x = u16::try_from(x).map_err(|_| ComputerError::InvalidTerminalRequest)?;
+    let y = u16::try_from(y).map_err(|_| ComputerError::InvalidTerminalRequest)?;
+    let width = u16::try_from(width).map_err(|_| ComputerError::InvalidTerminalRequest)?;
+    let height = u16::try_from(height).map_err(|_| ComputerError::InvalidTerminalRequest)?;
+    TerminalRectangle::new(x, y, width, height).map_err(|_| ComputerError::InvalidTerminalRequest)
 }
 
 fn copy_host_request(request: HostRequestView<'_>) -> ComputerHostRequest {
@@ -1589,6 +1734,42 @@ mod tests {
             ComputerError::NoActiveTerminalEvent,
             computer.terminal_finish_event().unwrap_err()
         );
+    }
+
+    #[test]
+    fn positional_terminal_capability_mutates_one_authoritative_grid() {
+        let artifact = crate::execution::fixtures::positional_terminal_artifact();
+        let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+
+        loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::Halted(None) => break,
+                other => panic!("unexpected positional terminal outcome: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            TerminalPosition::new(50, 6).unwrap(),
+            computer.terminal().cursor_position()
+        );
+        assert!(!computer.terminal().cursor_visible());
+        let supplementary = computer.terminal().cell(50, 6).unwrap();
+        assert_eq!(0x1f600, supplementary.code_point());
+        assert_eq!(3, supplementary.foreground());
+        assert_eq!(4, supplementary.background());
+        assert_eq!(
+            ' ' as u32,
+            computer.terminal().cell(0, 7).unwrap().code_point()
+        );
+        for y in 2..4 {
+            for x in 1..3 {
+                let cell = computer.terminal().cell(x, y).unwrap();
+                assert_eq!('Q' as u32, cell.code_point());
+                assert_eq!(3, cell.foreground());
+                assert_eq!(4, cell.background());
+            }
+        }
     }
 
     #[test]

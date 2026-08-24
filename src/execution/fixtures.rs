@@ -2090,6 +2090,154 @@ pub(crate) fn raw_terminal_conformance_artifact(
     )
 }
 
+pub(crate) fn positional_terminal_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let mut constants = vec![
+        Constant::I32(50),
+        Constant::I32(6),
+        Constant::I32(3),
+        Constant::I32(4),
+        Constant::I32(1),
+        Constant::I32(2),
+        Constant::Bool(false),
+        Constant::Char('Q' as u16),
+    ];
+    constants.sort_by_key(crate::test_encode::encode_constant);
+    let constant_id = |value: &Constant| {
+        constants
+            .iter()
+            .position(|candidate| candidate == value)
+            .unwrap() as u32
+    };
+    let x_id = constant_id(&Constant::I32(50));
+    let y_id = constant_id(&Constant::I32(6));
+    let foreground_id = constant_id(&Constant::I32(3));
+    let background_id = constant_id(&Constant::I32(4));
+    let one_id = constant_id(&Constant::I32(1));
+    let two_id = constant_id(&Constant::I32(2));
+    let hidden_id = constant_id(&Constant::Bool(false));
+    let fill_id = constant_id(&Constant::Char('Q' as u16));
+    let string_id = constants.len() as u32;
+    literal_string_program_blocks_configured(
+        primitive(0),
+        vec![
+            string,
+            primitive(1),
+            primitive(1),
+            primitive(5),
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(6),
+        ],
+        constants,
+        &[0xd83d, 0xde00, 'Z' as u16],
+        vec![vec![
+            Instruction::Const {
+                dst: 0,
+                constant: string_id,
+            },
+            Instruction::Const {
+                dst: 1,
+                constant: x_id,
+            },
+            Instruction::Const {
+                dst: 2,
+                constant: y_id,
+            },
+            Instruction::Const {
+                dst: 3,
+                constant: hidden_id,
+            },
+            Instruction::Const {
+                dst: 4,
+                constant: foreground_id,
+            },
+            Instruction::Const {
+                dst: 5,
+                constant: background_id,
+            },
+            Instruction::Const {
+                dst: 6,
+                constant: one_id,
+            },
+            Instruction::Const {
+                dst: 7,
+                constant: two_id,
+            },
+            Instruction::Const {
+                dst: 8,
+                constant: fill_id,
+            },
+            Instruction::CapabilityCallSync {
+                dst: u16::MAX,
+                capability: 0,
+                operation: 9,
+                args: Box::new([1, 2]),
+            },
+            Instruction::CapabilityCallSync {
+                dst: u16::MAX,
+                capability: 0,
+                operation: 10,
+                args: Box::new([3]),
+            },
+            Instruction::CapabilityCallSync {
+                dst: u16::MAX,
+                capability: 0,
+                operation: 11,
+                args: Box::new([4, 5]),
+            },
+            Instruction::CapabilityCallSync {
+                dst: u16::MAX,
+                capability: 0,
+                operation: 12,
+                args: Box::new([1, 2, 0]),
+            },
+            Instruction::CapabilityCallSync {
+                dst: u16::MAX,
+                capability: 0,
+                operation: 13,
+                args: Box::new([6, 7, 7, 7, 8]),
+            },
+            Instruction::Return { value: u16::MAX },
+        ]],
+        |artifact| {
+            let mut bytes = artifact.bytes.to_vec();
+            let namespace_start = bytes.len();
+            bytes.extend_from_slice(b"compukter");
+            let namespace_end = bytes.len();
+            let name_start = bytes.len();
+            bytes.extend_from_slice(b"terminal");
+            let name_end = bytes.len();
+            artifact.bytes = Arc::from(bytes);
+            artifact.modules[0].strings[0] = ByteRange {
+                start: namespace_start,
+                end: namespace_end,
+            };
+            artifact.modules[0].strings[1] = ByteRange {
+                start: name_start,
+                end: name_end,
+            };
+            artifact.header.semantic_features = 0b1100;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 2,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 14,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 5;
+        },
+    )
+}
+
 pub(crate) fn process_terminal_child_artifact() -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
