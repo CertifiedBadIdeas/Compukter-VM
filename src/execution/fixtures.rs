@@ -1910,6 +1910,14 @@ pub(crate) fn raw_terminal_conformance_artifact(
 }
 
 pub(crate) fn filesystem_conformance_artifact() -> VerifiedArtifact {
+    filesystem_marker_artifact("fun main() = 42\n")
+}
+
+pub(crate) fn filesystem_alternate_marker_artifact() -> VerifiedArtifact {
+    filesystem_marker_artifact("fun main() = 7\n")
+}
+
+fn filesystem_marker_artifact(content: &str) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
         flags: 0,
@@ -1917,7 +1925,7 @@ pub(crate) fn filesystem_conformance_artifact() -> VerifiedArtifact {
     };
     let directory = "/home/project".encode_utf16().collect::<Vec<_>>();
     let file = "/home/project/main.kt".encode_utf16().collect::<Vec<_>>();
-    let content = "fun main() = 42\n".encode_utf16().collect::<Vec<_>>();
+    let content = content.encode_utf16().collect::<Vec<_>>();
     literal_string_program_blocks_configured(
         primitive(1),
         vec![

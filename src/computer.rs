@@ -922,11 +922,15 @@ mod tests {
         }
     }
 
-    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 2] {
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 3] {
         [
             (
                 "filesystem-write.cpkt",
                 crate::execution::fixtures::filesystem_conformance_artifact(),
+            ),
+            (
+                "filesystem-write-alternate.cpkt",
+                crate::execution::fixtures::filesystem_alternate_marker_artifact(),
             ),
             (
                 "filesystem-read.cpkt",
