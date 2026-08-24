@@ -166,6 +166,39 @@ fn explicit_scroll_keeps_logical_coordinates_and_clears_reclaimed_rows() {
 }
 
 #[test]
+fn borrowed_logical_cells_follow_visible_row_order_after_scroll() {
+    let mut terminal = TerminalDevice::default();
+    let first = TerminalCell::new('A' as u32, 1, 2).unwrap();
+    let second = TerminalCell::new('B' as u32, 3, 4).unwrap();
+    terminal
+        .fill(
+            TerminalRectangle::new(0, 0, TERMINAL_WIDTH, 1).unwrap(),
+            first,
+        )
+        .unwrap();
+    terminal
+        .fill(
+            TerminalRectangle::new(0, 1, TERMINAL_WIDTH, 1).unwrap(),
+            second,
+        )
+        .unwrap();
+
+    terminal.scroll(1).unwrap();
+
+    let cells = terminal.logical_cells().collect::<Vec<_>>();
+    assert_eq!(
+        TERMINAL_WIDTH as usize * TERMINAL_HEIGHT as usize,
+        cells.len()
+    );
+    assert!(cells[..TERMINAL_WIDTH as usize]
+        .iter()
+        .all(|cell| *cell == second));
+    assert!(cells[cells.len() - TERMINAL_WIDTH as usize..]
+        .iter()
+        .all(|cell| *cell == TerminalCell::default()));
+}
+
+#[test]
 fn stable_key_and_atomic_text_events_merge_in_fifo_order() {
     assert_eq!(13, TerminalKey::Enter.code());
     assert_eq!(TerminalKey::Enter, TerminalKey::try_from(13).unwrap());
