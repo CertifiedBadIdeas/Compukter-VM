@@ -1909,6 +1909,136 @@ pub(crate) fn raw_terminal_conformance_artifact(
     )
 }
 
+pub(crate) fn filesystem_conformance_artifact() -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let directory = "/home/project".encode_utf16().collect::<Vec<_>>();
+    let file = "/home/project/main.kt".encode_utf16().collect::<Vec<_>>();
+    let content = "fun main() = 42\n".encode_utf16().collect::<Vec<_>>();
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![
+            string,
+            string,
+            string,
+            primitive(1),
+            primitive(1),
+            string,
+            string,
+            primitive(1),
+            primitive(1),
+            primitive(1),
+        ],
+        Vec::new(),
+        &directory,
+        vec![vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::Const {
+                dst: 1,
+                constant: 1,
+            },
+            Instruction::Const {
+                dst: 2,
+                constant: 2,
+            },
+            Instruction::CapabilityCallSync {
+                dst: 3,
+                capability: 0,
+                operation: 4,
+                args: Box::new([0]),
+            },
+            Instruction::CapabilityCallSync {
+                dst: 4,
+                capability: 0,
+                operation: 3,
+                args: Box::new([1, 2]),
+            },
+            Instruction::CapabilityCallSync {
+                dst: 5,
+                capability: 0,
+                operation: 2,
+                args: Box::new([1]),
+            },
+            Instruction::CapabilityCallSync {
+                dst: 6,
+                capability: 0,
+                operation: 1,
+                args: Box::new([0]),
+            },
+            Instruction::StringHash { dst: 7, string: 5 },
+            Instruction::StringHash { dst: 8, string: 6 },
+            Instruction::Add {
+                form: 1,
+                dst: 9,
+                lhs: 7,
+                rhs: 8,
+            },
+            Instruction::Return { value: 9 },
+        ]],
+        |artifact| {
+            let mut bytes = artifact.bytes.to_vec();
+            let namespace_start = bytes.len();
+            bytes.extend_from_slice(b"compukter");
+            let namespace_end = bytes.len();
+            let name_start = bytes.len();
+            bytes.extend_from_slice(b"filesystem");
+            let name_end = bytes.len();
+            let file_start = bytes.len();
+            for unit in &file {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            let file_end = bytes.len();
+            let content_start = bytes.len();
+            for unit in &content {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            let content_end = bytes.len();
+            artifact.bytes = Arc::from(bytes);
+
+            let application = &mut artifact.modules[0];
+            application.strings[0] = ByteRange {
+                start: namespace_start,
+                end: namespace_end,
+            };
+            application.strings[1] = ByteRange {
+                start: name_start,
+                end: name_end,
+            };
+            application.utf16_literals.push(ByteRange {
+                start: file_start,
+                end: file_end,
+            });
+            application.utf16_literals.push(ByteRange {
+                start: content_start,
+                end: content_end,
+            });
+            application
+                .constants
+                .push(Constant::String(Utf16LiteralId(1)));
+            application
+                .constants
+                .push(Constant::String(Utf16LiteralId(2)));
+            artifact.header.semantic_features = 0b1100;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 7,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 4;
+        },
+    )
+}
+
 pub(super) fn string_response_gc_retry_artifact() -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
