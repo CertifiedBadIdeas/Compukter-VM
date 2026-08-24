@@ -208,6 +208,10 @@ impl TerminalDevice {
         (TERMINAL_WIDTH, TERMINAL_HEIGHT)
     }
 
+    pub const fn revision(&self) -> u64 {
+        self.replication.revision()
+    }
+
     pub fn cell(&self, x: u16, y: u16) -> Result<TerminalCell, TerminalError> {
         let position = TerminalPosition::new(x, y)?;
         Ok(self.cells[self.physical_index(position)])
@@ -219,6 +223,16 @@ impl TerminalDevice {
 
     pub const fn cursor_visible(&self) -> bool {
         self.cursor_visible
+    }
+
+    pub fn logical_cells(&self) -> impl ExactSizeIterator<Item = TerminalCell> + '_ {
+        (0..CELL_COUNT).map(move |logical| {
+            let position = TerminalPosition {
+                x: (logical % TERMINAL_WIDTH as usize) as u16,
+                y: (logical / TERMINAL_WIDTH as usize) as u16,
+            };
+            self.cells[self.physical_index(position)]
+        })
     }
 
     pub fn set_cursor(&mut self, position: TerminalPosition) {
@@ -370,7 +384,7 @@ impl TerminalDevice {
         let full_cells = self
             .replication
             .requires_full_replacement()
-            .then(|| self.logical_cells());
+            .then(|| self.materialize_logical_cells());
         self.replication
             .commit(full_cells, self.cursor, self.cursor_visible)
     }
@@ -434,22 +448,14 @@ impl TerminalDevice {
     fn snapshot(&self) -> TerminalSnapshot {
         TerminalSnapshot::new(
             self.replication.revision(),
-            self.logical_cells(),
+            self.materialize_logical_cells(),
             self.cursor,
             self.cursor_visible,
         )
     }
 
-    fn logical_cells(&self) -> Box<[TerminalCell]> {
-        (0..TERMINAL_HEIGHT)
-            .flat_map(|y| {
-                (0..TERMINAL_WIDTH).map(move |x| {
-                    let position = TerminalPosition { x, y };
-                    self.cells[self.physical_index(position)]
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
+    fn materialize_logical_cells(&self) -> Box<[TerminalCell]> {
+        self.logical_cells().collect::<Vec<_>>().into_boxed_slice()
     }
 }
 
