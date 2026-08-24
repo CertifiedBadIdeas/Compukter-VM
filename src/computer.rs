@@ -10,12 +10,13 @@
  */
 
 use crate::{
-    AdmissionError, AdvanceOutcome, CapabilityBinding, ComputerFileSystem, EntryValue,
-    ExecutionProfile, FileCapability, FileRights, FileSystemError, FileSystemLimits, GuestTrap,
-    HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType,
-    HostValueView, ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, QuotaExhaustion,
-    RequestId, ResumeError, RunError, Session, TerminalDevice, TerminalInputEvent,
-    TerminalKeyAction, VerifiedArtifact, VirtualPath, VmFault,
+    verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
+    ComputerFileSystem, EntryValue, ExecutionProfile, FileCapability, FileRights, FileSystemError,
+    FileSystemLimits, GuestTrap, HostFailure, HostFailureKind, HostRequestView, HostResponse,
+    HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, NodeKind, OpenMode,
+    OperationSchema, ProcessCapabilityMask, ProcessResult, QuotaExhaustion, RequestId, ResumeError,
+    RunError, Session, TerminalDevice, TerminalInputEvent, TerminalKeyAction, VerifiedArtifact,
+    VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
@@ -23,6 +24,8 @@ const TERMINAL_NAME: &str = "terminal";
 const RAW_TERMINAL_ABI_MAJOR: u16 = 2;
 const FILESYSTEM_NAME: &str = "filesystem";
 const FILESYSTEM_ABI_MAJOR: u16 = 1;
+const PROCESS_NAME: &str = "process";
+const PROCESS_ABI_MAJOR: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComputerStartError {
@@ -37,6 +40,7 @@ pub enum ComputerError {
     InvalidRequestId,
     InvalidTerminalRequest,
     InvalidFileSystemRequest,
+    InvalidProcessRequest,
     ActiveTerminalEvent,
     NoActiveTerminalEvent,
     WrongTerminalEventKind,
@@ -86,13 +90,21 @@ pub enum ComputerAdvanceOutcome {
 
 #[derive(Debug)]
 pub struct ComputerMachine {
-    session: Session,
+    sessions: Vec<ProcessFrame>,
     terminal: TerminalDevice,
-    pending_terminal_event: Option<RequestId>,
     active_terminal_event: Option<TerminalInputEvent>,
     filesystem: ComputerFileSystem,
     initial_file_capability: FileCapability,
+    profile: ExecutionProfile,
     maximum_text_code_units: usize,
+}
+
+#[derive(Debug)]
+struct ProcessFrame {
+    session: Session,
+    capabilities: ProcessCapabilityMask,
+    pending_terminal_event: Option<RequestId>,
+    pending_process: Option<RequestId>,
 }
 
 impl ComputerMachine {
@@ -126,58 +138,29 @@ impl ComputerMachine {
         initial_capability: FileCapability,
     ) -> Result<Self, ComputerStartError> {
         let maximum_text_code_units = profile.maximum_inbound_utf16_code_units as usize;
-        let string_argument = [HostValueType::String];
-        let two_string_arguments = [HostValueType::String, HostValueType::String];
-        let raw_terminal_operations = [
-            OperationSchema::synchronous(&string_argument, HostValueType::Unit),
-            OperationSchema::synchronous(&[], HostValueType::Unit),
-            OperationSchema::synchronous(&[], HostValueType::Unit),
-            OperationSchema::asynchronous(&[], HostValueType::I32),
-            OperationSchema::synchronous(&[], HostValueType::String),
-            OperationSchema::synchronous(&[], HostValueType::I32),
-            OperationSchema::synchronous(&[], HostValueType::I32),
-            OperationSchema::synchronous(&[], HostValueType::I32),
-            OperationSchema::synchronous(&[], HostValueType::Unit),
-        ];
-        let raw_terminal_binding = CapabilityBinding::new(
-            TERMINAL_NAMESPACE,
-            TERMINAL_NAME,
-            RAW_TERMINAL_ABI_MAJOR,
-            0,
-            &raw_terminal_operations,
-        );
-        let filesystem_operations = [
-            OperationSchema::synchronous(&string_argument, HostValueType::I32),
-            OperationSchema::synchronous(&string_argument, HostValueType::String),
-            OperationSchema::synchronous(&string_argument, HostValueType::String),
-            OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
-            OperationSchema::synchronous(&string_argument, HostValueType::I32),
-            OperationSchema::synchronous(&string_argument, HostValueType::I32),
-            OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
-        ];
-        let filesystem_binding = CapabilityBinding::new(
-            TERMINAL_NAMESPACE,
-            FILESYSTEM_NAME,
-            FILESYSTEM_ABI_MAJOR,
-            0,
-            &filesystem_operations,
-        );
-        let mut bindings = Vec::with_capacity(addon_bindings.len() + 2);
-        bindings.extend_from_slice(addon_bindings);
-        bindings.push(raw_terminal_binding);
-        bindings.push(filesystem_binding);
+        let root_capabilities = ProcessCapabilityMask::new(
+            ProcessCapabilityMask::STANDARD as i32,
+            ProcessCapabilityMask::STANDARD,
+        )
+        .expect("the standard capability mask delegates to itself");
         let mut session =
-            Session::admit(artifact, profile, &bindings).map_err(ComputerStartError::Admission)?;
+            admit_session(artifact, profile.clone(), addon_bindings, root_capabilities)
+                .map_err(ComputerStartError::Admission)?;
         session
             .start(arguments)
             .map_err(ComputerStartError::Start)?;
         Ok(Self {
-            session,
+            sessions: vec![ProcessFrame {
+                session,
+                capabilities: root_capabilities,
+                pending_terminal_event: None,
+                pending_process: None,
+            }],
             terminal: TerminalDevice::default(),
-            pending_terminal_event: None,
             active_terminal_event: None,
             filesystem,
             initial_file_capability: initial_capability,
+            profile,
             maximum_text_code_units,
         })
     }
@@ -258,22 +241,22 @@ impl ComputerMachine {
         guest_budget: u32,
         maintenance_budget: u32,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
-        if let Some(request) = self.pending_terminal_event {
+        if let Some(request) = self.active_frame().pending_terminal_event {
             let Some(kind) = self.terminal_await_event()? else {
                 return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
             };
-            self.session
+            self.active_session_mut()
                 .resume_internal(
                     request,
                     HostResponse::Success(HostValueInput::I32(kind as i32)),
                 )
                 .map_err(ComputerError::Resume)?;
-            self.pending_terminal_event = None;
+            self.active_frame_mut().pending_terminal_event = None;
             return Ok(ComputerAdvanceOutcome::SliceExhausted);
         }
         let internal = {
             let outcome = self
-                .session
+                .active_session_mut()
                 .advance(guest_budget, maintenance_budget)
                 .map_err(ComputerError::Run)?;
             match outcome {
@@ -282,6 +265,9 @@ impl ComputerMachine {
                 }
                 AdvanceOutcome::HostRequest(request) if is_filesystem(request) => {
                     Some(copy_filesystem_request(request)?)
+                }
+                AdvanceOutcome::HostRequest(request) if is_process(request) => {
+                    Some(copy_process_request(request)?)
                 }
                 AdvanceOutcome::SliceExhausted => {
                     return Ok(ComputerAdvanceOutcome::SliceExhausted)
@@ -298,7 +284,25 @@ impl ComputerMachine {
                     return Ok(ComputerAdvanceOutcome::QuotaExhausted(value))
                 }
                 AdvanceOutcome::Halted(value) => {
-                    return Ok(ComputerAdvanceOutcome::Halted(value.map(copy_value)))
+                    let value = value.map(copy_value);
+                    if self.sessions.len() > 1 {
+                        self.sessions.pop();
+                        let request = self
+                            .active_frame_mut()
+                            .pending_process
+                            .take()
+                            .expect("a child session always has a suspended parent request");
+                        self.active_session_mut()
+                            .resume_internal(
+                                request,
+                                HostResponse::Success(HostValueInput::I32(
+                                    ProcessResult::Exited.code(),
+                                )),
+                            )
+                            .map_err(ComputerError::Resume)?;
+                        return Ok(ComputerAdvanceOutcome::SliceExhausted);
+                    }
+                    return Ok(ComputerAdvanceOutcome::Halted(value));
                 }
                 AdvanceOutcome::Crashed(value) => {
                     return Ok(ComputerAdvanceOutcome::Crashed(value))
@@ -317,6 +321,9 @@ impl ComputerMachine {
             }
             TerminalRequest::FileSystem { id, operation } => {
                 self.handle_filesystem_request(id, operation)
+            }
+            TerminalRequest::Process { id, operation } => {
+                self.handle_process_request(id, operation)
             }
         }
     }
@@ -343,7 +350,7 @@ impl ComputerMachine {
             }
             RawTerminalOperation::AwaitEvent => {
                 let Some(kind) = self.terminal_await_event()? else {
-                    self.pending_terminal_event = Some(id);
+                    self.active_frame_mut().pending_terminal_event = Some(id);
                     return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
                 };
                 HostValueInput::I32(kind as i32)
@@ -353,7 +360,7 @@ impl ComputerMachine {
                     .terminal_event_text()?
                     .encode_utf16()
                     .collect::<Vec<_>>();
-                self.session
+                self.active_session_mut()
                     .resume_internal(id, HostResponse::Success(HostValueInput::String(&units)))
                     .map_err(ComputerError::Resume)?;
                 return Ok(ComputerAdvanceOutcome::SliceExhausted);
@@ -370,7 +377,7 @@ impl ComputerMachine {
                 HostValueInput::Unit
             }
         };
-        self.session
+        self.active_session_mut()
             .resume_internal(id, HostResponse::Success(response))
             .map_err(ComputerError::Resume)?;
         Ok(ComputerAdvanceOutcome::SliceExhausted)
@@ -559,7 +566,7 @@ impl ComputerMachine {
         id: RequestId,
         response: HostResponse<'_>,
     ) -> Result<(), ComputerError> {
-        self.session
+        self.active_session_mut()
             .resume_internal(id, response)
             .map_err(ComputerError::Resume)
     }
@@ -570,9 +577,85 @@ impl ComputerMachine {
         response: HostResponse<'_>,
     ) -> Result<(), ComputerError> {
         let request_id = RequestId::new(request_id).ok_or(ComputerError::InvalidRequestId)?;
-        self.session
+        self.active_session_mut()
             .resume(request_id, response)
             .map_err(ComputerError::Resume)
+    }
+
+    fn handle_process_request(
+        &mut self,
+        id: RequestId,
+        operation: ProcessOperation,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        let ProcessOperation::Run(path, requested_capabilities) = operation;
+        let capabilities = match self
+            .active_frame()
+            .capabilities
+            .delegate(requested_capabilities)
+        {
+            Ok(capabilities) => capabilities,
+            Err(_) => return self.resume_process_result(id, ProcessResult::InvalidCapabilities),
+        };
+        let path = match self.parse_path(&path) {
+            Ok(path) => path,
+            Err(_) => return self.resume_process_result(id, ProcessResult::InvalidPath),
+        };
+        let bytes = match self
+            .filesystem
+            .read_executable(&self.initial_file_capability, &path)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return self.resume_process_result(id, process_filesystem_result(error)),
+        };
+        let artifact = match verify_artifact(bytes.into(), ArtifactLimits::default()) {
+            Ok(artifact) => artifact,
+            Err(_) => return self.resume_process_result(id, ProcessResult::InvalidArtifact),
+        };
+        let mut child = match admit_session(artifact, self.profile.clone(), &[], capabilities) {
+            Ok(session) => session,
+            Err(_) => return self.resume_process_result(id, ProcessResult::AdmissionFailed),
+        };
+        if child.start(&[]).is_err() {
+            return self.resume_process_result(id, ProcessResult::StartFailed);
+        }
+        self.active_frame_mut().pending_process = Some(id);
+        self.sessions.push(ProcessFrame {
+            session: child,
+            capabilities,
+            pending_terminal_event: None,
+            pending_process: None,
+        });
+        Ok(ComputerAdvanceOutcome::SliceExhausted)
+    }
+
+    fn resume_process_result(
+        &mut self,
+        id: RequestId,
+        result: ProcessResult,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        self.active_session_mut()
+            .resume_internal(
+                id,
+                HostResponse::Success(HostValueInput::I32(result.code())),
+            )
+            .map_err(ComputerError::Resume)?;
+        Ok(ComputerAdvanceOutcome::SliceExhausted)
+    }
+
+    fn active_frame(&self) -> &ProcessFrame {
+        self.sessions
+            .last()
+            .expect("a computer always has a root process")
+    }
+
+    fn active_frame_mut(&mut self) -> &mut ProcessFrame {
+        self.sessions
+            .last_mut()
+            .expect("a computer always has a root process")
+    }
+
+    fn active_session_mut(&mut self) -> &mut Session {
+        &mut self.active_frame_mut().session
     }
 }
 
@@ -584,6 +667,10 @@ enum TerminalRequest {
     FileSystem {
         id: RequestId,
         operation: FileSystemOperation,
+    },
+    Process {
+        id: RequestId,
+        operation: ProcessOperation,
     },
 }
 
@@ -609,6 +696,75 @@ enum FileSystemOperation {
     Rename(Vec<u16>, Vec<u16>),
 }
 
+enum ProcessOperation {
+    Run(Vec<u16>, i32),
+}
+
+fn admit_session(
+    artifact: VerifiedArtifact,
+    profile: ExecutionProfile,
+    addon_bindings: &[CapabilityBinding<'_>],
+    capabilities: ProcessCapabilityMask,
+) -> Result<Session, AdmissionError> {
+    let string_argument = [HostValueType::String];
+    let two_string_arguments = [HostValueType::String, HostValueType::String];
+    let process_arguments = [HostValueType::String, HostValueType::I32];
+    let raw_terminal_operations = [
+        OperationSchema::synchronous(&string_argument, HostValueType::Unit),
+        OperationSchema::synchronous(&[], HostValueType::Unit),
+        OperationSchema::synchronous(&[], HostValueType::Unit),
+        OperationSchema::asynchronous(&[], HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::String),
+        OperationSchema::synchronous(&[], HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::Unit),
+    ];
+    let filesystem_operations = [
+        OperationSchema::synchronous(&string_argument, HostValueType::I32),
+        OperationSchema::synchronous(&string_argument, HostValueType::String),
+        OperationSchema::synchronous(&string_argument, HostValueType::String),
+        OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
+        OperationSchema::synchronous(&string_argument, HostValueType::I32),
+        OperationSchema::synchronous(&string_argument, HostValueType::I32),
+        OperationSchema::synchronous(&two_string_arguments, HostValueType::I32),
+    ];
+    let process_operations = [OperationSchema::asynchronous(
+        &process_arguments,
+        HostValueType::I32,
+    )];
+    let mut bindings = Vec::with_capacity(addon_bindings.len() + 3);
+    bindings.extend_from_slice(addon_bindings);
+    if capabilities.allows(ProcessCapabilityMask::TERMINAL) {
+        bindings.push(CapabilityBinding::new(
+            TERMINAL_NAMESPACE,
+            TERMINAL_NAME,
+            RAW_TERMINAL_ABI_MAJOR,
+            0,
+            &raw_terminal_operations,
+        ));
+    }
+    if capabilities.allows(ProcessCapabilityMask::FILESYSTEM) {
+        bindings.push(CapabilityBinding::new(
+            TERMINAL_NAMESPACE,
+            FILESYSTEM_NAME,
+            FILESYSTEM_ABI_MAJOR,
+            0,
+            &filesystem_operations,
+        ));
+    }
+    if capabilities.allows(ProcessCapabilityMask::PROCESS) {
+        bindings.push(CapabilityBinding::new(
+            TERMINAL_NAMESPACE,
+            PROCESS_NAME,
+            PROCESS_ABI_MAJOR,
+            0,
+            &process_operations,
+        ));
+    }
+    Session::admit(artifact, profile, &bindings)
+}
+
 fn is_raw_terminal(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == TERMINAL_NAME
@@ -619,6 +775,48 @@ fn is_filesystem(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == FILESYSTEM_NAME
         && request.abi_major() == FILESYSTEM_ABI_MAJOR
+}
+
+fn is_process(request: HostRequestView<'_>) -> bool {
+    request.namespace() == TERMINAL_NAMESPACE
+        && request.name() == PROCESS_NAME
+        && request.abi_major() == PROCESS_ABI_MAJOR
+}
+
+fn copy_process_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
+    if !request.asynchronous() || request.operation() != 0 || request.arguments().len() != 2 {
+        return Err(ComputerError::InvalidProcessRequest);
+    }
+    let Some(HostValueView::String(path)) = request.arguments().get(0) else {
+        return Err(ComputerError::InvalidProcessRequest);
+    };
+    let Some(HostValueView::I32(capabilities)) = request.arguments().get(1) else {
+        return Err(ComputerError::InvalidProcessRequest);
+    };
+    Ok(TerminalRequest::Process {
+        id: request.id(),
+        operation: ProcessOperation::Run(path.to_vec(), capabilities),
+    })
+}
+
+fn process_filesystem_result(error: FileSystemError) -> ProcessResult {
+    match error {
+        FileSystemError::InvalidPath => ProcessResult::InvalidPath,
+        FileSystemError::NotFound => ProcessResult::NotFound,
+        FileSystemError::PermissionDenied | FileSystemError::ReadOnly => {
+            ProcessResult::PermissionDenied
+        }
+        FileSystemError::NotExecutable
+        | FileSystemError::IsDirectory
+        | FileSystemError::NotDirectory => ProcessResult::NotExecutable,
+        FileSystemError::QuotaExceeded => ProcessResult::QuotaExhausted,
+        FileSystemError::AlreadyExists
+        | FileSystemError::NotEmpty
+        | FileSystemError::StaleHandle
+        | FileSystemError::Busy
+        | FileSystemError::StorageFaulted
+        | FileSystemError::Closed => ProcessResult::IoFailed,
+    }
 }
 
 fn copy_filesystem_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
@@ -756,8 +954,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits, RomImage,
-        TerminalKey, TerminalKeyEvent, TerminalModifiers, VirtualPath, WorldFileSystemStore,
+        ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits, ProcessResult,
+        RomImage, TerminalKey, TerminalKeyEvent, TerminalModifiers, VirtualPath,
+        WorldFileSystemStore,
     };
 
     #[test]
@@ -809,6 +1008,46 @@ mod tests {
             ComputerError::NoActiveTerminalEvent,
             computer.terminal_finish_event().unwrap_err()
         );
+    }
+
+    #[test]
+    fn process_run_suspends_parent_until_child_halts() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        let child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let child_bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        filesystem
+            .write_file(&owner, &path("/home/child", &limits), &child_bytes, true)
+            .unwrap();
+        let parent = crate::execution::fixtures::process_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            0,
+        );
+        let mut computer =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+
+        assert_eq!(1, computer.sessions.len());
+        while computer.sessions.len() == 1 {
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                computer.advance(64, 64).unwrap()
+            );
+        }
+        assert_eq!(2, computer.sessions.len());
+        let halted = loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::Halted(value) => break value,
+                other => panic!("unexpected process outcome: {other:?}"),
+            }
+        };
+        assert_eq!(
+            Some(ComputerValue::I32(ProcessResult::Exited.code())),
+            halted
+        );
+        assert_eq!(1, computer.sessions.len());
     }
 
     #[test]

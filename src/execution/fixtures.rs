@@ -126,7 +126,7 @@ pub(super) fn recursive_pre_call_state() -> Box<[RegisterValue]> {
     Box::new([RegisterValue::Initialized(RuntimeValue::I32(7))])
 }
 
-pub(super) fn two_block_artifact(first_cost: u32, second_cost: u32) -> VerifiedArtifact {
+pub(crate) fn two_block_artifact(first_cost: u32, second_cost: u32) -> VerifiedArtifact {
     let mut first = (0..first_cost - 1)
         .map(|_| Instruction::Nop)
         .collect::<Vec<_>>();
@@ -1900,6 +1900,74 @@ pub(crate) fn raw_terminal_conformance_artifact(
             });
             artifact.manifest.required_capabilities = 1;
             artifact.manifest.maximum_host_requests = maximum_host_requests;
+            let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
+                unreachable!();
+            };
+            *flags = 1;
+            artifact.modules[0].functions[0].flags = 1;
+        },
+    )
+}
+
+pub(crate) fn process_run_artifact(path: &[u16], capabilities: i32) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![string, primitive(1), primitive(1)],
+        vec![Constant::I32(capabilities)],
+        path,
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 1,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: 0,
+                },
+                Instruction::CapabilityCallAsync {
+                    dst: 2,
+                    capability: 0,
+                    operation: 0,
+                    args: Box::new([0, 1]),
+                    resume_block: 1,
+                },
+            ],
+            vec![Instruction::Return { value: 2 }],
+        ],
+        |artifact| {
+            let mut bytes = artifact.bytes.to_vec();
+            let namespace_start = bytes.len();
+            bytes.extend_from_slice(b"compukter");
+            let namespace_end = bytes.len();
+            let name_start = bytes.len();
+            bytes.extend_from_slice(b"process");
+            let name_end = bytes.len();
+            artifact.bytes = Arc::from(bytes);
+            artifact.modules[0].strings[0] = ByteRange {
+                start: namespace_start,
+                end: namespace_end,
+            };
+            artifact.modules[0].strings[1] = ByteRange {
+                start: name_start,
+                end: name_end,
+            };
+            artifact.header.semantic_features = 0b1110;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 1,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
             let NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0] else {
                 unreachable!();
             };
