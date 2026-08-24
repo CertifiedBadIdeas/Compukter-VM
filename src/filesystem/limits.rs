@@ -32,6 +32,8 @@ pub struct FileSystemLimits {
     pub maximum_checkpoint_bytes: usize,
     pub maximum_recovery_records: usize,
     pub maximum_recovery_bytes: usize,
+    pub maximum_persistence_queue_records: usize,
+    pub maximum_persistence_queue_bytes: usize,
 }
 
 impl FileSystemLimits {
@@ -53,6 +55,8 @@ impl FileSystemLimits {
             maximum_checkpoint_bytes: 1 << 20,
             maximum_recovery_records: 1_024,
             maximum_recovery_bytes: 4 << 20,
+            maximum_persistence_queue_records: 64,
+            maximum_persistence_queue_bytes: 1 << 20,
         }
     }
 }
@@ -75,6 +79,8 @@ impl Default for FileSystemLimits {
             maximum_checkpoint_bytes: 128 << 20,
             maximum_recovery_records: 65_536,
             maximum_recovery_bytes: 512 << 20,
+            maximum_persistence_queue_records: 4_096,
+            maximum_persistence_queue_bytes: 64 << 20,
         }
     }
 }

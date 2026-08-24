@@ -21,9 +21,11 @@ use sha2::{Digest, Sha256};
 
 use super::quota::{MutationCost, QuotaLedger};
 use super::rom::RomEntryKind;
+use super::worker::{ComputerPersistence, PersistenceMutation};
 use super::{
-    FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits, HandleTable,
-    OpenFile, OpenMode, RomImage, RomImageError, VirtualPath,
+    CheckpointNode, FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits,
+    HandleTable, JournalOperation, OpenFile, OpenMode, RecoveredState, RomImage, RomImageError,
+    VirtualPath,
 };
 
 type Directory = BTreeMap<Box<str>, Node>;
@@ -163,6 +165,7 @@ pub struct ComputerFileSystem {
     quota: QuotaLedger,
     limits: FileSystemLimits,
     generation: u64,
+    persistence: Option<ComputerPersistence>,
 }
 
 impl ComputerFileSystem {
@@ -175,6 +178,7 @@ impl ComputerFileSystem {
             quota: QuotaLedger::new(&limits, 2),
             limits,
             generation: 0,
+            persistence: None,
         }
     }
 
@@ -216,6 +220,56 @@ impl ComputerFileSystem {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn attach_persistence(&mut self, persistence: ComputerPersistence) {
+        self.persistence = Some(persistence);
+    }
+
+    pub(crate) fn restore_recovered(
+        &mut self,
+        recovered: &RecoveredState,
+        objects: &BTreeMap<ObjectId, Arc<[u8]>>,
+    ) -> Result<(), FileSystemError> {
+        let logical_bytes = recovered.nodes().try_fold(0_u64, |total, node| {
+            node.object()
+                .map_or(Some(total), |(_, size)| total.checked_add(size))
+        });
+        let reservation = self.quota.reserve(MutationCost {
+            logical_bytes_added: logical_bytes.ok_or(FileSystemError::StorageFaulted)?,
+            nodes_added: u32::try_from(recovered.nodes().len())
+                .map_err(|_| FileSystemError::StorageFaulted)?,
+            ..MutationCost::default()
+        })?;
+        for node in recovered.nodes() {
+            let (_, components) = writable_path(node.path())?;
+            let (name, parent) = split_name(components)?;
+            let restored = match node {
+                CheckpointNode::Directory {
+                    node_generation, ..
+                } => Node::directory(*node_generation),
+                CheckpointNode::File {
+                    node_generation,
+                    logical_size,
+                    object_id,
+                    executable,
+                    ..
+                } => {
+                    let bytes = objects
+                        .get(object_id)
+                        .ok_or(FileSystemError::StorageFaulted)?;
+                    if bytes.len() as u64 != *logical_size {
+                        return Err(FileSystemError::StorageFaulted);
+                    }
+                    self.objects.replace(None, *object_id, Arc::clone(bytes));
+                    Node::file(*object_id, *logical_size, *node_generation, *executable)
+                }
+            };
+            find_directory_mut(&mut self.home, parent)?.insert(Box::from(name), restored);
+        }
+        self.quota.commit(reservation);
+        self.generation = recovered.generation();
+        Ok(())
     }
 
     pub fn logical_bytes(&self) -> u64 {
@@ -276,10 +330,18 @@ impl ComputerFileSystem {
             ..MutationCost::default()
         })?;
         let generation = self.next_generation()?;
+        let persistence = self.prepare_persistence(
+            generation,
+            None,
+            JournalOperation::create_directory(path.clone(), generation),
+        )?;
         find_directory_mut(self.directory_mut(mount), parent_components)?
             .insert(Box::from(name), Node::directory(generation));
         self.quota.commit(reservation);
         self.generation = generation;
+        if let Some(persistence) = persistence {
+            persistence.publish();
+        }
         Ok(())
     }
 
@@ -319,6 +381,11 @@ impl ComputerFileSystem {
         let generation = self.next_generation()?;
         let bytes: Arc<[u8]> = Arc::from(bytes);
         let object = object_id(&bytes);
+        let persistence = self.prepare_persistence(
+            generation,
+            Some((object, Arc::clone(&bytes))),
+            JournalOperation::put_file(path.clone(), generation, size, object, executable),
+        )?;
         find_directory_mut(self.directory_mut(mount), parent_components)?.insert(
             Box::from(name),
             Node::file(object, size, generation, executable),
@@ -328,6 +395,9 @@ impl ComputerFileSystem {
         self.quota.commit(reservation);
         self.quota.release(previous_size.saturating_sub(size), 0);
         self.generation = generation;
+        if let Some(persistence) = persistence {
+            persistence.publish();
+        }
         Ok(())
     }
 
@@ -437,12 +507,17 @@ impl ComputerFileSystem {
             return Err(FileSystemError::NotEmpty);
         }
         let generation = self.next_generation()?;
+        let persistence =
+            self.prepare_persistence(generation, None, JournalOperation::remove(path.clone()))?;
         find_directory_mut(self.directory_mut(mount), parent_components)?.remove(name);
         if let Some(object) = node.object_id() {
             self.objects.remove(object);
         }
         self.quota.release(node.metadata.logical_size, 1);
         self.generation = generation;
+        if let Some(persistence) = persistence {
+            persistence.publish();
+        }
         Ok(())
     }
 
@@ -493,6 +568,11 @@ impl ComputerFileSystem {
             self.check_directory_entry_limit(find_directory(directory, destination_parent)?.len())?;
         }
         let generation = self.next_generation()?;
+        let persistence = self.prepare_persistence(
+            generation,
+            None,
+            JournalOperation::rename(source.clone(), destination.clone(), replace),
+        )?;
         let mut node = find_directory_mut(self.directory_mut(source_mount), source_parent)?
             .remove(source_name)
             .expect("source was validated before mutation");
@@ -509,6 +589,9 @@ impl ComputerFileSystem {
             self.quota.release(existing.metadata.logical_size, 1);
         }
         self.generation = generation;
+        if let Some(persistence) = persistence {
+            persistence.publish();
+        }
         Ok(())
     }
 
@@ -544,6 +627,17 @@ impl ComputerFileSystem {
         let generation = self.next_generation()?;
         let bytes: Arc<[u8]> = bytes.into();
         let object = object_id(&bytes);
+        let persistence = self.prepare_persistence(
+            generation,
+            Some((object, Arc::clone(&bytes))),
+            JournalOperation::put_file(
+                path.clone(),
+                generation,
+                size,
+                object,
+                previous.metadata.executable,
+            ),
+        )?;
         *find_node_mut(self.directory_mut(mount), components)? =
             Node::file(object, size, generation, previous.metadata.executable);
         self.objects.replace(Some(previous_object), object, bytes);
@@ -551,6 +645,9 @@ impl ComputerFileSystem {
         self.quota
             .release(previous.metadata.logical_size.saturating_sub(size), 0);
         self.generation = generation;
+        if let Some(persistence) = persistence {
+            persistence.publish();
+        }
         Ok(())
     }
 
@@ -593,6 +690,18 @@ impl ComputerFileSystem {
         (current < self.limits.maximum_directory_entries as usize)
             .then_some(())
             .ok_or(FileSystemError::QuotaExceeded)
+    }
+
+    fn prepare_persistence(
+        &self,
+        generation: u64,
+        object: Option<(ObjectId, Arc<[u8]>)>,
+        operation: JournalOperation,
+    ) -> Result<Option<PersistenceMutation>, FileSystemError> {
+        self.persistence
+            .as_ref()
+            .map(|persistence| persistence.prepare(generation, object, operation))
+            .transpose()
     }
 }
 

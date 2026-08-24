@@ -82,6 +82,17 @@ impl CheckpointNode {
         matches!(self, Self::Directory { .. })
     }
 
+    pub(crate) fn object(&self) -> Option<([u8; 32], u64)> {
+        match self {
+            Self::File {
+                object_id,
+                logical_size,
+                ..
+            } => Some((*object_id, *logical_size)),
+            Self::Directory { .. } => None,
+        }
+    }
+
     pub(crate) fn with_path(&self, path: VirtualPath, generation: u64) -> Self {
         match self {
             Self::Directory { .. } => Self::directory(path, generation),
