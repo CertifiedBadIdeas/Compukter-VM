@@ -251,6 +251,8 @@ fn borrowed_logical_cells_follow_visible_row_order_after_scroll() {
 fn stable_key_and_atomic_text_events_merge_in_fifo_order() {
     assert_eq!(13, TerminalKey::Enter.code());
     assert_eq!(TerminalKey::Enter, TerminalKey::try_from(13).unwrap());
+    assert_eq!(TerminalKey::S, TerminalKey::try_from(83).unwrap());
+    assert_eq!(TerminalKey::X, TerminalKey::try_from(88).unwrap());
     assert!(TerminalKey::try_from(u16::MAX).is_err());
     let mut terminal = TerminalDevice::with_config(TerminalConfig {
         input: TerminalInputLimits::new(3, 4).unwrap(),
