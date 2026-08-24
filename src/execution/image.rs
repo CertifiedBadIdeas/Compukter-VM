@@ -291,6 +291,12 @@ pub(super) enum ResolvedInstruction {
         target: usize,
         args: Box<[u16]>,
     },
+    CallSuspend {
+        dst: u16,
+        target: usize,
+        args: Box<[u16]>,
+        resume_block: usize,
+    },
     CapabilityCallSync {
         dst: u16,
         capability: u32,
@@ -1714,6 +1720,24 @@ fn resolve_instruction(
                 dst: *dst,
                 target,
                 args: args.clone(),
+            }
+        }
+        Instruction::CallSuspend {
+            dst,
+            function_ref,
+            args,
+            resume_block,
+        } => {
+            let key = resolve_function(artifact, module, *function_ref)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let target = resolution.function_offsets[key.module as usize]
+                .checked_add(key.function as usize)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            ResolvedInstruction::CallSuspend {
+                dst: *dst,
+                target,
+                args: args.clone(),
+                resume_block: block(*resume_block)?,
             }
         }
         Instruction::CapabilityCallSync {

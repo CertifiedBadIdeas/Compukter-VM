@@ -97,6 +97,142 @@ pub(super) fn nested_call_artifact() -> VerifiedArtifact {
     })
 }
 
+pub(super) fn suspend_value_call_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let i32_type = primitive(1);
+        artifact.header.semantic_features = 0b10;
+        artifact.modules[0].types = vec![
+            NominalType::Function {
+                name: 1,
+                flags: 1,
+                result: i32_type,
+                parameters: Vec::new(),
+            },
+            NominalType::Function {
+                name: 1,
+                flags: 1,
+                result: i32_type,
+                parameters: Vec::new(),
+            },
+        ];
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].constants = vec![Constant::I32(42)];
+        let mut entry = function(0, 0, vec![i32_type], 0);
+        entry.flags = 1;
+        entry.block_count = 2;
+        let mut child = function(1, 0, vec![i32_type], 2);
+        child.flags = 1;
+        artifact.modules[0].functions = vec![entry, child];
+        artifact.modules[0].declared_functions = 2;
+        let programs = [
+            (
+                FunctionId(0),
+                vec![Instruction::CallSuspend {
+                    dst: 0,
+                    function_ref: 1,
+                    args: Box::new([]),
+                    resume_block: 1,
+                }],
+            ),
+            (FunctionId(0), vec![Instruction::Return { value: 0 }]),
+            (
+                FunctionId(1),
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::Return { value: 0 },
+                ],
+            ),
+        ];
+        let mut maximum_block_cost = 0;
+        artifact.modules[0].blocks.clear();
+        artifact.modules[0].code.clear();
+        for (block_id, (owner, instructions)) in programs.into_iter().enumerate() {
+            let fixed_cost = instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum();
+            maximum_block_cost = maximum_block_cost.max(fixed_cost);
+            artifact.modules[0].blocks.push(Block {
+                owner_function: owner,
+                code_record: BlockId(block_id as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: fixed_cost,
+                flags: 0,
+            });
+            artifact.modules[0].code.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: instructions.into_boxed_slice(),
+                fixed_cost,
+            });
+        }
+        artifact.manifest.maximum_block_cost = maximum_block_cost;
+        artifact.manifest.minimum_slice_cost = maximum_block_cost;
+        configure_stack(artifact, 1, 2);
+    })
+}
+
+pub(super) fn recursive_suspend_artifact(maximum_call_depth: u32) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let i32_type = primitive(1);
+        artifact.header.semantic_features = 0b10;
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 1,
+            result: primitive(0),
+            parameters: Vec::new(),
+        };
+        artifact.modules[0].constants = vec![Constant::I32(7)];
+        let function = &mut artifact.modules[0].functions[0];
+        function.flags = 1;
+        function.register_count = 1;
+        function.registers = vec![i32_type];
+        function.block_count = 2;
+        let programs = [
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::CallSuspend {
+                    dst: u16::MAX,
+                    function_ref: 0,
+                    args: Box::new([]),
+                    resume_block: 1,
+                },
+            ],
+            vec![Instruction::Return { value: u16::MAX }],
+        ];
+        let mut maximum_block_cost = 0;
+        artifact.modules[0].blocks.clear();
+        artifact.modules[0].code.clear();
+        for (block_id, instructions) in programs.into_iter().enumerate() {
+            let fixed_cost = instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum();
+            maximum_block_cost = maximum_block_cost.max(fixed_cost);
+            artifact.modules[0].blocks.push(Block {
+                owner_function: FunctionId(0),
+                code_record: BlockId(block_id as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: fixed_cost,
+                flags: 0,
+            });
+            artifact.modules[0].code.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: instructions.into_boxed_slice(),
+                fixed_cost,
+            });
+        }
+        artifact.manifest.maximum_block_cost = maximum_block_cost;
+        artifact.manifest.minimum_slice_cost = maximum_block_cost;
+        configure_stack(artifact, 1, maximum_call_depth);
+    })
+}
+
 pub(super) fn recursive_artifact(maximum_call_depth: u32) -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let i32_type = primitive(1);
@@ -414,6 +550,94 @@ pub(super) fn unit_capability_loop_artifact(maximum_requests: u32) -> VerifiedAr
         artifact.modules[0].code[0].fixed_cost = cost;
         artifact.manifest.maximum_block_cost = cost;
         artifact.manifest.minimum_slice_cost = cost;
+    })
+}
+
+pub(super) fn suspend_scalar_capability_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let i32_type = primitive(1);
+        artifact.header.semantic_features = 0b110;
+        artifact.capabilities.push(crate::artifact::Capability {
+            namespace: 0,
+            name: 1,
+            abi_major: 1,
+            minimum_abi_minor: 0,
+            flags: 1,
+            operation_count: 1,
+        });
+        artifact.manifest.required_capabilities = 1;
+        artifact.manifest.maximum_host_requests = 1;
+        artifact.modules[0].types = vec![
+            NominalType::Function {
+                name: 1,
+                flags: 1,
+                result: i32_type,
+                parameters: Vec::new(),
+            },
+            NominalType::Function {
+                name: 1,
+                flags: 1,
+                result: i32_type,
+                parameters: Vec::new(),
+            },
+        ];
+        artifact.modules[0].declared_types = 2;
+        let mut entry = function(0, 0, vec![i32_type], 0);
+        entry.flags = 1;
+        entry.block_count = 2;
+        let mut child = function(1, 0, vec![i32_type], 2);
+        child.flags = 1;
+        child.block_count = 2;
+        artifact.modules[0].functions = vec![entry, child];
+        artifact.modules[0].declared_functions = 2;
+        let programs = [
+            (
+                FunctionId(0),
+                vec![Instruction::CallSuspend {
+                    dst: 0,
+                    function_ref: 1,
+                    args: Box::new([]),
+                    resume_block: 1,
+                }],
+            ),
+            (FunctionId(0), vec![Instruction::Return { value: 0 }]),
+            (
+                FunctionId(1),
+                vec![Instruction::CapabilityCallAsync {
+                    dst: 0,
+                    capability: 0,
+                    operation: 0,
+                    args: Box::new([]),
+                    resume_block: 3,
+                }],
+            ),
+            (FunctionId(1), vec![Instruction::Return { value: 0 }]),
+        ];
+        let mut maximum_block_cost = 0;
+        artifact.modules[0].blocks.clear();
+        artifact.modules[0].code.clear();
+        for (block_id, (owner, instructions)) in programs.into_iter().enumerate() {
+            let fixed_cost = instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum();
+            maximum_block_cost = maximum_block_cost.max(fixed_cost);
+            artifact.modules[0].blocks.push(Block {
+                owner_function: owner,
+                code_record: BlockId(block_id as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: fixed_cost,
+                flags: 0,
+            });
+            artifact.modules[0].code.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: instructions.into_boxed_slice(),
+                fixed_cost,
+            });
+        }
+        artifact.manifest.maximum_block_cost = maximum_block_cost;
+        artifact.manifest.minimum_slice_cost = maximum_block_cost;
+        configure_stack(artifact, 1, 2);
     })
 }
 

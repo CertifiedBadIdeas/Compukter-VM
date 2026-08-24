@@ -25,6 +25,7 @@ pub(super) struct Frame {
     pub(super) function: usize,
     pub(super) block: usize,
     pub(super) instruction: usize,
+    pub(super) caller_block: usize,
     pub(super) caller_instruction: usize,
     pub(super) destination: u16,
 }
@@ -41,6 +42,7 @@ impl Frame {
         function: usize::MAX,
         block: usize::MAX,
         instruction: 0,
+        caller_block: usize::MAX,
         caller_instruction: 0,
         destination: u16::MAX,
     };
@@ -51,6 +53,7 @@ impl Frame {
             function,
             block: 0,
             instruction: 0,
+            caller_block: usize::MAX,
             caller_instruction: 0,
             destination: u16::MAX,
         }
@@ -232,6 +235,7 @@ impl Machine {
             function: entry_index,
             block: entry.first_block,
             instruction: 0,
+            caller_block: usize::MAX,
             caller_instruction: 0,
             destination: u16::MAX,
         };
@@ -366,7 +370,8 @@ impl Machine {
                             return Ok(outcome);
                         }
 
-                        let continuation = self.frames[frame_index].caller_instruction;
+                        let continuation_block = self.frames[frame_index].caller_block;
+                        let continuation_instruction = self.frames[frame_index].caller_instruction;
                         let destination = self.frames[frame_index].destination;
                         if (destination == u16::MAX) != returned.is_none() {
                             return Ok(self.fault(VmFault::InvalidValueType));
@@ -380,7 +385,8 @@ impl Machine {
                         self.frames[frame_index] = Frame::EMPTY;
                         self.frame_depth = frame_index;
                         let caller_index = frame_index - 1;
-                        self.frames[caller_index].instruction = continuation;
+                        self.frames[caller_index].block = continuation_block;
+                        self.frames[caller_index].instruction = continuation_instruction;
                         if let Some(value) = returned {
                             let destination_index = caller_index
                                 .checked_mul(width)
@@ -393,8 +399,26 @@ impl Machine {
                         }
                         break;
                     }
-                    ResolvedInstruction::CallDirect { dst, target, args } => {
-                        let Some(target_function) = self.image.function(*target) else {
+                    ResolvedInstruction::CallDirect { .. }
+                    | ResolvedInstruction::CallSuspend { .. } => {
+                        let (dst, target, args, caller_block, caller_instruction) =
+                            match instruction {
+                                ResolvedInstruction::CallDirect { dst, target, args } => (
+                                    *dst,
+                                    *target,
+                                    args.as_ref(),
+                                    block_index,
+                                    instruction_index + 1,
+                                ),
+                                ResolvedInstruction::CallSuspend {
+                                    dst,
+                                    target,
+                                    args,
+                                    resume_block,
+                                } => (*dst, *target, args.as_ref(), *resume_block, 0),
+                                _ => unreachable!(),
+                            };
+                        let Some(target_function) = self.image.function(target) else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));
                         };
                         if target_function.parameter_count != args.len() {
@@ -434,11 +458,12 @@ impl Machine {
                                 RegisterValue::Initialized(value);
                         }
                         self.frames[callee_index] = Frame {
-                            function: *target,
+                            function: target,
                             block: target_function.first_block,
                             instruction: 0,
-                            caller_instruction: instruction_index + 1,
-                            destination: *dst,
+                            caller_block,
+                            caller_instruction,
+                            destination: dst,
                         };
                         self.frame_depth += 1;
                         self.maximum_observed_frame_depth =
