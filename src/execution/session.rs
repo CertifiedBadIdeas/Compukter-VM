@@ -344,7 +344,16 @@ impl Session {
         request_id: RequestId,
         response: HostResponse<'_>,
     ) -> Result<(), ResumeError> {
-        self.resume(request_id, response)?;
+        self.resume_internal_for(TaskId::ROOT, request_id, response)
+    }
+
+    pub(crate) fn resume_internal_for(
+        &mut self,
+        task: TaskId,
+        request_id: RequestId,
+        response: HostResponse<'_>,
+    ) -> Result<(), ResumeError> {
+        self.resume_for(task, request_id, response)?;
         self.published_requests = self
             .published_requests
             .checked_sub(1)

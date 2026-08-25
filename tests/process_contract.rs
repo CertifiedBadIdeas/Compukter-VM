@@ -16,50 +16,71 @@
  * limitations under the License.
  */
 
-use compukter_vm::{ProcessCapabilityMask, ProcessLimits, ProcessResult};
+use compukter_vm::{ProcessArgumentLimits, ProcessCompletion, ProcessFailureReason, ProcessLimits};
 
 #[test]
-fn process_results_have_stable_v1_codes() {
-    let results = [
-        ProcessResult::Exited,
-        ProcessResult::InvalidCapabilities,
-        ProcessResult::DepthLimit,
-        ProcessResult::StartLimit,
-        ProcessResult::InvalidPath,
-        ProcessResult::NotFound,
-        ProcessResult::PermissionDenied,
-        ProcessResult::NotExecutable,
-        ProcessResult::InvalidArtifact,
-        ProcessResult::AdmissionFailed,
-        ProcessResult::StartFailed,
-        ProcessResult::AllocationExhausted,
-        ProcessResult::QuotaExhausted,
-        ProcessResult::Trapped,
-        ProcessResult::Faulted,
-        ProcessResult::HostFailed,
-        ProcessResult::IoFailed,
+fn process_v2_failure_reasons_have_stable_negative_statuses() {
+    let reasons = [
+        ProcessFailureReason::InvalidPath,
+        ProcessFailureReason::NotFound,
+        ProcessFailureReason::AccessDenied,
+        ProcessFailureReason::NotExecutable,
+        ProcessFailureReason::InvalidProgram,
+        ProcessFailureReason::Incompatible,
+        ProcessFailureReason::LimitExceeded,
+        ProcessFailureReason::Trapped,
+        ProcessFailureReason::VmFault,
+        ProcessFailureReason::HostFailure,
+        ProcessFailureReason::IoFailure,
     ];
 
-    for (code, result) in results.into_iter().enumerate() {
-        assert_eq!(result.code(), code as i32);
+    for (index, reason) in reasons.into_iter().enumerate() {
+        assert_eq!(reason.code(), (index + 1) as i32);
+        assert_eq!(reason.status(), -((index + 1) as i32));
     }
 }
 
 #[test]
-fn process_capability_masks_only_delegate_known_subsets() {
-    let parent = ProcessCapabilityMask::new(0b111, 0b111).unwrap();
-
-    assert_eq!(parent.delegate(0b011).unwrap().bits(), 0b011);
-    assert!(parent.delegate(0b1000).is_err());
-    assert!(parent.delegate(-1).is_err());
-    assert!(ProcessCapabilityMask::new(0b1000, 0b111).is_err());
+fn process_v2_completion_preserves_every_exit_code() {
+    for code in 0_u8..=u8::MAX {
+        assert_eq!(ProcessCompletion::Exited(code).status(), i32::from(code));
+    }
+    assert_eq!(
+        ProcessCompletion::Failed {
+            reason: ProcessFailureReason::NotFound,
+            diagnostic: "/home/nope".encode_utf16().collect(),
+        }
+        .status(),
+        -2,
+    );
 }
 
 #[test]
-fn process_limits_reject_zero_values() {
-    assert!(ProcessLimits::new(0, 1, 1, 1).is_err());
-    assert!(ProcessLimits::new(1, 0, 1, 1).is_err());
-    assert!(ProcessLimits::new(1, 1, 0, 1).is_err());
-    assert!(ProcessLimits::new(1, 1, 1, 0).is_err());
-    assert!(ProcessLimits::new(3, 16, 3 * 64 * 1024, 3 * 64 * 1024).is_ok());
+fn process_v2_limits_reject_every_zero_bound() {
+    let valid = [1, 1, 1, 1, 1];
+    for zero in 0..valid.len() {
+        let mut values = valid;
+        values[zero] = 0;
+        assert!(ProcessLimits::new(
+            values[0] as u32,
+            values[1] as u64,
+            values[2] as u64,
+            values[3] as u64,
+            ProcessArgumentLimits::new(1, 1, 1).unwrap(),
+            values[4],
+        )
+        .is_err());
+    }
+    assert!(ProcessArgumentLimits::new(0, 1, 1).is_err());
+    assert!(ProcessArgumentLimits::new(1, 0, 1).is_err());
+    assert!(ProcessArgumentLimits::new(1, 1, 0).is_err());
+    assert!(ProcessLimits::new(
+        3,
+        16,
+        3 * 64 * 1024,
+        3 * 64 * 1024,
+        ProcessArgumentLimits::new(8, 32, 128).unwrap(),
+        96,
+    )
+    .is_ok());
 }
