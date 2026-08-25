@@ -425,7 +425,6 @@ fn verify_instruction(
                 | Instruction::Yield { .. }
                 | Instruction::Sleep { .. }
                 | Instruction::CoroutineJoin { .. }
-                | Instruction::CapabilityCallAsync { .. }
         )
     {
         return Err(failure(
