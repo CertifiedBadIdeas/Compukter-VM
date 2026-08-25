@@ -135,6 +135,25 @@ pub(super) struct ResolvedCapability {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TaskId(u32);
+
+impl TaskId {
+    pub const ROOT: Self = Self(1);
+
+    pub const fn new(value: u32) -> Option<Self> {
+        if value == 0 {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RequestId(u64);
 
 impl RequestId {
@@ -227,6 +246,7 @@ pub enum HostResponse<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeError {
     NoPendingRequest,
+    WrongTask,
     WrongRequestId,
     WrongResponseType,
     ResponseTooLarge,
@@ -280,6 +300,7 @@ impl<'a> HostArguments<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct HostRequestView<'a> {
     pub(super) id: RequestId,
+    pub(super) task: TaskId,
     pub(super) capability: &'a ResolvedCapability,
     pub(super) operation: u32,
     pub(super) arguments: HostArguments<'a>,
@@ -288,6 +309,9 @@ pub struct HostRequestView<'a> {
 impl<'a> HostRequestView<'a> {
     pub const fn id(self) -> RequestId {
         self.id
+    }
+    pub const fn task_id(self) -> TaskId {
+        self.task
     }
     pub fn namespace(self) -> &'a str {
         &self.capability.namespace
@@ -319,6 +343,7 @@ impl<'a> HostRequestView<'a> {
 impl PartialEq for HostRequestView<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+            && self.task == other.task
             && self.namespace() == other.namespace()
             && self.name() == other.name()
             && self.abi_major() == other.abi_major()

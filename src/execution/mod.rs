@@ -18,7 +18,7 @@ pub use host::{
     AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
     ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse,
     HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema,
-    QuotaExhaustion, QuotaKind, RequestId, ResumeError,
+    QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
 };
 pub use session::Session;
 

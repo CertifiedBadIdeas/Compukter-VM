@@ -4,7 +4,7 @@ use super::{
     host::{
         AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue, ExecutionProfile,
         HostFailure, HostFailureKind, HostResponse, HostValueInput, HostValueType, HostValueView,
-        OperationSchema, QuotaKind, RequestId, ResumeError,
+        OperationSchema, QuotaKind, RequestId, ResumeError, TaskId,
     },
     session::Session,
 };
@@ -466,6 +466,60 @@ fn waiting_poll_is_stable_and_invalid_responses_are_atomic() {
 }
 
 #[test]
+fn task_owned_request_rejects_the_wrong_task_and_resumes_the_owner_once() {
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+    let mut session = Session::admit(
+        fixtures::capability_artifact(true, true, 1, 0),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+
+    let request = match session.advance(64, 0).unwrap() {
+        AdvanceOutcome::HostRequest(request) => request,
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    assert_eq!(TaskId::ROOT, request.task_id());
+    let request_id = request.id();
+    let other = TaskId::new(2).unwrap();
+    assert_eq!(
+        ResumeError::WrongTask,
+        session
+            .resume_for(
+                other,
+                request_id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap_err(),
+    );
+    assert!(matches!(
+        session.advance(1, 1).unwrap(),
+        AdvanceOutcome::HostRequest(request)
+            if request.task_id() == TaskId::ROOT && request.id() == request_id
+    ));
+
+    session
+        .resume_for(
+            TaskId::ROOT,
+            request_id,
+            HostResponse::Success(HostValueInput::Unit),
+        )
+        .unwrap();
+    assert_eq!(
+        ResumeError::NoPendingRequest,
+        session
+            .resume_for(
+                TaskId::ROOT,
+                request_id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap_err(),
+    );
+}
+
+#[test]
 fn request_ids_are_monotonic_and_overflow_faults_before_publication() {
     let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
     let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
@@ -534,11 +588,16 @@ fn explicit_host_failure_is_a_stable_terminal_outcome() {
     .unwrap();
     session.start(&[]).unwrap();
     let id = match session.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(r) => r.id(),
+        AdvanceOutcome::HostRequest(request) => {
+            assert_eq!(TaskId::ROOT, request.task_id());
+            request.id()
+        }
         other => panic!("{other:?}"),
     };
     let failure = HostFailure::new(HostFailureKind::Unavailable, 17);
-    session.resume(id, HostResponse::Failure(failure)).unwrap();
+    session
+        .resume_for(TaskId::ROOT, id, HostResponse::Failure(failure))
+        .unwrap();
     assert_eq!(
         AdvanceOutcome::HostFailed(failure),
         session.advance(64, 0).unwrap()
@@ -546,6 +605,12 @@ fn explicit_host_failure_is_a_stable_terminal_outcome() {
     assert_eq!(
         AdvanceOutcome::HostFailed(failure),
         session.advance(1, 1).unwrap()
+    );
+    assert_eq!(
+        ResumeError::NoPendingRequest,
+        session
+            .resume_for(TaskId::ROOT, id, HostResponse::Failure(failure))
+            .unwrap_err(),
     );
 }
 

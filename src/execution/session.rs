@@ -7,6 +7,7 @@ use super::{
         ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostRequestView,
         HostResponse, HostValueInput, HostValueSlot, HostValueView, ManagedAllocationFailure,
         QuotaExhaustion, QuotaKind, RequestId, ResolvedCapability, ResolvedOperation, ResumeError,
+        TaskId,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::Machine,
@@ -39,6 +40,7 @@ pub struct Session {
 #[derive(Clone, Copy, Debug)]
 struct PendingRequest {
     id: RequestId,
+    task: TaskId,
     capability: u32,
     operation: u32,
 }
@@ -46,6 +48,7 @@ struct PendingRequest {
 #[derive(Clone, Copy, Debug)]
 struct PreparingRequest {
     id: RequestId,
+    task: TaskId,
     capability: u32,
     operation: u32,
     argument: usize,
@@ -249,10 +252,22 @@ impl Session {
         request_id: RequestId,
         response: HostResponse<'_>,
     ) -> Result<(), ResumeError> {
+        self.resume_for(TaskId::ROOT, request_id, response)
+    }
+
+    pub fn resume_for(
+        &mut self,
+        task: TaskId,
+        request_id: RequestId,
+        response: HostResponse<'_>,
+    ) -> Result<(), ResumeError> {
         if self.terminal.is_some() {
             return Err(ResumeError::NoPendingRequest);
         }
         let pending = self.pending_request.ok_or(ResumeError::NoPendingRequest)?;
+        if task != pending.task {
+            return Err(ResumeError::WrongTask);
+        }
         if request_id != pending.id {
             return Err(ResumeError::WrongRequestId);
         }
@@ -422,6 +437,7 @@ impl Session {
         if contains_string && outbound_used != 0 {
             self.preparing_request = Some(PreparingRequest {
                 id,
+                task: TaskId::ROOT,
                 capability,
                 operation,
                 argument: 0,
@@ -429,12 +445,13 @@ impl Session {
             });
             return Ok(AdvanceOutcome::SliceExhausted);
         }
-        self.publish_prepared_request(id, next_request_id, capability, operation)
+        self.publish_prepared_request(id, TaskId::ROOT, next_request_id, capability, operation)
     }
 
     fn publish_prepared_request(
         &mut self,
         id: RequestId,
+        task: TaskId,
         next_request_id: u64,
         capability: u32,
         operation: u32,
@@ -442,6 +459,7 @@ impl Session {
         self.next_request_id = next_request_id;
         self.pending_request = Some(PendingRequest {
             id,
+            task,
             capability,
             operation,
         });
@@ -529,7 +547,13 @@ impl Session {
         }
         self.preparing_request = None;
         let next_request_id = state.id.get().checked_add(1).ok_or(RunError::NotRunnable)?;
-        self.publish_prepared_request(state.id, next_request_id, state.capability, state.operation)
+        self.publish_prepared_request(
+            state.id,
+            state.task,
+            next_request_id,
+            state.capability,
+            state.operation,
+        )
     }
 
     fn request_outcome(&self) -> Result<AdvanceOutcome<'_>, super::error::VmFault> {
@@ -543,6 +567,7 @@ impl Session {
             .ok_or(super::error::VmFault::InvalidResolvedId)?;
         Ok(AdvanceOutcome::HostRequest(HostRequestView {
             id: pending.id,
+            task: pending.task,
             capability,
             operation: pending.operation,
             arguments: HostArguments {
