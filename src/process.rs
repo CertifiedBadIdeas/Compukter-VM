@@ -90,73 +90,79 @@ impl OwnedOperationSchema {
     }
 }
 
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProcessResult {
-    Exited = 0,
-    InvalidCapabilities = 1,
-    DepthLimit = 2,
-    StartLimit = 3,
-    InvalidPath = 4,
-    NotFound = 5,
-    PermissionDenied = 6,
-    NotExecutable = 7,
-    InvalidArtifact = 8,
-    AdmissionFailed = 9,
-    StartFailed = 10,
-    AllocationExhausted = 11,
-    QuotaExhausted = 12,
-    Trapped = 13,
-    Faulted = 14,
-    HostFailed = 15,
-    IoFailed = 16,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProcessCompletion {
+    Exited(u8),
+    Failed {
+        reason: ProcessFailureReason,
+        diagnostic: Box<[u16]>,
+    },
 }
 
-impl ProcessResult {
+impl ProcessCompletion {
+    pub const fn status(&self) -> i32 {
+        match self {
+            Self::Exited(code) => *code as i32,
+            Self::Failed { reason, .. } => reason.status(),
+        }
+    }
+}
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessFailureReason {
+    InvalidPath = 1,
+    NotFound = 2,
+    AccessDenied = 3,
+    NotExecutable = 4,
+    InvalidProgram = 5,
+    Incompatible = 6,
+    LimitExceeded = 7,
+    Trapped = 8,
+    VmFault = 9,
+    HostFailure = 10,
+    IoFailure = 11,
+}
+
+impl ProcessFailureReason {
     pub const fn code(self) -> i32 {
         self as i32
+    }
+
+    pub const fn status(self) -> i32 {
+        -self.code()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessContractError {
-    InvalidCapabilities,
     InvalidLimits,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProcessCapabilityMask(u32);
+pub struct ProcessArgumentLimits {
+    pub maximum_count: u32,
+    pub maximum_utf16_code_units: usize,
+    pub maximum_total_utf16_code_units: usize,
+}
 
-impl ProcessCapabilityMask {
-    pub const TERMINAL: u32 = 1 << 0;
-    pub const FILESYSTEM: u32 = 1 << 1;
-    pub const PROCESS: u32 = 1 << 2;
-    pub const COMPILER: u32 = 1 << 3;
-    pub const STANDARD: u32 = Self::TERMINAL | Self::FILESYSTEM | Self::PROCESS | Self::COMPILER;
-
-    pub fn new(requested: i32, available: u32) -> Result<Self, ProcessContractError> {
-        let requested =
-            u32::try_from(requested).map_err(|_| ProcessContractError::InvalidCapabilities)?;
-        if requested & !available != 0 {
-            return Err(ProcessContractError::InvalidCapabilities);
+impl ProcessArgumentLimits {
+    pub const fn new(
+        maximum_count: u32,
+        maximum_utf16_code_units: usize,
+        maximum_total_utf16_code_units: usize,
+    ) -> Result<Self, ProcessContractError> {
+        if maximum_count == 0
+            || maximum_utf16_code_units == 0
+            || maximum_total_utf16_code_units == 0
+        {
+            return Err(ProcessContractError::InvalidLimits);
         }
-        Ok(Self(requested))
-    }
-
-    pub(crate) const fn from_bits(bits: u32) -> Self {
-        Self(bits)
-    }
-
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-
-    pub const fn allows(self, requested: u32) -> bool {
-        requested & !self.0 == 0
-    }
-
-    pub fn delegate(self, requested: i32) -> Result<Self, ProcessContractError> {
-        Self::new(requested, self.0)
+        Ok(Self {
+            maximum_count,
+            maximum_utf16_code_units,
+            maximum_total_utf16_code_units,
+        })
     }
 }
 
@@ -166,6 +172,8 @@ pub struct ProcessLimits {
     pub maximum_starts: u64,
     pub maximum_aggregate_heap_bytes: u64,
     pub maximum_aggregate_frame_storage_bytes: u64,
+    pub arguments: ProcessArgumentLimits,
+    pub maximum_diagnostic_utf16_code_units: usize,
 }
 
 impl ProcessLimits {
@@ -174,11 +182,14 @@ impl ProcessLimits {
         maximum_starts: u64,
         maximum_aggregate_heap_bytes: u64,
         maximum_aggregate_frame_storage_bytes: u64,
+        arguments: ProcessArgumentLimits,
+        maximum_diagnostic_utf16_code_units: usize,
     ) -> Result<Self, ProcessContractError> {
         if maximum_depth == 0
             || maximum_starts == 0
             || maximum_aggregate_heap_bytes == 0
             || maximum_aggregate_frame_storage_bytes == 0
+            || maximum_diagnostic_utf16_code_units == 0
         {
             return Err(ProcessContractError::InvalidLimits);
         }
@@ -187,12 +198,23 @@ impl ProcessLimits {
             maximum_starts,
             maximum_aggregate_heap_bytes,
             maximum_aggregate_frame_storage_bytes,
+            arguments,
+            maximum_diagnostic_utf16_code_units,
         })
     }
 }
 
 impl Default for ProcessLimits {
     fn default() -> Self {
-        Self::new(8, 4_096, 8 << 20, 8 << 20).expect("fixed process limits are valid")
+        Self::new(
+            8,
+            4_096,
+            8 << 20,
+            8 << 20,
+            ProcessArgumentLimits::new(256, 16_384, 65_536)
+                .expect("fixed argument limits are valid"),
+            4_096,
+        )
+        .expect("fixed process limits are valid")
     }
 }

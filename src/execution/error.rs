@@ -97,6 +97,7 @@ pub enum GuestTrap {
     NullReference,
     IndexOutOfBounds,
     ClassCast,
+    InvalidExitCode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

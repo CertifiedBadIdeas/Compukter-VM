@@ -79,7 +79,10 @@ pub use filesystem::{
     VirtualPath, WorldFileSystemStore,
 };
 pub use limits::ArtifactLimits;
-pub use process::{ProcessCapabilityMask, ProcessContractError, ProcessLimits, ProcessResult};
+pub use process::{
+    ProcessArgumentLimits, ProcessCompletion, ProcessContractError, ProcessFailureReason,
+    ProcessLimits,
+};
 pub use terminal::{
     TerminalCell, TerminalChange, TerminalCommit, TerminalConfig, TerminalDelta, TerminalDevice,
     TerminalError, TerminalInputError, TerminalInputEvent, TerminalInputLimits, TerminalKey,
