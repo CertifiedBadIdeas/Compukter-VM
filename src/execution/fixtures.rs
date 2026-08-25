@@ -940,8 +940,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 2,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(7))),
             digest: [
-                210, 97, 93, 138, 111, 54, 126, 53, 10, 37, 45, 198, 192, 27, 212, 174, 59, 165,
-                154, 74, 150, 26, 207, 5, 120, 25, 252, 251, 187, 38, 243, 161,
+                151, 108, 90, 222, 201, 3, 54, 117, 188, 106, 18, 217, 130, 135, 42, 203, 128, 100,
+                20, 138, 15, 232, 16, 80, 214, 121, 142, 153, 176, 26, 7, 178,
             ],
             fixed_cost: 2,
         },
@@ -952,8 +952,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 64,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(10))),
             digest: [
-                60, 68, 50, 190, 195, 34, 207, 80, 192, 210, 247, 156, 55, 119, 238, 51, 173, 210,
-                119, 78, 5, 155, 156, 243, 49, 36, 233, 82, 96, 197, 162, 114,
+                244, 209, 2, 74, 20, 210, 35, 144, 0, 113, 50, 177, 169, 80, 239, 240, 172, 42, 89,
+                92, 112, 31, 70, 210, 58, 92, 218, 58, 52, 156, 181, 249,
             ],
             fixed_cost: 3,
         },
@@ -964,8 +964,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 64,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(20))),
             digest: [
-                76, 169, 238, 254, 205, 63, 208, 233, 222, 142, 242, 6, 127, 193, 101, 114, 49, 19,
-                172, 203, 186, 236, 88, 43, 75, 42, 148, 32, 187, 206, 13, 20,
+                211, 66, 210, 200, 71, 142, 65, 251, 248, 217, 13, 67, 251, 243, 197, 163, 196, 91,
+                239, 129, 28, 37, 192, 254, 217, 187, 60, 196, 38, 164, 238, 204,
             ],
             fixed_cost: 5,
         },
@@ -976,8 +976,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 128,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(42))),
             digest: [
-                93, 211, 170, 141, 159, 215, 165, 184, 12, 97, 91, 119, 9, 235, 35, 229, 40, 117,
-                32, 8, 215, 140, 224, 81, 73, 12, 173, 251, 156, 94, 20, 157,
+                201, 119, 75, 39, 178, 10, 57, 219, 215, 36, 205, 152, 146, 42, 127, 132, 68, 81,
+                143, 149, 175, 30, 3, 9, 154, 210, 194, 158, 118, 123, 93, 87,
             ],
             fixed_cost: 17,
         },
@@ -988,8 +988,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 7,
             outcome: super::error::Outcome::Crashed(super::error::GuestTrap::DivisionByZero),
             digest: [
-                119, 50, 19, 43, 241, 140, 29, 222, 192, 224, 117, 237, 160, 122, 174, 22, 139,
-                135, 46, 235, 204, 215, 249, 198, 74, 121, 177, 198, 31, 116, 67, 199,
+                35, 202, 17, 96, 145, 125, 133, 203, 249, 195, 128, 149, 104, 107, 165, 79, 153,
+                192, 62, 78, 177, 11, 129, 129, 182, 210, 124, 57, 3, 57, 234, 43,
             ],
             fixed_cost: 7,
         },
@@ -1000,8 +1000,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 8,
             outcome: super::error::Outcome::Halted(None),
             digest: [
-                217, 218, 127, 86, 12, 61, 234, 142, 196, 9, 58, 58, 145, 71, 116, 101, 8, 126,
-                144, 104, 213, 32, 185, 216, 158, 118, 35, 208, 92, 128, 13, 155,
+                215, 252, 250, 124, 85, 228, 249, 2, 87, 112, 107, 148, 86, 120, 171, 246, 233,
+                219, 187, 107, 60, 7, 135, 23, 169, 239, 247, 121, 78, 79, 206, 76,
             ],
             fixed_cost: 8,
         },
@@ -1012,8 +1012,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 7,
             outcome: super::error::Outcome::SliceExhausted,
             digest: [
-                232, 248, 68, 1, 178, 67, 15, 167, 210, 241, 173, 87, 16, 75, 185, 128, 253, 212,
-                217, 71, 18, 167, 204, 181, 126, 203, 39, 113, 39, 61, 136, 127,
+                34, 19, 23, 229, 33, 41, 193, 18, 208, 220, 222, 159, 225, 186, 88, 105, 11, 116,
+                4, 213, 124, 241, 190, 107, 205, 191, 20, 193, 142, 89, 94, 144,
             ],
             fixed_cost: 3,
         },
@@ -1024,8 +1024,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 10,
             outcome: super::error::Outcome::SliceExhausted,
             digest: [
-                97, 66, 140, 5, 73, 113, 159, 198, 178, 206, 33, 114, 180, 166, 99, 191, 35, 175,
-                246, 164, 251, 169, 175, 54, 117, 38, 209, 143, 47, 193, 94, 78,
+                149, 254, 246, 115, 98, 218, 144, 42, 127, 35, 58, 243, 181, 22, 123, 44, 194, 229,
+                69, 98, 0, 80, 8, 87, 172, 24, 216, 24, 87, 189, 85, 95,
             ],
             fixed_cost: 9,
         },
@@ -1179,6 +1179,156 @@ pub(super) fn scalar_cases() -> Vec<ScalarCase> {
 
 pub(super) fn scalar_artifact() -> VerifiedArtifact {
     verified_with_stack(crate::test_support::minimal_vector(), 32)
+}
+
+pub(crate) fn entry_string_array_length_artifact() -> VerifiedArtifact {
+    entry_string_array_artifact(None)
+}
+
+pub(super) fn entry_string_array_code_unit_artifact(
+    argument: i32,
+    code_unit: i32,
+) -> VerifiedArtifact {
+    entry_string_array_artifact(Some((argument, code_unit)))
+}
+
+fn entry_string_array_artifact(code_unit: Option<(i32, i32)>) -> VerifiedArtifact {
+    let mut artifact = crate::decode::records::decode_artifact(
+        Arc::from(crate::test_support::two_module_vector()),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    {
+        let mut bytes = artifact.bytes.to_vec();
+        let library_name_start = bytes.len();
+        bytes.extend_from_slice(b"aaa");
+        let library_name_end = bytes.len();
+        let function_name_start = bytes.len();
+        bytes.extend_from_slice(b"bbb");
+        let function_name_end = bytes.len();
+        let name_start = bytes.len();
+        bytes.extend_from_slice(b"kotlin.String");
+        let name_end = bytes.len();
+        artifact.bytes = Arc::from(bytes);
+
+        let library = &mut artifact.modules[1];
+        library.strings[0] = ByteRange {
+            start: library_name_start,
+            end: library_name_end,
+        };
+        library.strings[1] = ByteRange {
+            start: function_name_start,
+            end: function_name_end,
+        };
+        let string_name = library.strings.len() as u32;
+        library.strings.push(ByteRange {
+            start: name_start,
+            end: name_end,
+        });
+        library.types.push(NominalType::Class {
+            flags: 2,
+            generic_arity: 0,
+            name: string_name,
+            super_type: TypeId(u32::MAX),
+            interfaces: Vec::new(),
+            field_start: 0,
+            field_count: 0,
+            method_start: 0,
+            method_count: 0,
+        });
+        library.exports.insert(
+            0,
+            Export {
+                kind: 0,
+                visibility: 1,
+                name: string_name,
+                local_symbol: 1,
+                signature: TypeId(1),
+            },
+        );
+        library.declared_types = 2;
+        library.declared_exports = 2;
+
+        let module = &mut artifact.modules[0];
+        module.imports.clear();
+        module.imports.push(Import {
+            kind: 0,
+            target_module: ModuleId(1),
+            target_name: string_name,
+            expected_signature: TypeId(0x8000_0000),
+            target_hash: [0; 32],
+        });
+        module.declared_imports = 1;
+        let string = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(0x8000_0000),
+        };
+        let array = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        let (result, registers, constants, instructions) = match code_unit {
+            None => (
+                primitive(1),
+                vec![array, primitive(1)],
+                Vec::new(),
+                vec![
+                    Instruction::ArrayLength { dst: 1, array: 0 },
+                    Instruction::Return { value: 1 },
+                ],
+            ),
+            Some((argument, code_unit)) => (
+                primitive(6),
+                vec![array, primitive(1), primitive(1), string, primitive(6)],
+                vec![Constant::I32(argument), Constant::I32(code_unit)],
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 2,
+                        constant: 1,
+                    },
+                    Instruction::ArrayLoad {
+                        dst: 3,
+                        array: 0,
+                        index: 1,
+                    },
+                    Instruction::StringGet {
+                        dst: 4,
+                        string: 3,
+                        index: 2,
+                    },
+                    Instruction::Return { value: 4 },
+                ],
+            ),
+        };
+        module.types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result,
+            parameters: vec![array],
+        };
+        module.types.push(NominalType::Array {
+            name: 0,
+            element: string,
+        });
+        module.declared_types = 2;
+        let function = &mut module.functions[0];
+        function.register_count = registers.len() as u16;
+        function.parameter_count = 1;
+        function.registers = registers;
+        module.constants = constants;
+        artifact.header.entry_arguments = crate::artifact::EntryArguments::StringArray;
+        install_entry_blocks(&mut artifact, vec![instructions]);
+        let registers = artifact.modules[0].functions[0].register_count as u64;
+        configure_stack(&mut artifact, registers, 1);
+    }
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
 
 pub(super) fn literal_string_artifact() -> VerifiedArtifact {
@@ -4436,7 +4586,7 @@ fn verified_mutated(
     .unwrap();
     change(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
-    verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
 
 fn verified_program(

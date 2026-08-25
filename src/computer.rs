@@ -199,7 +199,7 @@ impl ComputerMachine {
         artifact: VerifiedArtifact,
         profile: ExecutionProfile,
         addon_bindings: &[CapabilityBinding<'_>],
-        arguments: &[EntryValue],
+        arguments: &[EntryValue<'_>],
     ) -> Result<Self, ComputerStartError> {
         Self::start_with_process_limits(
             artifact,
@@ -215,7 +215,7 @@ impl ComputerMachine {
         profile: ExecutionProfile,
         process_limits: ProcessLimits,
         addon_bindings: &[CapabilityBinding<'_>],
-        arguments: &[EntryValue],
+        arguments: &[EntryValue<'_>],
     ) -> Result<Self, ComputerStartError> {
         let limits = FileSystemLimits::default();
         let initial_capability = FileCapability::new(
@@ -237,7 +237,7 @@ impl ComputerMachine {
         artifact: VerifiedArtifact,
         profile: ExecutionProfile,
         addon_bindings: &[CapabilityBinding<'_>],
-        arguments: &[EntryValue],
+        arguments: &[EntryValue<'_>],
         filesystem: ComputerFileSystem,
         initial_capability: FileCapability,
     ) -> Result<Self, ComputerStartError> {
@@ -257,7 +257,7 @@ impl ComputerMachine {
         profile: ExecutionProfile,
         process_limits: ProcessLimits,
         addon_bindings: &[CapabilityBinding<'_>],
-        arguments: &[EntryValue],
+        arguments: &[EntryValue<'_>],
         filesystem: ComputerFileSystem,
         initial_capability: FileCapability,
     ) -> Result<Self, ComputerStartError> {
@@ -2137,7 +2137,7 @@ mod tests {
         let terminal_child = crate::execution::fixtures::raw_terminal_conformance_artifact(&[], 1);
         let terminal_child_bytes =
             crate::test_encode::encode_artifact(terminal_child.decoded()).unwrap();
-        let typed_child = crate::execution::fixtures::typed_entry_artifact();
+        let typed_child = crate::execution::fixtures::entry_string_array_length_artifact();
         let typed_child_bytes = crate::test_encode::encode_artifact(typed_child.decoded()).unwrap();
         let trapped_child = crate::execution::fixtures::trap_after_write_artifact(7);
         let trapped_child_bytes =
@@ -2821,6 +2821,11 @@ mod tests {
             maximum_outbound_utf16_code_units: 4096,
             maximum_inbound_utf16_code_units: 4096,
             maximum_accepted_responses: 64,
+            entry_argument_limits: crate::EntryArgumentLimits {
+                maximum_count: 64,
+                maximum_code_units_per_argument: 4096,
+                maximum_total_code_units: 16_384,
+            },
         }
     }
 }

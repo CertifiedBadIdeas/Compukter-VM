@@ -65,10 +65,9 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
     let mut function_type = vec![3, 0];
     push_u16(&mut function_type, 0);
     push_u32(&mut function_type, 1);
-    push_u16(&mut function_type, 1);
+    push_u16(&mut function_type, 0);
     push_u16(&mut function_type, 0);
     function_type.extend(value_type(0, 0, u32::MAX));
-    function_type.extend(value_type(7, 0, 0));
     let types = indexed(&[&class_type, &function_type]);
 
     let mut function = Vec::new();
@@ -76,7 +75,7 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
         push_u32(&mut function, value);
     }
     push_u16(&mut function, 1);
-    push_u16(&mut function, 1);
+    push_u16(&mut function, 0);
     for value in [0, 2, 0, 1] {
         push_u32(&mut function, value);
     }
@@ -86,7 +85,7 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
     let mut protected = Vec::new();
     let mut handler = Vec::new();
     for (record, values) in [
-        (&mut protected, [0, 0, 1, 2, 0, 0]),
+        (&mut protected, [0, 0, 2, 6, 0, 0]),
         (&mut handler, [0, 1, 1, 1, 0, 0]),
     ] {
         for value in values {
@@ -94,7 +93,8 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
         }
     }
     let blocks = indexed(&[&protected, &handler]);
-    let throw = [0xe4, 0, 6, 0, 0, 0];
+    let mut throw = frame(0x30, 0, &[0, 0, 0]);
+    throw.extend(frame(0xe4, 0, &[0, 0]));
     let return_unit = [0xe3, 0, 6, 0, 0xff, 0xff];
     let code = indexed(&[&throw, &return_unit]);
 
@@ -132,8 +132,8 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
     let capabilities = indexed(&[&capability]);
 
     let mut manifest = manifest();
-    manifest[24..28].copy_from_slice(&2_u32.to_le_bytes());
-    manifest[28..32].copy_from_slice(&2_u32.to_le_bytes());
+    manifest[24..28].copy_from_slice(&6_u32.to_le_bytes());
+    manifest[28..32].copy_from_slice(&6_u32.to_le_bytes());
     manifest[32..36].copy_from_slice(&1_u32.to_le_bytes());
     let module = module_record_with_counts(module_hash, 2, 1, 0, 0);
     let modules = indexed(&[&module]);
@@ -594,7 +594,7 @@ fn assemble(sections: Vec<(u16, u32, Vec<u8>, u32)>, semantic_features: u32) -> 
     let payload_end = entries.last().unwrap().2 + entries.last().unwrap().3;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"CPKT");
-    for value in [1_u16, 0, 1, 0, 64, 32] {
+    for value in [2_u16, 0, 1, 0, 64, 32] {
         push_u16(&mut bytes, value);
     }
     push_u32(&mut bytes, sections.len() as u32);
@@ -746,7 +746,7 @@ fn vector_with_tables(
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"CPKT");
-    for value in [1_u16, 0, 1, 0, 64, 32] {
+    for value in [2_u16, 0, 1, 0, 64, 32] {
         push_u16(&mut bytes, value);
     }
     push_u32(&mut bytes, sections.len() as u32);

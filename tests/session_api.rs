@@ -4,8 +4,8 @@ mod support;
 use std::sync::Arc;
 
 use compukter_vm::{
-    verify_artifact, AdvanceOutcome, ArtifactLimits, CapabilityBinding, ExecutionProfile,
-    HostValueType, OperationSchema, Session,
+    verify_artifact, AdvanceOutcome, ArtifactLimits, CapabilityBinding, EntryArgumentLimits,
+    ExecutionProfile, HostValueType, OperationSchema, Session,
 };
 
 fn profile() -> ExecutionProfile {
@@ -23,6 +23,11 @@ fn profile() -> ExecutionProfile {
         maximum_outbound_utf16_code_units: 4096,
         maximum_inbound_utf16_code_units: 4096,
         maximum_accepted_responses: 64,
+        entry_argument_limits: EntryArgumentLimits {
+            maximum_count: 64,
+            maximum_code_units_per_argument: 4096,
+            maximum_total_code_units: 16_384,
+        },
     }
 }
 

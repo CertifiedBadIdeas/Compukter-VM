@@ -43,9 +43,16 @@ pub(crate) struct DecodedArtifact {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryArguments {
+    None,
+    StringArray,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EntryPoint {
     pub module: u32,
     pub function: u32,
+    pub arguments: EntryArguments,
 }
 
 /// A fully decoded and verified artifact.
@@ -91,6 +98,7 @@ impl VerifiedArtifact {
         EntryPoint {
             module: self.inner.decoded.header.entry_module,
             function: self.inner.decoded.header.entry_function,
+            arguments: self.inner.decoded.header.entry_arguments,
         }
     }
 

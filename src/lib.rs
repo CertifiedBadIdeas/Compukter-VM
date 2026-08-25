@@ -56,7 +56,7 @@ mod test_support;
 #[cfg_attr(not(test), allow(dead_code))]
 mod verify;
 
-pub use artifact::{EntryPoint, VerifiedArtifact};
+pub use artifact::{EntryArguments, EntryPoint, VerifiedArtifact};
 pub use computer::{
     CompilationRequest, CompilationSource, ComputerAdvanceOutcome, ComputerError,
     ComputerHostRequest, ComputerMachine, ComputerStartError, ComputerTerminalEventKind,
@@ -64,11 +64,11 @@ pub use computer::{
 };
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{
-    AccountingSnapshot, AdmissionError, AdvanceOutcome, CapabilityBinding, EntryValue,
-    ExecutionProfile, GuestTrap, HostArguments, HostFailure, HostFailureKind, HostRequestView,
-    HostResponse, HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure,
-    OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError, RunError, Session,
-    VmFault,
+    AccountingSnapshot, AdmissionError, AdvanceOutcome, CapabilityBinding, EntryArgumentLimit,
+    EntryArgumentLimits, EntryValue, ExecutionProfile, GuestTrap, HostArguments, HostFailure,
+    HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView,
+    ManagedAllocationFailure, OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError,
+    RunError, Session, VmFault,
 };
 pub use filesystem::{
     recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, FileCapability,

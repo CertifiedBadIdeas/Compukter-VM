@@ -18,6 +18,20 @@ pub(crate) fn verify_artifact(
     modules::verify_modules(&decoded, &limits)?;
     let exception_model = exceptions::verify_exceptions(&decoded, &limits)?;
     functions::verify_functions(&decoded, &exception_model, &limits)?;
+    functions::verify_entry_arguments(&decoded, &limits)?;
+    exceptions::verify_semantic_features(&decoded, &limits)?;
+    Ok(VerifiedArtifact::new(decoded))
+}
+
+#[cfg(test)]
+pub(crate) fn verify_execution_fixture(
+    bytes: Arc<[u8]>,
+    limits: ArtifactLimits,
+) -> Result<VerifiedArtifact, DiagnosticSet> {
+    let decoded = decode_artifact(bytes, &limits)?;
+    modules::verify_modules(&decoded, &limits)?;
+    let exception_model = exceptions::verify_exceptions(&decoded, &limits)?;
+    functions::verify_functions(&decoded, &exception_model, &limits)?;
     exceptions::verify_semantic_features(&decoded, &limits)?;
     Ok(VerifiedArtifact::new(decoded))
 }

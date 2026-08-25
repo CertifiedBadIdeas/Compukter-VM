@@ -77,6 +77,15 @@ pub enum RunError {
     DeadReference {
         parameter: u16,
     },
+    EntryArgumentLimit(EntryArgumentLimit),
+    EntryAllocationFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryArgumentLimit {
+    Count,
+    ArgumentCodeUnits,
+    TotalCodeUnits,
 }
 
 #[repr(u8)]

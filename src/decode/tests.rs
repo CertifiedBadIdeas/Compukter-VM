@@ -31,6 +31,31 @@ fn container_accepts_canonical_vector_a() {
     assert_eq!(container.header.payload_end, 1112);
     assert_eq!(container.directory.len(), 14);
     assert_eq!(container.bytes.len(), 1144);
+    assert_eq!(
+        container.header.entry_arguments,
+        crate::artifact::EntryArguments::None
+    );
+}
+
+#[test]
+fn container_rejects_format_v1_after_the_entry_contract_bump() {
+    let mut bytes = support::minimal_vector();
+    support::write_u16(&mut bytes, 4, 1);
+    support::rehash(&mut bytes);
+    assert_eq!(error_code(bytes), Code::UnsupportedVersion);
+}
+
+#[test]
+fn container_decodes_the_string_array_entry_tag() {
+    let mut bytes = support::minimal_vector();
+    support::write_u16(&mut bytes, 4, 2);
+    bytes[48] = 1;
+    support::rehash(&mut bytes);
+    let container = super::container::decode_container(&bytes, &ArtifactLimits::default()).unwrap();
+    assert_eq!(
+        container.header.entry_arguments,
+        crate::artifact::EntryArguments::StringArray
+    );
 }
 
 #[test]
@@ -76,7 +101,7 @@ fn container_rejects_unknown_feature_bit() {
 #[test]
 fn container_rejects_unsupported_major() {
     let mut bytes = support::minimal_vector();
-    support::write_u16(&mut bytes, 4, 2);
+    support::write_u16(&mut bytes, 4, 3);
     support::rehash(&mut bytes);
     assert_eq!(error_code(bytes), Code::UnsupportedVersion);
 }
@@ -400,7 +425,7 @@ fn records_decode_spec_vector_a() {
     assert_eq!(bytes.len(), 1144);
     assert_eq!(
         support::artifact_hash(&bytes),
-        support::hex32("23a3d933f13f78ac679e0cf10eca0355566f25e7e80a5937e45fb65ce8d06876")
+        support::hex32("ffdf3638f06189ffee32fe1c0df945a4f47e4a4efe7064fd37099139e3b809ac")
     );
     let artifact =
         super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap();

@@ -1,12 +1,12 @@
-use crate::VerifiedArtifact;
+use crate::{EntryArguments, VerifiedArtifact};
 
 use super::{
     error::{AdmissionError, RunError},
     host::{
-        AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile,
-        HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput,
-        HostValueSlot, HostValueView, ManagedAllocationFailure, QuotaExhaustion, QuotaKind,
-        RequestId, ResolvedCapability, ResolvedOperation, ResumeError,
+        AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
+        ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostRequestView,
+        HostResponse, HostValueInput, HostValueSlot, HostValueView, ManagedAllocationFailure,
+        QuotaExhaustion, QuotaKind, RequestId, ResolvedCapability, ResolvedOperation, ResumeError,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::Machine,
@@ -32,6 +32,8 @@ pub struct Session {
     resuming_host_string: bool,
     published_requests: u64,
     accepted_responses: u64,
+    entry_argument_limits: EntryArgumentLimits,
+    entry_contract: EntryArguments,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,6 +89,7 @@ impl Session {
         profile: ExecutionProfile,
         bindings: &[CapabilityBinding<'_>],
     ) -> Result<Self, AdmissionError> {
+        let entry_contract = artifact.entry().arguments;
         let CapabilityResolution {
             capabilities,
             mask: capability_mask,
@@ -97,6 +100,7 @@ impl Session {
         let maximum_host_requests = u64::from(profile.maximum_host_requests);
         let maximum_accepted_responses = profile.maximum_accepted_responses;
         let maximum_slice_budget = profile.maximum_slice_budget;
+        let entry_argument_limits = profile.entry_argument_limits;
         let image_profile = ImageProfile {
             heap_bytes: profile.heap_bytes,
             frame_storage_bytes: profile.frame_storage_bytes,
@@ -139,25 +143,45 @@ impl Session {
             resuming_host_string: false,
             published_requests: 0,
             accepted_responses: 0,
+            entry_argument_limits,
+            entry_contract,
         })
     }
 
-    pub fn start(&mut self, arguments: &[EntryValue]) -> Result<(), RunError> {
+    pub fn start(&mut self, arguments: &[EntryValue<'_>]) -> Result<(), RunError> {
+        let expected = match self.entry_contract {
+            EntryArguments::None => 0,
+            EntryArguments::StringArray => 1,
+        };
+        if arguments.len() != expected {
+            return Err(RunError::EntryArity {
+                expected: expected as u16,
+                supplied: u16::try_from(arguments.len()).unwrap_or(u16::MAX),
+            });
+        }
+        if matches!(self.entry_contract, EntryArguments::StringArray)
+            && !matches!(arguments, [EntryValue::StringArray(_)])
+        {
+            return Err(RunError::EntryType { parameter: 0 });
+        }
         if arguments.len() > self.entry_arguments.len() {
             return Err(RunError::EntryArity {
                 expected: u16::try_from(self.entry_arguments.len()).unwrap_or(u16::MAX),
                 supplied: u16::try_from(arguments.len()).unwrap_or(u16::MAX),
             });
         }
-        for (destination, source) in self.entry_arguments.iter_mut().zip(arguments) {
-            *destination = EntryArgument::unowned(match *source {
-                EntryValue::I32(value) => RuntimeValue::I32(value),
-                EntryValue::I64(value) => RuntimeValue::I64(value),
-                EntryValue::F32(value) => RuntimeValue::F32(value),
-                EntryValue::F64(value) => RuntimeValue::F64(value),
-                EntryValue::Bool(value) => RuntimeValue::Bool(value),
-                EntryValue::Char(value) => RuntimeValue::Char(value),
-            });
+        for (index, source) in arguments.iter().enumerate() {
+            self.entry_arguments[index] = match *source {
+                EntryValue::I32(value) => EntryArgument::unowned(RuntimeValue::I32(value)),
+                EntryValue::I64(value) => EntryArgument::unowned(RuntimeValue::I64(value)),
+                EntryValue::F32(value) => EntryArgument::unowned(RuntimeValue::F32(value)),
+                EntryValue::F64(value) => EntryArgument::unowned(RuntimeValue::F64(value)),
+                EntryValue::Bool(value) => EntryArgument::unowned(RuntimeValue::Bool(value)),
+                EntryValue::Char(value) => EntryArgument::unowned(RuntimeValue::Char(value)),
+                EntryValue::StringArray(values) => self
+                    .machine
+                    .materialize_entry_string_array(values, self.entry_argument_limits)?,
+            };
         }
         self.machine.start(&self.entry_arguments[..arguments.len()])
     }

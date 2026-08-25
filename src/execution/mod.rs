@@ -13,12 +13,12 @@ mod session;
 mod text;
 mod value;
 
-pub use error::{AdmissionError, GuestTrap, RunError, VmFault};
+pub use error::{AdmissionError, EntryArgumentLimit, GuestTrap, RunError, VmFault};
 pub use host::{
-    AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryValue, ExecutionProfile,
-    HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput,
-    HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema, QuotaExhaustion,
-    QuotaKind, RequestId, ResumeError,
+    AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
+    ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse,
+    HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema,
+    QuotaExhaustion, QuotaKind, RequestId, ResumeError,
 };
 pub use session::Session;
 

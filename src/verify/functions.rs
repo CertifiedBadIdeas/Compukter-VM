@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
 
 use crate::{
-    artifact::{Constant, DecodedArtifact, Field, Function, Instruction, NominalType, ValueType},
+    artifact::{
+        Constant, DecodedArtifact, EntryArguments, Field, Function, Instruction, NominalType,
+        ValueType,
+    },
     diagnostic::{Code, Diagnostic, DiagnosticSet, Family},
     limits::ArtifactLimits,
 };
@@ -83,6 +86,80 @@ pub(crate) fn verify_functions(
         }
     }
     Ok(())
+}
+
+pub(crate) fn verify_entry_arguments(
+    artifact: &DecodedArtifact,
+    limits: &ArtifactLimits,
+) -> Result<(), DiagnosticSet> {
+    let module_id = artifact.header.entry_module as usize;
+    let function_id = artifact.header.entry_function as usize;
+    let function = artifact
+        .modules
+        .get(module_id)
+        .and_then(|module| module.functions.get(function_id))
+        .ok_or_else(|| {
+            type_failure(
+                limits,
+                module_id,
+                function_id,
+                "entry function is out of range",
+            )
+        })?;
+    let signature = verify_signature(artifact, module_id, function_id, function, limits)?;
+    if entry_arguments_match(artifact, signature.0, signature.2) {
+        Ok(())
+    } else {
+        Err(type_failure(
+            limits,
+            module_id,
+            function_id,
+            "entry argument contract disagrees with the entry function signature",
+        ))
+    }
+}
+
+fn entry_arguments_match(
+    artifact: &DecodedArtifact,
+    signature_module: usize,
+    parameters: &[ValueType],
+) -> bool {
+    match artifact.header.entry_arguments {
+        EntryArguments::None => parameters.is_empty(),
+        EntryArguments::StringArray => {
+            let [parameter] = parameters else {
+                return false;
+            };
+            if parameter.kind != 7 || parameter.flags != 0 {
+                return false;
+            }
+            let Some((array_module, array_type)) =
+                modules::resolved_type(artifact, signature_module, parameter.nominal_type)
+            else {
+                return false;
+            };
+            let NominalType::Array { element, .. } =
+                &artifact.modules[array_module].types[array_type]
+            else {
+                return false;
+            };
+            if element.kind != 7 || element.flags != 0 {
+                return false;
+            }
+            let Some((string_module, string_type)) =
+                modules::resolved_type(artifact, array_module, element.nominal_type)
+            else {
+                return false;
+            };
+            let NominalType::Class { name, .. } =
+                &artifact.modules[string_module].types[string_type]
+            else {
+                return false;
+            };
+            artifact.modules[string_module].strings[*name as usize].slice(&artifact.bytes)
+                == b"kotlin.String"
+        }
+    }
 }
 
 fn verify_signature<'a>(
