@@ -243,7 +243,6 @@ pub(crate) fn verify_semantic_features(
                             | Instruction::Yield { .. }
                             | Instruction::Sleep { .. }
                             | Instruction::CoroutineJoin { .. }
-                            | Instruction::CapabilityCallAsync { .. }
                     )
                 })
         {

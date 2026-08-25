@@ -948,6 +948,34 @@ fn exception_rejects_suspend_in_non_suspending_function() {
 }
 
 #[test]
+fn vm_blocking_capability_is_valid_in_a_non_suspending_function() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.capabilities.push(crate::artifact::Capability {
+        namespace: 0,
+        name: 1,
+        abi_major: 1,
+        minimum_abi_minor: 0,
+        flags: 1,
+        operation_count: 1,
+    });
+    configure_entry(
+        &mut artifact,
+        Vec::new(),
+        0,
+        vec![crate::artifact::Instruction::CapabilityCallAsync {
+            dst: u16::MAX,
+            capability: 0,
+            operation: 0,
+            args: Vec::new().into_boxed_slice(),
+            resume_block: 0,
+        }],
+    );
+    artifact.modules[0].blocks[0].flags = 1;
+
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
 fn exception_rejects_capability_id_out_of_range() {
     let mut artifact = decoded(support::minimal_vector());
     configure_entry(
@@ -1038,6 +1066,31 @@ fn exception_rejects_unused_semantic_feature_bit() {
     let error = super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default())
         .unwrap_err();
     assert_eq!(error.first().unwrap().code, Code::BadModule);
+}
+
+#[test]
+fn vm_blocking_capability_does_not_claim_coroutine_semantics() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.header.semantic_features = 1 << 2;
+    artifact.capabilities.push(crate::artifact::Capability {
+        namespace: 0,
+        name: 1,
+        abi_major: 1,
+        minimum_abi_minor: 0,
+        flags: 1,
+        operation_count: 1,
+    });
+    artifact.modules[0].code[0].instructions =
+        vec![crate::artifact::Instruction::CapabilityCallAsync {
+            dst: u16::MAX,
+            capability: 0,
+            operation: 0,
+            args: Vec::new().into_boxed_slice(),
+            resume_block: 0,
+        }]
+        .into_boxed_slice();
+
+    super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default()).unwrap();
 }
 
 fn exception_handler_artifact(reads_uninitialized_local: bool) -> crate::artifact::DecodedArtifact {
