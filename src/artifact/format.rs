@@ -2,7 +2,7 @@ pub(crate) const HEADER_SIZE: usize = 64;
 pub(crate) const DIRECTORY_ENTRY_SIZE: usize = 32;
 pub(crate) const DIGEST_SIZE: usize = 32;
 
-pub(crate) const FORMAT_MAJOR: u16 = 1;
+pub(crate) const FORMAT_MAJOR: u16 = 2;
 pub(crate) const RUNTIME_ABI_MAJOR: u16 = 1;
 pub(crate) const RUNTIME_ABI_MINOR: u16 = 0;
 

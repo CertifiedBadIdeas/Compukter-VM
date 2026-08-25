@@ -179,6 +179,16 @@ fn cfg_rejects_bad_entry_function() {
 }
 
 #[test]
+fn cfg_rejects_entry_argument_contract_that_disagrees_with_signature() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.header.entry_arguments = crate::artifact::EntryArguments::StringArray;
+
+    let error = super::functions::verify_entry_arguments(&artifact, &ArtifactLimits::default())
+        .unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
 fn cfg_rejects_uninitialized_register_read() {
     let mut artifact = decoded(support::minimal_vector());
     artifact.manifest.maximum_block_cost = 2;

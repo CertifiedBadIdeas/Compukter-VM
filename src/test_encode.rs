@@ -81,6 +81,7 @@ pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, Enc
         artifact.header.semantic_features,
         artifact.header.entry_module,
         artifact.header.entry_function,
+        artifact.header.entry_arguments,
     )
 }
 
@@ -990,6 +991,7 @@ fn assemble(
     semantic_features: u32,
     entry_module: u32,
     entry_function: u32,
+    entry_arguments: crate::artifact::EntryArguments,
 ) -> Result<Vec<u8>, EncodeError> {
     let directory_bytes = sections
         .len()
@@ -1020,7 +1022,7 @@ fn assemble(
 
     let mut bytes = Vec::new();
     bytes.extend(b"CPKT");
-    for value in [1_u16, 0, 1, 0, 64, 32] {
+    for value in [format::FORMAT_MAJOR, 0, 1, 0, 64, 32] {
         u16le(&mut bytes, value);
     }
     u32le(
@@ -1035,6 +1037,10 @@ fn assemble(
     );
     u32le(&mut bytes, entry_module);
     u32le(&mut bytes, entry_function);
+    bytes.push(match entry_arguments {
+        crate::artifact::EntryArguments::None => 0,
+        crate::artifact::EntryArguments::StringArray => 1,
+    });
     bytes.resize(format::HEADER_SIZE, 0);
     for (kind, scope, offset, length, count) in &entries {
         u16le(&mut bytes, *kind);

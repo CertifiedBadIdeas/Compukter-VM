@@ -97,16 +97,25 @@ pub struct ExecutionProfile {
     pub maximum_outbound_utf16_code_units: u32,
     pub maximum_inbound_utf16_code_units: u32,
     pub maximum_accepted_responses: u64,
+    pub entry_argument_limits: EntryArgumentLimits,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryArgumentLimits {
+    pub maximum_count: u32,
+    pub maximum_code_units_per_argument: u32,
+    pub maximum_total_code_units: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EntryValue {
+pub enum EntryValue<'a> {
     I32(i32),
     I64(i64),
     F32(u32),
     F64(u64),
     Bool(bool),
     Char(u16),
+    StringArray(&'a [Box<[u16]>]),
 }
 
 #[derive(Clone, Debug)]

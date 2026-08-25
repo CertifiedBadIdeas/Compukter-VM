@@ -1,10 +1,10 @@
 use super::{
-    error::AdmissionError,
+    error::{AdmissionError, EntryArgumentLimit, RunError},
     fixtures,
     host::{
-        AdvanceOutcome, CapabilityBinding, ExecutionProfile, HostFailure, HostFailureKind,
-        HostResponse, HostValueInput, HostValueType, HostValueView, OperationSchema, QuotaKind,
-        RequestId, ResumeError,
+        AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue, ExecutionProfile,
+        HostFailure, HostFailureKind, HostResponse, HostValueInput, HostValueType, HostValueView,
+        OperationSchema, QuotaKind, RequestId, ResumeError,
     },
     session::Session,
 };
@@ -25,11 +25,146 @@ fn profile() -> ExecutionProfile {
         maximum_outbound_utf16_code_units: 4096,
         maximum_inbound_utf16_code_units: 4096,
         maximum_accepted_responses: 64,
+        entry_argument_limits: EntryArgumentLimits {
+            maximum_count: 64,
+            maximum_code_units_per_argument: 4096,
+            maximum_total_code_units: 16_384,
+        },
     }
 }
 
 fn operation() -> [OperationSchema<'static>; 1] {
     [OperationSchema::asynchronous(&[], HostValueType::Unit)]
+}
+
+#[test]
+fn entry_string_array_is_materialized_as_one_owned_guest_argument() {
+    let mut session = Session::admit(
+        fixtures::entry_string_array_length_artifact(),
+        profile(),
+        &[],
+    )
+    .unwrap();
+    let arguments = [
+        Vec::<u16>::new().into_boxed_slice(),
+        vec![0x0041, 0x0000, 0xd800, 0x0042].into_boxed_slice(),
+    ];
+
+    session
+        .start(&[EntryValue::StringArray(&arguments)])
+        .unwrap();
+    assert_eq!(
+        AdvanceOutcome::Halted(Some(super::host::HostValueView::I32(2))),
+        session.advance(64, 0).unwrap(),
+    );
+}
+
+#[test]
+fn entry_string_array_bounds_are_checked_before_start() {
+    let cases = [
+        (
+            EntryArgumentLimits {
+                maximum_count: 1,
+                maximum_code_units_per_argument: 8,
+                maximum_total_code_units: 8,
+            },
+            vec![vec![1].into_boxed_slice(), vec![2].into_boxed_slice()],
+            EntryArgumentLimit::Count,
+        ),
+        (
+            EntryArgumentLimits {
+                maximum_count: 2,
+                maximum_code_units_per_argument: 1,
+                maximum_total_code_units: 8,
+            },
+            vec![vec![1, 2].into_boxed_slice()],
+            EntryArgumentLimit::ArgumentCodeUnits,
+        ),
+        (
+            EntryArgumentLimits {
+                maximum_count: 2,
+                maximum_code_units_per_argument: 8,
+                maximum_total_code_units: 1,
+            },
+            vec![vec![1].into_boxed_slice(), vec![2].into_boxed_slice()],
+            EntryArgumentLimit::TotalCodeUnits,
+        ),
+    ];
+
+    for (limits, arguments, expected) in cases {
+        let mut execution_profile = profile();
+        execution_profile.entry_argument_limits = limits;
+        let mut session = Session::admit(
+            fixtures::entry_string_array_length_artifact(),
+            execution_profile,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            Err(RunError::EntryArgumentLimit(expected)),
+            session.start(&[EntryValue::StringArray(&arguments)]),
+        );
+
+        let empty: [Box<[u16]>; 0] = [];
+        session.start(&[EntryValue::StringArray(&empty)]).unwrap();
+        assert_eq!(
+            AdvanceOutcome::Halted(Some(HostValueView::I32(0))),
+            session.advance(64, 0).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn entry_string_array_preserves_utf16_code_units_verbatim() {
+    let arguments = [
+        vec![0x0041, 0x0000, 0xd800, 0x0042].into_boxed_slice(),
+        Vec::<u16>::new().into_boxed_slice(),
+    ];
+    for (index, expected) in [(1, 0x0000), (2, 0xd800)] {
+        let mut session = Session::admit(
+            fixtures::entry_string_array_code_unit_artifact(0, index),
+            profile(),
+            &[],
+        )
+        .unwrap();
+        session
+            .start(&[EntryValue::StringArray(&arguments)])
+            .unwrap();
+        assert_eq!(
+            AdvanceOutcome::Halted(Some(HostValueView::Char(expected))),
+            session.advance(64, 0).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn entry_string_array_allocation_failure_leaves_session_pristine() {
+    let mut execution_profile = profile();
+    execution_profile.heap_bytes = 256;
+    execution_profile
+        .entry_argument_limits
+        .maximum_code_units_per_argument = 4096;
+    execution_profile
+        .entry_argument_limits
+        .maximum_total_code_units = 4096;
+    let mut session = Session::admit(
+        fixtures::entry_string_array_length_artifact(),
+        execution_profile,
+        &[],
+    )
+    .unwrap();
+    let large = [vec![0x0100; 1024].into_boxed_slice()];
+    assert_eq!(
+        Err(RunError::EntryAllocationFailed),
+        session.start(&[EntryValue::StringArray(&large)]),
+    );
+
+    let empty: [Box<[u16]>; 0] = [];
+    session.start(&[EntryValue::StringArray(&empty)]).unwrap();
+    assert_eq!(
+        AdvanceOutcome::Halted(Some(HostValueView::I32(0))),
+        session.advance(64, 0).unwrap(),
+    );
 }
 
 #[test]
@@ -899,9 +1034,9 @@ fn terminal_vertical_conformance() {
     assert_eq!(3, accounting.accepted_responses);
     assert_eq!(
         [
-            0x51, 0x58, 0x89, 0x60, 0x02, 0x3f, 0xe3, 0xb9, 0xd4, 0xc1, 0xfe, 0x95, 0x35, 0xa5,
-            0x12, 0x42, 0x7d, 0x34, 0xa4, 0x0a, 0xf5, 0x57, 0x40, 0xb9, 0xbc, 0x32, 0x9d, 0x4f,
-            0x17, 0x55, 0x52, 0xf4,
+            0x90, 0x57, 0x7f, 0x50, 0x3a, 0xaf, 0x6f, 0x43, 0x69, 0x24, 0xc3, 0xf0, 0xa7, 0x9c,
+            0xb0, 0x6c, 0xe9, 0x78, 0xa7, 0x0d, 0x8a, 0xac, 0x6d, 0x10, 0xf5, 0x34, 0x19, 0x0b,
+            0x91, 0xf5, 0x07, 0x5e,
         ],
         accounting.trace_digest
     );

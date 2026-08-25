@@ -3,7 +3,7 @@ mod support;
 
 use std::sync::Arc;
 
-use compukter_vm::{verify_artifact, ArtifactLimits, EntryPoint};
+use compukter_vm::{verify_artifact, ArtifactLimits, EntryArguments, EntryPoint};
 
 #[test]
 fn publishes_exact_vector_a_only_after_verification() {
@@ -16,7 +16,8 @@ fn publishes_exact_vector_a_only_after_verification() {
         artifact.entry(),
         EntryPoint {
             module: 0,
-            function: 0
+            function: 0,
+            arguments: EntryArguments::None,
         }
     );
     assert_eq!(artifact.module_count(), 1);

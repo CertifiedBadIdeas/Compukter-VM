@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::{
-    artifact::format,
+    artifact::{format, EntryArguments},
     bytes::Cursor,
     diagnostic::{Code, Diagnostic, DiagnosticSet, Family},
     limits::ArtifactLimits,
@@ -14,6 +14,7 @@ pub(crate) struct Header {
     pub payload_end: u64,
     pub entry_module: u32,
     pub entry_function: u32,
+    pub entry_arguments: EntryArguments,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,7 +140,22 @@ fn decode_header(bytes: &[u8], limits: &ArtifactLimits) -> Result<Header, Diagno
     let payload_end = cursor.read_u64().map_err(|error| single(limits, error))?;
     let entry_module = cursor.read_u32().map_err(|error| single(limits, error))?;
     let entry_function = cursor.read_u32().map_err(|error| single(limits, error))?;
-    let reserved = cursor.take(16).map_err(|error| single(limits, error))?;
+    let entry_arguments = match cursor.read_u8().map_err(|error| single(limits, error))? {
+        0 => EntryArguments::None,
+        1 => EntryArguments::StringArray,
+        _ => {
+            return Err(single(
+                limits,
+                diagnostic(
+                    Family::Container,
+                    Code::UnsupportedVersion,
+                    48,
+                    "unsupported entry argument contract",
+                ),
+            ));
+        }
+    };
+    let reserved = cursor.take(15).map_err(|error| single(limits, error))?;
 
     if format_major != format::FORMAT_MAJOR
         || runtime_major > format::RUNTIME_ABI_MAJOR
@@ -189,6 +205,7 @@ fn decode_header(bytes: &[u8], limits: &ArtifactLimits) -> Result<Header, Diagno
         payload_end,
         entry_module,
         entry_function,
+        entry_arguments,
     })
 }
 

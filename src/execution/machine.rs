@@ -1,15 +1,16 @@
 use super::{
     error::{
         AdmissionError, AllocationDiagnostic, AllocationExhaustion, AllocationRequestKind,
-        AllocationSource, GuestTrap, Outcome, RunError, VmFault,
+        AllocationSource, EntryArgumentLimit, GuestTrap, Outcome, RunError, VmFault,
     },
     gc::Collector,
     heap::{AllocationRequest, Heap},
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
+    host::EntryArgumentLimits,
     image::{ExecutionImage, ResolvedInstruction, ResolvedValueType},
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     numeric, text,
-    value::{EntryArgument, RegisterValue, RuntimeValue},
+    value::{EntryArgument, ReferenceDomain, ReferenceValue, RegisterValue, RuntimeValue},
 };
 use sha2::{Digest, Sha256};
 
@@ -248,6 +249,141 @@ impl Machine {
         self.maximum_observed_frame_depth = 1;
         self.lifecycle = Lifecycle::Runnable;
         Ok(())
+    }
+
+    pub(super) fn materialize_entry_string_array(
+        &mut self,
+        arguments: &[Box<[u16]>],
+        limits: EntryArgumentLimits,
+    ) -> Result<EntryArgument, RunError> {
+        if self.lifecycle != Lifecycle::Pristine {
+            return Err(RunError::AlreadyStarted);
+        }
+        let count = u32::try_from(arguments.len())
+            .map_err(|_| RunError::EntryArgumentLimit(EntryArgumentLimit::Count))?;
+        if count > limits.maximum_count || count > i32::MAX as u32 {
+            return Err(RunError::EntryArgumentLimit(EntryArgumentLimit::Count));
+        }
+        let mut total = 0_u32;
+        for argument in arguments {
+            let length = u32::try_from(argument.len())
+                .map_err(|_| RunError::EntryArgumentLimit(EntryArgumentLimit::ArgumentCodeUnits))?;
+            if length > limits.maximum_code_units_per_argument {
+                return Err(RunError::EntryArgumentLimit(
+                    EntryArgumentLimit::ArgumentCodeUnits,
+                ));
+            }
+            total = total
+                .checked_add(length)
+                .ok_or(RunError::EntryArgumentLimit(
+                    EntryArgumentLimit::TotalCodeUnits,
+                ))?;
+            if total > limits.maximum_total_code_units {
+                return Err(RunError::EntryArgumentLimit(
+                    EntryArgumentLimit::TotalCodeUnits,
+                ));
+            }
+        }
+
+        let entry = self
+            .image
+            .function(self.image.entry_index())
+            .ok_or(RunError::NotRunnable)?;
+        let array_type = entry
+            .registers
+            .first()
+            .and_then(|value| value.nominal)
+            .ok_or(RunError::NotRunnable)?;
+        if !matches!(
+            self.image.type_layout(array_type),
+            Some(RuntimeTypeLayout::Array {
+                element: ValueWidth::Ref
+            })
+        ) {
+            return Err(RunError::NotRunnable);
+        }
+        let string_type = self.image.string_type().ok_or(RunError::NotRunnable)?;
+        if self
+            .image
+            .array_element_type(array_type)
+            .and_then(|value| value.nominal)
+            != Some(string_type)
+        {
+            return Err(RunError::NotRunnable);
+        }
+
+        let mut strings = Vec::new();
+        strings
+            .try_reserve_exact(arguments.len())
+            .map_err(|_| RunError::EntryAllocationFailed)?;
+        for argument in arguments {
+            let mut pending = text::PendingHostString::new(u16::MAX);
+            let reference = loop {
+                match pending.resume(&self.image, &mut self.heap, argument, u32::MAX) {
+                    Ok((_, Some((_, RuntimeValue::Reference(reference))))) => break reference,
+                    Ok((_, Some(_))) => {
+                        self.rollback_entry_references(&strings);
+                        return Err(RunError::NotRunnable);
+                    }
+                    Ok((_, None)) => continue,
+                    Err(_) => {
+                        let _ = pending.abort(&mut self.heap);
+                        self.rollback_entry_references(&strings);
+                        return Err(RunError::EntryAllocationFailed);
+                    }
+                }
+            };
+            strings.push(reference);
+        }
+
+        let layout = array_layout(ValueWidth::Ref, count as i32).map_err(|_| {
+            self.rollback_entry_references(&strings);
+            RunError::EntryAllocationFailed
+        })?;
+        let reservation = match self.heap.reserve(AllocationRequest {
+            block_bytes: layout.block_bytes,
+            ty: array_type,
+        }) {
+            Ok(Some(reservation)) => reservation,
+            _ => {
+                self.rollback_entry_references(&strings);
+                return Err(RunError::EntryAllocationFailed);
+            }
+        };
+        let initialize = (|| {
+            self.heap
+                .zero_reserved_payload(reservation, 0, layout.block_bytes - 16)?;
+            self.heap.write_reserved_u32(reservation, 0, count)?;
+            for (index, reference) in strings.iter().copied().enumerate() {
+                let offset = 8_u32
+                    .checked_add((index as u32).checked_mul(8).ok_or(VmFault::CorruptHeap)?)
+                    .ok_or(VmFault::CorruptHeap)?;
+                self.heap.write_reserved(
+                    reservation,
+                    offset,
+                    &reference.to_bits().to_le_bytes(),
+                )?;
+            }
+            self.heap.commit(reservation)
+        })();
+        let array = match initialize {
+            Ok(reference) => reference,
+            Err(_) => {
+                let _ = self.heap.abort(reservation);
+                self.rollback_entry_references(&strings);
+                return Err(RunError::EntryAllocationFailed);
+            }
+        };
+        Ok(EntryArgument::owned(
+            self.image.content_hash(),
+            RuntimeValue::Reference(array),
+        ))
+    }
+
+    fn rollback_entry_references(&mut self, references: &[ReferenceValue]) {
+        for reference in references.iter().rev().copied() {
+            let _ = self.heap.free(reference);
+        }
     }
 
     pub(super) fn run_slice(
@@ -1996,18 +2132,34 @@ impl Machine {
                 if argument.owner != Some(self.image.content_hash()) {
                     return Err(RunError::ForeignReference { parameter });
                 }
-                let admitted = self
-                    .image
-                    .host_reference(value)
-                    .ok_or(RunError::DeadReference { parameter })?;
-                if !admitted.live {
-                    return Err(RunError::DeadReference { parameter });
-                }
                 let expected_type = expected.nominal.ok_or(RunError::EntryType { parameter })?;
-                if admitted.assignable_to.contains(&expected_type) {
-                    Ok(())
-                } else {
-                    Err(RunError::EntryType { parameter })
+                match value.domain() {
+                    ReferenceDomain::Managed => {
+                        let actual = self
+                            .heap
+                            .managed_type(value)
+                            .map_err(|_| RunError::DeadReference { parameter })?;
+                        if self.image.is_assignable(actual, expected_type) {
+                            Ok(())
+                        } else {
+                            Err(RunError::EntryType { parameter })
+                        }
+                    }
+                    ReferenceDomain::Host => {
+                        let admitted = self
+                            .image
+                            .host_reference(value)
+                            .filter(|value| value.live)
+                            .ok_or(RunError::DeadReference { parameter })?;
+                        if admitted.assignable_to.contains(&expected_type) {
+                            Ok(())
+                        } else {
+                            Err(RunError::EntryType { parameter })
+                        }
+                    }
+                    ReferenceDomain::Literal | ReferenceDomain::Emergency => {
+                        Err(RunError::EntryType { parameter })
+                    }
                 }
             }
             _ => Err(RunError::EntryType { parameter }),
