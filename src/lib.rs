@@ -68,7 +68,7 @@ pub use execution::{
     EntryArgumentLimits, EntryValue, ExecutionProfile, GuestTrap, HostArguments, HostFailure,
     HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView,
     ManagedAllocationFailure, OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError,
-    RunError, Session, VmFault,
+    RunError, Session, TaskId, VmFault,
 };
 pub use filesystem::{
     recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, FileCapability,
