@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::filesystem::FileRevision;
 use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
-use crate::stdio::{InputOwner, InputOwnershipError, StandardStreams};
+use crate::stdio::{InputOwner, InputOwnershipError, StandardStreamError, StandardStreams};
 use crate::{
     verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
     ComputerFileSystem, EntryValue, ExecutionProfile, FileCapability, FileRights, FileSystemError,
@@ -34,6 +34,8 @@ use crate::{
 const TERMINAL_NAMESPACE: &str = "compukter";
 const TERMINAL_NAME: &str = "terminal";
 const RAW_TERMINAL_ABI_MAJOR: u16 = 2;
+const STDIO_NAME: &str = "stdio";
+const STDIO_ABI_MAJOR: u16 = 1;
 const FILESYSTEM_NAME: &str = "filesystem";
 const FILESYSTEM_ABI_MAJOR: u16 = 1;
 const PROCESS_NAME: &str = "process";
@@ -63,6 +65,7 @@ pub enum ComputerError {
     Resume(ResumeError),
     InvalidRequestId,
     InvalidTerminalRequest,
+    InvalidStdioRequest,
     InvalidFileSystemRequest,
     InvalidProcessRequest,
     InvalidCompilerRequest,
@@ -157,6 +160,7 @@ struct ProcessFrame {
     process_diagnostics: Vec<(TaskId, Box<[u16]>)>,
     compiler_diagnostics: Box<[u16]>,
     pending_terminal_event: Option<(TaskId, RequestId)>,
+    pending_stdio_read: Option<(TaskId, RequestId)>,
     pending_process: Option<(TaskId, RequestId)>,
 }
 
@@ -293,6 +297,7 @@ impl ComputerMachine {
                 process_diagnostics: Vec::new(),
                 compiler_diagnostics: Box::new([]),
                 pending_terminal_event: None,
+                pending_stdio_read: None,
                 pending_process: None,
             }],
             terminal: TerminalDevice::default(),
@@ -427,6 +432,9 @@ impl ComputerMachine {
         if self.pending_compilation.is_some() {
             return Ok(ComputerAdvanceOutcome::SliceExhausted);
         }
+        if self.active_frame().pending_stdio_read.is_some() {
+            return self.advance_pending_stdio();
+        }
         if let Some((task, request)) = self.active_frame().pending_terminal_event {
             let Some(kind) = self.terminal_await_event_for(task)? else {
                 return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
@@ -449,6 +457,9 @@ impl ComputerMachine {
             match outcome {
                 AdvanceOutcome::HostRequest(request) if is_raw_terminal(request) => {
                     Some(copy_raw_terminal_request(request)?)
+                }
+                AdvanceOutcome::HostRequest(request) if is_stdio(request) => {
+                    Some(copy_stdio_request(request)?)
                 }
                 AdvanceOutcome::HostRequest(request) if is_filesystem(request) => {
                     Some(copy_filesystem_request(request)?)
@@ -527,6 +538,11 @@ impl ComputerMachine {
                 id,
                 operation,
             } => self.handle_raw_terminal_request(task, id, operation),
+            TerminalRequest::Stdio {
+                task,
+                id,
+                operation,
+            } => self.handle_stdio_request(task, id, operation),
             TerminalRequest::FileSystem { id, operation } => {
                 self.handle_filesystem_request(id, operation)
             }
@@ -539,6 +555,104 @@ impl ComputerMachine {
                 self.handle_compiler_request(id, operation)
             }
         }
+    }
+
+    fn handle_stdio_request(
+        &mut self,
+        task: TaskId,
+        id: RequestId,
+        operation: StdioOperation,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        let owner = InputOwner::new(self.sessions.len(), task);
+        match operation {
+            StdioOperation::ReadLine => {
+                if let Err(error) = self.standard_streams.begin_read(owner) {
+                    self.active_session_mut()
+                        .resume_internal_for(task, id, stdio_ownership_failure(error))
+                        .map_err(ComputerError::Resume)?;
+                    return Ok(ComputerAdvanceOutcome::SliceExhausted);
+                }
+                self.active_frame_mut().pending_stdio_read = Some((task, id));
+                self.advance_pending_stdio()
+            }
+            StdioOperation::Write(units) => {
+                let response = match self
+                    .standard_streams
+                    .write_stdout(&units, &mut self.terminal)
+                {
+                    Ok(()) => HostResponse::Success(HostValueInput::Unit),
+                    Err(error) => stdio_stream_failure(error),
+                };
+                self.active_session_mut()
+                    .resume_internal_for(task, id, response)
+                    .map_err(ComputerError::Resume)?;
+                Ok(ComputerAdvanceOutcome::SliceExhausted)
+            }
+            StdioOperation::WriteError(units) => {
+                let response = match self
+                    .standard_streams
+                    .write_stderr(&units, &mut self.terminal)
+                {
+                    Ok(()) => HostResponse::Success(HostValueInput::Unit),
+                    Err(error) => stdio_stream_failure(error),
+                };
+                self.active_session_mut()
+                    .resume_internal_for(task, id, response)
+                    .map_err(ComputerError::Resume)?;
+                Ok(ComputerAdvanceOutcome::SliceExhausted)
+            }
+        }
+    }
+
+    fn advance_pending_stdio(&mut self) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        let (task, request) = self
+            .active_frame()
+            .pending_stdio_read
+            .expect("stdio advance requires a pending read");
+        let owner = InputOwner::new(self.sessions.len(), task);
+        while let Some(event) = self.terminal.poll_input() {
+            let result = match event {
+                TerminalInputEvent::Text(text) => {
+                    let units = text.encode_utf16().collect::<Vec<_>>();
+                    self.standard_streams
+                        .accept_text(&units, &mut self.terminal)
+                }
+                TerminalInputEvent::Key(event)
+                    if matches!(
+                        event.action(),
+                        TerminalKeyAction::Press | TerminalKeyAction::Repeat
+                    ) =>
+                {
+                    self.standard_streams
+                        .accept_key(event.key(), &mut self.terminal)
+                }
+                TerminalInputEvent::Key(_) => Ok(()),
+            };
+            match result {
+                Ok(()) => {}
+                Err(StandardStreamError::LineTooLong) => continue,
+                Err(error) => {
+                    self.standard_streams.cancel(owner);
+                    self.active_frame_mut().pending_stdio_read = None;
+                    self.active_session_mut()
+                        .resume_internal_for(task, request, stdio_stream_failure(error))
+                        .map_err(ComputerError::Resume)?;
+                    return Ok(ComputerAdvanceOutcome::SliceExhausted);
+                }
+            }
+            if let Some(line) = self.standard_streams.take_line(owner) {
+                self.active_frame_mut().pending_stdio_read = None;
+                self.active_session_mut()
+                    .resume_internal_for(
+                        task,
+                        request,
+                        HostResponse::Success(HostValueInput::String(&line)),
+                    )
+                    .map_err(ComputerError::Resume)?;
+                return Ok(ComputerAdvanceOutcome::SliceExhausted);
+            }
+        }
+        Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent)
     }
 
     fn handle_raw_terminal_request(
@@ -1052,6 +1166,7 @@ impl ComputerMachine {
             process_diagnostics: Vec::new(),
             compiler_diagnostics: Box::new([]),
             pending_terminal_event: None,
+            pending_stdio_read: None,
             pending_process: None,
         });
         Ok(ComputerAdvanceOutcome::SliceExhausted)
@@ -1346,6 +1461,11 @@ enum TerminalRequest {
         id: RequestId,
         operation: RawTerminalOperation,
     },
+    Stdio {
+        task: TaskId,
+        id: RequestId,
+        operation: StdioOperation,
+    },
     FileSystem {
         id: RequestId,
         operation: FileSystemOperation,
@@ -1359,6 +1479,12 @@ enum TerminalRequest {
         id: RequestId,
         operation: CompilerOperation,
     },
+}
+
+enum StdioOperation {
+    ReadLine,
+    Write(Vec<u16>),
+    WriteError(Vec<u16>),
 }
 
 enum RawTerminalOperation {
@@ -1459,6 +1585,11 @@ fn admit_session(
         OperationSchema::synchronous(&terminal_write_at_arguments, HostValueType::Unit),
         OperationSchema::synchronous(&terminal_fill_arguments, HostValueType::Unit),
     ];
+    let stdio_operations = [
+        OperationSchema::asynchronous(&[], HostValueType::String),
+        OperationSchema::synchronous(&string_argument, HostValueType::Unit),
+        OperationSchema::synchronous(&string_argument, HostValueType::Unit),
+    ];
     let filesystem_operations = [
         OperationSchema::synchronous(&string_argument, HostValueType::I32),
         OperationSchema::synchronous(&string_argument, HostValueType::String),
@@ -1492,7 +1623,7 @@ fn admit_session(
                 .collect::<Box<[_]>>()
         })
         .collect::<Box<[_]>>();
-    let mut bindings = Vec::with_capacity(addon_bindings.len() + 3);
+    let mut bindings = Vec::with_capacity(addon_bindings.len() + 5);
     for (index, binding) in addon_bindings.iter().enumerate() {
         bindings.push(CapabilityBinding::new(
             binding.namespace(),
@@ -1508,6 +1639,13 @@ fn admit_session(
         RAW_TERMINAL_ABI_MAJOR,
         0,
         &raw_terminal_operations,
+    ));
+    bindings.push(CapabilityBinding::new(
+        TERMINAL_NAMESPACE,
+        STDIO_NAME,
+        STDIO_ABI_MAJOR,
+        0,
+        &stdio_operations,
     ));
     bindings.push(CapabilityBinding::new(
         TERMINAL_NAMESPACE,
@@ -1537,6 +1675,12 @@ fn is_raw_terminal(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == TERMINAL_NAME
         && request.abi_major() == RAW_TERMINAL_ABI_MAJOR
+}
+
+fn is_stdio(request: HostRequestView<'_>) -> bool {
+    request.namespace() == TERMINAL_NAMESPACE
+        && request.name() == STDIO_NAME
+        && request.abi_major() == STDIO_ABI_MAJOR
 }
 
 fn is_filesystem(request: HostRequestView<'_>) -> bool {
@@ -1831,6 +1975,41 @@ fn copy_raw_terminal_request(
     })
 }
 
+fn copy_stdio_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
+    let string = || match request.arguments().get(0) {
+        Some(HostValueView::String(units)) if request.arguments().len() == 1 => Ok(units.to_vec()),
+        _ => Err(ComputerError::InvalidStdioRequest),
+    };
+    let operation = match request.operation() {
+        0 if request.asynchronous() && request.arguments().is_empty() => StdioOperation::ReadLine,
+        1 if !request.asynchronous() => StdioOperation::Write(string()?),
+        2 if !request.asynchronous() => StdioOperation::WriteError(string()?),
+        _ => return Err(ComputerError::InvalidStdioRequest),
+    };
+    Ok(TerminalRequest::Stdio {
+        task: request.task_id(),
+        id: request.id(),
+        operation,
+    })
+}
+
+const STDIO_BUSY_ERROR_CODE: u32 = 1;
+const STDIO_STREAM_ERROR_CODE: u32 = 2;
+
+fn stdio_ownership_failure(_: InputOwnershipError) -> HostResponse<'static> {
+    HostResponse::Failure(HostFailure::new(
+        HostFailureKind::Unavailable,
+        STDIO_BUSY_ERROR_CODE,
+    ))
+}
+
+fn stdio_stream_failure(_: StandardStreamError) -> HostResponse<'static> {
+    HostResponse::Failure(HostFailure::new(
+        HostFailureKind::InputOutput,
+        STDIO_STREAM_ERROR_CODE,
+    ))
+}
+
 fn terminal_position(x: i32, y: i32) -> Result<TerminalPosition, ComputerError> {
     let x = u16::try_from(x).map_err(|_| ComputerError::InvalidTerminalRequest)?;
     let y = u16::try_from(y).map_err(|_| ComputerError::InvalidTerminalRequest)?;
@@ -2003,6 +2182,79 @@ mod tests {
             ComputerError::NoActiveTerminalEvent,
             computer.terminal_finish_event().unwrap_err()
         );
+    }
+
+    #[test]
+    fn stdio_read_line_echoes_then_writes_stdout_and_stderr_in_order() {
+        let artifact = crate::execution::fixtures::stdio_conformance_artifact(&['!' as u16]);
+        let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+
+        while !matches!(
+            computer.advance(64, 64).unwrap(),
+            ComputerAdvanceOutcome::WaitingForTerminalEvent
+        ) {}
+        computer.terminal_mut().push_text("ab").unwrap();
+        computer
+            .terminal_mut()
+            .push_key(TerminalKeyEvent::new(
+                TerminalKey::Enter,
+                TerminalKeyAction::Press,
+                TerminalModifiers::default(),
+            ))
+            .unwrap();
+
+        loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::WaitingForTerminalEvent => {}
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(_))) => break,
+                other => panic!("unexpected stdio outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            'a' as u32,
+            computer.terminal().cell(0, 0).unwrap().code_point()
+        );
+        assert_eq!(
+            'b' as u32,
+            computer.terminal().cell(1, 0).unwrap().code_point()
+        );
+        assert_eq!(
+            'a' as u32,
+            computer.terminal().cell(0, 1).unwrap().code_point()
+        );
+        assert_eq!(
+            'b' as u32,
+            computer.terminal().cell(1, 1).unwrap().code_point()
+        );
+        assert_eq!(
+            '!' as u32,
+            computer.terminal().cell(2, 1).unwrap().code_point()
+        );
+    }
+
+    #[test]
+    fn stdio_read_conflict_becomes_bounded_host_failure_without_consuming_input() {
+        let artifact = crate::execution::fixtures::stdio_conformance_artifact(&['!' as u16]);
+        let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+        let owner = InputOwner::new(1, TaskId::ROOT);
+        computer.standard_streams.begin_raw_wait(owner).unwrap();
+        computer.terminal_mut().push_text("queued").unwrap();
+
+        let failure = loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::HostFailed(failure) => break failure,
+                other => panic!("unexpected conflicting stdio outcome: {other:?}"),
+            }
+        };
+        assert_eq!(HostFailureKind::Unavailable, failure.kind());
+        assert_eq!(STDIO_BUSY_ERROR_CODE, failure.code());
+        assert_eq!(
+            Some(ComputerTerminalEventKind::Text),
+            computer.terminal_await_event().unwrap()
+        );
+        assert_eq!("queued", computer.terminal_event_text().unwrap());
     }
 
     #[test]
