@@ -1057,13 +1057,7 @@ fn verify_instruction(
             } else {
                 read(function, state, *value, module_id, function_id, limits)?;
                 let value_type = register_type(function, *value, module_id, function_id, limits)?;
-                if !modules::value_types_match(
-                    artifact,
-                    module_id,
-                    value_type,
-                    signature.0,
-                    *signature.1,
-                ) {
+                if !value_assignable(artifact, module_id, value_type, signature.0, *signature.1) {
                     return Err(type_failure(
                         limits,
                         module_id,
