@@ -46,7 +46,6 @@ mod execution;
 pub mod filesystem;
 pub mod limits;
 mod process;
-#[cfg_attr(not(test), allow(dead_code))]
 mod stdio;
 pub mod terminal;
 
