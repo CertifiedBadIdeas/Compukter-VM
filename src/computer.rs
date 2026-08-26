@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::filesystem::FileRevision;
 use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
+use crate::stdio::{InputOwner, InputOwnershipError, StandardStreams};
 use crate::{
     verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
     ComputerFileSystem, EntryValue, ExecutionProfile, FileCapability, FileRights, FileSystemError,
@@ -71,6 +72,7 @@ pub enum ComputerError {
     ActiveTerminalEvent,
     NoActiveTerminalEvent,
     WrongTerminalEventKind,
+    TerminalInputBusy(InputOwnershipError),
 }
 
 #[repr(i32)]
@@ -133,8 +135,9 @@ pub struct CompilationRequest {
 pub struct ComputerMachine {
     sessions: Vec<ProcessFrame>,
     terminal: TerminalDevice,
+    standard_streams: StandardStreams,
     active_terminal_event: Option<TerminalInputEvent>,
-    active_terminal_event_owner: Option<usize>,
+    active_terminal_event_owner: Option<InputOwner>,
     filesystem: ComputerFileSystem,
     initial_file_capability: FileCapability,
     profile: ExecutionProfile,
@@ -153,7 +156,7 @@ struct ProcessFrame {
     session: Session,
     process_diagnostics: Vec<(TaskId, Box<[u16]>)>,
     compiler_diagnostics: Box<[u16]>,
-    pending_terminal_event: Option<RequestId>,
+    pending_terminal_event: Option<(TaskId, RequestId)>,
     pending_process: Option<(TaskId, RequestId)>,
 }
 
@@ -293,6 +296,11 @@ impl ComputerMachine {
                 pending_process: None,
             }],
             terminal: TerminalDevice::default(),
+            standard_streams: StandardStreams::new(
+                profile.maximum_inbound_utf16_code_units as usize,
+                profile.maximum_outbound_utf16_code_units as usize,
+            )
+            .expect("an admitted execution profile has non-zero text limits"),
             active_terminal_event: None,
             active_terminal_event_owner: None,
             filesystem,
@@ -324,9 +332,20 @@ impl ComputerMachine {
     pub fn terminal_await_event(
         &mut self,
     ) -> Result<Option<ComputerTerminalEventKind>, ComputerError> {
+        self.terminal_await_event_for(TaskId::ROOT)
+    }
+
+    fn terminal_await_event_for(
+        &mut self,
+        task: TaskId,
+    ) -> Result<Option<ComputerTerminalEventKind>, ComputerError> {
         if self.active_terminal_event.is_some() {
             return Err(ComputerError::ActiveTerminalEvent);
         }
+        let owner = InputOwner::new(self.sessions.len(), task);
+        self.standard_streams
+            .begin_raw_wait(owner)
+            .map_err(ComputerError::TerminalInputBusy)?;
         let Some(event) = self.terminal.poll_input() else {
             return Ok(None);
         };
@@ -335,7 +354,7 @@ impl ComputerMachine {
             TerminalInputEvent::Key(_) => ComputerTerminalEventKind::Key,
         };
         self.active_terminal_event = Some(event);
-        self.active_terminal_event_owner = Some(self.sessions.len());
+        self.active_terminal_event_owner = Some(owner);
         Ok(Some(kind))
     }
 
@@ -375,6 +394,17 @@ impl ComputerMachine {
     }
 
     pub fn terminal_finish_event(&mut self) -> Result<(), ComputerError> {
+        let owner = self
+            .active_terminal_event_owner
+            .ok_or(ComputerError::NoActiveTerminalEvent)?;
+        self.terminal_finish_event_for(owner.task())
+    }
+
+    fn terminal_finish_event_for(&mut self, task: TaskId) -> Result<(), ComputerError> {
+        let owner = InputOwner::new(self.sessions.len(), task);
+        if self.active_terminal_event_owner != Some(owner) {
+            return Err(ComputerError::NoActiveTerminalEvent);
+        }
         let result = self
             .active_terminal_event
             .take()
@@ -382,6 +412,9 @@ impl ComputerMachine {
             .ok_or(ComputerError::NoActiveTerminalEvent);
         if result.is_ok() {
             self.active_terminal_event_owner = None;
+            self.standard_streams
+                .finish_raw(owner)
+                .map_err(ComputerError::TerminalInputBusy)?;
         }
         result
     }
@@ -394,12 +427,13 @@ impl ComputerMachine {
         if self.pending_compilation.is_some() {
             return Ok(ComputerAdvanceOutcome::SliceExhausted);
         }
-        if let Some(request) = self.active_frame().pending_terminal_event {
-            let Some(kind) = self.terminal_await_event()? else {
+        if let Some((task, request)) = self.active_frame().pending_terminal_event {
+            let Some(kind) = self.terminal_await_event_for(task)? else {
                 return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
             };
             self.active_session_mut()
-                .resume_internal(
+                .resume_internal_for(
+                    task,
                     request,
                     HostResponse::Success(HostValueInput::I32(kind as i32)),
                 )
@@ -488,9 +522,11 @@ impl ComputerMachine {
             }
         };
         match internal.expect("internal request branch always publishes an action") {
-            TerminalRequest::Raw { id, operation } => {
-                self.handle_raw_terminal_request(id, operation)
-            }
+            TerminalRequest::Raw {
+                task,
+                id,
+                operation,
+            } => self.handle_raw_terminal_request(task, id, operation),
             TerminalRequest::FileSystem { id, operation } => {
                 self.handle_filesystem_request(id, operation)
             }
@@ -507,9 +543,22 @@ impl ComputerMachine {
 
     fn handle_raw_terminal_request(
         &mut self,
+        task: TaskId,
         id: RequestId,
         operation: RawTerminalOperation,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        if matches!(
+            &operation,
+            RawTerminalOperation::EventText
+                | RawTerminalOperation::EventKey
+                | RawTerminalOperation::EventAction
+                | RawTerminalOperation::EventModifiers
+                | RawTerminalOperation::FinishEvent
+        ) {
+            self.standard_streams
+                .ensure_raw_owner(InputOwner::new(self.sessions.len(), task))
+                .map_err(ComputerError::TerminalInputBusy)?;
+        }
         let response = match operation {
             RawTerminalOperation::Write(units) => {
                 self.terminal
@@ -526,8 +575,8 @@ impl ComputerMachine {
                 HostValueInput::Unit
             }
             RawTerminalOperation::AwaitEvent => {
-                let Some(kind) = self.terminal_await_event()? else {
-                    self.active_frame_mut().pending_terminal_event = Some(id);
+                let Some(kind) = self.terminal_await_event_for(task)? else {
+                    self.active_frame_mut().pending_terminal_event = Some((task, id));
                     return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
                 };
                 HostValueInput::I32(kind as i32)
@@ -550,7 +599,7 @@ impl ComputerMachine {
                 HostValueInput::I32(i32::from(self.terminal_event_modifiers()?))
             }
             RawTerminalOperation::FinishEvent => {
-                self.terminal_finish_event()?;
+                self.terminal_finish_event_for(task)?;
                 HostValueInput::Unit
             }
             RawTerminalOperation::SetCursor { x, y } => {
@@ -597,7 +646,7 @@ impl ComputerMachine {
             }
         };
         self.active_session_mut()
-            .resume_internal(id, HostResponse::Success(response))
+            .resume_internal_for(task, id, HostResponse::Success(response))
             .map_err(ComputerError::Resume)?;
         Ok(ComputerAdvanceOutcome::SliceExhausted)
     }
@@ -1198,10 +1247,14 @@ impl ComputerMachine {
         self.sessions.pop();
         self.reserved_heap_bytes -= u64::from(self.profile.heap_bytes);
         self.reserved_frame_storage_bytes -= self.profile.frame_storage_bytes;
-        if self.active_terminal_event_owner == Some(child_depth) {
+        if self
+            .active_terminal_event_owner
+            .is_some_and(|owner| owner.frame() == child_depth)
+        {
             self.active_terminal_event = None;
             self.active_terminal_event_owner = None;
         }
+        self.standard_streams.cancel_frame(child_depth);
         let (task, request) = self
             .active_frame_mut()
             .pending_process
@@ -1289,6 +1342,7 @@ impl ComputerMachine {
 
 enum TerminalRequest {
     Raw {
+        task: TaskId,
         id: RequestId,
         operation: RawTerminalOperation,
     },
@@ -1771,6 +1825,7 @@ fn copy_raw_terminal_request(
         _ => return Err(ComputerError::InvalidTerminalRequest),
     };
     Ok(TerminalRequest::Raw {
+        task: request.task_id(),
         id: request.id(),
         operation,
     })
@@ -1831,6 +1886,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::stdio::{InputOwner, InputOwnershipError};
     use crate::{
         ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits,
         ProcessFailureReason, ProcessLimits, RomImage, TaskId, TerminalKey, TerminalKeyEvent,
@@ -1946,6 +2002,73 @@ mod tests {
         assert_eq!(
             ComputerError::NoActiveTerminalEvent,
             computer.terminal_finish_event().unwrap_err()
+        );
+    }
+
+    #[test]
+    fn raw_wait_rejects_canonical_ownership_before_consuming_input() {
+        let artifact = crate::execution::fixtures::two_block_artifact(1, 1);
+        let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+        let root = InputOwner::new(1, TaskId::ROOT);
+        computer.standard_streams.begin_read(root).unwrap();
+        computer.terminal_mut().push_text("queued").unwrap();
+
+        assert_eq!(
+            ComputerError::TerminalInputBusy(InputOwnershipError::CanonicalBusy),
+            computer.terminal_await_event().unwrap_err(),
+        );
+        computer.standard_streams.cancel(root);
+        assert_eq!(
+            Some(ComputerTerminalEventKind::Text),
+            computer.terminal_await_event().unwrap(),
+        );
+        assert_eq!("queued", computer.terminal_event_text().unwrap());
+    }
+
+    #[test]
+    fn child_completion_releases_only_the_child_input_owner() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        let child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let child_bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        filesystem
+            .write_file(&owner, &path("/home/child", &limits), &child_bytes, true)
+            .unwrap();
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let mut computer =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        while computer.sessions.len() == 1 {
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                computer.advance(64, 64).unwrap(),
+            );
+        }
+
+        let child_owner = InputOwner::new(2, TaskId::ROOT);
+        computer.standard_streams.begin_read(child_owner).unwrap();
+        while computer.sessions.len() == 2 {
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                computer.advance(64, 64).unwrap(),
+            );
+        }
+
+        let root_owner = InputOwner::new(1, TaskId::ROOT);
+        computer
+            .standard_streams
+            .begin_raw_wait(root_owner)
+            .unwrap();
+        assert_eq!(
+            InputOwnershipError::RawBusy,
+            computer
+                .standard_streams
+                .begin_read(child_owner)
+                .unwrap_err(),
         );
     }
 
