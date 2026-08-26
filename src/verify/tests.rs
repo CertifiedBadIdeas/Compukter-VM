@@ -678,6 +678,32 @@ fn cfg_accepts_i32_char_conversions() {
 }
 
 #[test]
+fn cfg_accepts_subtype_return_for_declared_base_result() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.modules[0].types.push(class(0, 0, u32::MAX));
+    artifact.modules[0].types.push(class(0, 0, 1));
+    configure_entry(
+        &mut artifact,
+        vec![reference(2, false)],
+        0,
+        vec![
+            crate::artifact::Instruction::NewObject {
+                dst: 0,
+                type_ref: 2,
+            },
+            crate::artifact::Instruction::Return { value: 0 },
+        ],
+    );
+    let crate::artifact::NominalType::Function { result, .. } = &mut artifact.modules[0].types[0]
+    else {
+        unreachable!()
+    };
+    *result = reference(1, false);
+
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
 fn cfg_rejects_other_char_conversion_pairs() {
     for numeric_kind in [2, 3, 4] {
         let mut artifact = decoded(support::minimal_vector());
