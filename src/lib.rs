@@ -46,6 +46,8 @@ mod execution;
 pub mod filesystem;
 pub mod limits;
 mod process;
+#[cfg_attr(not(test), allow(dead_code))]
+mod stdio;
 pub mod terminal;
 
 #[cfg(test)]
@@ -83,6 +85,7 @@ pub use process::{
     ProcessArgumentLimits, ProcessCompletion, ProcessContractError, ProcessFailureReason,
     ProcessLimits,
 };
+pub use stdio::InputOwnershipError;
 pub use terminal::{
     TerminalCell, TerminalChange, TerminalCommit, TerminalConfig, TerminalDelta, TerminalDevice,
     TerminalError, TerminalInputError, TerminalInputEvent, TerminalInputLimits, TerminalKey,
