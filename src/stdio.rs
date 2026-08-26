@@ -158,6 +158,17 @@ impl StandardStreams {
         if self.input.ready.is_some() {
             return Err(StandardStreamError::LineReady);
         }
+        let filtered;
+        let units = if units.iter().copied().all(is_canonical_text_unit) {
+            units
+        } else {
+            filtered = units
+                .iter()
+                .copied()
+                .filter(|unit| is_canonical_text_unit(*unit))
+                .collect::<Vec<_>>();
+            filtered.as_slice()
+        };
         if self
             .input
             .editing
@@ -277,6 +288,10 @@ impl StandardStreams {
     }
 }
 
+fn is_canonical_text_unit(unit: u16) -> bool {
+    unit >= 0x20 && unit != 0x7f
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InputOwner, InputOwnershipError, StandardStreamError, StandardStreams};
@@ -326,6 +341,33 @@ mod tests {
         );
         assert_eq!(' ' as u32, terminal.cell(0, 0).unwrap().code_point());
         assert_eq!(None, streams.take_line(ROOT));
+    }
+
+    #[test]
+    fn canonical_input_ignores_control_text_without_echoing_or_storing_it() {
+        let mut terminal = TerminalDevice::default();
+        let mut streams = StandardStreams::new(8, 8).unwrap();
+        streams.begin_read(ROOT).unwrap();
+
+        streams
+            .accept_text(
+                &['a' as u16, 0x0000, '\r' as u16, '\n' as u16, 0x007f],
+                &mut terminal,
+            )
+            .unwrap();
+        streams
+            .accept_key(TerminalKey::Enter, &mut terminal)
+            .unwrap();
+
+        assert_eq!(
+            Some(vec!['a' as u16].into_boxed_slice()),
+            streams.take_line(ROOT),
+        );
+        assert_eq!('a' as u32, terminal.cell(0, 0).unwrap().code_point());
+        assert_eq!(
+            TerminalPosition::new(0, 1).unwrap(),
+            terminal.cursor_position(),
+        );
     }
 
     #[test]

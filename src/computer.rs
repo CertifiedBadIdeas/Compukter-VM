@@ -1055,7 +1055,8 @@ impl ComputerMachine {
             Ok(bytes) => bytes,
             Err(error) => {
                 let reason = process_filesystem_reason(error);
-                return self.resume_process_failure(task, id, reason, &path_diagnostic);
+                let diagnostic = process_filesystem_diagnostic(error, &path_diagnostic);
+                return self.resume_process_failure(task, id, reason, &diagnostic);
             }
         };
         let artifact = match verify_artifact(bytes.into(), ArtifactLimits::default()) {
@@ -1784,6 +1785,26 @@ fn process_filesystem_reason(error: FileSystemError) -> ProcessFailureReason {
     }
 }
 
+fn process_filesystem_diagnostic(error: FileSystemError, path: &str) -> String {
+    match error {
+        FileSystemError::InvalidPath => format!("invalid path: {path}"),
+        FileSystemError::NotFound => format!("not found: {path}"),
+        FileSystemError::PermissionDenied | FileSystemError::ReadOnly => {
+            format!("access denied: {path}")
+        }
+        FileSystemError::NotExecutable
+        | FileSystemError::IsDirectory
+        | FileSystemError::NotDirectory => format!("not executable: {path}"),
+        FileSystemError::QuotaExceeded => "filesystem quota exceeded".to_owned(),
+        FileSystemError::AlreadyExists
+        | FileSystemError::NotEmpty
+        | FileSystemError::StaleHandle
+        | FileSystemError::Busy
+        | FileSystemError::StorageFaulted
+        | FileSystemError::Closed => format!("filesystem I/O failed: {path}"),
+    }
+}
+
 fn decode_process_arguments(
     encoded: &[u16],
     limits: ProcessLimits,
@@ -2115,7 +2136,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            Some("/home/nop".encode_utf16().collect::<Box<[_]>>()),
+            Some("not found".encode_utf16().collect::<Box<[_]>>()),
             computer.take_process_diagnostic(TaskId::ROOT),
         );
         assert_eq!(None, computer.take_process_diagnostic(TaskId::ROOT));
