@@ -60,12 +60,15 @@ pub enum HostDeployError {
 #[derive(Debug)]
 pub struct DeploymentFailure {
     error: HostDeployError,
-    candidate: DeploymentCandidate,
+    candidate: Box<DeploymentCandidate>,
 }
 
 impl DeploymentFailure {
-    pub(crate) const fn new(error: HostDeployError, candidate: DeploymentCandidate) -> Self {
-        Self { error, candidate }
+    pub(crate) fn new(error: HostDeployError, candidate: DeploymentCandidate) -> Self {
+        Self {
+            error,
+            candidate: Box::new(candidate),
+        }
     }
 
     pub const fn error(&self) -> HostDeployError {
@@ -73,6 +76,6 @@ impl DeploymentFailure {
     }
 
     pub fn into_candidate(self) -> DeploymentCandidate {
-        self.candidate
+        *self.candidate
     }
 }

@@ -22,9 +22,10 @@ mod support;
 use std::sync::Arc;
 
 use compukter_vm::{
-    verify_artifact, ArtifactLimits, ComputerError, ComputerMachine, ComputerTerminalEventKind,
-    EntryArgumentLimits, ExecutableRevision, ExecutionProfile, FileSystemLimits, HostVerifyError,
-    TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, VirtualPath,
+    verify_artifact, ArtifactLimits, CanonicalLineSubmissionError, ComputerError, ComputerMachine,
+    ComputerTerminalEventKind, EntryArgumentLimits, ExecutableRevision, ExecutionProfile,
+    FileSystemLimits, HostVerifyError, TerminalKey, TerminalKeyAction, TerminalKeyEvent,
+    TerminalModifiers, VirtualPath,
 };
 
 #[test]
@@ -72,6 +73,27 @@ fn deployment_reports_the_exact_installed_revision() {
     let installed = computer.deploy(&path, expected, candidate).unwrap();
 
     assert!(matches!(installed, ExecutableRevision::Present(_)));
+    assert_eq!(installed, computer.executable_revision(&path).unwrap());
+}
+
+#[test]
+fn deployment_and_command_submission_are_separate_public_operations() {
+    let bytes: Arc<[u8]> = Arc::from(terminal_artifact());
+    let root = verify_artifact(Arc::clone(&bytes), ArtifactLimits::default()).unwrap();
+    let mut computer = ComputerMachine::start(root, profile(), &[], &[]).unwrap();
+    let path = VirtualPath::parse_utf8("/home/demo", &FileSystemLimits::default()).unwrap();
+    let expected = computer.executable_revision(&path).unwrap();
+    let candidate = computer.verify_for_deploy(bytes).unwrap();
+
+    let installed = computer.deploy(&path, expected, candidate).unwrap();
+
+    assert_eq!(installed, computer.executable_revision(&path).unwrap());
+    assert_eq!(
+        CanonicalLineSubmissionError::NoPendingRead,
+        computer
+            .submit_canonical_line(&"/home/demo".encode_utf16().collect::<Vec<_>>())
+            .unwrap_err(),
+    );
     assert_eq!(installed, computer.executable_revision(&path).unwrap());
 }
 
