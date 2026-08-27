@@ -23,13 +23,13 @@ use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
 use crate::stdio::{InputOwner, InputOwnershipError, StandardStreamError, StandardStreams};
 use crate::{
     verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
-    ComputerFileSystem, DeploymentCandidate, EntryValue, ExecutionProfile, FileCapability,
-    FileRights, FileSystemError, FileSystemLimits, GuestTrap, HostFailure, HostFailureKind,
-    HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView, HostVerifyError,
-    ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, ProcessCompletion,
-    ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId, ResumeError, RunError,
-    Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction, TerminalPosition,
-    TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
+    ComputerFileSystem, DeploymentCandidate, DeploymentFailure, EntryValue, ExecutionProfile,
+    FileCapability, FileRights, FileSystemError, FileSystemLimits, GuestTrap, HostDeployError,
+    HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType,
+    HostValueView, HostVerifyError, ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema,
+    ProcessCompletion, ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId,
+    ResumeError, RunError, Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction,
+    TerminalPosition, TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
@@ -349,6 +349,46 @@ impl ComputerMachine {
             artifact,
             bytes,
         ))
+    }
+
+    pub fn executable_revision(
+        &self,
+        path: &VirtualPath,
+    ) -> Result<ExecutableRevision, FileSystemError> {
+        self.filesystem
+            .executable_install_revision(&self.initial_file_capability, path)
+    }
+
+    pub fn deploy(
+        &mut self,
+        path: &VirtualPath,
+        expected: ExecutableRevision,
+        candidate: DeploymentCandidate,
+    ) -> Result<ExecutableRevision, DeploymentFailure> {
+        if !Arc::ptr_eq(&self.machine_identity, &candidate.machine) {
+            return Err(DeploymentFailure::new(
+                HostDeployError::WrongMachine,
+                candidate,
+            ));
+        }
+        if self.profile != candidate.profile {
+            return Err(DeploymentFailure::new(
+                HostDeployError::ProfileChanged,
+                candidate,
+            ));
+        }
+        if let Err(error) = self.filesystem.install_executable(
+            &self.initial_file_capability,
+            path,
+            candidate.bytes.as_ref(),
+            expected,
+        ) {
+            return Err(DeploymentFailure::new(
+                HostDeployError::FileSystem(error),
+                candidate,
+            ));
+        }
+        Ok(ExecutableRevision::Present(self.filesystem.generation()))
     }
 
     pub fn terminal_mut(&mut self) -> &mut TerminalDevice {
@@ -2593,6 +2633,60 @@ mod tests {
     }
 
     #[test]
+    fn deployment_installs_verified_bytes_at_the_expected_revision() {
+        let (mut computer, path, bytes) = deployment_fixture(None);
+        let expected = computer.executable_revision(&path).unwrap();
+        assert_eq!(ExecutableRevision::Absent, expected);
+        let candidate = computer.verify_for_deploy(Arc::clone(&bytes)).unwrap();
+
+        let revision = computer.deploy(&path, expected, candidate).unwrap();
+
+        assert!(matches!(revision, ExecutableRevision::Present(_)));
+        let installed = computer.filesystem.read_file_for_test(&path).unwrap();
+        assert_eq!(bytes.as_ref(), installed.as_slice());
+    }
+
+    #[test]
+    fn stale_deployment_returns_the_candidate_and_preserves_the_file() {
+        let (mut computer, path, replacement) = deployment_fixture(Some(b"old"));
+        let before = computer.filesystem.read_file_for_test(&path).unwrap();
+        let replacement_candidate = computer
+            .verify_for_deploy(Arc::clone(&replacement))
+            .unwrap();
+
+        let failure = computer
+            .deploy(&path, ExecutableRevision::Absent, replacement_candidate)
+            .unwrap_err();
+
+        assert_eq!(
+            HostDeployError::FileSystem(FileSystemError::Busy),
+            failure.error(),
+        );
+        assert_eq!(
+            before,
+            computer.filesystem.read_file_for_test(&path).unwrap()
+        );
+        drop(failure.into_candidate());
+    }
+
+    #[test]
+    fn deployment_candidate_cannot_cross_machine_instances() {
+        let (source, _, bytes) = deployment_fixture(None);
+        let candidate = source.verify_for_deploy(bytes).unwrap();
+        let (mut destination, path, _) = deployment_fixture(None);
+
+        let failure = destination
+            .deploy(&path, ExecutableRevision::Absent, candidate)
+            .unwrap_err();
+
+        assert_eq!(HostDeployError::WrongMachine, failure.error());
+        assert_eq!(
+            ExecutableRevision::Absent,
+            destination.executable_revision(&path).unwrap(),
+        );
+    }
+
+    #[test]
     fn compiler_transaction_rejects_invalid_artifacts_without_creating_output() {
         let (mut computer, owner, _, output) = compiler_computer(b"fun main() = 42\n", None);
         let request = next_compilation_request(&mut computer);
@@ -3190,6 +3284,24 @@ mod tests {
         )
         .unwrap();
         (computer, owner, source, output)
+    }
+
+    fn deployment_fixture(existing: Option<&[u8]>) -> (ComputerMachine, VirtualPath, Arc<[u8]>) {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let output = path("/home/demo", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        if let Some(bytes) = existing {
+            filesystem.write_file(&owner, &output, bytes, true).unwrap();
+        }
+        let root = crate::execution::fixtures::two_block_artifact(1, 1);
+        let computer =
+            ComputerMachine::start_in_filesystem(root, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        let replacement = crate::execution::fixtures::two_block_artifact(2, 1);
+        let bytes: Arc<[u8]> =
+            Arc::from(crate::test_encode::encode_artifact(replacement.decoded()).unwrap());
+        (computer, output, bytes)
     }
 
     fn next_compilation_request(computer: &mut ComputerMachine) -> CompilationRequest {
