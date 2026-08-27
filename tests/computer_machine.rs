@@ -23,9 +23,16 @@ use std::sync::Arc;
 
 use compukter_vm::{
     verify_artifact, ArtifactLimits, ComputerError, ComputerMachine, ComputerTerminalEventKind,
-    EntryArgumentLimits, ExecutionProfile, TerminalKey, TerminalKeyAction, TerminalKeyEvent,
-    TerminalModifiers,
+    EntryArgumentLimits, ExecutableRevision, ExecutionProfile, TerminalKey, TerminalKeyAction,
+    TerminalKeyEvent, TerminalModifiers,
 };
+
+#[test]
+fn executable_revision_distinguishes_absent_and_present_files() {
+    assert_ne!(ExecutableRevision::Absent, ExecutableRevision::Present(1));
+    assert_eq!(ExecutableRevision::Present(7).generation(), Some(7));
+    assert_eq!(ExecutableRevision::Absent.generation(), None);
+}
 
 #[test]
 fn computer_active_terminal_event_is_typed_fifo_and_lifetime_bounded() {

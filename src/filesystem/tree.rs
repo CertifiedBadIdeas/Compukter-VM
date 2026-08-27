@@ -48,9 +48,18 @@ pub struct NodeMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileRevision {
+pub enum ExecutableRevision {
     Absent,
     Present(u64),
+}
+
+impl ExecutableRevision {
+    pub const fn generation(self) -> Option<u64> {
+        match self {
+            Self::Absent => None,
+            Self::Present(generation) => Some(generation),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -464,7 +473,7 @@ impl ComputerFileSystem {
         &self,
         capability: &FileCapability,
         path: &VirtualPath,
-    ) -> Result<FileRevision, FileSystemError> {
+    ) -> Result<ExecutableRevision, FileSystemError> {
         let (mount, components) = writable_path(path)?;
         let (name, parent_components) = split_name(components)?;
         let parent = find_directory(self.directory(mount), parent_components)?;
@@ -474,12 +483,12 @@ impl ComputerFileSystem {
                 if node.metadata.kind != NodeKind::File {
                     return Err(FileSystemError::IsDirectory);
                 }
-                Ok(FileRevision::Present(node.metadata.generation))
+                Ok(ExecutableRevision::Present(node.metadata.generation))
             }
             None => {
                 require(capability, path, FileRights::CREATE | FileRights::WRITE)?;
                 self.check_directory_entry_limit(parent.len())?;
-                Ok(FileRevision::Absent)
+                Ok(ExecutableRevision::Absent)
             }
         }
     }
@@ -489,7 +498,7 @@ impl ComputerFileSystem {
         capability: &FileCapability,
         path: &VirtualPath,
         bytes: &[u8],
-        expected: FileRevision,
+        expected: ExecutableRevision,
     ) -> Result<(), FileSystemError> {
         let actual = self.executable_install_revision(capability, path)?;
         if actual != expected {
@@ -965,7 +974,7 @@ mod tests {
         let mut filesystem = ComputerFileSystem::with_limits(limits);
 
         filesystem
-            .install_executable(&owner, &output, b"first", FileRevision::Absent)
+            .install_executable(&owner, &output, b"first", ExecutableRevision::Absent)
             .unwrap();
         let first = filesystem.stat(&owner, &output).unwrap();
         assert!(first.executable);
@@ -979,7 +988,7 @@ mod tests {
                 &owner,
                 &output,
                 b"second",
-                FileRevision::Present(first.generation),
+                ExecutableRevision::Present(first.generation),
             )
             .unwrap();
         let second = filesystem.stat(&owner, &output).unwrap();
@@ -1003,7 +1012,7 @@ mod tests {
         let before = filesystem.snapshot_for_test();
 
         assert_eq!(
-            filesystem.install_executable(&owner, &output, b"new", FileRevision::Absent),
+            filesystem.install_executable(&owner, &output, b"new", ExecutableRevision::Absent),
             Err(FileSystemError::Busy),
         );
         assert_eq!(before, filesystem.snapshot_for_test());

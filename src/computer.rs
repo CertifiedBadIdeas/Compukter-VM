@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use crate::filesystem::FileRevision;
+use crate::filesystem::ExecutableRevision;
 use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
 use crate::stdio::{InputOwner, InputOwnershipError, StandardStreamError, StandardStreams};
 use crate::{
@@ -172,7 +172,7 @@ struct CompilationTransaction {
     source: VirtualPath,
     source_revision: u64,
     output: VirtualPath,
-    output_revision: FileRevision,
+    output_revision: ExecutableRevision,
 }
 
 impl ComputerMachine {

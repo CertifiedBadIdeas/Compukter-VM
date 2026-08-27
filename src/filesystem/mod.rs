@@ -40,5 +40,6 @@ pub use persistence::{
 };
 pub use rom::{RomImage, RomImageError};
 pub use store::{StoreError, StoreOpenError, WorldFileSystemStore};
-pub(crate) use tree::FileRevision;
-pub use tree::{ComputerFileSystem, FileSystemSnapshot, NodeKind, NodeMetadata};
+pub use tree::{
+    ComputerFileSystem, ExecutableRevision, FileSystemSnapshot, NodeKind, NodeMetadata,
+};

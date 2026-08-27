@@ -72,9 +72,9 @@ pub use execution::{
     RunError, Session, TaskId, VmFault,
 };
 pub use filesystem::{
-    recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, FileCapability,
-    FileHandle, FileRights, FileSystemError, FileSystemLimits, FileSystemSnapshot, HandleTable,
-    JournalOperation, JournalRecord, NodeKind, NodeMetadata, OpenFile, OpenMode,
+    recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, ExecutableRevision,
+    FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits, FileSystemSnapshot,
+    HandleTable, JournalOperation, JournalRecord, NodeKind, NodeMetadata, OpenFile, OpenMode,
     PersistenceCodecError, RecoveredState, RecoveryCheckpoint, RecoveryError, RecoveryInput,
     RecoveryJournalRecord, RomImage, RomImageError, StoreError, StoreHealth, StoreOpenError,
     VirtualPath, WorldFileSystemStore,
