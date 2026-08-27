@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use compukter_vm::{
     verify_artifact, ArtifactLimits, ComputerError, ComputerMachine, ComputerTerminalEventKind,
-    EntryArgumentLimits, ExecutableRevision, ExecutionProfile, TerminalKey, TerminalKeyAction,
-    TerminalKeyEvent, TerminalModifiers,
+    EntryArgumentLimits, ExecutableRevision, ExecutionProfile, HostVerifyError, TerminalKey,
+    TerminalKeyAction, TerminalKeyEvent, TerminalModifiers,
 };
 
 #[test]
@@ -32,6 +32,30 @@ fn executable_revision_distinguishes_absent_and_present_files() {
     assert_ne!(ExecutableRevision::Absent, ExecutableRevision::Present(1));
     assert_eq!(ExecutableRevision::Present(7).generation(), Some(7));
     assert_eq!(ExecutableRevision::Absent.generation(), None);
+}
+
+#[test]
+fn deployment_verification_rejects_malformed_artifacts_without_mutation() {
+    let root = verify_artifact(Arc::from(terminal_artifact()), ArtifactLimits::default()).unwrap();
+    let computer = ComputerMachine::start(root, profile(), &[], &[]).unwrap();
+    let filesystem_generation = computer.filesystem_generation();
+    let terminal_revision = computer.terminal().revision();
+
+    assert!(matches!(
+        computer.verify_for_deploy(Arc::from([0xff_u8].as_slice())),
+        Err(HostVerifyError::Artifact(_)),
+    ));
+    assert_eq!(filesystem_generation, computer.filesystem_generation());
+    assert_eq!(terminal_revision, computer.terminal().revision());
+}
+
+#[test]
+fn deployment_verification_accepts_a_compatible_artifact() {
+    let bytes: Arc<[u8]> = Arc::from(terminal_artifact());
+    let root = verify_artifact(Arc::clone(&bytes), ArtifactLimits::default()).unwrap();
+    let computer = ComputerMachine::start(root, profile(), &[], &[]).unwrap();
+
+    let _candidate = computer.verify_for_deploy(bytes).unwrap();
 }
 
 #[test]
