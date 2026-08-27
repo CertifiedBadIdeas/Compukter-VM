@@ -46,6 +46,17 @@ pub enum InputOwnershipError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalLineSubmissionError {
+    NoPendingRead,
+    InputBusy,
+    PartialInput,
+    UnsupportedCodeUnit,
+    LineTooLong,
+    Terminal,
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StandardStreamError {
     InvalidLimits,
     LineTooLong,
@@ -113,6 +124,34 @@ impl StandardStreams {
 
     pub(crate) fn begin_read(&mut self, owner: InputOwner) -> Result<(), InputOwnershipError> {
         self.acquire(InputMode::Canonical, owner)
+    }
+
+    pub(crate) fn submit_complete_line(
+        &mut self,
+        owner: InputOwner,
+        units: &[u16],
+        terminal: &mut TerminalDevice,
+    ) -> Result<Box<[u16]>, CanonicalLineSubmissionError> {
+        if self.owner != Some((InputMode::Canonical, owner)) {
+            return Err(CanonicalLineSubmissionError::InputBusy);
+        }
+        if !self.input.editing.is_empty() || self.input.ready.is_some() {
+            return Err(CanonicalLineSubmissionError::PartialInput);
+        }
+        if !units.iter().copied().all(is_canonical_text_unit) {
+            return Err(CanonicalLineSubmissionError::UnsupportedCodeUnit);
+        }
+        if units.len() > self.maximum_line_code_units {
+            return Err(CanonicalLineSubmissionError::LineTooLong);
+        }
+        terminal
+            .write_utf16(units)
+            .map_err(|_| CanonicalLineSubmissionError::Terminal)?;
+        terminal
+            .write_utf16(&['\n' as u16])
+            .map_err(|_| CanonicalLineSubmissionError::Terminal)?;
+        self.owner = None;
+        Ok(units.to_vec().into_boxed_slice())
     }
 
     pub(crate) fn begin_raw_wait(&mut self, owner: InputOwner) -> Result<(), InputOwnershipError> {
@@ -294,7 +333,10 @@ fn is_canonical_text_unit(unit: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputOwner, InputOwnershipError, StandardStreamError, StandardStreams};
+    use super::{
+        CanonicalLineSubmissionError, InputOwner, InputOwnershipError, StandardStreamError,
+        StandardStreams,
+    };
     use crate::{TaskId, TerminalDevice, TerminalKey, TerminalPosition};
 
     const ROOT: InputOwner = InputOwner::new(1, TaskId::ROOT);
@@ -417,6 +459,64 @@ mod tests {
         );
         streams.finish_raw(other).unwrap();
         streams.begin_read(ROOT).unwrap();
+    }
+
+    #[test]
+    fn complete_line_submission_requires_empty_canonical_input() {
+        let mut streams = StandardStreams::new(32, 32).unwrap();
+        let mut terminal = TerminalDevice::default();
+        streams.begin_read(ROOT).unwrap();
+        streams.accept_text(&['a' as u16], &mut terminal).unwrap();
+
+        assert_eq!(
+            CanonicalLineSubmissionError::PartialInput,
+            streams
+                .submit_complete_line(ROOT, &['x' as u16], &mut terminal)
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn complete_line_submission_returns_the_exact_line() {
+        let mut streams = StandardStreams::new(32, 32).unwrap();
+        let mut terminal = TerminalDevice::default();
+        streams.begin_read(ROOT).unwrap();
+
+        let line = streams
+            .submit_complete_line(ROOT, &['r' as u16, 'u' as u16, 'n' as u16], &mut terminal)
+            .unwrap();
+
+        assert_eq!(line.as_ref(), &['r' as u16, 'u' as u16, 'n' as u16]);
+        assert!(streams.take_line(ROOT).is_none());
+    }
+
+    #[test]
+    fn complete_line_submission_rejects_invalid_owner_units_and_length_without_echo() {
+        let mut streams = StandardStreams::new(2, 32).unwrap();
+        let mut terminal = TerminalDevice::default();
+        let other = InputOwner::new(1, TaskId::new(2).unwrap());
+        streams.begin_read(ROOT).unwrap();
+        let revision = terminal.revision();
+
+        assert_eq!(
+            CanonicalLineSubmissionError::InputBusy,
+            streams
+                .submit_complete_line(other, &['x' as u16], &mut terminal)
+                .unwrap_err(),
+        );
+        assert_eq!(
+            CanonicalLineSubmissionError::UnsupportedCodeUnit,
+            streams
+                .submit_complete_line(ROOT, &['\n' as u16], &mut terminal)
+                .unwrap_err(),
+        );
+        assert_eq!(
+            CanonicalLineSubmissionError::LineTooLong,
+            streams
+                .submit_complete_line(ROOT, &['a' as u16, 'b' as u16, 'c' as u16], &mut terminal,)
+                .unwrap_err(),
+        );
+        assert_eq!(revision, terminal.revision());
     }
 
     #[test]

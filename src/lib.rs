@@ -86,7 +86,7 @@ pub use process::{
     ProcessArgumentLimits, ProcessCompletion, ProcessContractError, ProcessFailureReason,
     ProcessLimits,
 };
-pub use stdio::InputOwnershipError;
+pub use stdio::{CanonicalLineSubmissionError, InputOwnershipError};
 pub use terminal::{
     TerminalCell, TerminalChange, TerminalCommit, TerminalConfig, TerminalDelta, TerminalDevice,
     TerminalError, TerminalInputError, TerminalInputEvent, TerminalInputLimits, TerminalKey,
