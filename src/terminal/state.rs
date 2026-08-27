@@ -416,6 +416,10 @@ impl TerminalDevice {
         self.input.poll()
     }
 
+    pub(crate) fn input_is_empty(&self) -> bool {
+        self.input.is_empty()
+    }
+
     pub fn commit(&mut self) -> TerminalCommit {
         let full_cells = self
             .replication

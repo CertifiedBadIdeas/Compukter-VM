@@ -234,6 +234,10 @@ impl TerminalInputQueue {
         self.events.pop_front()
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     fn ensure_capacity(&self) -> Result<(), TerminalInputError> {
         if self.events.len() >= self.limits.maximum_events {
             Err(TerminalInputError::QueueFull)

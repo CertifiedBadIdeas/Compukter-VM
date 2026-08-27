@@ -20,7 +20,10 @@ use std::sync::Arc;
 
 use crate::filesystem::ExecutableRevision;
 use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
-use crate::stdio::{InputOwner, InputOwnershipError, StandardStreamError, StandardStreams};
+use crate::stdio::{
+    CanonicalLineSubmissionError, InputOwner, InputOwnershipError, StandardStreamError,
+    StandardStreams,
+};
 use crate::{
     verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
     ComputerFileSystem, DeploymentCandidate, DeploymentFailure, EntryValue, ExecutionProfile,
@@ -389,6 +392,31 @@ impl ComputerMachine {
             ));
         }
         Ok(ExecutableRevision::Present(self.filesystem.generation()))
+    }
+
+    pub fn submit_canonical_line(
+        &mut self,
+        line: &[u16],
+    ) -> Result<(), CanonicalLineSubmissionError> {
+        if !self.terminal.input_is_empty() || self.active_terminal_event.is_some() {
+            return Err(CanonicalLineSubmissionError::InputBusy);
+        }
+        let (task, request) = self
+            .active_frame()
+            .pending_stdio_read
+            .ok_or(CanonicalLineSubmissionError::NoPendingRead)?;
+        let owner = InputOwner::new(self.sessions.len(), task);
+        let line = self
+            .standard_streams
+            .submit_complete_line(owner, line, &mut self.terminal)?;
+        self.active_frame_mut().pending_stdio_read = None;
+        self.active_session_mut()
+            .resume_internal_for(
+                task,
+                request,
+                HostResponse::Success(HostValueInput::String(&line)),
+            )
+            .map_err(|_| CanonicalLineSubmissionError::Resume)
     }
 
     pub fn terminal_mut(&mut self) -> &mut TerminalDevice {
@@ -2316,6 +2344,87 @@ mod tests {
     }
 
     #[test]
+    fn canonical_line_submission_resumes_the_exact_pending_read() {
+        let artifact = crate::execution::fixtures::stdio_conformance_artifact(&['!' as u16]);
+        let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+        advance_to_canonical_read(&mut computer);
+        let line = "/home/demo".encode_utf16().collect::<Vec<_>>();
+
+        assert_eq!(Ok(()), computer.submit_canonical_line(&line));
+        let expected_hash = line.iter().copied().fold(0_i32, |hash, unit| {
+            hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+        });
+        assert_eq!(Some(ComputerValue::I32(expected_hash)), halt(&mut computer));
+        for (x, unit) in line.iter().copied().enumerate() {
+            assert_eq!(
+                u32::from(unit),
+                computer.terminal().cell(x as u16, 0).unwrap().code_point(),
+            );
+            assert_eq!(
+                u32::from(unit),
+                computer.terminal().cell(x as u16, 1).unwrap().code_point(),
+            );
+        }
+        assert_eq!(
+            '!' as u32,
+            computer
+                .terminal()
+                .cell(line.len() as u16, 1)
+                .unwrap()
+                .code_point(),
+        );
+        assert_eq!(
+            TerminalPosition::new(line.len() as u16 + 1, 1).unwrap(),
+            computer.terminal().cursor_position(),
+        );
+    }
+
+    #[test]
+    fn canonical_line_submission_rejects_missing_partial_and_queued_input() {
+        let idle = crate::execution::fixtures::two_block_artifact(1, 1);
+        let mut idle = ComputerMachine::start(idle, profile(), &[], &[]).unwrap();
+        let idle_revision = idle.terminal().revision();
+        assert_eq!(
+            CanonicalLineSubmissionError::NoPendingRead,
+            idle.submit_canonical_line(&['x' as u16]).unwrap_err(),
+        );
+        assert_eq!(idle_revision, idle.terminal().revision());
+
+        let reader = crate::execution::fixtures::stdio_conformance_artifact(&[]);
+        let mut partial = ComputerMachine::start(reader.clone(), profile(), &[], &[]).unwrap();
+        advance_to_canonical_read(&mut partial);
+        partial.terminal_mut().push_text("partial").unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::WaitingForTerminalEvent,
+            partial.advance(64, 64).unwrap(),
+        );
+        let partial_revision = partial.terminal().revision();
+        assert_eq!(
+            CanonicalLineSubmissionError::PartialInput,
+            partial.submit_canonical_line(&['x' as u16]).unwrap_err(),
+        );
+        assert_eq!(partial_revision, partial.terminal().revision());
+
+        let mut queued = ComputerMachine::start(reader, profile(), &[], &[]).unwrap();
+        advance_to_canonical_read(&mut queued);
+        queued.terminal_mut().push_text("queued").unwrap();
+        let queued_revision = queued.terminal().revision();
+        assert_eq!(
+            CanonicalLineSubmissionError::InputBusy,
+            queued.submit_canonical_line(&['x' as u16]).unwrap_err(),
+        );
+        assert_eq!(queued_revision, queued.terminal().revision());
+        assert_eq!(
+            ComputerAdvanceOutcome::WaitingForTerminalEvent,
+            queued.advance(64, 64).unwrap(),
+        );
+        assert_eq!(
+            'q' as u32,
+            queued.terminal().cell(0, 0).unwrap().code_point()
+        );
+    }
+
+    #[test]
     fn stdio_read_conflict_becomes_bounded_host_failure_without_consuming_input() {
         let artifact = crate::execution::fixtures::stdio_conformance_artifact(&['!' as u16]);
         let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
@@ -3310,6 +3419,16 @@ mod tests {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::CompilationRequested(request) => return request,
                 other => panic!("unexpected compiler outcome: {other:?}"),
+            }
+        }
+    }
+
+    fn advance_to_canonical_read(computer: &mut ComputerMachine) {
+        loop {
+            match computer.advance(64, 64).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::WaitingForTerminalEvent => return,
+                other => panic!("unexpected canonical input outcome: {other:?}"),
             }
         }
     }
