@@ -21,7 +21,6 @@ use std::sync::Arc;
 use crate::{AdmissionError, DiagnosticSet, ExecutionProfile, FileSystemError, VerifiedArtifact};
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct DeploymentCandidate {
     pub(crate) machine: Arc<()>,
     pub(crate) profile: ExecutionProfile,
@@ -65,7 +64,6 @@ pub struct DeploymentFailure {
 }
 
 impl DeploymentFailure {
-    #[allow(dead_code)]
     pub(crate) const fn new(error: HostDeployError, candidate: DeploymentCandidate) -> Self {
         Self { error, candidate }
     }
