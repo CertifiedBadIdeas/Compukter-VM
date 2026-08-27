@@ -23,12 +23,13 @@ use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
 use crate::stdio::{InputOwner, InputOwnershipError, StandardStreamError, StandardStreams};
 use crate::{
     verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
-    ComputerFileSystem, EntryValue, ExecutionProfile, FileCapability, FileRights, FileSystemError,
-    FileSystemLimits, GuestTrap, HostFailure, HostFailureKind, HostRequestView, HostResponse,
-    HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, NodeKind, OpenMode,
-    OperationSchema, ProcessCompletion, ProcessFailureReason, ProcessLimits, QuotaExhaustion,
-    RequestId, ResumeError, RunError, Session, TaskId, TerminalDevice, TerminalInputEvent,
-    TerminalKeyAction, TerminalPosition, TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
+    ComputerFileSystem, DeploymentCandidate, EntryValue, ExecutionProfile, FileCapability,
+    FileRights, FileSystemError, FileSystemLimits, GuestTrap, HostFailure, HostFailureKind,
+    HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView, HostVerifyError,
+    ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, ProcessCompletion,
+    ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId, ResumeError, RunError,
+    Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction, TerminalPosition,
+    TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
@@ -136,6 +137,7 @@ pub struct CompilationRequest {
 
 #[derive(Debug)]
 pub struct ComputerMachine {
+    machine_identity: Arc<()>,
     sessions: Vec<ProcessFrame>,
     terminal: TerminalDevice,
     standard_streams: StandardStreams,
@@ -292,6 +294,7 @@ impl ComputerMachine {
             .start(arguments)
             .map_err(ComputerStartError::Start)?;
         Ok(Self {
+            machine_identity: Arc::new(()),
             sessions: vec![ProcessFrame {
                 session,
                 process_diagnostics: Vec::new(),
@@ -328,6 +331,24 @@ impl ComputerMachine {
 
     pub fn filesystem_generation(&self) -> u64 {
         self.filesystem.generation()
+    }
+
+    pub fn verify_for_deploy(
+        &self,
+        bytes: Arc<[u8]>,
+    ) -> Result<DeploymentCandidate, HostVerifyError> {
+        let artifact = verify_artifact(Arc::clone(&bytes), ArtifactLimits::default())
+            .map_err(HostVerifyError::Artifact)?;
+        drop(
+            admit_session(artifact.clone(), self.profile.clone(), &self.addon_bindings)
+                .map_err(HostVerifyError::Admission)?,
+        );
+        Ok(DeploymentCandidate::new(
+            Arc::clone(&self.machine_identity),
+            self.profile.clone(),
+            artifact,
+            bytes,
+        ))
     }
 
     pub fn terminal_mut(&mut self) -> &mut TerminalDevice {

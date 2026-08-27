@@ -41,6 +41,7 @@ mod bytes;
 mod computer;
 #[cfg_attr(not(test), allow(dead_code))]
 mod decode;
+mod deployment;
 pub mod diagnostic;
 mod execution;
 pub mod filesystem;
@@ -63,6 +64,7 @@ pub use computer::{
     ComputerHostRequest, ComputerMachine, ComputerStartError, ComputerTerminalEventKind,
     ComputerValue,
 };
+pub use deployment::{DeploymentCandidate, DeploymentFailure, HostDeployError, HostVerifyError};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{
     AccountingSnapshot, AdmissionError, AdvanceOutcome, CapabilityBinding, EntryArgumentLimit,
