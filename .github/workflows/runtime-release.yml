@@ -1,0 +1,126 @@
+name: Runtime release
+
+on:
+  push:
+    tags:
+      - "runtime-v*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Runtime tag identity to validate without publishing
+        required: true
+        default: runtime-v5.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            library: target/release/libcompukter_ffi.so
+            asset: compukter-runtime-5.0-linux-x86_64.tar.gz
+          - platform: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            library: target/release/compukter_ffi.dll
+            asset: compukter-runtime-5.0-windows-x86_64.zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RUNTIME_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Verify workspace
+        run: cargo test --workspace --locked --offline
+      - name: Verify formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - name: Verify Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+      - name: Build native Runtime
+        run: cargo build -p compukter-ffi --release --locked --offline
+      - name: Smoke and package native Runtime
+        shell: bash
+        run: |
+          cargo run -p runtime-bundler --locked --offline -- smoke \
+            --library "${{ matrix.library }}" \
+            --abi 5
+          cargo run -p runtime-bundler --locked --offline -- package \
+            --version-file runtime-version.toml \
+            --tag "$RUNTIME_TAG" \
+            --commit "${{ github.sha }}" \
+            --target "${{ matrix.target }}" \
+            --library "${{ matrix.library }}" \
+            --license LICENSE \
+            --notice NOTICE \
+            --rustc "$(rustc --version)" \
+            --format artifact=2 \
+            --format filesystem-generation=1 \
+            --format executable-revision=1 \
+            --format compilation-request=1 \
+            --output target/runtime-release
+      - name: Upload temporary platform bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-${{ matrix.platform }}-${{ github.sha }}
+          path: target/runtime-release/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish tagged Runtime
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Download platform bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: runtime-*-${{ github.sha }}
+          path: release-assets
+          merge-multiple: true
+      - name: Reinspect and checksum release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bundle in release-assets/compukter-runtime-5.0-*; do
+            cargo run -p runtime-bundler --locked --offline -- inspect "$bundle" \
+              | jq -e --arg tag "$GITHUB_REF_NAME" '.release_tag == $tag'
+          done
+          runtime_version="${GITHUB_REF_NAME#runtime-v}"
+          (
+            cd release-assets
+            sha256sum compukter-runtime-"$runtime_version"-linux-x86_64.tar.gz \
+              compukter-runtime-"$runtime_version"-windows-x86_64.zip \
+              > compukter-runtime-"$runtime_version"-checksums.sha256
+          )
+      - name: Create immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "Compukter Runtime ${GITHUB_REF_NAME#runtime-v}" \
+            --generate-notes \
+            release-assets/*
