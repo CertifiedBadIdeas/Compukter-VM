@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "ffi"]
+resolver = "2"
+
 [package]
 name = "compukter-vm"
 version = "0.1.0"
