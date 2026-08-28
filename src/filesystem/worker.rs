@@ -557,7 +557,7 @@ fn persist_tombstone(root: &Path, id: ComputerId, present: bool) -> io::Result<(
         write_atomic(&path, &bytes)
     } else {
         std::fs::remove_file(path)?;
-        File::open(computer)?.sync_all()
+        sync_directory(&computer)
     }
 }
 
@@ -565,7 +565,7 @@ fn collect_objects(root: &Path, objects: &[[u8; 32]]) -> io::Result<usize> {
     for object in objects {
         let path = object_path(root, *object);
         std::fs::remove_file(&path)?;
-        File::open(path.parent().expect("fixed object shard"))?.sync_all()?;
+        sync_directory(path.parent().expect("fixed object shard"))?;
     }
     Ok(objects.len())
 }
@@ -615,8 +615,26 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
-    File::open(parent)?.sync_all()?;
+    sync_directory(parent)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
 }
 
 pub(crate) fn verify_object(path: &Path, expected: [u8; 32]) -> io::Result<Arc<[u8]>> {
@@ -696,6 +714,19 @@ fn filesystem_to_store(error: FileSystemError) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistence_can_sync_a_directory() {
+        let path = std::env::temp_dir().join(format!(
+            "compukter-vm-sync-directory-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+
+        sync_directory(&path).unwrap();
+
+        std::fs::remove_dir(path).unwrap();
+    }
 
     #[test]
     fn worker_fault_completes_every_queued_control_command() {
