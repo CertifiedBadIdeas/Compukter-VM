@@ -675,7 +675,10 @@ impl TestRoot {
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
-        let expected = std::env::temp_dir().join("compukters-ffi-tests");
+        let expected = std::env::temp_dir()
+            .join("compukters-ffi-tests")
+            .canonicalize()
+            .unwrap();
         assert!(self.0.starts_with(expected));
         let _ = std::fs::remove_dir_all(&self.0);
     }
