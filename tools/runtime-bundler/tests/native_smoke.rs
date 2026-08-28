@@ -16,8 +16,16 @@
  * limitations under the License.
  */
 
-pub mod archive;
-pub mod cli;
-pub mod manifest;
-pub mod smoke;
-pub mod version;
+use runtime_bundler::smoke::require_ffi_abi;
+use std::path::PathBuf;
+
+#[test]
+#[ignore = "requires a separately built current-platform cdylib"]
+fn loads_the_exported_abi_from_the_dynamic_library() {
+    let library = PathBuf::from(
+        std::env::var_os("COMPUKTER_FFI_SMOKE_LIBRARY")
+            .expect("COMPUKTER_FFI_SMOKE_LIBRARY must point at the built cdylib"),
+    );
+
+    require_ffi_abi(&library, 5).unwrap();
+}

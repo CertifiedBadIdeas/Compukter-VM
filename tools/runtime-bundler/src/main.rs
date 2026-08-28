@@ -16,8 +16,15 @@
  * limitations under the License.
  */
 
-pub mod archive;
-pub mod cli;
-pub mod manifest;
-pub mod smoke;
-pub mod version;
+use runtime_bundler::cli::{execute, Command};
+
+fn main() {
+    let result = Command::parse(std::env::args().skip(1)).and_then(execute);
+    match result {
+        Ok(output) => println!("{output}"),
+        Err(error) => {
+            eprintln!("runtime-bundler: {error}");
+            std::process::exit(2);
+        }
+    }
+}
