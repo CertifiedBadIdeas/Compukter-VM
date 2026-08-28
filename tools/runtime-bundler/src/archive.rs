@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use tar::{Archive, Builder, EntryType, Header};
 use tempfile::NamedTempFile;
 use zip::write::SimpleFileOptions;
@@ -283,7 +283,11 @@ fn read_tar_gz(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, BundleError> {
             entry.header().entry_type().is_file(),
             "runtime TAR entries must be regular files",
         )?;
-        let name = safe_entry_name(&entry.path()?)?;
+        let path = entry.path_bytes();
+        let name = safe_entry_name(
+            std::str::from_utf8(&path)
+                .map_err(|_| BundleError("runtime bundle entry path is not UTF-8".to_owned()))?,
+        )?;
         let maximum = entry_limit(&name);
         require(
             entry.size() <= maximum,
@@ -320,10 +324,7 @@ fn read_zip(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, BundleError> {
                 "runtime ZIP symlinks are forbidden",
             )?;
         }
-        let enclosed = entry
-            .enclosed_name()
-            .ok_or_else(|| BundleError("runtime ZIP entry path is unsafe".to_owned()))?;
-        let name = safe_entry_name(&enclosed)?;
+        let name = safe_entry_name(entry.name())?;
         let maximum = entry_limit(&name);
         require(
             entry.size() <= maximum,
@@ -343,15 +344,16 @@ fn read_zip(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, BundleError> {
     Ok(contents)
 }
 
-fn safe_entry_name(path: &Path) -> Result<String, BundleError> {
+fn safe_entry_name(name: &str) -> Result<String, BundleError> {
     require(
-        path.components()
-            .all(|component| matches!(component, Component::Normal(_))),
+        !name.is_empty()
+            && !name.contains('\\')
+            && name
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != ".."),
         "runtime bundle entry path is unsafe",
     )?;
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| BundleError("runtime bundle entry path is not UTF-8".to_owned()))
+    Ok(name.to_owned())
 }
 
 fn entry_limit(name: &str) -> u64 {
@@ -376,7 +378,7 @@ fn require(condition: bool, message: &str) -> Result<(), BundleError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_bundle, inspect_bundle, BundleInputs};
+    use super::{create_bundle, inspect_bundle, safe_entry_name, BundleInputs};
     use crate::manifest::{LINUX_TARGET, WINDOWS_TARGET};
     use crate::version::RuntimeVersion;
     use flate2::read::GzDecoder;
@@ -393,6 +395,23 @@ mod tests {
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const NATIVE_BYTES: &[u8] = b"not a real library, only an archive fixture";
+
+    #[test]
+    fn archive_entry_names_use_canonical_forward_slashes() {
+        assert_eq!(
+            "native/compukter_ffi.dll",
+            safe_entry_name("native/compukter_ffi.dll").unwrap()
+        );
+        for unsafe_name in [
+            "native\\compukter_ffi.dll",
+            "/native/library",
+            "native//library",
+            "native/../library",
+            "native/./library",
+        ] {
+            assert!(safe_entry_name(unsafe_name).is_err());
+        }
+    }
 
     struct Fixture {
         root: TempDir,
