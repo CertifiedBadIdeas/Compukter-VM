@@ -434,7 +434,7 @@ mod tests {
         fn inputs<'a>(&'a self, target: &'a str) -> BundleInputs<'a> {
             BundleInputs {
                 runtime_version: RuntimeVersion::parse("0.5.1").unwrap(),
-                release_tag: "runtime-v0.5.1",
+                release_tag: "v0.5.1",
                 vm_commit: COMMIT,
                 rustc: "rustc 1.98.0 (88d9e12ae 2026-08-18)",
                 target,
