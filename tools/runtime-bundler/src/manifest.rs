@@ -152,8 +152,8 @@ mod tests {
     fn manifest() -> RuntimeManifest {
         RuntimeManifest {
             schema: 1,
-            runtime_version: "5.1".to_owned(),
-            release_tag: "runtime-v5.1".to_owned(),
+            runtime_version: "0.5.1".to_owned(),
+            release_tag: "runtime-v0.5.1".to_owned(),
             vm_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             ffi_abi: 5,
             formats: BTreeMap::from([
@@ -182,36 +182,42 @@ mod tests {
 
     #[test]
     fn validates_the_runtime_identity_and_platform_contract() {
-        let version = RuntimeVersion::parse("5.1").unwrap();
+        let version = RuntimeVersion::parse("0.5.1").unwrap();
 
-        assert!(manifest().validate_for(version, "runtime-v5.1", 5).is_ok());
+        assert!(manifest()
+            .validate_for(version, "runtime-v0.5.1", 5)
+            .is_ok());
     }
 
     #[test]
     fn rejects_noncanonical_commit_and_digest() {
-        let version = RuntimeVersion::parse("5.1").unwrap();
+        let version = RuntimeVersion::parse("0.5.1").unwrap();
         let mut short_commit = manifest();
         short_commit.vm_commit = "short".to_owned();
         let mut bad_digest = manifest();
         bad_digest.sha256 = "xyz".to_owned();
 
         assert!(short_commit
-            .validate_for(version, "runtime-v5.1", 5)
+            .validate_for(version, "runtime-v0.5.1", 5)
             .is_err());
-        assert!(bad_digest.validate_for(version, "runtime-v5.1", 5).is_err());
+        assert!(bad_digest
+            .validate_for(version, "runtime-v0.5.1", 5)
+            .is_err());
     }
 
     #[test]
     fn rejects_target_filename_mismatch_and_empty_formats() {
-        let version = RuntimeVersion::parse("5.1").unwrap();
+        let version = RuntimeVersion::parse("0.5.1").unwrap();
         let mut wrong_filename = manifest();
         wrong_filename.filename = "compukter_ffi.dll".to_owned();
         let mut no_formats = manifest();
         no_formats.formats.clear();
 
         assert!(wrong_filename
-            .validate_for(version, "runtime-v5.1", 5)
+            .validate_for(version, "runtime-v0.5.1", 5)
             .is_err());
-        assert!(no_formats.validate_for(version, "runtime-v5.1", 5).is_err());
+        assert!(no_formats
+            .validate_for(version, "runtime-v0.5.1", 5)
+            .is_err());
     }
 }

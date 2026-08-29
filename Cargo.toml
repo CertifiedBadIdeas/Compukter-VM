@@ -2,9 +2,12 @@
 members = [".", "ffi", "tools/runtime-bundler"]
 resolver = "2"
 
+[workspace.package]
+version = "0.5.1"
+
 [package]
 name = "compukter-vm"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
 
