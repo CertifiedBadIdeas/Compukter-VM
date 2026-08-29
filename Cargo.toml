@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ffi", "tools/runtime-bundler"]
+members = [".", "ffi", "tools/runtime-bundler", "tools/xtask"]
 resolver = "2"
 
 [workspace.package]
