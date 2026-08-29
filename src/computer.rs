@@ -138,6 +138,62 @@ pub struct CompilationRequest {
     pub sources: Box<[CompilationSource]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputerFileKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputerFileMetadata {
+    pub kind: ComputerFileKind,
+    pub logical_size: u64,
+    pub generation: u64,
+    pub executable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputerFileStat {
+    pub filesystem_generation: u64,
+    pub metadata: ComputerFileMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputerDirectoryEntry {
+    pub name: Box<str>,
+    pub metadata: ComputerFileMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputerDirectoryListing {
+    pub filesystem_generation: u64,
+    pub directory_generation: u64,
+    pub complete: bool,
+    pub entries: Box<[ComputerDirectoryEntry]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputerFileChunk {
+    pub generation: u64,
+    pub next_offset: u64,
+    pub eof: bool,
+    pub bytes: Box<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputerFileReadError {
+    FileSystem(FileSystemError),
+    StaleGeneration { expected: u64, actual: u64 },
+    InvalidRange,
+    LimitExceeded,
+}
+
+impl From<FileSystemError> for ComputerFileReadError {
+    fn from(error: FileSystemError) -> Self {
+        Self::FileSystem(error)
+    }
+}
+
 #[derive(Debug)]
 pub struct ComputerMachine {
     machine_identity: Arc<()>,
@@ -148,6 +204,7 @@ pub struct ComputerMachine {
     active_terminal_event_owner: Option<InputOwner>,
     filesystem: ComputerFileSystem,
     initial_file_capability: FileCapability,
+    inspection_file_capability: FileCapability,
     profile: ExecutionProfile,
     addon_bindings: Box<[OwnedCapabilityBinding]>,
     process_limits: ProcessLimits,
@@ -296,6 +353,10 @@ impl ComputerMachine {
         session
             .start(arguments)
             .map_err(ComputerStartError::Start)?;
+        let inspection_file_capability = FileCapability::new(
+            VirtualPath::root(),
+            FileRights::INSPECT | FileRights::LIST | FileRights::READ,
+        );
         Ok(Self {
             machine_identity: Arc::new(()),
             sessions: vec![ProcessFrame {
@@ -316,6 +377,7 @@ impl ComputerMachine {
             active_terminal_event_owner: None,
             filesystem,
             initial_file_capability: initial_capability,
+            inspection_file_capability,
             profile,
             addon_bindings: owned_addon_bindings,
             process_limits,
@@ -334,6 +396,125 @@ impl ComputerMachine {
 
     pub fn filesystem_generation(&self) -> u64 {
         self.filesystem.generation()
+    }
+
+    pub fn filesystem_stat(&self, path: &VirtualPath) -> Result<ComputerFileStat, FileSystemError> {
+        if path.components().len() == 0 {
+            let generation = self.filesystem.generation();
+            return Ok(ComputerFileStat {
+                filesystem_generation: generation,
+                metadata: ComputerFileMetadata {
+                    kind: ComputerFileKind::Directory,
+                    logical_size: 0,
+                    generation,
+                    executable: false,
+                },
+            });
+        }
+        let metadata = self
+            .filesystem
+            .stat(&self.inspection_file_capability, path)?;
+        Ok(ComputerFileStat {
+            filesystem_generation: self.filesystem.generation(),
+            metadata: file_metadata(metadata),
+        })
+    }
+
+    pub fn filesystem_list(
+        &self,
+        path: &VirtualPath,
+        start_after: Option<&str>,
+        maximum_entries: u32,
+    ) -> Result<ComputerDirectoryListing, ComputerFileReadError> {
+        if maximum_entries == 0
+            || maximum_entries > self.filesystem.limits().maximum_directory_entries
+        {
+            return Err(ComputerFileReadError::LimitExceeded);
+        }
+        let directory = self.filesystem_stat(path)?;
+        if directory.metadata.kind != ComputerFileKind::Directory {
+            return Err(FileSystemError::NotDirectory.into());
+        }
+        let names = if path.components().len() == 0 {
+            vec![Box::<str>::from("home"), Box::<str>::from("rom")]
+        } else {
+            self.filesystem
+                .list(&self.inspection_file_capability, path)?
+        };
+        if let Some(cursor) = start_after {
+            child_path(path, cursor, self.filesystem.limits())?;
+        }
+        let mut names = names
+            .into_iter()
+            .filter(|name| start_after.is_none_or(|cursor| name.as_ref() > cursor));
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(maximum_entries as usize)
+            .map_err(|_| ComputerFileReadError::LimitExceeded)?;
+        for name in names.by_ref().take(maximum_entries as usize) {
+            let child = child_path(path, &name, self.filesystem.limits())?;
+            entries.push(ComputerDirectoryEntry {
+                name,
+                metadata: self.filesystem_stat(&child)?.metadata,
+            });
+        }
+        Ok(ComputerDirectoryListing {
+            filesystem_generation: self.filesystem.generation(),
+            directory_generation: directory.metadata.generation,
+            complete: names.next().is_none(),
+            entries: entries.into_boxed_slice(),
+        })
+    }
+
+    pub fn filesystem_read(
+        &mut self,
+        path: &VirtualPath,
+        offset: u64,
+        maximum_bytes: u32,
+        expected_generation: u64,
+    ) -> Result<ComputerFileChunk, ComputerFileReadError> {
+        if maximum_bytes == 0 || maximum_bytes as usize > self.filesystem.limits().maximum_io_bytes
+        {
+            return Err(ComputerFileReadError::LimitExceeded);
+        }
+        let before = self.filesystem_stat(path)?.metadata;
+        if before.kind != ComputerFileKind::File {
+            return Err(FileSystemError::IsDirectory.into());
+        }
+        if before.generation != expected_generation {
+            return Err(ComputerFileReadError::StaleGeneration {
+                expected: expected_generation,
+                actual: before.generation,
+            });
+        }
+        if offset > before.logical_size {
+            return Err(ComputerFileReadError::InvalidRange);
+        }
+        let handle =
+            self.filesystem
+                .open(&self.inspection_file_capability, path, OpenMode::Read)?;
+        let result = self.filesystem.read(handle, offset, maximum_bytes as usize);
+        let close = self.filesystem.close(handle);
+        let bytes = match (result, close) {
+            (Err(error), _) | (Ok(_), Err(error)) => return Err(error.into()),
+            (Ok(bytes), Ok(())) => bytes,
+        };
+        let after = self.filesystem_stat(path)?.metadata;
+        if after.generation != expected_generation {
+            return Err(ComputerFileReadError::StaleGeneration {
+                expected: expected_generation,
+                actual: after.generation,
+            });
+        }
+        let next_offset = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(ComputerFileReadError::InvalidRange)?;
+        Ok(ComputerFileChunk {
+            generation: after.generation,
+            next_offset,
+            eof: next_offset == after.logical_size,
+            bytes: bytes.into_boxed_slice(),
+        })
     }
 
     pub fn verify_for_deploy(
@@ -2167,6 +2348,31 @@ fn copy_value(value: HostValueView<'_>) -> ComputerValue {
     }
 }
 
+fn file_metadata(metadata: crate::NodeMetadata) -> ComputerFileMetadata {
+    ComputerFileMetadata {
+        kind: match metadata.kind {
+            NodeKind::File => ComputerFileKind::File,
+            NodeKind::Directory => ComputerFileKind::Directory,
+        },
+        logical_size: metadata.logical_size,
+        generation: metadata.generation,
+        executable: metadata.executable,
+    }
+}
+
+fn child_path(
+    parent: &VirtualPath,
+    name: &str,
+    limits: &FileSystemLimits,
+) -> Result<VirtualPath, FileSystemError> {
+    let path = if parent.components().len() == 0 {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    };
+    VirtualPath::parse_utf8(&path, limits)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3175,6 +3381,148 @@ mod tests {
                 .read_file_for_test(&boot)
                 .unwrap()
                 .as_slice(),
+        );
+    }
+
+    #[test]
+    fn host_filesystem_inspection_sees_the_virtual_root_independently_of_guest_authority() {
+        let limits = FileSystemLimits::testing();
+        let guest_home = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let source = path("/home/source.kt", &limits);
+        let mut filesystem =
+            ComputerFileSystem::with_rom(limits, rom_with_executable("/rom/boot", b"rom", &limits))
+                .unwrap();
+        filesystem
+            .write_file(&guest_home, &source, b"fun main() = Unit", false)
+            .unwrap();
+        let computer = ComputerMachine::start_in_filesystem(
+            crate::execution::fixtures::filesystem_conformance_artifact(),
+            profile(),
+            &[],
+            &[],
+            filesystem,
+            guest_home,
+        )
+        .unwrap();
+
+        let root = computer.filesystem_stat(&path("/", &limits)).unwrap();
+        assert_eq!(ComputerFileKind::Directory, root.metadata.kind);
+        let listing = computer
+            .filesystem_list(&path("/", &limits), None, 2)
+            .unwrap();
+        assert_eq!(
+            ["home", "rom"],
+            listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        let source = computer.filesystem_stat(&source).unwrap();
+        assert_eq!(ComputerFileKind::File, source.metadata.kind);
+        assert_eq!(17, source.metadata.logical_size);
+        assert!(!source.metadata.executable);
+    }
+
+    #[test]
+    fn host_filesystem_listing_pages_in_stable_name_order() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        for name in ["c.kt", "a.kt", "b.kt"] {
+            filesystem
+                .write_file(
+                    &owner,
+                    &path(&format!("/home/{name}"), &limits),
+                    name.as_bytes(),
+                    false,
+                )
+                .unwrap();
+        }
+        let computer = ComputerMachine::start_in_filesystem(
+            crate::execution::fixtures::filesystem_conformance_artifact(),
+            profile(),
+            &[],
+            &[],
+            filesystem,
+            owner,
+        )
+        .unwrap();
+
+        let first = computer
+            .filesystem_list(&path("/home", &limits), None, 2)
+            .unwrap();
+        assert_eq!(
+            ["a.kt", "b.kt"],
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        assert!(!first.complete);
+
+        let second = computer
+            .filesystem_list(&path("/home", &limits), Some("b.kt"), 2)
+            .unwrap();
+        assert_eq!(
+            ["c.kt"],
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        assert!(second.complete);
+    }
+
+    #[test]
+    fn host_filesystem_read_is_chunk_bounded_and_rejects_stale_generation() {
+        let mut limits = FileSystemLimits::testing();
+        limits.maximum_io_bytes = 4;
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let source = path("/home/source.kt", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&owner, &source, b"abcdefgh", false)
+            .unwrap();
+        let mut computer = ComputerMachine::start_in_filesystem(
+            crate::execution::fixtures::filesystem_conformance_artifact(),
+            profile(),
+            &[],
+            &[],
+            filesystem,
+            owner.clone(),
+        )
+        .unwrap();
+        let generation = computer
+            .filesystem_stat(&source)
+            .unwrap()
+            .metadata
+            .generation;
+
+        let first = computer.filesystem_read(&source, 0, 4, generation).unwrap();
+        assert_eq!(b"abcd", first.bytes.as_ref());
+        assert_eq!(4, first.next_offset);
+        assert!(!first.eof);
+
+        computer
+            .filesystem
+            .write_file(&owner, &source, b"replacement", false)
+            .unwrap();
+        assert_eq!(
+            Err(ComputerFileReadError::StaleGeneration {
+                expected: generation,
+                actual: computer
+                    .filesystem_stat(&source)
+                    .unwrap()
+                    .metadata
+                    .generation,
+            }),
+            computer.filesystem_read(&source, first.next_offset, 4, generation),
         );
     }
 

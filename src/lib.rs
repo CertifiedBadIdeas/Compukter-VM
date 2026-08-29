@@ -60,9 +60,10 @@ mod verify;
 
 pub use artifact::{EntryArguments, EntryPoint, VerifiedArtifact};
 pub use computer::{
-    CompilationRequest, CompilationSource, ComputerAdvanceOutcome, ComputerError,
-    ComputerHostRequest, ComputerMachine, ComputerStartError, ComputerTerminalEventKind,
-    ComputerValue,
+    CompilationRequest, CompilationSource, ComputerAdvanceOutcome, ComputerDirectoryEntry,
+    ComputerDirectoryListing, ComputerError, ComputerFileChunk, ComputerFileKind,
+    ComputerFileMetadata, ComputerFileReadError, ComputerFileStat, ComputerHostRequest,
+    ComputerMachine, ComputerStartError, ComputerTerminalEventKind, ComputerValue,
 };
 pub use deployment::{DeploymentCandidate, DeploymentFailure, HostDeployError, HostVerifyError};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
