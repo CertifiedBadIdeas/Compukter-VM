@@ -19,7 +19,7 @@
 use crate::{
     bridge::{
         self, BridgeError, CreateInStoreError, DeploymentBridgeError, DeploymentVerifyBridgeError,
-        OwnedResponse, RevisionBridgeError, StoreBridgeError,
+        FileInspectionBridgeError, OwnedResponse, RevisionBridgeError, StoreBridgeError,
     },
     handle_table::HandleError,
 };
@@ -57,6 +57,19 @@ pub enum FfiStatus {
     InputLineTooLong = 27,
     InputTerminal = 28,
     InputResume = 29,
+    FilesystemInvalidPath = 30,
+    FilesystemNotFound = 31,
+    FilesystemNotDirectory = 32,
+    FilesystemIsDirectory = 33,
+    FilesystemReadOnly = 34,
+    FilesystemPermissionDenied = 35,
+    FilesystemStale = 36,
+    FilesystemLimitExceeded = 37,
+    FilesystemBusy = 38,
+    FilesystemFaulted = 39,
+    FilesystemClosed = 40,
+    FilesystemOther = 41,
+    FilesystemInvalidRange = 42,
 }
 
 const MAXIMUM_OUTCOME_BYTES: usize = 64 * 1024;
@@ -72,6 +85,8 @@ const MAXIMUM_COMPILATION_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const MAXIMUM_COMPILATION_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const MAXIMUM_EXECUTABLE_REVISION_BYTES: usize = 10;
 const MAXIMUM_DEPLOYMENT_PATH_BYTES: usize = 4 * 1024;
+const MAXIMUM_FILESYSTEM_LIST_ENTRIES: u32 = 256;
+const MAXIMUM_FILESYSTEM_READ_BYTES: u32 = 32 * 1024;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn compukter_abi_version() -> u32 {
@@ -737,6 +752,149 @@ pub unsafe extern "C" fn compukter_filesystem_generation(
 }
 
 #[unsafe(no_mangle)]
+/// Writes metadata for one path in the machine filesystem.
+///
+/// # Safety
+///
+/// Inputs and outputs must name readable or writable regions of their declared lengths.
+/// `written_out` must name one writable `usize`.
+pub unsafe extern "C" fn compukter_filesystem_stat(
+    handle: u64,
+    path_utf8: *const u8,
+    path_len: usize,
+    output: *mut u8,
+    output_capacity: usize,
+    written_out: *mut usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        let path = match unsafe {
+            inspection_text(
+                path_utf8,
+                path_len,
+                false,
+                output,
+                output_capacity,
+                written_out,
+            )
+        } {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let stat = match bridge::filesystem_stat(handle, path) {
+            Ok(stat) => stat,
+            Err(error) => return file_inspection_status(error),
+        };
+        let encoded = crate::wire::encode_filesystem_stat(&stat);
+        unsafe { write_dynamic_output(&encoded, output, output_capacity, written_out) }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Writes one stable name-ordered page from a machine directory.
+///
+/// # Safety
+///
+/// Inputs and outputs must name readable or writable regions of their declared lengths.
+/// `written_out` must name one writable `usize`.
+pub unsafe extern "C" fn compukter_filesystem_list(
+    handle: u64,
+    path_utf8: *const u8,
+    path_len: usize,
+    start_after_utf8: *const u8,
+    start_after_len: usize,
+    maximum_entries: u32,
+    output: *mut u8,
+    output_capacity: usize,
+    written_out: *mut usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if maximum_entries == 0 || maximum_entries > MAXIMUM_FILESYSTEM_LIST_ENTRIES {
+            return FfiStatus::FilesystemLimitExceeded;
+        }
+        let path = match unsafe {
+            inspection_text(
+                path_utf8,
+                path_len,
+                false,
+                output,
+                output_capacity,
+                written_out,
+            )
+        } {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let start_after = match unsafe {
+            inspection_text(
+                start_after_utf8,
+                start_after_len,
+                true,
+                output,
+                output_capacity,
+                written_out,
+            )
+        } {
+            Ok(value) => (!value.is_empty()).then_some(value),
+            Err(status) => return status,
+        };
+        let listing = match bridge::filesystem_list(handle, path, start_after, maximum_entries) {
+            Ok(listing) => listing,
+            Err(error) => return file_inspection_status(error),
+        };
+        let Some(encoded) = crate::wire::encode_filesystem_list(&listing) else {
+            return FfiStatus::FilesystemLimitExceeded;
+        };
+        unsafe { write_dynamic_output(&encoded, output, output_capacity, written_out) }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Writes a bounded chunk from one machine file at the expected node generation.
+///
+/// # Safety
+///
+/// Inputs and outputs must name readable or writable regions of their declared lengths.
+/// `written_out` must name one writable `usize`.
+pub unsafe extern "C" fn compukter_filesystem_read(
+    handle: u64,
+    path_utf8: *const u8,
+    path_len: usize,
+    offset: u64,
+    maximum_bytes: u32,
+    expected_generation: u64,
+    output: *mut u8,
+    output_capacity: usize,
+    written_out: *mut usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if maximum_bytes == 0 || maximum_bytes > MAXIMUM_FILESYSTEM_READ_BYTES {
+            return FfiStatus::FilesystemLimitExceeded;
+        }
+        let path = match unsafe {
+            inspection_text(
+                path_utf8,
+                path_len,
+                false,
+                output,
+                output_capacity,
+                written_out,
+            )
+        } {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let chunk =
+            match bridge::filesystem_read(handle, path, offset, maximum_bytes, expected_generation)
+            {
+                Ok(chunk) => chunk,
+                Err(error) => return file_inspection_status(error),
+            };
+        let encoded = crate::wire::encode_filesystem_chunk(&chunk);
+        unsafe { write_dynamic_output(&encoded, output, output_capacity, written_out) }
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Advances a VM session and writes its bounded outcome wire result.
 ///
 /// # Safety
@@ -1090,6 +1248,80 @@ pub unsafe extern "C" fn compukter_terminal_text(
 
 fn ffi_status(operation: impl FnOnce() -> FfiStatus) -> FfiStatus {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or(FfiStatus::Internal)
+}
+
+unsafe fn inspection_text<'a>(
+    input: *const u8,
+    input_len: usize,
+    allow_empty: bool,
+    output: *mut u8,
+    output_capacity: usize,
+    written_out: *mut usize,
+) -> Result<&'a str, FfiStatus> {
+    if written_out.is_null()
+        || input_len > MAXIMUM_DEPLOYMENT_PATH_BYTES
+        || (!allow_empty && input_len == 0)
+        || (input_len != 0 && input.is_null())
+        || (output_capacity != 0 && output.is_null())
+    {
+        return Err(FfiStatus::InvalidArgument);
+    }
+    let bytes = if input_len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: The caller promises a readable input region of the declared length.
+        unsafe { core::slice::from_raw_parts(input, input_len) }
+    };
+    core::str::from_utf8(bytes).map_err(|_| FfiStatus::InvalidArgument)
+}
+
+unsafe fn write_dynamic_output(
+    encoded: &[u8],
+    output: *mut u8,
+    output_capacity: usize,
+    written_out: *mut usize,
+) -> FfiStatus {
+    // SAFETY: The caller validated the writable length pointer.
+    unsafe { written_out.write(encoded.len()) };
+    if output_capacity < encoded.len() {
+        return FfiStatus::BufferTooSmall;
+    }
+    // SAFETY: The caller validated a writable output region of `output_capacity` bytes.
+    unsafe { core::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
+    FfiStatus::Ok
+}
+
+fn file_inspection_status(error: FileInspectionBridgeError) -> FfiStatus {
+    match error {
+        FileInspectionBridgeError::Session(error) => handle_status(error),
+        FileInspectionBridgeError::File(error) => match error {
+            compukter_vm::ComputerFileReadError::StaleGeneration { .. } => {
+                FfiStatus::FilesystemStale
+            }
+            compukter_vm::ComputerFileReadError::InvalidRange => FfiStatus::FilesystemInvalidRange,
+            compukter_vm::ComputerFileReadError::LimitExceeded => {
+                FfiStatus::FilesystemLimitExceeded
+            }
+            compukter_vm::ComputerFileReadError::FileSystem(error) => match error {
+                compukter_vm::FileSystemError::InvalidPath => FfiStatus::FilesystemInvalidPath,
+                compukter_vm::FileSystemError::NotFound => FfiStatus::FilesystemNotFound,
+                compukter_vm::FileSystemError::NotDirectory => FfiStatus::FilesystemNotDirectory,
+                compukter_vm::FileSystemError::IsDirectory => FfiStatus::FilesystemIsDirectory,
+                compukter_vm::FileSystemError::ReadOnly => FfiStatus::FilesystemReadOnly,
+                compukter_vm::FileSystemError::PermissionDenied => {
+                    FfiStatus::FilesystemPermissionDenied
+                }
+                compukter_vm::FileSystemError::QuotaExceeded => FfiStatus::FilesystemLimitExceeded,
+                compukter_vm::FileSystemError::Busy => FfiStatus::FilesystemBusy,
+                compukter_vm::FileSystemError::StorageFaulted => FfiStatus::FilesystemFaulted,
+                compukter_vm::FileSystemError::Closed => FfiStatus::FilesystemClosed,
+                compukter_vm::FileSystemError::AlreadyExists
+                | compukter_vm::FileSystemError::NotExecutable
+                | compukter_vm::FileSystemError::NotEmpty
+                | compukter_vm::FileSystemError::StaleHandle => FfiStatus::FilesystemOther,
+            },
+        },
+    }
 }
 
 fn bridge_status(outcome: Result<(), BridgeError>) -> FfiStatus {

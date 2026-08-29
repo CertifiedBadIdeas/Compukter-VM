@@ -1,7 +1,8 @@
 use compukter_vm::{
-    AdmissionError, CompilationRequest, EntryArgumentLimit, ExecutableRevision, FileSystemLimits,
-    HostFailureKind, QuotaKind, RunError, StoreHealth, StoreOpenError, TerminalCell,
-    TerminalChange, TerminalDevice, TerminalSnapshot, TerminalUpdate,
+    AdmissionError, CompilationRequest, ComputerDirectoryListing, ComputerFileChunk,
+    ComputerFileKind, ComputerFileMetadata, ComputerFileStat, EntryArgumentLimit,
+    ExecutableRevision, FileSystemLimits, HostFailureKind, QuotaKind, RunError, StoreHealth,
+    StoreOpenError, TerminalCell, TerminalChange, TerminalDevice, TerminalSnapshot, TerminalUpdate,
 };
 
 pub(crate) fn encode_executable_revision(revision: ExecutableRevision) -> Vec<u8> {
@@ -88,6 +89,40 @@ pub(crate) fn encode_store_health(health: StoreHealth) -> Vec<u8> {
 pub(crate) fn encode_store_generation(generation: u64) -> Vec<u8> {
     let mut encoder = Encoder::new(1);
     encoder.u64(generation);
+    encoder.finish()
+}
+
+pub(crate) fn encode_filesystem_stat(stat: &ComputerFileStat) -> Vec<u8> {
+    let mut encoder = Encoder::new(1);
+    encoder.file_kind(stat.metadata.kind);
+    encoder.u8(u8::from(stat.metadata.executable));
+    encoder.u8(0);
+    encoder.u64(stat.metadata.logical_size);
+    encoder.u64(stat.metadata.generation);
+    encoder.u64(stat.filesystem_generation);
+    encoder.finish()
+}
+
+pub(crate) fn encode_filesystem_list(listing: &ComputerDirectoryListing) -> Option<Vec<u8>> {
+    let mut encoder = Encoder::new(1);
+    encoder.u64(listing.filesystem_generation);
+    encoder.u64(listing.directory_generation);
+    encoder.u8(u8::from(listing.complete));
+    encoder
+        .u32(u32::try_from(listing.entries.len()).expect("bounded directory entry count fits u32"));
+    for entry in &listing.entries {
+        encoder.short_bytes(entry.name.as_bytes())?;
+        encoder.file_metadata(&entry.metadata);
+    }
+    Some(encoder.finish())
+}
+
+pub(crate) fn encode_filesystem_chunk(chunk: &ComputerFileChunk) -> Vec<u8> {
+    let mut encoder = Encoder::new(1);
+    encoder.u64(chunk.generation);
+    encoder.u64(chunk.next_offset);
+    encoder.u8(u8::from(chunk.eof));
+    encoder.bytes(&chunk.bytes);
     encoder.finish()
 }
 
@@ -532,6 +567,26 @@ impl Encoder {
     fn bytes(&mut self, value: &[u8]) {
         self.u32(u32::try_from(value.len()).expect("bounded bridge value length fits u32"));
         self.bytes.extend_from_slice(value);
+    }
+
+    fn short_bytes(&mut self, value: &[u8]) -> Option<()> {
+        self.u16(u16::try_from(value.len()).ok()?);
+        self.bytes.extend_from_slice(value);
+        Some(())
+    }
+
+    fn file_metadata(&mut self, metadata: &ComputerFileMetadata) {
+        self.file_kind(metadata.kind);
+        self.u8(u8::from(metadata.executable));
+        self.u64(metadata.logical_size);
+        self.u64(metadata.generation);
+    }
+
+    fn file_kind(&mut self, kind: ComputerFileKind) {
+        self.u8(match kind {
+            ComputerFileKind::File => 0,
+            ComputerFileKind::Directory => 1,
+        });
     }
 
     fn request(&mut self, request: &OwnedRequest) {

@@ -25,7 +25,8 @@ use compukter_ffi::{
     compukter_compilation_request_copy, compukter_compilation_request_size, compukter_create,
     compukter_create_boot_in_store, compukter_create_in_store, compukter_deploy,
     compukter_deployment_candidate_close, compukter_executable_revision,
-    compukter_filesystem_generation, compukter_max_create_bytes, compukter_max_outcome_bytes,
+    compukter_filesystem_generation, compukter_filesystem_list, compukter_filesystem_read,
+    compukter_filesystem_stat, compukter_max_create_bytes, compukter_max_outcome_bytes,
     compukter_store_close, compukter_store_durable_generation, compukter_store_flush,
     compukter_store_health, compukter_store_open, compukter_store_recover,
     compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
@@ -384,6 +385,136 @@ fn c_abi_boots_a_machine_from_the_executable_rom_entry() {
 }
 
 #[test]
+fn c_abi_inspects_and_reads_the_machine_filesystem_in_bounded_pages() {
+    let root = TestRoot::new();
+    let store = open_store(root.path());
+    let artifact = terminal_artifact();
+    let rom = rom_with_boot(&artifact, true);
+    let machine = create_boot_machine(store, [12; 16], &rom);
+
+    let stat = filesystem_stat(machine, b"/rom/boot");
+    assert_eq!(28, stat.len());
+    assert_eq!(1, stat[0]);
+    assert_eq!(0, stat[1]);
+    assert_eq!(1, stat[2]);
+    assert_eq!(0, stat[3]);
+    assert_eq!(
+        artifact.len() as u64,
+        u64::from_le_bytes(stat[4..12].try_into().unwrap())
+    );
+    let generation = u64::from_le_bytes(stat[12..20].try_into().unwrap());
+
+    let root_page = filesystem_list(machine, b"/", b"", 1);
+    assert_eq!(1, root_page[0]);
+    assert_eq!(0, root_page[17]);
+    assert_eq!(1, u32::from_le_bytes(root_page[18..22].try_into().unwrap()));
+    let name_len = u16::from_le_bytes(root_page[22..24].try_into().unwrap()) as usize;
+    assert_eq!(b"home", &root_page[24..24 + name_len]);
+
+    let next_page = filesystem_list(machine, b"/", b"home", 1);
+    assert_eq!(1, next_page[17]);
+    let name_len = u16::from_le_bytes(next_page[22..24].try_into().unwrap()) as usize;
+    assert_eq!(b"rom", &next_page[24..24 + name_len]);
+
+    let first = filesystem_read(machine, b"/rom/boot", 0, 8, generation);
+    assert_eq!(1, first[0]);
+    assert_eq!(8, u64::from_le_bytes(first[9..17].try_into().unwrap()));
+    assert_eq!(0, first[17]);
+    assert_eq!(8, u32::from_le_bytes(first[18..22].try_into().unwrap()));
+    assert_eq!(&artifact[..8], &first[22..]);
+
+    let mut written = 0_usize;
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_filesystem_stat(
+            machine,
+            [0xff].as_ptr(),
+            1,
+            core::ptr::null_mut(),
+            0,
+            &mut written,
+        )
+    });
+    assert_eq!(FfiStatus::FilesystemNotFound, unsafe {
+        compukter_filesystem_stat(
+            machine,
+            b"/home/missing".as_ptr(),
+            b"/home/missing".len(),
+            core::ptr::null_mut(),
+            0,
+            &mut written,
+        )
+    });
+    assert_eq!(FfiStatus::FilesystemNotDirectory, unsafe {
+        compukter_filesystem_list(
+            machine,
+            b"/rom/boot".as_ptr(),
+            b"/rom/boot".len(),
+            core::ptr::null(),
+            0,
+            1,
+            core::ptr::null_mut(),
+            0,
+            &mut written,
+        )
+    });
+    assert_eq!(FfiStatus::FilesystemLimitExceeded, unsafe {
+        compukter_filesystem_list(
+            machine,
+            b"/".as_ptr(),
+            1,
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null_mut(),
+            0,
+            &mut written,
+        )
+    });
+    assert_eq!(FfiStatus::FilesystemIsDirectory, unsafe {
+        compukter_filesystem_read(
+            machine,
+            b"/rom".as_ptr(),
+            b"/rom".len(),
+            0,
+            1,
+            0,
+            core::ptr::null_mut(),
+            0,
+            &mut written,
+        )
+    });
+    assert_eq!(FfiStatus::FilesystemLimitExceeded, unsafe {
+        compukter_filesystem_read(
+            machine,
+            b"/rom/boot".as_ptr(),
+            b"/rom/boot".len(),
+            0,
+            32 * 1024 + 1,
+            generation,
+            core::ptr::null_mut(),
+            0,
+            &mut written,
+        )
+    });
+    assert_eq!(FfiStatus::FilesystemStale, unsafe {
+        compukter_filesystem_read(
+            machine,
+            b"/rom/boot".as_ptr(),
+            b"/rom/boot".len(),
+            0,
+            8,
+            generation.wrapping_add(1),
+            core::ptr::null_mut(),
+            0,
+            &mut written,
+        )
+    });
+
+    assert_eq!(FfiStatus::Ok, compukter_close(machine));
+    assert_eq!(FfiStatus::Ok, compukter_store_close(store));
+}
+
+#[test]
 fn create_preserves_the_typed_wire_result_and_rejects_short_output_first() {
     let invalid_artifact = [0_u8];
     let mut short = [0_u8; 1];
@@ -529,6 +660,74 @@ fn executable_revision(machine: u64, path: &[u8]) -> Vec<u8> {
     output[..written].to_vec()
 }
 
+fn filesystem_stat(machine: u64, path: &[u8]) -> Vec<u8> {
+    read_dynamic_output(|output, capacity, written| unsafe {
+        compukter_filesystem_stat(
+            machine,
+            path.as_ptr(),
+            path.len(),
+            output,
+            capacity,
+            written,
+        )
+    })
+}
+
+fn filesystem_list(machine: u64, path: &[u8], start_after: &[u8], maximum: u32) -> Vec<u8> {
+    read_dynamic_output(|output, capacity, written| unsafe {
+        compukter_filesystem_list(
+            machine,
+            path.as_ptr(),
+            path.len(),
+            start_after.as_ptr(),
+            start_after.len(),
+            maximum,
+            output,
+            capacity,
+            written,
+        )
+    })
+}
+
+fn filesystem_read(
+    machine: u64,
+    path: &[u8],
+    offset: u64,
+    maximum: u32,
+    generation: u64,
+) -> Vec<u8> {
+    read_dynamic_output(|output, capacity, written| unsafe {
+        compukter_filesystem_read(
+            machine,
+            path.as_ptr(),
+            path.len(),
+            offset,
+            maximum,
+            generation,
+            output,
+            capacity,
+            written,
+        )
+    })
+}
+
+fn read_dynamic_output(call: impl Fn(*mut u8, usize, *mut usize) -> FfiStatus) -> Vec<u8> {
+    let mut required = 0_usize;
+    assert_eq!(
+        FfiStatus::BufferTooSmall,
+        call(core::ptr::null_mut(), 0, &mut required),
+    );
+    assert_ne!(0, required);
+    let mut output = vec![0; required];
+    let mut written = 0_usize;
+    assert_eq!(
+        FfiStatus::Ok,
+        call(output.as_mut_ptr(), output.len(), &mut written),
+    );
+    output.truncate(written);
+    output
+}
+
 fn deploy(
     machine: u64,
     candidate: u64,
@@ -631,6 +830,12 @@ fn boot_create_wire(store: u64, id: [u8; 16], rom: &[u8]) -> Vec<u8> {
     });
     output.truncate(written);
     output
+}
+
+fn create_boot_machine(store: u64, id: [u8; 16], rom: &[u8]) -> u64 {
+    let wire = boot_create_wire(store, id, rom);
+    assert_eq!(0, wire[0]);
+    u64::from_le_bytes(wire[1..9].try_into().unwrap())
 }
 
 fn open_store(root: &Path) -> u64 {

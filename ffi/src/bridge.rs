@@ -3,7 +3,8 @@ use std::sync::{Arc, OnceLock};
 
 use compukter_vm::{
     verify_artifact, AdmissionError, ArtifactLimits, CanonicalLineSubmissionError,
-    CompilationRequest, ComputerAdvanceOutcome, ComputerError, ComputerId, ComputerMachine,
+    CompilationRequest, ComputerAdvanceOutcome, ComputerDirectoryListing, ComputerError,
+    ComputerFileChunk, ComputerFileReadError, ComputerFileStat, ComputerId, ComputerMachine,
     ComputerStartError, ComputerValue, DeploymentCandidate, EntryArgumentLimits,
     ExecutableRevision, ExecutionProfile, FileCapability, FileRights, FileSystemError,
     FileSystemLimits, GuestTrap, HostDeployError, HostFailure, HostResponse, HostValueInput,
@@ -109,6 +110,12 @@ pub(crate) enum DeploymentBridgeError {
 pub(crate) enum RevisionBridgeError {
     Session(HandleError),
     FileSystem(FileSystemError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileInspectionBridgeError {
+    Session(HandleError),
+    File(ComputerFileReadError),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -303,6 +310,60 @@ pub(crate) fn filesystem_generation(handle: u64) -> Result<u64, BridgeError> {
     sessions()
         .with(handle, |session| session.computer.filesystem_generation())
         .map_err(BridgeError::Handle)
+}
+
+pub(crate) fn filesystem_stat(
+    handle: u64,
+    path: &str,
+) -> Result<ComputerFileStat, FileInspectionBridgeError> {
+    sessions()
+        .with(handle, |session| {
+            let path = VirtualPath::parse_utf8(path, &session.filesystem_limits)
+                .map_err(ComputerFileReadError::FileSystem)?;
+            session
+                .computer
+                .filesystem_stat(&path)
+                .map_err(ComputerFileReadError::FileSystem)
+        })
+        .map_err(FileInspectionBridgeError::Session)?
+        .map_err(FileInspectionBridgeError::File)
+}
+
+pub(crate) fn filesystem_list(
+    handle: u64,
+    path: &str,
+    start_after: Option<&str>,
+    maximum_entries: u32,
+) -> Result<ComputerDirectoryListing, FileInspectionBridgeError> {
+    sessions()
+        .with(handle, |session| {
+            let path = VirtualPath::parse_utf8(path, &session.filesystem_limits)
+                .map_err(ComputerFileReadError::FileSystem)?;
+            session
+                .computer
+                .filesystem_list(&path, start_after, maximum_entries)
+        })
+        .map_err(FileInspectionBridgeError::Session)?
+        .map_err(FileInspectionBridgeError::File)
+}
+
+pub(crate) fn filesystem_read(
+    handle: u64,
+    path: &str,
+    offset: u64,
+    maximum_bytes: u32,
+    expected_generation: u64,
+) -> Result<ComputerFileChunk, FileInspectionBridgeError> {
+    sessions()
+        .with(handle, |session| {
+            let path = VirtualPath::parse_utf8(path, &session.filesystem_limits)
+                .map_err(ComputerFileReadError::FileSystem)?;
+            session
+                .computer
+                .filesystem_read(&path, offset, maximum_bytes, expected_generation)
+        })
+        .map_err(FileInspectionBridgeError::Session)?
+        .map_err(FileInspectionBridgeError::File)
 }
 
 pub(crate) fn verify_for_deploy(
