@@ -20,6 +20,7 @@ pub mod bump;
 pub mod cli;
 pub mod git;
 pub mod process;
+pub mod release;
 pub mod state;
 pub mod transaction;
 pub mod version;
@@ -27,6 +28,7 @@ pub mod version;
 use bump::bump;
 use cli::Command;
 use process::SystemProcessRunner;
+use release::release;
 use state::ReleaseState;
 use std::path::PathBuf;
 
@@ -46,7 +48,7 @@ where
             ))
         }
         Command::Bump(kind) => bump(&repository_root(), kind, &SystemProcessRunner),
-        Command::Release => Err(format!("{command:?} is not implemented")),
+        Command::Release => release(&repository_root(), &SystemProcessRunner),
     }
 }
 

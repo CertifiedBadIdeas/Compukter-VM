@@ -19,10 +19,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use tempfile::TempDir;
 use xtask::bump::bump;
 use xtask::cli::BumpKind;
 use xtask::process::ProcessRunner;
+use xtask::release::release;
 
 struct TestRepository {
     directory: TempDir,
@@ -87,6 +89,35 @@ impl TestRepository {
     fn is_clean(&self) -> bool {
         git_output(self.path(), &["status", "--porcelain=v1"]).is_empty()
     }
+
+    fn checkout(&self, branch: &str) {
+        git(self.path(), &["checkout", "-b", branch]);
+    }
+
+    fn create_tag(&self, tag: &str) {
+        git(self.path(), &["tag", "-a", tag, "-m", tag]);
+    }
+
+    fn tag_is_annotated(&self, tag: &str) -> bool {
+        git_output(
+            self.path(),
+            &["cat-file", "-t", &format!("refs/tags/{tag}")],
+        ) == "tag"
+    }
+
+    fn tag_exists(&self, tag: &str) -> bool {
+        Command::new("git")
+            .current_dir(self.path())
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/tags/{tag}"),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    }
 }
 
 struct UpdatingRunner;
@@ -122,6 +153,48 @@ impl ProcessRunner for FailingRunner {
         purpose: &str,
     ) -> Result<(), String> {
         Err(format!("{purpose} failed with exit status 1"))
+    }
+}
+
+struct RecordingRunner {
+    purposes: Mutex<Vec<String>>,
+    failure: Option<&'static str>,
+}
+
+impl RecordingRunner {
+    fn successful() -> Self {
+        Self {
+            purposes: Mutex::new(Vec::new()),
+            failure: None,
+        }
+    }
+
+    fn fail_on(purpose: &'static str) -> Self {
+        Self {
+            purposes: Mutex::new(Vec::new()),
+            failure: Some(purpose),
+        }
+    }
+
+    fn purposes(&self) -> Vec<String> {
+        self.purposes.lock().unwrap().clone()
+    }
+}
+
+impl ProcessRunner for RecordingRunner {
+    fn run(
+        &self,
+        _root: &Path,
+        _program: &str,
+        _arguments: &[&str],
+        purpose: &str,
+    ) -> Result<(), String> {
+        self.purposes.lock().unwrap().push(purpose.to_owned());
+        if self.failure == Some(purpose) {
+            Err(format!("{purpose} failed with exit status 1"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -179,6 +252,42 @@ fn abi_bump_requires_the_exported_next_abi() {
     let rejected = TestRepository::consistent("0.5.2", 5);
     assert!(bump(rejected.path(), BumpKind::Abi, &UpdatingRunner).is_err());
     assert_eq!("0.5.2", rejected.runtime_version());
+}
+
+#[test]
+fn release_runs_all_gates_then_creates_one_annotated_tag() {
+    let repository = TestRepository::consistent("0.5.1", 5);
+    let runner = RecordingRunner::successful();
+    release(repository.path(), &runner).unwrap();
+    assert_eq!(
+        vec!["format workspace", "lint workspace", "test workspace"],
+        runner.purposes()
+    );
+    assert!(repository.tag_is_annotated("v0.5.1"));
+}
+
+#[test]
+fn failed_release_gate_creates_no_tag() {
+    let repository = TestRepository::consistent("0.5.1", 5);
+    let runner = RecordingRunner::fail_on("lint workspace");
+    let error = release(repository.path(), &runner).unwrap_err();
+    assert!(error.contains("lint workspace"), "{error}");
+    assert!(!repository.tag_exists("v0.5.1"));
+    assert_eq!(
+        vec!["format workspace", "lint workspace"],
+        runner.purposes()
+    );
+}
+
+#[test]
+fn release_rejects_non_main_and_existing_tag() {
+    let non_main = TestRepository::consistent("0.5.1", 5);
+    non_main.checkout("development");
+    assert!(release(non_main.path(), &RecordingRunner::successful()).is_err());
+
+    let tagged = TestRepository::consistent("0.5.1", 5);
+    tagged.create_tag("v0.5.1");
+    assert!(release(tagged.path(), &RecordingRunner::successful()).is_err());
 }
 
 fn write_lock(root: &Path, version: &str) {
