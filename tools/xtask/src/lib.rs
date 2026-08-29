@@ -16,11 +16,17 @@
  * limitations under the License.
  */
 
+pub mod bump;
 pub mod cli;
+pub mod git;
+pub mod process;
 pub mod state;
+pub mod transaction;
 pub mod version;
 
+use bump::bump;
 use cli::Command;
+use process::SystemProcessRunner;
 use state::ReleaseState;
 use std::path::PathBuf;
 
@@ -39,7 +45,8 @@ where
                 state.version, state.exported_abi
             ))
         }
-        _ => Err(format!("{command:?} is not implemented")),
+        Command::Bump(kind) => bump(&repository_root(), kind, &SystemProcessRunner),
+        Command::Release => Err(format!("{command:?} is not implemented")),
     }
 }
 
