@@ -55,7 +55,7 @@ impl TestRepository {
         );
         write(
             root.join(".github/workflows/runtime-release.yml"),
-            "tags:\n  - \"v0.*.*\"\nenv:\n  RUNTIME_TAG: input\n  RUNTIME_VERSION: dynamic\nasset: compukter-runtime-${RUNTIME_VERSION}\n",
+            "tags:\n  - \"v0.*.*\"\nenv:\n  RUNTIME_TAG: input\n  RUNTIME_VERSION: dynamic\n  RUNTIME_ABI: dynamic\nsmoke: --abi \"$RUNTIME_ABI\"\nasset: compukter-runtime-${RUNTIME_VERSION}\nrelease:\n  if: github.event_name == 'push' && github.ref_type == 'tag'\n",
         );
         git(root, &["init", "-b", "main"]);
         git(root, &["config", "user.name", "Compukters Test"]);
@@ -153,6 +153,25 @@ impl ProcessRunner for FailingRunner {
         purpose: &str,
     ) -> Result<(), String> {
         Err(format!("{purpose} failed with exit status 1"))
+    }
+}
+
+struct HeadChangingRunner;
+
+impl ProcessRunner for HeadChangingRunner {
+    fn run(
+        &self,
+        root: &Path,
+        _program: &str,
+        _arguments: &[&str],
+        purpose: &str,
+    ) -> Result<(), String> {
+        if purpose == "test workspace" {
+            write(root.join("concurrent.txt"), "changed after admission\n");
+            git(root, &["add", "concurrent.txt"]);
+            git(root, &["commit", "-m", "concurrent change"]);
+        }
+        Ok(())
     }
 }
 
@@ -277,6 +296,17 @@ fn failed_release_gate_creates_no_tag() {
         vec!["format workspace", "lint workspace"],
         runner.purposes()
     );
+}
+
+#[test]
+fn release_rejects_a_head_change_after_running_the_gates() {
+    let repository = TestRepository::consistent("0.5.1", 5);
+    let error = release(repository.path(), &HeadChangingRunner).unwrap_err();
+    assert!(
+        error.contains("HEAD changed while running release gates"),
+        "{error}"
+    );
+    assert!(!repository.tag_exists("v0.5.1"));
 }
 
 #[test]

@@ -197,10 +197,27 @@ fn validate_workflow(
             "Runtime release workflow contains hard-coded runtime version {version}"
         ));
     }
+    if let Some(fixed_abi) = workflow.lines().find_map(|line| {
+        let (_, argument) = line.split_once("--abi")?;
+        let argument = argument.split_whitespace().next()?;
+        argument
+            .chars()
+            .all(|character| character.is_ascii_digit())
+            .then_some(argument)
+    }) {
+        errors.push(format!(
+            "Runtime release workflow contains hard-coded Runtime ABI {fixed_abi}"
+        ));
+    }
+    if !workflow.contains("github.event_name == 'push' && github.ref_type == 'tag'") {
+        errors.push("Runtime release workflow manual dispatch can publish a release".to_owned());
+    }
     for marker in [
         "v0.*.*",
         "RUNTIME_TAG",
         "RUNTIME_VERSION",
+        "RUNTIME_ABI",
+        "--abi \"$RUNTIME_ABI\"",
         "compukter-runtime-${RUNTIME_VERSION}",
     ] {
         if !workflow.contains(marker) {
@@ -254,7 +271,7 @@ mod tests {
                 directory
                     .path()
                     .join(".github/workflows/runtime-release.yml"),
-                "tags:\n  - \"v0.*.*\"\nenv:\n  RUNTIME_TAG: input\n  RUNTIME_VERSION: dynamic\nasset: compukter-runtime-${RUNTIME_VERSION}\n",
+                "tags:\n  - \"v0.*.*\"\nenv:\n  RUNTIME_TAG: input\n  RUNTIME_VERSION: dynamic\n  RUNTIME_ABI: dynamic\nsmoke: --abi \"$RUNTIME_ABI\"\nasset: compukter-runtime-${RUNTIME_VERSION}\nrelease:\n  if: github.event_name == 'push' && github.ref_type == 'tag'\n",
             );
             Self { directory }
         }
@@ -309,5 +326,17 @@ mod tests {
         let state = ReleaseState::load(fixture.path()).unwrap();
         assert!(state.require_current_abi().is_err());
         assert_eq!(6, state.exported_abi);
+    }
+
+    #[test]
+    fn rejects_a_fixed_smoke_abi_and_manual_release_publication() {
+        let fixture = Fixture::consistent("0.6.0", 6);
+        fixture.overwrite(
+            ".github/workflows/runtime-release.yml",
+            "tags: [v0.*.*]\nenv:\n  RUNTIME_TAG: input\n  RUNTIME_VERSION: dynamic\nasset: compukter-runtime-${RUNTIME_VERSION}\nsmoke: --abi 5\nrelease:\n  if: github.ref_type == 'tag'\n",
+        );
+        let error = ReleaseState::load(fixture.path()).unwrap_err();
+        assert!(error.contains("hard-coded Runtime ABI"), "{error}");
+        assert!(error.contains("manual dispatch can publish"), "{error}");
     }
 }

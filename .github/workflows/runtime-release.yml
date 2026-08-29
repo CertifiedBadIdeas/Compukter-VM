@@ -51,10 +51,13 @@ jobs:
             *) echo "invalid Runtime tag: $RUNTIME_TAG" >&2; exit 1 ;;
           esac
           RUNTIME_VERSION="${RUNTIME_TAG#v}"
+          RUNTIME_ABI="${RUNTIME_VERSION#0.}"
+          RUNTIME_ABI="${RUNTIME_ABI%%.*}"
           declared_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' runtime-version.toml)"
           test "$declared_version" = "$RUNTIME_VERSION"
           asset="compukter-runtime-${RUNTIME_VERSION}-${{ matrix.platform }}${{ matrix.extension }}"
           echo "RUNTIME_VERSION=$RUNTIME_VERSION" >> "$GITHUB_ENV"
+          echo "RUNTIME_ABI=$RUNTIME_ABI" >> "$GITHUB_ENV"
           echo "version=$RUNTIME_VERSION" >> "$GITHUB_OUTPUT"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
       - name: Fetch locked dependencies
@@ -74,7 +77,7 @@ jobs:
         run: |
           cargo run -p runtime-bundler --locked --offline -- smoke \
             --library "${{ matrix.library }}" \
-            --abi 5
+            --abi "$RUNTIME_ABI"
           cargo run -p runtime-bundler --locked --offline -- package \
             --version-file runtime-version.toml \
             --tag "$RUNTIME_TAG" \
@@ -99,7 +102,7 @@ jobs:
 
   release:
     name: Publish tagged Runtime
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10

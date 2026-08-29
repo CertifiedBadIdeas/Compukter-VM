@@ -43,6 +43,10 @@ impl GitRepository {
         self.output(&["symbolic-ref", "--quiet", "--short", "HEAD"])
     }
 
+    pub fn head(&self) -> Result<String, String> {
+        self.output(&["rev-parse", "--verify", "HEAD"])
+    }
+
     pub fn tag_exists(&self, tag: &str) -> Result<bool, String> {
         let reference = format!("refs/tags/{tag}");
         let status = Command::new("git")
