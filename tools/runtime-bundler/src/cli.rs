@@ -225,7 +225,7 @@ mod tests {
             "--version-file",
             "runtime-version.toml",
             "--tag",
-            "runtime-v5.0",
+            "runtime-v5.1",
             "--commit",
             "0123456789abcdef0123456789abcdef01234567",
             "--target",
@@ -248,7 +248,7 @@ mod tests {
         .unwrap();
 
         let package = command.package().unwrap();
-        assert_eq!("runtime-v5.0", package.tag);
+        assert_eq!("runtime-v5.1", package.tag);
         assert_eq!(Some(&2), package.formats.get("artifact"));
         assert_eq!(Some(&1), package.formats.get("filesystem-generation"));
     }
@@ -271,13 +271,13 @@ mod tests {
         let valid = directory.path().join("valid.toml");
         let semver = directory.path().join("semver.toml");
         let extra = directory.path().join("extra.toml");
-        fs::write(&valid, "version = \"5.0\"\n").unwrap();
-        fs::write(&semver, "version = \"5.0.0\"\n").unwrap();
-        fs::write(&extra, "version = \"5.0\"\nother = 1\n").unwrap();
+        fs::write(&valid, "version = \"5.1\"\n").unwrap();
+        fs::write(&semver, "version = \"5.1.0\"\n").unwrap();
+        fs::write(&extra, "version = \"5.1\"\nother = 1\n").unwrap();
 
         let version = read_runtime_version(&valid).unwrap();
         assert_eq!(5, version.abi);
-        assert_eq!(0, version.revision);
+        assert_eq!(1, version.revision);
         assert!(read_runtime_version(&semver).is_err());
         assert!(read_runtime_version(&extra).is_err());
     }

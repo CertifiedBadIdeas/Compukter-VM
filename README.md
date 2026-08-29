@@ -76,14 +76,14 @@ the Rust crate versions:
 - `y` is incremented for a compatible implementation replacement;
 - an ABI break changes `x` and resets `y` to zero.
 
-Runtime `5.0` is tagged `runtime-v5.0`. The first supported targets are Linux
+Runtime `5.1` is tagged `runtime-v5.1`. The first supported targets are Linux
 x86_64 (`x86_64-unknown-linux-gnu`) and Windows x86_64
 (`x86_64-pc-windows-msvc`). Each release contains these immutable assets:
 
 ```text
-compukter-runtime-5.0-linux-x86_64.tar.gz
-compukter-runtime-5.0-windows-x86_64.zip
-compukter-runtime-5.0-checksums.sha256
+compukter-runtime-5.1-linux-x86_64.tar.gz
+compukter-runtime-5.1-windows-x86_64.zip
+compukter-runtime-5.1-checksums.sha256
 ```
 
 Each platform archive has one fixed, self-describing layout:
