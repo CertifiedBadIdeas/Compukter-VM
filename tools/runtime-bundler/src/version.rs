@@ -41,7 +41,7 @@ impl RuntimeVersion {
     }
 
     pub fn tag(self) -> String {
-        format!("runtime-v{self}")
+        format!("v{self}")
     }
 
     pub fn require_abi(self, exported_abi: u32) -> Result<(), String> {
@@ -83,7 +83,7 @@ mod tests {
         let version = RuntimeVersion::parse("0.5.1").unwrap();
         assert_eq!(5, version.abi);
         assert_eq!(1, version.revision);
-        assert_eq!("runtime-v0.5.1", version.tag());
+        assert_eq!("v0.5.1", version.tag());
     }
 
     #[test]

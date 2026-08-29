@@ -227,7 +227,7 @@ mod tests {
             "--version-file",
             "runtime-version.toml",
             "--tag",
-            "runtime-v0.5.1",
+            "v0.5.1",
             "--commit",
             "0123456789abcdef0123456789abcdef01234567",
             "--target",
@@ -250,7 +250,7 @@ mod tests {
         .unwrap();
 
         let package = command.package().unwrap();
-        assert_eq!("runtime-v0.5.1", package.tag);
+        assert_eq!("v0.5.1", package.tag);
         assert_eq!(Some(&2), package.formats.get("artifact"));
         assert_eq!(Some(&1), package.formats.get("filesystem-generation"));
     }

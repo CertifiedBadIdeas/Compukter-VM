@@ -153,7 +153,7 @@ mod tests {
         RuntimeManifest {
             schema: 1,
             runtime_version: "0.5.1".to_owned(),
-            release_tag: "runtime-v0.5.1".to_owned(),
+            release_tag: "v0.5.1".to_owned(),
             vm_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             ffi_abi: 5,
             formats: BTreeMap::from([
@@ -184,9 +184,7 @@ mod tests {
     fn validates_the_runtime_identity_and_platform_contract() {
         let version = RuntimeVersion::parse("0.5.1").unwrap();
 
-        assert!(manifest()
-            .validate_for(version, "runtime-v0.5.1", 5)
-            .is_ok());
+        assert!(manifest().validate_for(version, "v0.5.1", 5).is_ok());
     }
 
     #[test]
@@ -197,12 +195,8 @@ mod tests {
         let mut bad_digest = manifest();
         bad_digest.sha256 = "xyz".to_owned();
 
-        assert!(short_commit
-            .validate_for(version, "runtime-v0.5.1", 5)
-            .is_err());
-        assert!(bad_digest
-            .validate_for(version, "runtime-v0.5.1", 5)
-            .is_err());
+        assert!(short_commit.validate_for(version, "v0.5.1", 5).is_err());
+        assert!(bad_digest.validate_for(version, "v0.5.1", 5).is_err());
     }
 
     #[test]
@@ -213,11 +207,7 @@ mod tests {
         let mut no_formats = manifest();
         no_formats.formats.clear();
 
-        assert!(wrong_filename
-            .validate_for(version, "runtime-v0.5.1", 5)
-            .is_err());
-        assert!(no_formats
-            .validate_for(version, "runtime-v0.5.1", 5)
-            .is_err());
+        assert!(wrong_filename.validate_for(version, "v0.5.1", 5).is_err());
+        assert!(no_formats.validate_for(version, "v0.5.1", 5).is_err());
     }
 }
