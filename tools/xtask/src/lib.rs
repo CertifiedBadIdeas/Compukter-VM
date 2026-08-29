@@ -17,9 +17,12 @@
  */
 
 pub mod cli;
+pub mod state;
 pub mod version;
 
 use cli::Command;
+use state::ReleaseState;
+use std::path::PathBuf;
 
 pub fn run<I, S>(arguments: I) -> Result<String, String>
 where
@@ -27,5 +30,19 @@ where
     S: AsRef<str>,
 {
     let command = Command::parse(arguments)?;
-    Err(format!("{command:?} is not implemented"))
+    match command {
+        Command::Check => {
+            let state = ReleaseState::load(&repository_root())?;
+            state.require_current_abi()?;
+            Ok(format!(
+                "release state {} (ABI {}) is consistent",
+                state.version, state.exported_abi
+            ))
+        }
+        _ => Err(format!("{command:?} is not implemented")),
+    }
+}
+
+fn repository_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
