@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+use std::fmt::{Display, Formatter};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeVersion {
     pub abi: u32,
@@ -24,20 +26,22 @@ pub struct RuntimeVersion {
 
 impl RuntimeVersion {
     pub fn parse(value: &str) -> Result<Self, String> {
-        let (abi, revision) = value
-            .split_once('.')
-            .ok_or_else(|| "runtime version must contain exactly one dot".to_owned())?;
-        if revision.contains('.') {
-            return Err("runtime version must contain exactly one dot".to_owned());
+        let mut components = value.split('.');
+        let major = components.next();
+        let abi = components.next();
+        let revision = components.next();
+        if major != Some("0") || abi.is_none() || revision.is_none() || components.next().is_some()
+        {
+            return Err("runtime version must use canonical 0.<abi>.<revision> form".to_owned());
         }
         Ok(Self {
-            abi: parse_component(abi, "ABI")?,
-            revision: parse_component(revision, "revision")?,
+            abi: parse_component(abi.unwrap(), "ABI")?,
+            revision: parse_component(revision.unwrap(), "revision")?,
         })
     }
 
     pub fn tag(self) -> String {
-        format!("runtime-v{}.{}", self.abi, self.revision)
+        format!("runtime-v{self}")
     }
 
     pub fn require_abi(self, exported_abi: u32) -> Result<(), String> {
@@ -49,6 +53,12 @@ impl RuntimeVersion {
                 self.abi
             ))
         }
+    }
+}
+
+impl Display for RuntimeVersion {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "0.{}.{}", self.abi, self.revision)
     }
 }
 
@@ -70,15 +80,24 @@ mod tests {
 
     #[test]
     fn parses_runtime_version_and_tag() {
-        let version = RuntimeVersion::parse("5.1").unwrap();
+        let version = RuntimeVersion::parse("0.5.1").unwrap();
         assert_eq!(5, version.abi);
         assert_eq!(1, version.revision);
-        assert_eq!("runtime-v5.1", version.tag());
+        assert_eq!("runtime-v0.5.1", version.tag());
     }
 
     #[test]
-    fn rejects_semver_and_malformed_runtime_versions() {
-        for invalid in ["5", "5.1.0", "v5.1", "5.-1", "05.1", "5.1-alpha"] {
+    fn rejects_non_pre_one_and_malformed_runtime_versions() {
+        for invalid in [
+            "5.1",
+            "0.5",
+            "0.5.1.0",
+            "1.5.1",
+            "v0.5.1",
+            "0.05.1",
+            "0.5.01",
+            "0.5.1-alpha",
+        ] {
             assert!(
                 RuntimeVersion::parse(invalid).is_err(),
                 "accepted {invalid}"
@@ -88,7 +107,7 @@ mod tests {
 
     #[test]
     fn requires_version_abi_to_match_exported_abi() {
-        let version = RuntimeVersion::parse("6.0").unwrap();
+        let version = RuntimeVersion::parse("0.6.0").unwrap();
         assert!(version.require_abi(5).is_err());
     }
 }

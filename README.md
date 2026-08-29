@@ -69,21 +69,22 @@ cargo doc --workspace --no-deps --document-private-items --locked --offline
 
 ## Native Runtime bundles
 
-Compukter Runtime releases use a two-component `x.y` version independent of
-the Rust crate versions:
+Compukter Runtime releases and Rust workspace packages use one pre-1.0 SemVer
+`0.x.y`:
 
+- `0` marks the runtime as pre-1.0;
 - `x` is exactly the exported FFI ABI returned by `compukter_abi_version`;
 - `y` is incremented for a compatible implementation replacement;
 - an ABI break changes `x` and resets `y` to zero.
 
-Runtime `5.1` is tagged `runtime-v5.1`. The first supported targets are Linux
+Runtime `0.5.1` is tagged `runtime-v0.5.1`. The first supported targets are Linux
 x86_64 (`x86_64-unknown-linux-gnu`) and Windows x86_64
 (`x86_64-pc-windows-msvc`). Each release contains these immutable assets:
 
 ```text
-compukter-runtime-5.1-linux-x86_64.tar.gz
-compukter-runtime-5.1-windows-x86_64.zip
-compukter-runtime-5.1-checksums.sha256
+compukter-runtime-0.5.1-linux-x86_64.tar.gz
+compukter-runtime-0.5.1-windows-x86_64.zip
+compukter-runtime-0.5.1-checksums.sha256
 ```
 
 Each platform archive has one fixed, self-describing layout:
@@ -99,12 +100,12 @@ The manifest binds the Runtime version and tag, full VM commit, FFI ABI,
 external format versions, pinned Rust compiler, target, native filename, byte
 size, SHA-256, and release profile. Consumers must pin both the exact Runtime
 release and the exact VM commit from that manifest. Published assets are
-immutable; a compatible replacement is a new revision such as `5.1`, never an
-overwrite of `5.0`.
+immutable; a compatible replacement is a new revision such as `0.5.1`, never
+an overwrite of `0.5.0`.
 
 The `Runtime release` workflow may be dispatched manually to build and test
 temporary Linux and Windows artifacts. It publishes a durable GitHub Release
-only for a pushed tag matching `runtime-vX.Y`. Creating that public tag is a
+only for a pushed tag matching `runtime-v0.X.Y`. Creating that public tag is a
 manual release decision made after local verification.
 
 ## Golden fixtures
