@@ -439,8 +439,8 @@ mod tests {
 
         fn inputs<'a>(&'a self, target: &'a str) -> BundleInputs<'a> {
             BundleInputs {
-                runtime_version: RuntimeVersion::parse("5.0").unwrap(),
-                release_tag: "runtime-v5.0",
+                runtime_version: RuntimeVersion::parse("5.1").unwrap(),
+                release_tag: "runtime-v5.1",
                 vm_commit: COMMIT,
                 rustc: "rustc 1.98.0 (88d9e12ae 2026-08-18)",
                 target,
@@ -463,7 +463,7 @@ mod tests {
         let bundle = create_bundle(&fixture.inputs(LINUX_TARGET), fixture.root.path()).unwrap();
 
         assert_eq!(
-            "compukter-runtime-5.0-linux-x86_64.tar.gz",
+            "compukter-runtime-5.1-linux-x86_64.tar.gz",
             bundle.file_name().unwrap()
         );
         assert_eq!(
@@ -486,7 +486,7 @@ mod tests {
         let bundle = create_bundle(&fixture.inputs(WINDOWS_TARGET), fixture.root.path()).unwrap();
 
         assert_eq!(
-            "compukter-runtime-5.0-windows-x86_64.zip",
+            "compukter-runtime-5.1-windows-x86_64.zip",
             bundle.file_name().unwrap()
         );
         assert_eq!(
@@ -511,7 +511,7 @@ mod tests {
         assert!(!fixture
             .root
             .path()
-            .join("compukter-runtime-5.0-linux-x86_64.tar.gz")
+            .join("compukter-runtime-5.1-linux-x86_64.tar.gz")
             .exists());
     }
 

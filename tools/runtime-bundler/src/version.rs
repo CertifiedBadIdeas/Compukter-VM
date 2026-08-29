@@ -70,15 +70,15 @@ mod tests {
 
     #[test]
     fn parses_runtime_version_and_tag() {
-        let version = RuntimeVersion::parse("5.0").unwrap();
+        let version = RuntimeVersion::parse("5.1").unwrap();
         assert_eq!(5, version.abi);
-        assert_eq!(0, version.revision);
-        assert_eq!("runtime-v5.0", version.tag());
+        assert_eq!(1, version.revision);
+        assert_eq!("runtime-v5.1", version.tag());
     }
 
     #[test]
     fn rejects_semver_and_malformed_runtime_versions() {
-        for invalid in ["5", "5.0.0", "v5.0", "5.-1", "05.0", "5.0-alpha"] {
+        for invalid in ["5", "5.1.0", "v5.1", "5.-1", "05.1", "5.1-alpha"] {
             assert!(
                 RuntimeVersion::parse(invalid).is_err(),
                 "accepted {invalid}"

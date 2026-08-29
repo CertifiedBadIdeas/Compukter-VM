@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Runtime tag identity to validate without publishing
         required: true
-        default: runtime-v5.0
+        default: runtime-v5.1
         type: string
 
 permissions:
@@ -30,12 +30,12 @@ jobs:
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             library: target/release/libcompukter_ffi.so
-            asset: compukter-runtime-5.0-linux-x86_64.tar.gz
+            asset: compukter-runtime-5.1-linux-x86_64.tar.gz
           - platform: windows-x86_64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             library: target/release/compukter_ffi.dll
-            asset: compukter-runtime-5.0-windows-x86_64.zip
+            asset: compukter-runtime-5.1-windows-x86_64.zip
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
@@ -104,7 +104,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for bundle in release-assets/compukter-runtime-5.0-*; do
+          for bundle in release-assets/compukter-runtime-5.1-*; do
             cargo run -p runtime-bundler --locked --offline -- inspect "$bundle" \
               | jq -e --arg tag "$GITHUB_REF_NAME" '.release_tag == $tag'
           done
