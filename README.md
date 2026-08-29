@@ -77,7 +77,7 @@ Compukter Runtime releases and Rust workspace packages use one pre-1.0 SemVer
 - `y` is incremented for a compatible implementation replacement;
 - an ABI break changes `x` and resets `y` to zero.
 
-Runtime `0.5.1` is tagged `runtime-v0.5.1`. The first supported targets are Linux
+Runtime `0.5.1` is tagged `v0.5.1`. The first supported targets are Linux
 x86_64 (`x86_64-unknown-linux-gnu`) and Windows x86_64
 (`x86_64-pc-windows-msvc`). Each release contains these immutable assets:
 
@@ -105,8 +105,20 @@ an overwrite of `0.5.0`.
 
 The `Runtime release` workflow may be dispatched manually to build and test
 temporary Linux and Windows artifacts. It publishes a durable GitHub Release
-only for a pushed tag matching `runtime-v0.X.Y`. Creating that public tag is a
-manual release decision made after local verification.
+only for a pushed tag matching `v0.X.Y`. Local release preparation is explicit:
+
+```text
+cargo xtask check
+cargo xtask bump revision
+cargo xtask release
+git push origin main v0.5.2
+```
+
+`bump` updates every canonical version file and creates a local commit.
+`release` runs formatting, Clippy, and workspace tests before creating a local
+annotated tag. Neither command pushes or publishes anything. Archive names keep
+the descriptive `compukter-runtime-*` prefix; GitHub publishes only after the
+maintainer pushes the prepared `v0.X.Y` tag.
 
 ## Golden fixtures
 

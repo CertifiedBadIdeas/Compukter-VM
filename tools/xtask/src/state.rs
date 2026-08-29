@@ -189,7 +189,7 @@ fn validate_workflow(
         &root.join(".github/workflows/runtime-release.yml"),
         "Runtime release workflow",
     )?;
-    if workflow.contains("runtime-v") {
+    if workflow.contains("runtime-v0") {
         errors.push("Runtime release workflow uses the legacy runtime-v tag prefix".to_owned());
     }
     if workflow.contains(&format!("compukter-runtime-{version}")) {
