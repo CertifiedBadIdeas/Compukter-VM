@@ -780,25 +780,46 @@ impl ComputerMachine {
                 .map_err(ComputerError::Run)?;
             match outcome {
                 AdvanceOutcome::HostRequestBatch(batch) => {
-                    let request = batch
-                        .get(0)
-                        .ok_or(ComputerError::Run(RunError::NotRunnable))?;
-                    if is_raw_terminal(request) {
-                        Some(copy_raw_terminal_request(request)?)
-                    } else if is_stdio(request) {
-                        Some(copy_stdio_request(request)?)
-                    } else if is_filesystem(request) {
-                        Some(copy_filesystem_request(request)?)
-                    } else if is_process(request) {
-                        Some(copy_process_request(request)?)
-                    } else if is_compiler(request) {
-                        Some(copy_compiler_request(request)?)
-                    } else if is_redstone_local(request) {
-                        Some(copy_redstone_request(request)?)
+                    if batch.len() == 0 {
+                        return Err(ComputerError::Run(RunError::NotRunnable));
+                    }
+                    let mut internal = None;
+                    for index in 0..batch.len() {
+                        let request = batch
+                            .get(index)
+                            .ok_or(ComputerError::Run(RunError::NotRunnable))?;
+                        internal = if is_raw_terminal(request) {
+                            Some(copy_raw_terminal_request(request)?)
+                        } else if is_stdio(request) {
+                            Some(copy_stdio_request(request)?)
+                        } else if is_filesystem(request) {
+                            Some(copy_filesystem_request(request)?)
+                        } else if is_process(request) {
+                            Some(copy_process_request(request)?)
+                        } else if is_compiler(request) {
+                            Some(copy_compiler_request(request)?)
+                        } else if is_redstone_local(request) {
+                            Some(copy_redstone_request(request)?)
+                        } else {
+                            None
+                        };
+                        if internal.is_some() {
+                            break;
+                        }
+                    }
+                    if internal.is_some() {
+                        internal
                     } else {
+                        let mut requests = Vec::with_capacity(batch.len());
+                        for index in 0..batch.len() {
+                            let request = batch
+                                .get(index)
+                                .ok_or(ComputerError::Run(RunError::NotRunnable))?;
+                            requests.push(copy_external_request(request)?);
+                        }
                         return Ok(ComputerAdvanceOutcome::HostRequestBatch(
                             ComputerHostRequestBatch {
-                                requests: vec![copy_host_request(request)].into_boxed_slice(),
+                                requests: requests.into_boxed_slice(),
                             },
                         ));
                     }
@@ -2548,6 +2569,27 @@ fn terminal_rectangle(
     TerminalRectangle::new(x, y, width, height).map_err(|_| ComputerError::InvalidTerminalRequest)
 }
 
+fn copy_external_request(
+    request: HostRequestView<'_>,
+) -> Result<ComputerHostRequest, ComputerError> {
+    if is_redstone(request) {
+        let integer = |index| match request.arguments().get(index) {
+            Some(HostValueView::I32(value)) => Ok(value),
+            _ => Err(ComputerError::InvalidRedstoneRequest),
+        };
+        match (
+            request.operation(),
+            request.asynchronous(),
+            request.arguments().len(),
+        ) {
+            (6, true, 2) if (0..6).contains(&integer(0)?) && (0..32).contains(&integer(1)?) => {}
+            (7, true, 1) if (integer(0)? as u32) & !crate::redstone::REGISTER_MASK == 0 => {}
+            _ => return Err(ComputerError::InvalidRedstoneRequest),
+        }
+    }
+    Ok(copy_host_request(request))
+}
+
 fn copy_host_request(request: HostRequestView<'_>) -> ComputerHostRequest {
     let arguments = (0..request.arguments().len())
         .filter_map(|index| request.arguments().get(index).map(copy_value))
@@ -2738,6 +2780,69 @@ mod tests {
             computer.confirm_redstone_output(1 << 31).unwrap_err(),
         );
         assert_eq!(Some(ComputerValue::I32(0)), halt(&mut computer));
+    }
+
+    #[test]
+    fn redstone_output_requests_publish_validated_per_side_merge_entries() {
+        let mut side = ComputerMachine::start(
+            crate::execution::fixtures::redstone_unit_artifact(6, &[2, 23]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let request = match side.advance(64, 64).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
+            other => panic!("unexpected redstone side-write outcome: {other:?}"),
+        };
+        assert_eq!(
+            ComputerHostMerge::LastWriteWins {
+                group: REDSTONE_MERGE_GROUP,
+                entries: vec![ComputerHostMergeEntry { key: 2, value: 23 }].into_boxed_slice(),
+            },
+            request.merge,
+        );
+        side.resume_host_request(request.id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+        assert_eq!(None, halt(&mut side));
+
+        let packed = 1 | (2 << 5) | (15 << 10) | (16 << 15) | (23 << 20) | (31 << 25);
+        let mut bulk = ComputerMachine::start(
+            crate::execution::fixtures::redstone_unit_artifact(7, &[packed]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let request = match bulk.advance(64, 64).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
+            other => panic!("unexpected redstone bulk-write outcome: {other:?}"),
+        };
+        let ComputerHostMerge::LastWriteWins { group, entries } = request.merge else {
+            panic!("bulk redstone write must be mergeable")
+        };
+        assert_eq!(REDSTONE_MERGE_GROUP, group);
+        assert_eq!(
+            vec![1, 2, 15, 16, 23, 31],
+            entries.iter().map(|entry| entry.value).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn malformed_redstone_output_is_rejected_before_host_publication() {
+        for (operation, arguments) in [(6, vec![6, 0]), (6, vec![0, 32]), (7, vec![-1])] {
+            let mut computer = ComputerMachine::start(
+                crate::execution::fixtures::redstone_unit_artifact(operation, &arguments),
+                profile(),
+                &[],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                ComputerError::InvalidRedstoneRequest,
+                computer.advance(64, 64).unwrap_err(),
+            );
+        }
     }
 
     #[test]

@@ -401,7 +401,10 @@ pub(crate) fn redstone_i32_artifact(
         result: i32_type,
         parameters: Vec::new(),
     };
-    decoded.modules[0].constants = arguments.iter().copied().map(Constant::I32).collect();
+    let mut constants = arguments.to_vec();
+    constants.sort_unstable();
+    constants.dedup();
+    decoded.modules[0].constants = constants.iter().copied().map(Constant::I32).collect();
     let function = &mut decoded.modules[0].functions[0];
     function.name = 1;
     function.flags = u32::from(asynchronous);
@@ -411,9 +414,9 @@ pub(crate) fn redstone_i32_artifact(
     let mut first = arguments
         .iter()
         .enumerate()
-        .map(|(index, _)| Instruction::Const {
+        .map(|(index, value)| Instruction::Const {
             dst: index as u16,
-            constant: index as u32,
+            constant: constants.binary_search(value).unwrap() as u32,
         })
         .collect::<Vec<_>>();
     let destination = arguments.len() as u16;
@@ -442,6 +445,70 @@ pub(crate) fn redstone_i32_artifact(
         first.push(Instruction::Return { value: destination });
         install_entry_blocks(&mut decoded, vec![first]);
     }
+    let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+pub(crate) fn redstone_unit_artifact(operation: u32, arguments: &[i32]) -> VerifiedArtifact {
+    let mut decoded = crate::decode::records::decode_artifact(
+        Arc::from(crate::test_support::minimal_vector_with_string_records(&[
+            b"compukter",
+            b"redstone",
+        ])),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let unit_type = primitive(0);
+    let i32_type = primitive(1);
+    decoded.header.semantic_features = 0b110;
+    decoded.capabilities.push(crate::artifact::Capability {
+        namespace: 0,
+        name: 1,
+        abi_major: 1,
+        minimum_abi_minor: 0,
+        flags: 1,
+        operation_count: 8,
+    });
+    decoded.manifest.required_capabilities = 1;
+    decoded.manifest.maximum_host_requests = 1;
+    decoded.manifest.required_stack_bytes = 128;
+    decoded.modules[0].types[0] = NominalType::Function {
+        name: 1,
+        flags: 1,
+        result: unit_type,
+        parameters: Vec::new(),
+    };
+    let mut constants = arguments.to_vec();
+    constants.sort_unstable();
+    constants.dedup();
+    decoded.modules[0].constants = constants.iter().copied().map(Constant::I32).collect();
+    let function = &mut decoded.modules[0].functions[0];
+    function.name = 1;
+    function.flags = 1;
+    function.register_count = arguments.len() as u16;
+    function.parameter_count = 0;
+    function.registers = vec![i32_type; arguments.len()];
+    let mut first = arguments
+        .iter()
+        .enumerate()
+        .map(|(index, value)| Instruction::Const {
+            dst: index as u16,
+            constant: constants.binary_search(value).unwrap() as u32,
+        })
+        .collect::<Vec<_>>();
+    first.push(Instruction::CapabilityCallAsync {
+        dst: u16::MAX,
+        capability: 0,
+        operation,
+        args: (0..arguments.len() as u16)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        resume_block: 1,
+    });
+    install_entry_blocks(
+        &mut decoded,
+        vec![first, vec![Instruction::Return { value: u16::MAX }]],
+    );
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
