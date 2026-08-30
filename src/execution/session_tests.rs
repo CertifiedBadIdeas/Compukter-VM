@@ -882,12 +882,9 @@ fn determinism_is_independent_of_wait_poll_count() {
         session
             .resume(id, HostResponse::Success(HostValueInput::Unit))
             .unwrap();
-        assert!(matches!(
-            session.advance(64, 0).unwrap(),
-            AdvanceOutcome::QuotaExhausted(_)
-        ));
+        only_request(session.advance(64, 0).unwrap());
         let accounting = session.accounting();
-        assert_eq!(1, accounting.published_requests);
+        assert_eq!(2, accounting.published_requests);
         assert_eq!(1, accounting.accepted_responses);
         accounting
     };
@@ -895,44 +892,24 @@ fn determinism_is_independent_of_wait_poll_count() {
 }
 
 #[test]
-fn request_and_response_quotas_are_distinct_stable_outcomes() {
-    let mut request_limited = unit_loop_session(1, 1);
-    let id = only_request(request_limited.advance(64, 0).unwrap()).id();
-    request_limited
-        .resume(id, HostResponse::Success(HostValueInput::Unit))
-        .unwrap();
-    let request_exhaustion = match request_limited.advance(64, 0).unwrap() {
-        AdvanceOutcome::QuotaExhausted(value) => value,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(QuotaKind::HostRequests, request_exhaustion.kind);
-    assert_eq!(1, request_exhaustion.limit);
-    assert_eq!(1, request_exhaustion.consumed);
-    assert_eq!(1, request_limited.accounting().published_requests);
-    assert_eq!(1, request_limited.accounting().accepted_responses);
-    assert_eq!(
-        AdvanceOutcome::QuotaExhausted(request_exhaustion),
-        request_limited.advance(1, 1).unwrap()
-    );
+fn request_and_response_accounting_is_not_a_lifetime_quota() {
+    const ITERATIONS: u64 = 128;
+    let mut session = unit_loop_session(1, 0);
 
-    let mut response_limited = unit_loop_session(1, 0);
-    let id = only_request(response_limited.advance(64, 0).unwrap()).id();
-    response_limited
-        .resume(id, HostResponse::Success(HostValueInput::Unit))
-        .unwrap();
-    let response_exhaustion = match response_limited.advance(1, 1).unwrap() {
-        AdvanceOutcome::QuotaExhausted(value) => value,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(QuotaKind::AcceptedResponses, response_exhaustion.kind);
-    assert_eq!(0, response_exhaustion.limit);
-    assert_eq!(0, response_exhaustion.consumed);
-    assert_eq!(1, response_limited.accounting().published_requests);
-    assert_eq!(0, response_limited.accounting().accepted_responses);
-    assert_eq!(
-        AdvanceOutcome::QuotaExhausted(response_exhaustion),
-        response_limited.advance(1, 1).unwrap()
-    );
+    for _ in 0..ITERATIONS {
+        let id = only_request(session.advance(64, 0).unwrap()).id();
+        session
+            .resume(id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+    }
+
+    let accounting = session.accounting();
+    assert_eq!(ITERATIONS, accounting.published_requests);
+    assert_eq!(ITERATIONS, accounting.accepted_responses);
+    assert!(matches!(
+        session.advance(64, 0).unwrap(),
+        AdvanceOutcome::HostRequestBatch(_)
+    ));
 }
 
 #[test]
