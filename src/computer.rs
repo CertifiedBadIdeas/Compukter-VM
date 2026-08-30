@@ -780,7 +780,7 @@ impl ComputerMachine {
                 .map_err(ComputerError::Run)?;
             match outcome {
                 AdvanceOutcome::HostRequestBatch(batch) => {
-                    if batch.len() == 0 {
+                    if batch.is_empty() {
                         return Err(ComputerError::Run(RunError::NotRunnable));
                     }
                     let mut internal = None;
