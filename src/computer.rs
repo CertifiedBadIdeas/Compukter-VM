@@ -143,6 +143,7 @@ pub struct ComputerHostRequestBatch {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComputerAdvanceOutcome {
     SliceExhausted,
+    WaitingForHostQuota,
     WaitingForTerminalEvent,
     HostRequestBatch(ComputerHostRequestBatch),
     CompilationRequested(CompilationRequest),
@@ -752,6 +753,7 @@ impl ComputerMachine {
         &mut self,
         guest_budget: u32,
         maintenance_budget: u32,
+        host_request_budget: u32,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
         if self.pending_compilation.is_some() {
             return Ok(ComputerAdvanceOutcome::SliceExhausted);
@@ -810,8 +812,13 @@ impl ComputerMachine {
                     if internal.is_some() {
                         internal
                     } else {
-                        let mut requests = Vec::with_capacity(batch.len());
-                        for index in 0..batch.len() {
+                        let allowed = usize::try_from(host_request_budget).unwrap_or(usize::MAX);
+                        if allowed == 0 {
+                            return Ok(ComputerAdvanceOutcome::WaitingForHostQuota);
+                        }
+                        let count = batch.len().min(allowed);
+                        let mut requests = Vec::with_capacity(count);
+                        for index in 0..count {
                             let request = batch
                                 .get(index)
                                 .ok_or(ComputerError::Run(RunError::NotRunnable))?;
@@ -2747,12 +2754,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             ComputerAdvanceOutcome::SliceExhausted,
-            computer.advance(64, 64).unwrap(),
+            computer.advance(64, 64, u32::MAX).unwrap(),
         );
         computer.submit_redstone_input(2 | (3 << 10)).unwrap();
         assert_eq!(
             ComputerAdvanceOutcome::SliceExhausted,
-            computer.advance(64, 64).unwrap(),
+            computer.advance(64, 64, u32::MAX).unwrap(),
         );
         computer
             .submit_redstone_input(1 | (9 << 6) | (3 << 10))
@@ -2791,7 +2798,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        let request = match side.advance(64, 64).unwrap() {
+        let request = match side.advance(64, 64, u32::MAX).unwrap() {
             ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
             other => panic!("unexpected redstone side-write outcome: {other:?}"),
         };
@@ -2814,7 +2821,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        let request = match bulk.advance(64, 64).unwrap() {
+        let request = match bulk.advance(64, 64, u32::MAX).unwrap() {
             ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
             other => panic!("unexpected redstone bulk-write outcome: {other:?}"),
         };
@@ -2840,7 +2847,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 ComputerError::InvalidRedstoneRequest,
-                computer.advance(64, 64).unwrap_err(),
+                computer.advance(64, 64, u32::MAX).unwrap_err(),
             );
         }
     }
@@ -2918,7 +2925,7 @@ mod tests {
         let mut computer = ComputerMachine::start(artifact, constrained_profile, &[], &[]).unwrap();
 
         while !matches!(
-            computer.advance(64, 64).unwrap(),
+            computer.advance(64, 64, 0).unwrap(),
             ComputerAdvanceOutcome::WaitingForTerminalEvent
         ) {}
         assert_eq!(
@@ -2928,7 +2935,7 @@ mod tests {
 
         computer.terminal_mut().push_text("λ").unwrap();
         while !matches!(
-            computer.advance(64, 64).unwrap(),
+            computer.advance(64, 64, 0).unwrap(),
             ComputerAdvanceOutcome::WaitingForTerminalEvent
         ) {}
 
@@ -2941,7 +2948,7 @@ mod tests {
             ))
             .unwrap();
         let halted = loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, 0).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected raw terminal outcome: {other:?}"),
@@ -2963,7 +2970,7 @@ mod tests {
         let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
 
         while !matches!(
-            computer.advance(64, 64).unwrap(),
+            computer.advance(64, 64, u32::MAX).unwrap(),
             ComputerAdvanceOutcome::WaitingForTerminalEvent
         ) {}
         computer.terminal_mut().push_text("ab").unwrap();
@@ -2977,7 +2984,7 @@ mod tests {
             .unwrap();
 
         loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::WaitingForTerminalEvent => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(_))) => break,
@@ -3059,7 +3066,7 @@ mod tests {
         partial.terminal_mut().push_text("partial").unwrap();
         assert_eq!(
             ComputerAdvanceOutcome::WaitingForTerminalEvent,
-            partial.advance(64, 64).unwrap(),
+            partial.advance(64, 64, u32::MAX).unwrap(),
         );
         let partial_revision = partial.terminal().revision();
         assert_eq!(
@@ -3079,7 +3086,7 @@ mod tests {
         assert_eq!(queued_revision, queued.terminal().revision());
         assert_eq!(
             ComputerAdvanceOutcome::WaitingForTerminalEvent,
-            queued.advance(64, 64).unwrap(),
+            queued.advance(64, 64, u32::MAX).unwrap(),
         );
         assert_eq!(
             'q' as u32,
@@ -3096,7 +3103,7 @@ mod tests {
         computer.terminal_mut().push_text("queued").unwrap();
 
         let failure = loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::HostFailed(failure) => break failure,
                 other => panic!("unexpected conflicting stdio outcome: {other:?}"),
@@ -3151,7 +3158,7 @@ mod tests {
         while computer.sessions.len() == 1 {
             assert_eq!(
                 ComputerAdvanceOutcome::SliceExhausted,
-                computer.advance(64, 64).unwrap(),
+                computer.advance(64, 64, u32::MAX).unwrap(),
             );
         }
 
@@ -3160,7 +3167,7 @@ mod tests {
         while computer.sessions.len() == 2 {
             assert_eq!(
                 ComputerAdvanceOutcome::SliceExhausted,
-                computer.advance(64, 64).unwrap(),
+                computer.advance(64, 64, u32::MAX).unwrap(),
             );
         }
 
@@ -3184,7 +3191,7 @@ mod tests {
         let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
 
         loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::Halted(None) => break,
                 other => panic!("unexpected positional terminal outcome: {other:?}"),
@@ -3236,12 +3243,12 @@ mod tests {
         while computer.sessions.len() == 1 {
             assert_eq!(
                 ComputerAdvanceOutcome::SliceExhausted,
-                computer.advance(64, 64).unwrap()
+                computer.advance(64, 64, u32::MAX).unwrap()
             );
         }
         assert_eq!(2, computer.sessions.len());
         let halted = loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected process outcome: {other:?}"),
@@ -3544,7 +3551,7 @@ mod tests {
         let request = next_compilation_request(&mut computer);
         assert_eq!(
             ComputerAdvanceOutcome::SliceExhausted,
-            computer.advance(64, 64).unwrap()
+            computer.advance(64, 64, u32::MAX).unwrap()
         );
         let oversized = "λ".repeat(computer.maximum_text_code_units + 1);
 
@@ -3585,7 +3592,7 @@ mod tests {
                 .unwrap();
 
         let halted = loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected ROM installer outcome: {other:?}"),
@@ -3619,6 +3626,27 @@ mod tests {
                 &path("/home/copy", &limits),
             ),
         );
+    }
+
+    #[test]
+    fn external_request_waits_for_allowance_without_becoming_terminal() {
+        let artifact = crate::execution::fixtures::capability_artifact(true, true, 1, 0);
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+        let mut computer = ComputerMachine::start(artifact, profile(), &[addon], &[]).unwrap();
+
+        assert_eq!(
+            ComputerAdvanceOutcome::WaitingForHostQuota,
+            computer.advance(64, 64, 0).unwrap(),
+        );
+        let request = match computer.advance(64, 64, 1).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(("app", "entry"), (&*request.namespace, &*request.name));
+        computer
+            .resume_host_request(request.id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
     }
 
     #[test]
@@ -3668,7 +3696,7 @@ mod tests {
             ComputerMachine::start_in_filesystem(parent, profile(), addons, &[], filesystem, owner)
                 .unwrap();
         loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::HostRequestBatch(batch) => {
                     assert_eq!(1, batch.requests.len());
@@ -3716,7 +3744,7 @@ mod tests {
             ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
                 .unwrap();
         let status = loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(status))) => break status,
                 other => panic!("unexpected process-v2 exit outcome: {other:?}"),
@@ -3741,7 +3769,7 @@ mod tests {
         )
         .unwrap();
         let result = loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(result))) => break result,
                 other => panic!("unexpected filesystem text outcome: {other:?}"),
@@ -4018,7 +4046,7 @@ mod tests {
         .unwrap();
 
         let result = loop {
-            match computer.advance(128, 128).unwrap() {
+            match computer.advance(128, 128, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(value))) => break value,
                 other => panic!("unexpected filesystem conformance outcome: {other:?}"),
@@ -4063,7 +4091,7 @@ mod tests {
         .unwrap();
 
         loop {
-            match computer.advance(128, 128).unwrap() {
+            match computer.advance(128, 128, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::HostFailed(failure) => {
                     assert_eq!(HostFailureKind::InputOutput, failure.kind());
@@ -4223,7 +4251,7 @@ mod tests {
 
     fn next_compilation_request(computer: &mut ComputerMachine) -> CompilationRequest {
         loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::CompilationRequested(request) => return request,
                 other => panic!("unexpected compiler outcome: {other:?}"),
@@ -4233,7 +4261,7 @@ mod tests {
 
     fn advance_to_canonical_read(computer: &mut ComputerMachine) {
         loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::WaitingForTerminalEvent => return,
                 other => panic!("unexpected canonical input outcome: {other:?}"),
@@ -4243,7 +4271,7 @@ mod tests {
 
     fn halt(computer: &mut ComputerMachine) -> Option<ComputerValue> {
         loop {
-            match computer.advance(64, 64).unwrap() {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::Halted(value) => return value,
                 other => panic!("unexpected compiler completion outcome: {other:?}"),

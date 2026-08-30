@@ -199,6 +199,7 @@ impl<'a> LimitsDecoder<'a> {
 pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
     let encoder = match outcome {
         OwnedOutcome::SliceExhausted => Encoder::new(0),
+        OwnedOutcome::WaitingForHostQuota => Encoder::new(11),
         OwnedOutcome::HostRequestBatch(requests) => {
             let mut encoder = Encoder::new(1);
             encoder.u32(u32::try_from(requests.len()).expect("bounded request batch fits u32"));
@@ -928,6 +929,11 @@ mod tests {
             vec![9],
             encode_outcome(OwnedOutcome::WaitingForTerminalEvent)
         );
+    }
+
+    #[test]
+    fn waiting_for_host_quota_has_a_stable_outcome_tag() {
+        assert_eq!(vec![11], encode_outcome(OwnedOutcome::WaitingForHostQuota));
     }
 
     #[test]

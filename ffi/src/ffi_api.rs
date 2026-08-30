@@ -916,6 +916,7 @@ pub unsafe extern "C" fn compukter_advance(
     handle: u64,
     guest_budget: u32,
     maintenance_budget: u32,
+    host_request_budget: u32,
     output: *mut u8,
     output_capacity: usize,
     written_out: *mut usize,
@@ -929,7 +930,12 @@ pub unsafe extern "C" fn compukter_advance(
             unsafe { written_out.write(MAXIMUM_OUTCOME_BYTES) };
             return FfiStatus::BufferTooSmall;
         }
-        let encoded = match bridge::advance(handle, guest_budget, maintenance_budget) {
+        let encoded = match bridge::advance(
+            handle,
+            guest_budget,
+            maintenance_budget,
+            host_request_budget,
+        ) {
             Ok(outcome) => crate::wire::encode_outcome(outcome),
             Err(BridgeError::Handle(error)) => return handle_status(error),
             Err(BridgeError::Run(_)) => return FfiStatus::Run,

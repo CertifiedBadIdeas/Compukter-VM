@@ -21,7 +21,7 @@ mod ffi_api;
 mod handle_table;
 mod wire;
 
-pub const COMPUKTER_FFI_ABI_VERSION: u32 = 7;
+pub const COMPUKTER_FFI_ABI_VERSION: u32 = 8;
 
 pub use ffi_api::{
     compukter_abi_version, compukter_advance, compukter_close, compukter_compilation_complete,
