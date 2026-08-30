@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 use compukter_vm::{
     verify_artifact, AdmissionError, ArtifactLimits, CanonicalLineSubmissionError,
     CompilationRequest, ComputerAdvanceOutcome, ComputerDirectoryListing, ComputerError,
-    ComputerFileChunk, ComputerFileReadError, ComputerFileStat, ComputerId, ComputerMachine,
-    ComputerStartError, ComputerValue, DeploymentCandidate, EntryArgumentLimits,
+    ComputerFileChunk, ComputerFileReadError, ComputerFileStat, ComputerHostMerge, ComputerId,
+    ComputerMachine, ComputerStartError, ComputerValue, DeploymentCandidate, EntryArgumentLimits,
     ExecutableRevision, ExecutionProfile, FileCapability, FileRights, FileSystemError,
     FileSystemLimits, GuestTrap, HostDeployError, HostFailure, HostResponse, HostValueInput,
     HostVerifyError, ManagedAllocationFailure, ProcessFailureReason, ProcessLimits,
@@ -49,6 +49,7 @@ pub(crate) enum OwnedValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OwnedRequest {
+    pub task_id: u32,
     pub id: u64,
     pub namespace: String,
     pub name: String,
@@ -56,12 +57,28 @@ pub(crate) struct OwnedRequest {
     pub abi_minor: u16,
     pub operation: u32,
     pub arguments: Vec<OwnedValue>,
+    pub merge: OwnedMerge,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnedMergeEntry {
+    pub key: u32,
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OwnedMerge {
+    Ordinary,
+    LastWriteWins {
+        group: u32,
+        entries: Vec<OwnedMergeEntry>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedOutcome {
     SliceExhausted,
-    HostRequest(OwnedRequest),
+    HostRequestBatch(Vec<OwnedRequest>),
     AllocationExhausted(ManagedAllocationFailure),
     QuotaExhausted(QuotaExhaustion),
     Halted(Option<OwnedValue>),
@@ -278,6 +295,7 @@ pub(crate) fn advance(
 
 pub(crate) fn resume(
     handle: u64,
+    task_id: u32,
     request_id: u64,
     response: &OwnedResponse,
 ) -> Result<(), BridgeError> {
@@ -292,7 +310,7 @@ pub(crate) fn resume(
             };
             session
                 .computer
-                .resume_host_request(request_id, borrowed)
+                .resume_host_request_for(task_id, request_id, borrowed)
                 .map_err(copy_error)
         })
         .map_err(BridgeError::Handle)?
@@ -651,20 +669,44 @@ fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
     match outcome {
         ComputerAdvanceOutcome::SliceExhausted => OwnedOutcome::SliceExhausted,
         ComputerAdvanceOutcome::WaitingForTerminalEvent => OwnedOutcome::WaitingForTerminalEvent,
-        ComputerAdvanceOutcome::HostRequest(request) => OwnedOutcome::HostRequest(OwnedRequest {
-            id: request.id,
-            namespace: request.namespace.into(),
-            name: request.name.into(),
-            abi_major: request.abi_major,
-            abi_minor: request.abi_minor,
-            operation: request.operation,
-            arguments: request
-                .arguments
+        ComputerAdvanceOutcome::HostRequestBatch(batch) => OwnedOutcome::HostRequestBatch(
+            batch
+                .requests
                 .into_vec()
                 .into_iter()
-                .map(copy_value)
+                .map(|request| OwnedRequest {
+                    task_id: request.task_id,
+                    id: request.id,
+                    namespace: request.namespace.into(),
+                    name: request.name.into(),
+                    abi_major: request.abi_major,
+                    abi_minor: request.abi_minor,
+                    operation: request.operation,
+                    arguments: request
+                        .arguments
+                        .into_vec()
+                        .into_iter()
+                        .map(copy_value)
+                        .collect(),
+                    merge: match request.merge {
+                        ComputerHostMerge::Ordinary => OwnedMerge::Ordinary,
+                        ComputerHostMerge::LastWriteWins { group, entries } => {
+                            OwnedMerge::LastWriteWins {
+                                group,
+                                entries: entries
+                                    .into_vec()
+                                    .into_iter()
+                                    .map(|entry| OwnedMergeEntry {
+                                        key: entry.key,
+                                        value: entry.value,
+                                    })
+                                    .collect(),
+                            }
+                        }
+                    },
+                })
                 .collect(),
-        }),
+        ),
         ComputerAdvanceOutcome::AllocationExhausted(value) => {
             OwnedOutcome::AllocationExhausted(value)
         }

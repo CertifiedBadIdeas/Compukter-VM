@@ -1,3 +1,5 @@
+pub use super::requests::{HostMergeEntry, HostMergeGroup};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostValueType {
     Unit,
@@ -11,10 +13,26 @@ pub enum HostValueType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostMergeEntrySource {
+    ArgumentPair { key: u16, value: u16 },
+    PackedFields { argument: u16, width: u8, count: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostMergeSchema {
+    Ordinary,
+    LastWriteWins {
+        group: HostMergeGroup,
+        source: HostMergeEntrySource,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationSchema<'a> {
     pub arguments: &'a [HostValueType],
     pub result: HostValueType,
     pub asynchronous: bool,
+    pub merge: HostMergeSchema,
 }
 
 impl<'a> OperationSchema<'a> {
@@ -23,6 +41,7 @@ impl<'a> OperationSchema<'a> {
             arguments,
             result,
             asynchronous: false,
+            merge: HostMergeSchema::Ordinary,
         }
     }
 
@@ -31,6 +50,21 @@ impl<'a> OperationSchema<'a> {
             arguments,
             result,
             asynchronous: true,
+            merge: HostMergeSchema::Ordinary,
+        }
+    }
+
+    pub const fn asynchronous_last_write_wins(
+        arguments: &'a [HostValueType],
+        result: HostValueType,
+        group: HostMergeGroup,
+        source: HostMergeEntrySource,
+    ) -> Self {
+        Self {
+            arguments,
+            result,
+            asynchronous: true,
+            merge: HostMergeSchema::LastWriteWins { group, source },
         }
     }
 }
@@ -123,6 +157,7 @@ pub(super) struct ResolvedOperation {
     pub arguments: Box<[HostValueType]>,
     pub result: HostValueType,
     pub asynchronous: bool,
+    pub merge: HostMergeSchema,
 }
 
 #[derive(Clone, Debug)]
@@ -338,6 +373,13 @@ impl<'a> HostRequestView<'a> {
             .get(self.operation as usize)
             .is_some_and(|operation| operation.asynchronous)
     }
+
+    pub fn merge_schema(self) -> HostMergeSchema {
+        self.capability
+            .operations
+            .get(self.operation as usize)
+            .map_or(HostMergeSchema::Ordinary, |operation| operation.merge)
+    }
 }
 
 impl PartialEq for HostRequestView<'_> {
@@ -352,6 +394,33 @@ impl PartialEq for HostRequestView<'_> {
             && self.arguments.len() == other.arguments.len()
             && (0..self.arguments.len())
                 .all(|index| self.arguments.get(index) == other.arguments.get(index))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HostRequestBatchView<'a> {
+    request: HostRequestView<'a>,
+}
+
+impl<'a> HostRequestBatchView<'a> {
+    pub(super) const fn one(request: HostRequestView<'a>) -> Self {
+        Self { request }
+    }
+
+    pub const fn len(self) -> usize {
+        1
+    }
+
+    pub const fn is_empty(self) -> bool {
+        false
+    }
+
+    pub const fn get(self, index: usize) -> Option<HostRequestView<'a>> {
+        if index == 0 {
+            Some(self.request)
+        } else {
+            None
+        }
     }
 }
 
@@ -390,7 +459,7 @@ pub struct AccountingSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AdvanceOutcome<'a> {
     SliceExhausted,
-    HostRequest(HostRequestView<'a>),
+    HostRequestBatch(HostRequestBatchView<'a>),
     AllocationExhausted(ManagedAllocationFailure),
     QuotaExhausted(QuotaExhaustion),
     Halted(Option<HostValueView<'a>>),

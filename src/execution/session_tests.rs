@@ -37,6 +37,13 @@ fn operation() -> [OperationSchema<'static>; 1] {
     [OperationSchema::asynchronous(&[], HostValueType::Unit)]
 }
 
+fn only_request(outcome: AdvanceOutcome<'_>) -> super::host::HostRequestView<'_> {
+    match outcome {
+        AdvanceOutcome::HostRequestBatch(batch) if batch.len() == 1 => batch.get(0).unwrap(),
+        other => panic!("expected one host request, got {other:?}"),
+    }
+}
+
 #[test]
 fn entry_string_array_is_materialized_as_one_owned_guest_argument() {
     let mut session = Session::admit(
@@ -248,13 +255,9 @@ fn admission_rejects_invoked_unbound_optional_calls_and_runs_sync_calls() {
     .unwrap();
     session.start(&[]).unwrap();
 
-    let request_id = match session.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(request) => {
-            assert!(!request.asynchronous());
-            request.id()
-        }
-        other => panic!("synchronous capability did not publish a request: {other:?}"),
-    };
+    let request = only_request(session.advance(64, 0).unwrap());
+    assert!(!request.asynchronous());
+    let request_id = request.id();
     session
         .resume(request_id, HostResponse::Success(HostValueInput::Unit))
         .unwrap();
@@ -283,9 +286,7 @@ fn scalar_case(
     session.start(&[]).unwrap();
 
     let request_id = {
-        let AdvanceOutcome::HostRequest(request) = session.advance(64, 0).unwrap() else {
-            panic!("scalar call did not suspend");
-        };
+        let request = only_request(session.advance(64, 0).unwrap());
         assert_eq!("app", request.namespace());
         assert_eq!("entry", request.name());
         assert_eq!(0, request.operation());
@@ -387,15 +388,22 @@ fn suspend_callee_can_wait_for_and_return_a_host_response() {
     .unwrap();
     session.start(&[]).unwrap();
 
-    let request_id = match session.advance(128, 0).unwrap() {
-        AdvanceOutcome::HostRequest(request) => {
+    let (task_id, request_id) = match session.advance(128, 0).unwrap() {
+        AdvanceOutcome::HostRequestBatch(batch) => {
+            assert_eq!(1, batch.len());
+            let request = batch.get(0).unwrap();
             assert!(request.asynchronous());
-            request.id()
+            (request.task_id(), request.id())
         }
         other => panic!("expected host request, got {other:?}"),
     };
+    assert_eq!(TaskId::ROOT, task_id);
     session
-        .resume(request_id, HostResponse::Success(HostValueInput::I32(7)))
+        .resume_for(
+            task_id,
+            request_id,
+            HostResponse::Success(HostValueInput::I32(7)),
+        )
         .unwrap();
     assert_eq!(
         AdvanceOutcome::Halted(Some(HostValueView::I32(7))),
@@ -414,15 +422,9 @@ fn waiting_poll_is_stable_and_invalid_responses_are_atomic() {
     )
     .unwrap();
     session.start(&[]).unwrap();
-    let first_id = match session.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(request) => request.id(),
-        other => panic!("unexpected outcome: {other:?}"),
-    };
+    let first_id = only_request(session.advance(64, 0).unwrap()).id();
     let waiting_accounting = session.accounting();
-    let repeated_id = match session.advance(1, 1).unwrap() {
-        AdvanceOutcome::HostRequest(request) => request.id(),
-        other => panic!("unexpected outcome: {other:?}"),
-    };
+    let repeated_id = only_request(session.advance(1, 1).unwrap()).id();
     assert_eq!(first_id, repeated_id);
     assert_eq!(waiting_accounting, session.accounting());
     assert_eq!(
@@ -434,7 +436,7 @@ fn waiting_poll_is_stable_and_invalid_responses_are_atomic() {
     assert_eq!(waiting_accounting, session.accounting());
     assert!(matches!(
         session.advance(1, 1).unwrap(),
-        AdvanceOutcome::HostRequest(_)
+        AdvanceOutcome::HostRequestBatch(_)
     ));
     assert_eq!(
         ResumeError::WrongRequestId,
@@ -448,7 +450,7 @@ fn waiting_poll_is_stable_and_invalid_responses_are_atomic() {
     assert_eq!(waiting_accounting, session.accounting());
     assert!(matches!(
         session.advance(1, 1).unwrap(),
-        AdvanceOutcome::HostRequest(_)
+        AdvanceOutcome::HostRequestBatch(_)
     ));
     session
         .resume(first_id, HostResponse::Success(HostValueInput::Unit))
@@ -477,10 +479,7 @@ fn task_owned_request_rejects_the_wrong_task_and_resumes_the_owner_once() {
     .unwrap();
     session.start(&[]).unwrap();
 
-    let request = match session.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(request) => request,
-        other => panic!("unexpected outcome: {other:?}"),
-    };
+    let request = only_request(session.advance(64, 0).unwrap());
     assert_eq!(TaskId::ROOT, request.task_id());
     let request_id = request.id();
     let other = TaskId::new(2).unwrap();
@@ -496,8 +495,8 @@ fn task_owned_request_rejects_the_wrong_task_and_resumes_the_owner_once() {
     );
     assert!(matches!(
         session.advance(1, 1).unwrap(),
-        AdvanceOutcome::HostRequest(request)
-            if request.task_id() == TaskId::ROOT && request.id() == request_id
+        AdvanceOutcome::HostRequestBatch(batch)
+            if batch.get(0).is_some_and(|request| request.task_id() == TaskId::ROOT && request.id() == request_id)
     ));
 
     session
@@ -530,17 +529,11 @@ fn request_ids_are_monotonic_and_overflow_faults_before_publication() {
     )
     .unwrap();
     session.start(&[]).unwrap();
-    let first = match session.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(r) => r.id(),
-        other => panic!("{other:?}"),
-    };
+    let first = only_request(session.advance(64, 0).unwrap()).id();
     session
         .resume(first, HostResponse::Success(HostValueInput::Unit))
         .unwrap();
-    let second = match session.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(r) => r.id(),
-        other => panic!("{other:?}"),
-    };
+    let second = only_request(session.advance(64, 0).unwrap()).id();
     assert!(second.get() > first.get());
 
     let overflow_binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
@@ -587,13 +580,9 @@ fn explicit_host_failure_is_a_stable_terminal_outcome() {
     )
     .unwrap();
     session.start(&[]).unwrap();
-    let id = match session.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(request) => {
-            assert_eq!(TaskId::ROOT, request.task_id());
-            request.id()
-        }
-        other => panic!("{other:?}"),
-    };
+    let request = only_request(session.advance(64, 0).unwrap());
+    assert_eq!(TaskId::ROOT, request.task_id());
+    let id = request.id();
     let failure = HostFailure::new(HostFailureKind::Unavailable, 17);
     session
         .resume_for(TaskId::ROOT, id, HostResponse::Failure(failure))
@@ -649,7 +638,8 @@ fn advance_to_request(session: &mut Session) -> (RequestId, Vec<Vec<u16>>) {
     loop {
         match session.advance(1, 1).unwrap() {
             AdvanceOutcome::SliceExhausted => {}
-            AdvanceOutcome::HostRequest(request) => {
+            AdvanceOutcome::HostRequestBatch(batch) => {
+                let request = batch.get(0).unwrap();
                 let values = (0..request.arguments().len())
                     .map(|index| match request.arguments().get(index).unwrap() {
                         HostValueView::String(value) => value.to_vec(),
@@ -732,10 +722,7 @@ fn string_response_session(mut execution_profile: ExecutionProfile) -> (Session,
     )
     .unwrap();
     session.start(&[]).unwrap();
-    let id = match session.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(request) => request.id(),
-        other => panic!("unexpected outcome: {other:?}"),
-    };
+    let id = only_request(session.advance(64, 0).unwrap()).id();
     (session, id)
 }
 
@@ -797,7 +784,7 @@ fn oversized_inbound_string_is_correctable_and_keeps_request_pending() {
     );
     assert!(matches!(
         session.advance(1, 1).unwrap(),
-        AdvanceOutcome::HostRequest(request) if request.id() == id
+        AdvanceOutcome::HostRequestBatch(batch) if batch.get(0).is_some_and(|request| request.id() == id)
     ));
     session
         .resume(
@@ -842,7 +829,7 @@ fn inbound_string_collects_dead_guest_string_and_retries_once() {
     let id = loop {
         match session.advance(64, 1).unwrap() {
             AdvanceOutcome::SliceExhausted => {}
-            AdvanceOutcome::HostRequest(request) => break request.id(),
+            AdvanceOutcome::HostRequestBatch(batch) => break batch.get(0).unwrap().id(),
             other => panic!("unexpected outcome: {other:?}"),
         }
     };
@@ -883,15 +870,12 @@ fn unit_loop_session(maximum_requests: u32, maximum_responses: u64) -> Session {
 fn determinism_is_independent_of_wait_poll_count() {
     let run = |polls: usize| {
         let mut session = unit_loop_session(1, 1);
-        let id = match session.advance(64, 0).unwrap() {
-            AdvanceOutcome::HostRequest(request) => request.id(),
-            other => panic!("{other:?}"),
-        };
+        let id = only_request(session.advance(64, 0).unwrap()).id();
         let waiting = session.accounting();
         for _ in 0..polls {
             assert!(matches!(
                 session.advance(1, 1).unwrap(),
-                AdvanceOutcome::HostRequest(_)
+                AdvanceOutcome::HostRequestBatch(_)
             ));
             assert_eq!(waiting, session.accounting());
         }
@@ -913,10 +897,7 @@ fn determinism_is_independent_of_wait_poll_count() {
 #[test]
 fn request_and_response_quotas_are_distinct_stable_outcomes() {
     let mut request_limited = unit_loop_session(1, 1);
-    let id = match request_limited.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(request) => request.id(),
-        other => panic!("{other:?}"),
-    };
+    let id = only_request(request_limited.advance(64, 0).unwrap()).id();
     request_limited
         .resume(id, HostResponse::Success(HostValueInput::Unit))
         .unwrap();
@@ -935,10 +916,7 @@ fn request_and_response_quotas_are_distinct_stable_outcomes() {
     );
 
     let mut response_limited = unit_loop_session(1, 0);
-    let id = match response_limited.advance(64, 0).unwrap() {
-        AdvanceOutcome::HostRequest(request) => request.id(),
-        other => panic!("{other:?}"),
-    };
+    let id = only_request(response_limited.advance(64, 0).unwrap()).id();
     response_limited
         .resume(id, HostResponse::Success(HostValueInput::Unit))
         .unwrap();
@@ -963,10 +941,7 @@ fn steady_state_request_resume_allocates_nothing() {
     let mut session = unit_loop_session(ITERATIONS + 1, u64::from(ITERATIONS + 1));
     super::tests::allocation_counter::reset_and_enable();
     for _ in 0..ITERATIONS {
-        let id = match session.advance(64, 0).unwrap() {
-            AdvanceOutcome::HostRequest(request) => request.id(),
-            other => panic!("{other:?}"),
-        };
+        let id = only_request(session.advance(64, 0).unwrap()).id();
         session
             .resume(id, HostResponse::Success(HostValueInput::Unit))
             .unwrap();
@@ -993,7 +968,7 @@ fn steady_state_request_resume_allocates_nothing() {
         let id = loop {
             match string_session.advance(64, 64).unwrap() {
                 AdvanceOutcome::SliceExhausted => {}
-                AdvanceOutcome::HostRequest(request) => break request.id(),
+                AdvanceOutcome::HostRequestBatch(batch) => break batch.get(0).unwrap().id(),
                 other => panic!("{other:?}"),
             }
         };
@@ -1032,7 +1007,8 @@ fn terminal_vertical_conformance() {
         let id = loop {
             match session.advance(64, 64).unwrap() {
                 AdvanceOutcome::SliceExhausted => {}
-                AdvanceOutcome::HostRequest(request) => {
+                AdvanceOutcome::HostRequestBatch(batch) => {
+                    let request = batch.get(0).unwrap();
                     assert_eq!("compukter", request.namespace());
                     assert_eq!("terminal", request.name());
                     assert_eq!(1, request.abi_major());
@@ -1056,7 +1032,8 @@ fn terminal_vertical_conformance() {
     let read_id = loop {
         match session.advance(64, 64).unwrap() {
             AdvanceOutcome::SliceExhausted => {}
-            AdvanceOutcome::HostRequest(request) => {
+            AdvanceOutcome::HostRequestBatch(batch) => {
+                let request = batch.get(0).unwrap();
                 assert_eq!("compukter", request.namespace());
                 assert_eq!("terminal", request.name());
                 assert_eq!(1, request.abi_major());
@@ -1117,10 +1094,7 @@ fn host_session_performance_baseline() {
     let mut session =
         unit_loop_session(WARMUP + ITERATIONS + 1, u64::from(WARMUP + ITERATIONS + 1));
     let cycle = |session: &mut Session| {
-        let id = match session.advance(64, 0).unwrap() {
-            AdvanceOutcome::HostRequest(request) => request.id(),
-            other => panic!("{other:?}"),
-        };
+        let id = only_request(session.advance(64, 0).unwrap()).id();
         session
             .resume(id, HostResponse::Success(HostValueInput::Unit))
             .unwrap();

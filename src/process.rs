@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-use crate::{CapabilityBinding, HostValueType};
+use crate::{CapabilityBinding, HostMergeSchema, HostValueType};
 
 pub(crate) const MAXIMUM_ADDON_CAPABILITIES: usize = 28;
 
@@ -34,6 +34,7 @@ pub(crate) struct OwnedOperationSchema {
     arguments: Box<[HostValueType]>,
     result: HostValueType,
     asynchronous: bool,
+    merge: HostMergeSchema,
 }
 
 impl OwnedCapabilityBinding {
@@ -50,6 +51,7 @@ impl OwnedCapabilityBinding {
                     arguments: operation.arguments.into(),
                     result: operation.result,
                     asynchronous: operation.asynchronous,
+                    merge: operation.merge,
                 })
                 .collect(),
         }
@@ -87,6 +89,10 @@ impl OwnedOperationSchema {
 
     pub(crate) const fn asynchronous(&self) -> bool {
         self.asynchronous
+    }
+
+    pub(crate) const fn merge(&self) -> HostMergeSchema {
+        self.merge
     }
 }
 

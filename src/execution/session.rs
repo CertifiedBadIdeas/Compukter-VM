@@ -4,10 +4,10 @@ use super::{
     error::{AdmissionError, RunError},
     host::{
         AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
-        ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostRequestView,
-        HostResponse, HostValueInput, HostValueSlot, HostValueView, ManagedAllocationFailure,
-        QuotaExhaustion, QuotaKind, RequestId, ResolvedCapability, ResolvedOperation, ResumeError,
-        TaskId,
+        ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostRequestBatchView,
+        HostRequestView, HostResponse, HostValueInput, HostValueSlot, HostValueView,
+        ManagedAllocationFailure, QuotaExhaustion, QuotaKind, RequestId, ResolvedCapability,
+        ResolvedOperation, ResumeError, TaskId,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::Machine,
@@ -574,16 +574,18 @@ impl Session {
             .get(pending.capability as usize)
             .and_then(Option::as_ref)
             .ok_or(super::error::VmFault::InvalidResolvedId)?;
-        Ok(AdvanceOutcome::HostRequest(HostRequestView {
-            id: pending.id,
-            task: pending.task,
-            capability,
-            operation: pending.operation,
-            arguments: HostArguments {
-                slots: &self.argument_slots[..self.argument_count],
-                utf16: &self.outbound_utf16,
+        Ok(AdvanceOutcome::HostRequestBatch(HostRequestBatchView::one(
+            HostRequestView {
+                id: pending.id,
+                task: pending.task,
+                capability,
+                operation: pending.operation,
+                arguments: HostArguments {
+                    slots: &self.argument_slots[..self.argument_count],
+                    utf16: &self.outbound_utf16,
+                },
             },
-        }))
+        )))
     }
 
     fn establish_fault(
@@ -806,7 +808,15 @@ fn resolve_capabilities(
         operations
             .try_reserve_exact(binding.operations().len())
             .map_err(|_| AdmissionError::AllocationFailed)?;
-        for schema in binding.operations() {
+        for (operation_index, schema) in binding.operations().iter().enumerate() {
+            if !valid_merge_schema(schema) {
+                return Err(AdmissionError::CapabilitySchema {
+                    capability: u32::try_from(index)
+                        .map_err(|_| AdmissionError::StoragePlanOverflow)?,
+                    operation: u32::try_from(operation_index)
+                        .map_err(|_| AdmissionError::StoragePlanOverflow)?,
+                });
+            }
             let mut arguments = Vec::new();
             arguments
                 .try_reserve_exact(schema.arguments.len())
@@ -816,6 +826,7 @@ fn resolve_capabilities(
                 arguments: arguments.into_boxed_slice(),
                 result: schema.result,
                 asynchronous: schema.asynchronous,
+                merge: schema.merge,
             });
         }
         if index < u32::BITS as usize {
@@ -833,6 +844,35 @@ fn resolve_capabilities(
         capabilities: resolved.into_boxed_slice(),
         mask: capability_mask,
     })
+}
+
+fn valid_merge_schema(schema: &super::host::OperationSchema<'_>) -> bool {
+    use super::host::{HostMergeEntrySource, HostMergeSchema, HostValueType};
+
+    match schema.merge {
+        HostMergeSchema::Ordinary => true,
+        HostMergeSchema::LastWriteWins { source, .. }
+            if schema.asynchronous && schema.result == HostValueType::Unit =>
+        {
+            match source {
+                HostMergeEntrySource::ArgumentPair { key, value } => {
+                    schema.arguments.get(usize::from(key)) == Some(&HostValueType::I32)
+                        && schema.arguments.get(usize::from(value)) == Some(&HostValueType::I32)
+                }
+                HostMergeEntrySource::PackedFields {
+                    argument,
+                    width,
+                    count,
+                } => {
+                    width != 0
+                        && count != 0
+                        && u16::from(width) * u16::from(count) <= 32
+                        && schema.arguments.get(usize::from(argument)) == Some(&HostValueType::I32)
+                }
+            }
+        }
+        HostMergeSchema::LastWriteWins { .. } => false,
+    }
 }
 
 fn boxed_str(value: &str) -> Result<Box<str>, AdmissionError> {

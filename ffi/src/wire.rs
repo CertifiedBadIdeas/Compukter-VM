@@ -17,7 +17,11 @@ pub(crate) fn encode_executable_revision(revision: ExecutableRevision) -> Vec<u8
     encoder.finish()
 }
 
-use crate::bridge::{CreateError, OwnedOutcome, OwnedRequest, OwnedValue, StoreCreateError};
+#[cfg(test)]
+use crate::bridge::OwnedMergeEntry;
+use crate::bridge::{
+    CreateError, OwnedMerge, OwnedOutcome, OwnedRequest, OwnedValue, StoreCreateError,
+};
 use crate::handle_table::HandleError;
 
 pub(crate) fn encode_create(outcome: Result<u64, CreateError>) -> Vec<u8> {
@@ -195,9 +199,12 @@ impl<'a> LimitsDecoder<'a> {
 pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
     let encoder = match outcome {
         OwnedOutcome::SliceExhausted => Encoder::new(0),
-        OwnedOutcome::HostRequest(request) => {
+        OwnedOutcome::HostRequestBatch(requests) => {
             let mut encoder = Encoder::new(1);
-            encoder.request(&request);
+            encoder.u32(u32::try_from(requests.len()).expect("bounded request batch fits u32"));
+            for request in &requests {
+                encoder.request(request);
+            }
             encoder
         }
         OwnedOutcome::AllocationExhausted(value) => {
@@ -590,6 +597,7 @@ impl Encoder {
     }
 
     fn request(&mut self, request: &OwnedRequest) {
+        self.u32(request.task_id);
         self.u64(request.id);
         self.bytes(request.namespace.as_bytes());
         self.bytes(request.name.as_bytes());
@@ -601,6 +609,18 @@ impl Encoder {
         );
         for argument in &request.arguments {
             self.value(argument);
+        }
+        match &request.merge {
+            OwnedMerge::Ordinary => self.u8(0),
+            OwnedMerge::LastWriteWins { group, entries } => {
+                self.u8(1);
+                self.u32(*group);
+                self.u32(u32::try_from(entries.len()).expect("bounded merge entry count fits u32"));
+                for entry in entries {
+                    self.u32(entry.key);
+                    self.u32(entry.value);
+                }
+            }
         }
     }
 
@@ -833,7 +853,8 @@ mod tests {
 
     #[test]
     fn request_wire_form_owns_exact_utf16_code_units() {
-        let outcome = OwnedOutcome::HostRequest(OwnedRequest {
+        let outcome = OwnedOutcome::HostRequestBatch(vec![OwnedRequest {
+            task_id: 1,
             id: 9,
             namespace: "c".to_owned(),
             name: "t".to_owned(),
@@ -841,14 +862,43 @@ mod tests {
             abi_minor: 0,
             operation: 2,
             arguments: vec![OwnedValue::String(vec![0x0041, 0xd800, 0xdc00])],
-        });
+            merge: OwnedMerge::Ordinary,
+        }]);
 
         assert_eq!(
             vec![
-                1, 9, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, b'c', 1, 0, 0, 0, b't', 1, 0, 0, 0, 2, 0, 0,
-                0, 1, 0, 0, 0, 7, 3, 0, 0, 0, 0x41, 0x00, 0x00, 0xd8, 0x00, 0xdc,
+                1, 1, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, b'c', 1, 0, 0, 0,
+                b't', 1, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 7, 3, 0, 0, 0, 0x41, 0x00, 0x00, 0xd8,
+                0x00, 0xdc, 0,
             ],
             encode_outcome(outcome),
+        );
+    }
+
+    #[test]
+    fn request_batch_wire_keeps_lww_group_and_entries() {
+        let outcome = OwnedOutcome::HostRequestBatch(vec![OwnedRequest {
+            task_id: 2,
+            id: 11,
+            namespace: "c".to_owned(),
+            name: "r".to_owned(),
+            abi_major: 1,
+            abi_minor: 0,
+            operation: 7,
+            arguments: Vec::new(),
+            merge: OwnedMerge::LastWriteWins {
+                group: 3,
+                entries: vec![
+                    OwnedMergeEntry { key: 2, value: 7 },
+                    OwnedMergeEntry { key: 4, value: 15 },
+                ],
+            },
+        }]);
+
+        let encoded = encode_outcome(outcome);
+        assert_eq!(
+            &[1, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 4, 0, 0, 0, 15, 0, 0, 0],
+            &encoded[encoded.len() - 25..]
         );
     }
 

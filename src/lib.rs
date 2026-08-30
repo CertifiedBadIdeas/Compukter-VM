@@ -62,17 +62,19 @@ pub use artifact::{EntryArguments, EntryPoint, VerifiedArtifact};
 pub use computer::{
     CompilationRequest, CompilationSource, ComputerAdvanceOutcome, ComputerDirectoryEntry,
     ComputerDirectoryListing, ComputerError, ComputerFileChunk, ComputerFileKind,
-    ComputerFileMetadata, ComputerFileReadError, ComputerFileStat, ComputerHostRequest,
-    ComputerMachine, ComputerStartError, ComputerTerminalEventKind, ComputerValue,
+    ComputerFileMetadata, ComputerFileReadError, ComputerFileStat, ComputerHostMerge,
+    ComputerHostMergeEntry, ComputerHostRequest, ComputerHostRequestBatch, ComputerMachine,
+    ComputerStartError, ComputerTerminalEventKind, ComputerValue,
 };
 pub use deployment::{DeploymentCandidate, DeploymentFailure, HostDeployError, HostVerifyError};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{
     AccountingSnapshot, AdmissionError, AdvanceOutcome, CapabilityBinding, EntryArgumentLimit,
     EntryArgumentLimits, EntryValue, ExecutionProfile, GuestTrap, HostArguments, HostFailure,
-    HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView,
-    ManagedAllocationFailure, OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError,
-    RunError, Session, TaskId, VmFault,
+    HostFailureKind, HostMergeEntry, HostMergeEntrySource, HostMergeGroup, HostMergeSchema,
+    HostRequestBatchView, HostRequestView, HostResponse, HostValueInput, HostValueType,
+    HostValueView, ManagedAllocationFailure, OperationSchema, QuotaExhaustion, QuotaKind,
+    RequestId, ResumeError, RunError, Session, TaskId, VmFault,
 };
 pub use filesystem::{
     recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, ExecutableRevision,
