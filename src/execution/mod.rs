@@ -9,6 +9,7 @@ mod image;
 mod layout;
 mod machine;
 mod numeric;
+mod requests;
 mod session;
 mod text;
 mod value;
@@ -16,9 +17,10 @@ mod value;
 pub use error::{AdmissionError, EntryArgumentLimit, GuestTrap, RunError, VmFault};
 pub use host::{
     AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
-    ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostRequestView, HostResponse,
-    HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema,
-    QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
+    ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostMergeEntry,
+    HostMergeEntrySource, HostMergeGroup, HostMergeSchema, HostRequestBatchView, HostRequestView,
+    HostResponse, HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure,
+    OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
 };
 pub use session::Session;
 
@@ -28,6 +30,8 @@ pub(crate) mod fixtures;
 mod gc_tests;
 #[cfg(test)]
 mod heap_tests;
+#[cfg(test)]
+mod requests_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]

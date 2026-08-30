@@ -1053,10 +1053,14 @@ pub unsafe extern "C" fn compukter_compilation_complete(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn compukter_resume_unit(handle: u64, request_id: u64) -> FfiStatus {
+pub extern "C" fn compukter_resume_unit(handle: u64, task_id: u32, request_id: u64) -> FfiStatus {
     ffi_status(|| {
+        if task_id == 0 {
+            return FfiStatus::InvalidArgument;
+        }
         bridge_status(bridge::resume(
             handle,
+            task_id,
             request_id,
             &OwnedResponse::SuccessUnit,
         ))
@@ -1072,12 +1076,16 @@ pub extern "C" fn compukter_resume_unit(handle: u64, request_id: u64) -> FfiStat
 /// least that many `u16` values.
 pub unsafe extern "C" fn compukter_resume_string(
     handle: u64,
+    task_id: u32,
     request_id: u64,
     value: *const u16,
     value_len: usize,
 ) -> FfiStatus {
     ffi_status(|| {
-        if value_len > MAXIMUM_INBOUND_UTF16_CODE_UNITS || (value_len != 0 && value.is_null()) {
+        if task_id == 0
+            || value_len > MAXIMUM_INBOUND_UTF16_CODE_UNITS
+            || (value_len != 0 && value.is_null())
+        {
             return FfiStatus::InvalidArgument;
         }
         let units = if value_len == 0 {
@@ -1088,6 +1096,7 @@ pub unsafe extern "C" fn compukter_resume_string(
         };
         bridge_status(bridge::resume(
             handle,
+            task_id,
             request_id,
             &OwnedResponse::SuccessString(units),
         ))
@@ -1097,11 +1106,15 @@ pub unsafe extern "C" fn compukter_resume_string(
 #[unsafe(no_mangle)]
 pub extern "C" fn compukter_resume_failure(
     handle: u64,
+    task_id: u32,
     request_id: u64,
     kind: u32,
     code: u32,
 ) -> FfiStatus {
     ffi_status(|| {
+        if task_id == 0 {
+            return FfiStatus::InvalidArgument;
+        }
         let kind = match kind {
             0 => compukter_vm::HostFailureKind::EndOfFile,
             1 => compukter_vm::HostFailureKind::Unavailable,
@@ -1112,6 +1125,7 @@ pub extern "C" fn compukter_resume_failure(
         };
         bridge_status(bridge::resume(
             handle,
+            task_id,
             request_id,
             &OwnedResponse::Failure(compukter_vm::HostFailure::new(kind, code)),
         ))

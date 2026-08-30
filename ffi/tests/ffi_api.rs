@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(5, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(6, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 

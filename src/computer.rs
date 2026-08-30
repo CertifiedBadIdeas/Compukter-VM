@@ -28,11 +28,12 @@ use crate::{
     verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
     ComputerFileSystem, DeploymentCandidate, DeploymentFailure, EntryValue, ExecutionProfile,
     FileCapability, FileRights, FileSystemError, FileSystemLimits, GuestTrap, HostDeployError,
-    HostFailure, HostFailureKind, HostRequestView, HostResponse, HostValueInput, HostValueType,
-    HostValueView, HostVerifyError, ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema,
-    ProcessCompletion, ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId,
-    ResumeError, RunError, Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction,
-    TerminalPosition, TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
+    HostFailure, HostFailureKind, HostMergeEntrySource, HostMergeSchema, HostRequestView,
+    HostResponse, HostValueInput, HostValueType, HostValueView, HostVerifyError,
+    ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, ProcessCompletion,
+    ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId, ResumeError, RunError,
+    Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction, TerminalPosition,
+    TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
@@ -102,6 +103,7 @@ pub enum ComputerValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComputerHostRequest {
+    pub task_id: u32,
     pub id: u64,
     pub namespace: Box<str>,
     pub name: Box<str>,
@@ -109,13 +111,34 @@ pub struct ComputerHostRequest {
     pub abi_minor: u16,
     pub operation: u32,
     pub arguments: Box<[ComputerValue]>,
+    pub merge: ComputerHostMerge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputerHostMergeEntry {
+    pub key: u32,
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComputerHostMerge {
+    Ordinary,
+    LastWriteWins {
+        group: u32,
+        entries: Box<[ComputerHostMergeEntry]>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComputerHostRequestBatch {
+    pub requests: Box<[ComputerHostRequest]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComputerAdvanceOutcome {
     SliceExhausted,
     WaitingForTerminalEvent,
-    HostRequest(ComputerHostRequest),
+    HostRequestBatch(ComputerHostRequestBatch),
     CompilationRequested(CompilationRequest),
     AllocationExhausted(ManagedAllocationFailure),
     QuotaExhausted(QuotaExhaustion),
@@ -725,28 +748,30 @@ impl ComputerMachine {
                 .advance(guest_budget, maintenance_budget)
                 .map_err(ComputerError::Run)?;
             match outcome {
-                AdvanceOutcome::HostRequest(request) if is_raw_terminal(request) => {
-                    Some(copy_raw_terminal_request(request)?)
-                }
-                AdvanceOutcome::HostRequest(request) if is_stdio(request) => {
-                    Some(copy_stdio_request(request)?)
-                }
-                AdvanceOutcome::HostRequest(request) if is_filesystem(request) => {
-                    Some(copy_filesystem_request(request)?)
-                }
-                AdvanceOutcome::HostRequest(request) if is_process(request) => {
-                    Some(copy_process_request(request)?)
-                }
-                AdvanceOutcome::HostRequest(request) if is_compiler(request) => {
-                    Some(copy_compiler_request(request)?)
+                AdvanceOutcome::HostRequestBatch(batch) => {
+                    let request = batch
+                        .get(0)
+                        .ok_or(ComputerError::Run(RunError::NotRunnable))?;
+                    if is_raw_terminal(request) {
+                        Some(copy_raw_terminal_request(request)?)
+                    } else if is_stdio(request) {
+                        Some(copy_stdio_request(request)?)
+                    } else if is_filesystem(request) {
+                        Some(copy_filesystem_request(request)?)
+                    } else if is_process(request) {
+                        Some(copy_process_request(request)?)
+                    } else if is_compiler(request) {
+                        Some(copy_compiler_request(request)?)
+                    } else {
+                        return Ok(ComputerAdvanceOutcome::HostRequestBatch(
+                            ComputerHostRequestBatch {
+                                requests: vec![copy_host_request(request)].into_boxed_slice(),
+                            },
+                        ));
+                    }
                 }
                 AdvanceOutcome::SliceExhausted => {
                     return Ok(ComputerAdvanceOutcome::SliceExhausted)
-                }
-                AdvanceOutcome::HostRequest(request) => {
-                    return Ok(ComputerAdvanceOutcome::HostRequest(copy_host_request(
-                        request,
-                    )))
                 }
                 AdvanceOutcome::AllocationExhausted(value) => {
                     if self.sessions.len() > 1 {
@@ -1251,9 +1276,19 @@ impl ComputerMachine {
         request_id: u64,
         response: HostResponse<'_>,
     ) -> Result<(), ComputerError> {
+        self.resume_host_request_for(TaskId::ROOT.get(), request_id, response)
+    }
+
+    pub fn resume_host_request_for(
+        &mut self,
+        task_id: u32,
+        request_id: u64,
+        response: HostResponse<'_>,
+    ) -> Result<(), ComputerError> {
+        let task = TaskId::new(task_id).ok_or(ComputerError::InvalidRequestId)?;
         let request_id = RequestId::new(request_id).ok_or(ComputerError::InvalidRequestId)?;
         self.active_session_mut()
-            .resume(request_id, response)
+            .resume_for(task, request_id, response)
             .map_err(ComputerError::Resume)
     }
 
@@ -1890,6 +1925,7 @@ fn admit_session(
                     arguments: operation.arguments(),
                     result: operation.result(),
                     asynchronous: operation.asynchronous(),
+                    merge: operation.merge(),
                 })
                 .collect::<Box<[_]>>()
         })
@@ -2325,7 +2361,45 @@ fn copy_host_request(request: HostRequestView<'_>) -> ComputerHostRequest {
         .filter_map(|index| request.arguments().get(index).map(copy_value))
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    let merge = match request.merge_schema() {
+        HostMergeSchema::Ordinary => ComputerHostMerge::Ordinary,
+        HostMergeSchema::LastWriteWins { group, source } => {
+            let scalar = |argument: u16| match request.arguments().get(usize::from(argument)) {
+                Some(HostValueView::I32(value)) => value as u32,
+                _ => unreachable!("merge schemas are validated during capability admission"),
+            };
+            let entries = match source {
+                HostMergeEntrySource::ArgumentPair { key, value } => vec![ComputerHostMergeEntry {
+                    key: scalar(key),
+                    value: scalar(value),
+                }],
+                HostMergeEntrySource::PackedFields {
+                    argument,
+                    width,
+                    count,
+                } => {
+                    let packed = scalar(argument);
+                    let mask = if width == 32 {
+                        u32::MAX
+                    } else {
+                        (1_u32 << width) - 1
+                    };
+                    (0..count)
+                        .map(|key| ComputerHostMergeEntry {
+                            key: u32::from(key),
+                            value: (packed >> (u32::from(key) * u32::from(width))) & mask,
+                        })
+                        .collect()
+                }
+            };
+            ComputerHostMerge::LastWriteWins {
+                group: group.value(),
+                entries: entries.into_boxed_slice(),
+            }
+        }
+    };
     ComputerHostRequest {
+        task_id: request.task_id().get(),
         id: request.id().get(),
         namespace: request.namespace().into(),
         name: request.name().into(),
@@ -2333,6 +2407,7 @@ fn copy_host_request(request: HostRequestView<'_>) -> ComputerHostRequest {
         abi_minor: request.abi_minor(),
         operation: request.operation(),
         arguments,
+        merge,
     }
 }
 
@@ -3213,7 +3288,10 @@ mod tests {
         loop {
             match computer.advance(64, 64).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
-                ComputerAdvanceOutcome::HostRequest(request) => {
+                ComputerAdvanceOutcome::HostRequestBatch(batch) => {
+                    assert_eq!(1, batch.requests.len());
+                    let request = &batch.requests[0];
+                    assert_eq!(TaskId::ROOT.get(), request.task_id);
                     assert_eq!(("app", "entry"), (&*request.namespace, &*request.name));
                     computer.terminal_mut().push_text("x").unwrap();
                     assert_eq!(
