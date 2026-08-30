@@ -21,7 +21,7 @@ mod ffi_api;
 mod handle_table;
 mod wire;
 
-pub const COMPUKTER_FFI_ABI_VERSION: u32 = 6;
+pub const COMPUKTER_FFI_ABI_VERSION: u32 = 7;
 
 pub use ffi_api::{
     compukter_abi_version, compukter_advance, compukter_close, compukter_compilation_complete,
@@ -30,6 +30,7 @@ pub use ffi_api::{
     compukter_deployment_candidate_close, compukter_executable_revision,
     compukter_filesystem_generation, compukter_filesystem_list, compukter_filesystem_read,
     compukter_filesystem_stat, compukter_max_create_bytes, compukter_max_outcome_bytes,
+    compukter_redstone_confirm_output, compukter_redstone_submit_input,
     compukter_resume_failure, compukter_resume_string, compukter_resume_unit,
     compukter_store_close, compukter_store_durable_generation, compukter_store_flush,
     compukter_store_health, compukter_store_open, compukter_store_recover,

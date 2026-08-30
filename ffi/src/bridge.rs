@@ -293,6 +293,28 @@ pub(crate) fn advance(
         .map_err(BridgeError::Handle)?
 }
 
+pub(crate) fn submit_redstone_input(handle: u64, packet: u32) -> Result<(), BridgeError> {
+    sessions()
+        .with(handle, |session| {
+            session
+                .computer
+                .submit_redstone_input(packet)
+                .map_err(copy_error)
+        })
+        .map_err(BridgeError::Handle)?
+}
+
+pub(crate) fn confirm_redstone_output(handle: u64, packed: u32) -> Result<(), BridgeError> {
+    sessions()
+        .with(handle, |session| {
+            session
+                .computer
+                .confirm_redstone_output(packed)
+                .map_err(copy_error)
+        })
+        .map_err(BridgeError::Handle)?
+}
+
 pub(crate) fn resume(
     handle: u64,
     task_id: u32,
@@ -743,6 +765,7 @@ fn copy_error(error: ComputerError) -> BridgeError {
         | ComputerError::InvalidFileSystemRequest
         | ComputerError::InvalidProcessRequest
         | ComputerError::InvalidCompilerRequest
+        | ComputerError::InvalidRedstoneRequest
         | ComputerError::ActiveCompilation
         | ComputerError::NoActiveCompilation
         | ComputerError::InvalidCompilationToken
