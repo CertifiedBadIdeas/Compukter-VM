@@ -27,6 +27,7 @@ use compukter_ffi::{
     compukter_deployment_candidate_close, compukter_executable_revision,
     compukter_filesystem_generation, compukter_filesystem_list, compukter_filesystem_read,
     compukter_filesystem_stat, compukter_max_create_bytes, compukter_max_outcome_bytes,
+    compukter_redstone_confirm_output, compukter_redstone_submit_input,
     compukter_store_close, compukter_store_durable_generation, compukter_store_flush,
     compukter_store_health, compukter_store_open, compukter_store_recover,
     compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
@@ -40,8 +41,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(6, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(7, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
+}
+
+#[test]
+fn redstone_scalar_synchronization_validates_packets_and_handles() {
+    let handle = create_machine(&terminal_artifact());
+    let input = 1 | (15 << 6);
+    let output = 31 << 25;
+
+    assert_eq!(FfiStatus::Ok, compukter_redstone_submit_input(handle, input));
+    assert_eq!(
+        FfiStatus::Ok,
+        compukter_redstone_confirm_output(handle, output),
+    );
+    assert_eq!(
+        FfiStatus::InvalidArgument,
+        compukter_redstone_submit_input(handle, 1 << 30),
+    );
+    assert_eq!(
+        FfiStatus::InvalidArgument,
+        compukter_redstone_confirm_output(handle, 1 << 31),
+    );
+    assert_eq!(
+        FfiStatus::InvalidHandle,
+        compukter_redstone_submit_input(u64::MAX, 0),
+    );
+    assert_eq!(FfiStatus::Ok, compukter_close(handle));
 }
 
 #[test]

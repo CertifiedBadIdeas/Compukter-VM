@@ -505,6 +505,16 @@ pub extern "C" fn compukter_close(handle: u64) -> FfiStatus {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn compukter_redstone_submit_input(handle: u64, packet: u32) -> FfiStatus {
+    ffi_status(|| bridge_status(bridge::submit_redstone_input(handle, packet)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn compukter_redstone_confirm_output(handle: u64, packed: u32) -> FfiStatus {
+    ffi_status(|| bridge_status(bridge::confirm_redstone_output(handle, packed)))
+}
+
+#[unsafe(no_mangle)]
 /// Dry-verifies an artifact for one existing VM and publishes an opaque candidate handle.
 ///
 /// # Safety
