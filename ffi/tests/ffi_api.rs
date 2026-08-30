@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(7, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(8, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
@@ -586,6 +586,7 @@ fn advance_rejects_a_short_buffer_before_advancing_the_machine() {
             handle,
             64,
             64,
+            u32::MAX,
             short.as_mut_ptr(),
             short.len(),
             &mut written,
@@ -601,6 +602,7 @@ fn advance_rejects_a_short_buffer_before_advancing_the_machine() {
             handle,
             64,
             64,
+            u32::MAX,
             output.as_mut_ptr(),
             output.len(),
             &mut written,
@@ -612,6 +614,7 @@ fn advance_rejects_a_short_buffer_before_advancing_the_machine() {
             control,
             64,
             64,
+            u32::MAX,
             control_output.as_mut_ptr(),
             control_output.len(),
             &mut control_written,

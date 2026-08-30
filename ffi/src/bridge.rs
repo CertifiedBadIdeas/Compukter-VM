@@ -78,6 +78,7 @@ pub(crate) enum OwnedMerge {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedOutcome {
     SliceExhausted,
+    WaitingForHostQuota,
     HostRequestBatch(Vec<OwnedRequest>),
     AllocationExhausted(ManagedAllocationFailure),
     QuotaExhausted(QuotaExhaustion),
@@ -275,12 +276,13 @@ pub(crate) fn advance(
     handle: u64,
     guest_budget: u32,
     maintenance_budget: u32,
+    host_request_budget: u32,
 ) -> Result<OwnedOutcome, BridgeError> {
     sessions()
         .with(handle, |session| {
             let outcome = session
                 .computer
-                .advance(guest_budget, maintenance_budget)
+                .advance(guest_budget, maintenance_budget, host_request_budget)
                 .map_err(copy_error)?;
             if let ComputerAdvanceOutcome::CompilationRequested(request) = outcome {
                 let token = request.token;
@@ -690,6 +692,7 @@ fn deployment_candidates() -> &'static HandleTable<Box<DeploymentCandidate>> {
 fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
     match outcome {
         ComputerAdvanceOutcome::SliceExhausted => OwnedOutcome::SliceExhausted,
+        ComputerAdvanceOutcome::WaitingForHostQuota => OwnedOutcome::WaitingForHostQuota,
         ComputerAdvanceOutcome::WaitingForTerminalEvent => OwnedOutcome::WaitingForTerminalEvent,
         ComputerAdvanceOutcome::HostRequestBatch(batch) => OwnedOutcome::HostRequestBatch(
             batch
