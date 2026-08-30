@@ -17,9 +17,9 @@ part of the v1 host boundary.
 
 Admission reserves the mutable machine arenas, entry slots, host argument
 slots, and inbound/outbound UTF-16 buffers. Profile limits bound heap and frame
-storage, slice size, request and response counts, argument count, and both
-directions of string exchange. Allocation failure during admission is distinct
-from managed guest-heap exhaustion during execution.
+storage, slice size, request storage, argument count, and both directions of
+string exchange. Allocation failure during admission is distinct from managed
+guest-heap exhaustion during execution.
 
 ## Lifecycle
 
@@ -61,12 +61,13 @@ policy.
 
 ## Quotas, accounting, and trace
 
-Request-count exhaustion is checked before argument construction, string
-copying, or ID publication. Accepted-response exhaustion is checked after
-structural validation and before consuming the response. Both establish a
-stable bounded `QuotaExhausted` outcome. Outbound code-unit exhaustion is also
-terminal before publication; an oversized inbound value remains a correctable
-`ResumeError`.
+Request and response accounting is observational, not a lifetime throughput
+limit. `maximum_host_requests` remains a structural admission/storage bound.
+An adapter that needs throughput control supplies scheduling backpressure at
+its external boundary; accepting a valid response is never rejected because a
+cumulative response count was reached. Outbound code-unit exhaustion remains
+terminal before publication, while an oversized inbound value remains a
+correctable `ResumeError`.
 
 `Session::accounting()` returns fixed guest units, dynamic guest units,
 maintenance units, entered blocks, executed instructions, published requests,

@@ -20,8 +20,6 @@ pub struct Session {
     entry_arguments: Box<[EntryArgument]>,
     outbound_utf16: Box<[u16]>,
     inbound_utf16: Box<[u16]>,
-    maximum_host_requests: u64,
-    maximum_accepted_responses: u64,
     argument_slots: Box<[HostValueSlot]>,
     argument_count: usize,
     pending_request: Option<PendingRequest>,
@@ -75,11 +73,6 @@ impl core::fmt::Debug for Session {
             .field("entry_capacity", &self.entry_arguments.len())
             .field("outbound_utf16_capacity", &self.outbound_utf16.len())
             .field("inbound_utf16_capacity", &self.inbound_utf16.len())
-            .field("maximum_host_requests", &self.maximum_host_requests)
-            .field(
-                "maximum_accepted_responses",
-                &self.maximum_accepted_responses,
-            )
             .field("pending_request", &self.pending_request)
             .field("terminal", &self.terminal)
             .finish_non_exhaustive()
@@ -100,8 +93,6 @@ impl Session {
         let maximum_host_arguments = checked_usize(profile.maximum_host_arguments)?;
         let outbound_capacity = checked_usize(profile.maximum_outbound_utf16_code_units)?;
         let inbound_capacity = checked_usize(profile.maximum_inbound_utf16_code_units)?;
-        let maximum_host_requests = u64::from(profile.maximum_host_requests);
-        let maximum_accepted_responses = profile.maximum_accepted_responses;
         let maximum_slice_budget = profile.maximum_slice_budget;
         let entry_argument_limits = profile.entry_argument_limits;
         let image_profile = ImageProfile {
@@ -133,8 +124,6 @@ impl Session {
             entry_arguments,
             outbound_utf16,
             inbound_utf16,
-            maximum_host_requests,
-            maximum_accepted_responses,
             argument_slots,
             argument_count: 0,
             pending_request: None,
@@ -288,14 +277,6 @@ impl Session {
                 }
             }
         }
-        if self.accepted_responses >= self.maximum_accepted_responses {
-            self.terminal = Some(SessionTerminal::QuotaExhausted(QuotaExhaustion {
-                kind: QuotaKind::AcceptedResponses,
-                limit: self.maximum_accepted_responses,
-                consumed: self.accepted_responses,
-            }));
-            return Ok(());
-        }
         if let HostResponse::Failure(failure) = response {
             self.accept_response(request_id, response);
             self.pending_request = None;
@@ -379,13 +360,6 @@ impl Session {
     }
 
     fn begin_request(&mut self) -> Result<AdvanceOutcome<'_>, RunError> {
-        if self.published_requests >= self.maximum_host_requests {
-            return self.establish_quota(QuotaExhaustion {
-                kind: QuotaKind::HostRequests,
-                limit: self.maximum_host_requests,
-                consumed: self.published_requests,
-            });
-        }
         let Some(next_request_id) = self.next_request_id.checked_add(1) else {
             return self.establish_fault(super::error::VmFault::AccountingOverflow);
         };
