@@ -47,6 +47,7 @@ mod execution;
 pub mod filesystem;
 pub mod limits;
 mod process;
+mod redstone;
 mod stdio;
 pub mod terminal;
 

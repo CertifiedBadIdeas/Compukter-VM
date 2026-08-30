@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::filesystem::ExecutableRevision;
 use crate::process::{OwnedCapabilityBinding, MAXIMUM_ADDON_CAPABILITIES};
+use crate::redstone::{RedstoneDevice, RedstoneError, WaitRegistration};
 use crate::stdio::{
     CanonicalLineSubmissionError, InputOwner, InputOwnershipError, StandardStreamError,
     StandardStreams,
@@ -49,6 +50,10 @@ const PROCESS_ABI_MINOR: u16 = 0;
 const COMPILER_NAME: &str = "compiler";
 const COMPILER_ABI_MAJOR: u16 = 1;
 const COMPILER_ABI_MINOR: u16 = 0;
+const REDSTONE_NAME: &str = "redstone";
+const REDSTONE_ABI_MAJOR: u16 = 1;
+const REDSTONE_ABI_MINOR: u16 = 0;
+const REDSTONE_MERGE_GROUP: u32 = 0x7265_6473;
 const COMPILATION_WIRE_VERSION: u16 = 1;
 const MAXIMUM_COMPILER_SOURCE_BYTES: usize = 256 * 1024;
 const COMPILATION_STATUS_SUCCESS: i32 = 0;
@@ -74,6 +79,7 @@ pub enum ComputerError {
     InvalidFileSystemRequest,
     InvalidProcessRequest,
     InvalidCompilerRequest,
+    InvalidRedstoneRequest,
     ActiveCompilation,
     NoActiveCompilation,
     InvalidCompilationToken,
@@ -223,6 +229,7 @@ pub struct ComputerMachine {
     sessions: Vec<ProcessFrame>,
     terminal: TerminalDevice,
     standard_streams: StandardStreams,
+    redstone: RedstoneDevice,
     active_terminal_event: Option<TerminalInputEvent>,
     active_terminal_event_owner: Option<InputOwner>,
     filesystem: ComputerFileSystem,
@@ -396,6 +403,7 @@ impl ComputerMachine {
                 profile.maximum_outbound_utf16_code_units as usize,
             )
             .expect("an admitted execution profile has non-zero text limits"),
+            redstone: RedstoneDevice::new(profile.maximum_host_requests as usize),
             active_terminal_event: None,
             active_terminal_event_owner: None,
             filesystem,
@@ -415,6 +423,29 @@ impl ComputerMachine {
 
     pub const fn terminal(&self) -> &TerminalDevice {
         &self.terminal
+    }
+
+    pub fn submit_redstone_input(&mut self, packet: u32) -> Result<(), ComputerError> {
+        let wakeups = self
+            .redstone
+            .submit_input(packet)
+            .map_err(|_| ComputerError::InvalidRedstoneRequest)?;
+        for wakeup in wakeups {
+            self.active_session_mut()
+                .resume_internal_for(
+                    wakeup.task,
+                    wakeup.request,
+                    HostResponse::Success(HostValueInput::I32(i32::from(wakeup.level))),
+                )
+                .map_err(ComputerError::Resume)?;
+        }
+        Ok(())
+    }
+
+    pub fn confirm_redstone_output(&mut self, packed: u32) -> Result<(), ComputerError> {
+        self.redstone
+            .confirm_output(packed)
+            .map_err(|_| ComputerError::InvalidRedstoneRequest)
     }
 
     pub fn filesystem_generation(&self) -> u64 {
@@ -762,6 +793,8 @@ impl ComputerMachine {
                         Some(copy_process_request(request)?)
                     } else if is_compiler(request) {
                         Some(copy_compiler_request(request)?)
+                    } else if is_redstone_local(request) {
+                        Some(copy_redstone_request(request)?)
                     } else {
                         return Ok(ComputerAdvanceOutcome::HostRequestBatch(
                             ComputerHostRequestBatch {
@@ -849,7 +882,59 @@ impl ComputerMachine {
             TerminalRequest::Compiler { id, operation } => {
                 self.handle_compiler_request(id, operation)
             }
+            TerminalRequest::Redstone {
+                task,
+                id,
+                operation,
+            } => self.handle_redstone_request(task, id, operation),
         }
+    }
+
+    fn handle_redstone_request(
+        &mut self,
+        task: TaskId,
+        id: RequestId,
+        operation: RedstoneOperation,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        if self.redstone.contains_waiter(task, id) {
+            return Ok(ComputerAdvanceOutcome::SliceExhausted);
+        }
+        let registration = match operation {
+            RedstoneOperation::Input(side) => {
+                let level = self.redstone.input(side).map_err(redstone_request_error)?;
+                WaitRegistration::Ready(level)
+            }
+            RedstoneOperation::AwaitChange(side) => self
+                .redstone
+                .register_changed(task, id, side)
+                .map_err(redstone_request_error)?,
+            RedstoneOperation::AwaitExact(side, signal) => self
+                .redstone
+                .register_exact(task, id, side, signal)
+                .map_err(redstone_request_error)?,
+            RedstoneOperation::AwaitAtLeast(side, signal) => self
+                .redstone
+                .register_at_least(task, id, side, signal)
+                .map_err(redstone_request_error)?,
+            RedstoneOperation::AwaitAtMost(side, signal) => self
+                .redstone
+                .register_at_most(task, id, side, signal)
+                .map_err(redstone_request_error)?,
+            RedstoneOperation::Outputs => {
+                WaitRegistration::Ready((self.redstone.confirmed_output() & 0xff) as u8)
+            }
+        };
+        let value = match operation {
+            RedstoneOperation::Outputs => self.redstone.confirmed_output() as i32,
+            _ => match registration {
+                WaitRegistration::Ready(level) => i32::from(level),
+                WaitRegistration::Pending => return Ok(ComputerAdvanceOutcome::SliceExhausted),
+            },
+        };
+        self.active_session_mut()
+            .resume_internal_for(task, id, HostResponse::Success(HostValueInput::I32(value)))
+            .map_err(ComputerError::Resume)?;
+        Ok(ComputerAdvanceOutcome::SliceExhausted)
     }
 
     fn handle_stdio_request(
@@ -1785,6 +1870,21 @@ enum TerminalRequest {
         id: RequestId,
         operation: CompilerOperation,
     },
+    Redstone {
+        task: TaskId,
+        id: RequestId,
+        operation: RedstoneOperation,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum RedstoneOperation {
+    Input(u8),
+    AwaitChange(u8),
+    AwaitExact(u8, u8),
+    AwaitAtLeast(u8, u8),
+    AwaitAtMost(u8, u8),
+    Outputs,
 }
 
 enum StdioOperation {
@@ -1861,6 +1961,10 @@ fn admit_session(
     let process_arguments = [HostValueType::String, HostValueType::String];
     let process_exit_arguments = [HostValueType::I32];
     let compiler_arguments = [HostValueType::String, HostValueType::String];
+    let redstone_side_argument = [HostValueType::I32];
+    let redstone_wait_arguments = [HostValueType::I32, HostValueType::I32];
+    let redstone_output_arguments = [HostValueType::I32, HostValueType::I32];
+    let redstone_outputs_argument = [HostValueType::I32];
     let terminal_position_arguments = [HostValueType::I32, HostValueType::I32];
     let terminal_visibility_arguments = [HostValueType::Bool];
     let terminal_write_at_arguments = [
@@ -1915,6 +2019,30 @@ fn admit_session(
         OperationSchema::asynchronous(&compiler_arguments, HostValueType::I32),
         OperationSchema::synchronous(&[], HostValueType::String),
     ];
+    let redstone_operations = [
+        OperationSchema::synchronous(&redstone_side_argument, HostValueType::I32),
+        OperationSchema::asynchronous(&redstone_side_argument, HostValueType::I32),
+        OperationSchema::asynchronous(&redstone_wait_arguments, HostValueType::I32),
+        OperationSchema::asynchronous(&redstone_wait_arguments, HostValueType::I32),
+        OperationSchema::asynchronous(&redstone_wait_arguments, HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::I32),
+        OperationSchema::asynchronous_last_write_wins(
+            &redstone_output_arguments,
+            HostValueType::Unit,
+            crate::HostMergeGroup::new(REDSTONE_MERGE_GROUP),
+            HostMergeEntrySource::ArgumentPair { key: 0, value: 1 },
+        ),
+        OperationSchema::asynchronous_last_write_wins(
+            &redstone_outputs_argument,
+            HostValueType::Unit,
+            crate::HostMergeGroup::new(REDSTONE_MERGE_GROUP),
+            HostMergeEntrySource::PackedFields {
+                argument: 0,
+                width: 5,
+                count: 6,
+            },
+        ),
+    ];
     let addon_operations = addon_bindings
         .iter()
         .map(|binding| {
@@ -1930,7 +2058,7 @@ fn admit_session(
                 .collect::<Box<[_]>>()
         })
         .collect::<Box<[_]>>();
-    let mut bindings = Vec::with_capacity(addon_bindings.len() + 5);
+    let mut bindings = Vec::with_capacity(addon_bindings.len() + 6);
     for (index, binding) in addon_bindings.iter().enumerate() {
         bindings.push(CapabilityBinding::new(
             binding.namespace(),
@@ -1975,6 +2103,13 @@ fn admit_session(
         COMPILER_ABI_MINOR,
         &compiler_operations,
     ));
+    bindings.push(CapabilityBinding::new(
+        TERMINAL_NAMESPACE,
+        REDSTONE_NAME,
+        REDSTONE_ABI_MAJOR,
+        REDSTONE_ABI_MINOR,
+        &redstone_operations,
+    ));
     Session::admit(artifact, profile, &bindings)
 }
 
@@ -2006,6 +2141,63 @@ fn is_compiler(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == COMPILER_NAME
         && request.abi_major() == COMPILER_ABI_MAJOR
+}
+
+fn is_redstone(request: HostRequestView<'_>) -> bool {
+    request.namespace() == TERMINAL_NAMESPACE
+        && request.name() == REDSTONE_NAME
+        && request.abi_major() == REDSTONE_ABI_MAJOR
+}
+
+fn is_redstone_local(request: HostRequestView<'_>) -> bool {
+    is_redstone(request) && request.operation() <= 5
+}
+
+fn copy_redstone_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
+    let integer = |index| match request.arguments().get(index) {
+        Some(HostValueView::I32(value)) => Ok(value),
+        _ => Err(ComputerError::InvalidRedstoneRequest),
+    };
+    let side = |index| {
+        let value =
+            u8::try_from(integer(index)?).map_err(|_| ComputerError::InvalidRedstoneRequest)?;
+        if value < crate::redstone::SIDE_COUNT {
+            Ok(value)
+        } else {
+            Err(ComputerError::InvalidRedstoneRequest)
+        }
+    };
+    let signal = |index| {
+        let value =
+            u8::try_from(integer(index)?).map_err(|_| ComputerError::InvalidRedstoneRequest)?;
+        if value <= 15 {
+            Ok(value)
+        } else {
+            Err(ComputerError::InvalidRedstoneRequest)
+        }
+    };
+    let operation = match (
+        request.operation(),
+        request.asynchronous(),
+        request.arguments().len(),
+    ) {
+        (0, false, 1) => RedstoneOperation::Input(side(0)?),
+        (1, true, 1) => RedstoneOperation::AwaitChange(side(0)?),
+        (2, true, 2) => RedstoneOperation::AwaitExact(side(0)?, signal(1)?),
+        (3, true, 2) => RedstoneOperation::AwaitAtLeast(side(0)?, signal(1)?),
+        (4, true, 2) => RedstoneOperation::AwaitAtMost(side(0)?, signal(1)?),
+        (5, false, 0) => RedstoneOperation::Outputs,
+        _ => return Err(ComputerError::InvalidRedstoneRequest),
+    };
+    Ok(TerminalRequest::Redstone {
+        task: request.task_id(),
+        id: request.id(),
+        operation,
+    })
+}
+
+fn redstone_request_error(_: RedstoneError) -> ComputerError {
+    ComputerError::InvalidRedstoneRequest
 }
 
 fn copy_process_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
@@ -2462,6 +2654,91 @@ mod tests {
         ProcessFailureReason, ProcessLimits, RomImage, TaskId, TerminalKey, TerminalKeyEvent,
         TerminalModifiers, VirtualPath, WorldFileSystemStore,
     };
+
+    #[test]
+    fn redstone_input_and_confirmed_output_are_rust_local_scalar_reads() {
+        let mut input = ComputerMachine::start(
+            crate::execution::fixtures::redstone_i32_artifact(0, false, &[2]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        input
+            .submit_redstone_input(1 << 2 | (11 << (6 + 2 * 4)))
+            .unwrap();
+        assert_eq!(Some(ComputerValue::I32(11)), halt(&mut input));
+
+        let mut output = ComputerMachine::start(
+            crate::execution::fixtures::redstone_i32_artifact(5, false, &[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        output.confirm_redstone_output(0x1234_5678).unwrap();
+        assert_eq!(Some(ComputerValue::I32(0x1234_5678)), halt(&mut output));
+    }
+
+    #[test]
+    fn redstone_conditional_wait_checks_current_level_before_registration() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::redstone_i32_artifact(2, true, &[0, 7]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        computer.submit_redstone_input(1 | (7 << 6)).unwrap();
+
+        assert_eq!(Some(ComputerValue::I32(7)), halt(&mut computer));
+    }
+
+    #[test]
+    fn redstone_edge_wait_wakes_only_after_a_matching_side_change() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::redstone_i32_artifact(1, true, &[0]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64).unwrap(),
+        );
+        computer.submit_redstone_input(2 | (3 << 10)).unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64).unwrap(),
+        );
+        computer
+            .submit_redstone_input(1 | (9 << 6) | (3 << 10))
+            .unwrap();
+
+        assert_eq!(Some(ComputerValue::I32(9)), halt(&mut computer));
+    }
+
+    #[test]
+    fn redstone_scalar_synchronization_rejects_reserved_bits_without_mutation() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::redstone_i32_artifact(5, false, &[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ComputerError::InvalidRedstoneRequest,
+            computer.submit_redstone_input(1 << 30).unwrap_err(),
+        );
+        assert_eq!(
+            ComputerError::InvalidRedstoneRequest,
+            computer.confirm_redstone_output(1 << 31).unwrap_err(),
+        );
+        assert_eq!(Some(ComputerValue::I32(0)), halt(&mut computer));
+    }
 
     #[test]
     fn process_v2_missing_path_is_atomic_and_diagnostic_is_consumed_once() {
