@@ -1580,10 +1580,28 @@ fn resolve_symbol(
             "import target module is out of range",
         )
     })?;
+    let source_name = artifact.modules[module_id]
+        .strings
+        .get(import.target_name as usize)
+        .ok_or_else(|| {
+            code_failure(
+                limits,
+                module_id,
+                function_id,
+                "import target name is out of range",
+            )
+        })?
+        .slice(&artifact.bytes);
     target
         .exports
         .iter()
-        .find(|export| export.kind == kind && export.name == import.target_name)
+        .find(|export| {
+            export.kind == kind
+                && target
+                    .strings
+                    .get(export.name as usize)
+                    .is_some_and(|name| name.slice(&artifact.bytes) == source_name)
+        })
         .map(|export| (target_module, export.local_symbol as usize))
         .ok_or_else(|| {
             code_failure(

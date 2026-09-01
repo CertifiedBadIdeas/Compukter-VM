@@ -414,9 +414,9 @@ pub(crate) fn minimal_vector_with_string_records(records: &[&[u8]]) -> Vec<u8> {
 pub(crate) fn two_module_vector() -> Vec<u8> {
     let library_sections = minimal_module_sections(&[b"lib", b"work"], 1, &[], &[export_record(1)]);
     let library_hash = semantic_hash(&library_sections);
-    let application_import = import_record(1, 1, 1, 0, library_hash);
+    let application_import = import_record(1, 1, 2, 0, library_hash);
     let application_sections =
-        minimal_module_sections(&[b"app", b"entry"], 1, &[application_import], &[]);
+        minimal_module_sections(&[b"app", b"entry", b"work"], 1, &[application_import], &[]);
     let application_hash = semantic_hash(&application_sections);
 
     let manifest = manifest();

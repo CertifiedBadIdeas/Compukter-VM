@@ -23,3 +23,12 @@ fn public_api_rejects_missing_module_import_feature() {
     let error = verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap_err();
     assert_eq!(error.first().unwrap().code, Code::BadModule);
 }
+
+#[test]
+fn public_api_resolves_import_names_in_the_source_module_string_table() {
+    verify_artifact(
+        Arc::from(support::two_module_vector()),
+        ArtifactLimits::default(),
+    )
+    .unwrap();
+}

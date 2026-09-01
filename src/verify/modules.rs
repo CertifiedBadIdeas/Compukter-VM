@@ -313,10 +313,20 @@ pub(super) fn resolved_type(
     }
     let target_module = import.target_module.0 as usize;
     let target = artifact.modules.get(target_module)?;
+    let source_name = artifact.modules[module_id]
+        .strings
+        .get(import.target_name as usize)?
+        .slice(&artifact.bytes);
     target
         .exports
         .iter()
-        .find(|export| export.kind == 0 && export.name == import.target_name)
+        .find(|export| {
+            export.kind == 0
+                && target
+                    .strings
+                    .get(export.name as usize)
+                    .is_some_and(|name| name.slice(&artifact.bytes) == source_name)
+        })
         .and_then(|export| {
             let type_id = export.local_symbol as usize;
             (type_id < target.types.len()).then_some((target_module, type_id))
@@ -439,7 +449,7 @@ fn resolve_imports_and_exports(
                     "import target semantic hash does not match",
                 ));
             }
-            let target_name = target.strings[import.target_name as usize].slice(&artifact.bytes);
+            let target_name = source.strings[import.target_name as usize].slice(&artifact.bytes);
             let mut matches = target.exports.iter().filter(|export| {
                 export.kind == import.kind
                     && target.strings[export.name as usize].slice(&artifact.bytes) == target_name

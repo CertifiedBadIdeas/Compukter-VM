@@ -991,22 +991,20 @@ fn validate_module_tables(
         }
     }
     for import in &module.imports {
-        let target = modules
-            .get(import.target_module.0 as usize)
-            .ok_or_else(|| {
-                record_error(
-                    limits,
-                    format::IMPORTS,
-                    "import target module is out of range",
-                )
-            })?;
-        string(bytes, target, import.target_name, limits)?;
+        if modules.get(import.target_module.0 as usize).is_none() {
+            return Err(record_error(
+                limits,
+                format::IMPORTS,
+                "import target module is out of range",
+            ));
+        }
+        string(bytes, module, import.target_name, limits)?;
         type_ref(module, import.expected_signature, false, limits)?;
     }
     if module
         .imports
         .windows(2)
-        .any(|pair| import_key(bytes, modules, &pair[0]) >= import_key(bytes, modules, &pair[1]))
+        .any(|pair| import_key(bytes, module, &pair[0]) >= import_key(bytes, module, &pair[1]))
     {
         return Err(record_error(
             limits,
@@ -1221,13 +1219,13 @@ fn capability_key<'a>(
 
 fn import_key<'a>(
     bytes: &'a [u8],
-    modules: &[DecodedModule],
+    source: &DecodedModule,
     value: &Import,
 ) -> (ModuleId, u8, &'a [u8], TypeId) {
     (
         value.target_module,
         value.kind,
-        modules[value.target_module.0 as usize].strings[value.target_name as usize].slice(bytes),
+        source.strings[value.target_name as usize].slice(bytes),
         value.expected_signature,
     )
 }
