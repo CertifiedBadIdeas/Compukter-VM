@@ -1257,7 +1257,12 @@ fn resolve_type(artifact: &DecodedArtifact, module: usize, reference: TypeId) ->
     let target_module = import.target_module.0 as usize;
     let target = artifact.modules.get(target_module)?;
     let name = import.target_name as usize;
-    let import_name = target.strings.get(name)?.slice(&artifact.bytes);
+    let import_name = artifact
+        .modules
+        .get(module)?
+        .strings
+        .get(name)?
+        .slice(&artifact.bytes);
     target
         .exports
         .iter()
@@ -1303,7 +1308,9 @@ fn resolve_function(
     }
     let target_module = import.target_module.0 as usize;
     let target = artifact.modules.get(target_module)?;
-    let import_name = target
+    let import_name = artifact
+        .modules
+        .get(module)?
         .strings
         .get(import.target_name as usize)?
         .slice(&artifact.bytes);
@@ -1348,7 +1355,10 @@ fn resolve_field_index(
             .modules
             .get(target_module)
             .ok_or(AdmissionError::InvalidEntry)?;
-        let import_name = target
+        let import_name = artifact
+            .modules
+            .get(module)
+            .ok_or(AdmissionError::InvalidEntry)?
             .strings
             .get(import.target_name as usize)
             .ok_or(AdmissionError::InvalidEntry)?

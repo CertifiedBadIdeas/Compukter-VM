@@ -1394,6 +1394,10 @@ fn entry_string_array_artifact(code_unit: Option<(i32, i32)>) -> VerifiedArtifac
         library.declared_exports = 2;
 
         let module = &mut artifact.modules[0];
+        module.strings[string_name as usize] = ByteRange {
+            start: name_start,
+            end: name_end,
+        };
         module.imports.clear();
         module.imports.push(Import {
             kind: 0,
@@ -2149,6 +2153,10 @@ fn literal_string_program_blocks_configured(
     library.declared_exports = 2;
 
     let application = &mut decoded.modules[0];
+    application.strings[string_name as usize] = ByteRange {
+        start: name_start,
+        end: name_end,
+    };
     application.imports.clear();
     application.imports.push(Import {
         kind: 0,
@@ -2206,9 +2214,57 @@ fn literal_string_program_blocks_configured(
     decoded.manifest.required_stack_bytes =
         super::image::frame_charge(register_count as u64).unwrap() as u32;
     configure(&mut decoded);
+    canonicalize_module_strings(&mut decoded, 0);
 
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+fn canonicalize_module_strings(
+    artifact: &mut crate::artifact::DecodedArtifact,
+    module_index: usize,
+) {
+    let bytes = Arc::clone(&artifact.bytes);
+    let module = &mut artifact.modules[module_index];
+    let mut order: Vec<_> = (0..module.strings.len()).collect();
+    order.sort_by(|left, right| {
+        module.strings[*left]
+            .slice(&bytes)
+            .cmp(module.strings[*right].slice(&bytes))
+    });
+    let mut relocated = vec![0_u32; order.len()];
+    for (new, old) in order.iter().copied().enumerate() {
+        relocated[old] = new as u32;
+    }
+    module.strings = order.into_iter().map(|old| module.strings[old]).collect();
+    let string = |old: u32| relocated[old as usize];
+    module.name_string = string(module.name_string);
+    for nominal in &mut module.types {
+        match nominal {
+            NominalType::Class { name, .. }
+            | NominalType::Interface { name, .. }
+            | NominalType::Array { name, .. }
+            | NominalType::Function { name, .. } => *name = string(*name),
+        }
+    }
+    for import in &mut module.imports {
+        import.target_name = string(import.target_name);
+    }
+    for export in &mut module.exports {
+        export.name = string(export.name);
+    }
+    for field in &mut module.fields {
+        field.name = string(field.name);
+    }
+    for function in &mut module.functions {
+        function.name = string(function.name);
+    }
+    if module_index == 0 {
+        for capability in &mut artifact.capabilities {
+            capability.namespace = string(capability.namespace);
+            capability.name = string(capability.name);
+        }
+    }
 }
 
 pub(super) fn string_capability_artifact(
