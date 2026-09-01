@@ -104,7 +104,7 @@ impl Session {
             maximum_events: profile.maximum_events,
             maximum_slice_budget: profile.maximum_slice_budget,
             compiler_abi: profile.compiler_abi,
-            standard_library_abi: profile.standard_library_abi,
+            platform_abi: profile.platform_abi,
             capability_mask,
             host_references: Box::<[AdmittedReference]>::default(),
         };

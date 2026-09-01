@@ -4678,7 +4678,7 @@ pub(super) fn profile() -> ExecutionProfile {
         maximum_events: 64,
         maximum_slice_budget: u32::MAX,
         compiler_abi: [0; 32],
-        standard_library_abi: [0; 32],
+        platform_abi: [0; 32],
         capability_mask: u32::MAX,
         host_references: Box::new([]),
     }
@@ -4689,9 +4689,9 @@ pub(super) fn profiles_below_each_manifest_limit() -> Vec<ExecutionProfile> {
     let mut compiler = profile();
     compiler.compiler_abi = [1; 32];
     profiles.push(compiler);
-    let mut standard_library = profile();
-    standard_library.standard_library_abi = [1; 32];
-    profiles.push(standard_library);
+    let mut platform = profile();
+    platform.platform_abi = [1; 32];
+    profiles.push(platform);
     let mut frame_storage = profile();
     frame_storage.frame_storage_bytes = 31;
     profiles.push(frame_storage);

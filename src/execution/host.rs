@@ -126,7 +126,7 @@ pub struct ExecutionProfile {
     pub maximum_events: u32,
     pub maximum_slice_budget: u32,
     pub compiler_abi: [u8; 32],
-    pub standard_library_abi: [u8; 32],
+    pub platform_abi: [u8; 32],
     pub maximum_host_arguments: u32,
     pub maximum_outbound_utf16_code_units: u32,
     pub maximum_inbound_utf16_code_units: u32,

@@ -18,7 +18,7 @@ fn profile() -> ExecutionProfile {
         maximum_events: 64,
         maximum_slice_budget: u32::MAX,
         compiler_abi: [0; 32],
-        standard_library_abi: [0; 32],
+        platform_abi: [0; 32],
         maximum_host_arguments: 16,
         maximum_outbound_utf16_code_units: 4096,
         maximum_inbound_utf16_code_units: 4096,
