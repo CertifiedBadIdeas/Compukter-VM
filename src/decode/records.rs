@@ -1304,7 +1304,7 @@ fn decode_manifest(
         .map_err(|error| single(limits, relocate(error, start)))?
         .try_into()
         .unwrap();
-    let standard_library_abi = cursor
+    let platform_abi = cursor
         .take(32)
         .map_err(|error| single(limits, relocate(error, start)))?
         .try_into()
@@ -1337,7 +1337,7 @@ fn decode_manifest(
         required_capabilities: values[8],
         optional_capabilities: values[9],
         compiler_abi,
-        standard_library_abi,
+        platform_abi,
     })
 }
 

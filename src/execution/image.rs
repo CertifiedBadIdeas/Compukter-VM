@@ -31,7 +31,7 @@ pub(super) struct ExecutionProfile {
     pub maximum_events: u32,
     pub maximum_slice_budget: u32,
     pub compiler_abi: [u8; 32],
-    pub standard_library_abi: [u8; 32],
+    pub platform_abi: [u8; 32],
     pub capability_mask: u32,
     pub host_references: Box<[AdmittedReference]>,
 }
@@ -1066,8 +1066,8 @@ fn check_profile(
     if manifest.compiler_abi != profile.compiler_abi {
         return Err(AdmissionError::CompilerAbiMismatch);
     }
-    if manifest.standard_library_abi != profile.standard_library_abi {
-        return Err(AdmissionError::StandardLibraryAbiMismatch);
+    if manifest.platform_abi != profile.platform_abi {
+        return Err(AdmissionError::PlatformAbiMismatch);
     }
     if manifest.required_capabilities & !profile.capability_mask != 0 {
         return Err(AdmissionError::MissingCapability {

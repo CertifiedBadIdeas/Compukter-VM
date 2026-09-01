@@ -124,7 +124,7 @@ pub(crate) struct Manifest {
     pub required_capabilities: u32,
     pub optional_capabilities: u32,
     pub compiler_abi: [u8; 32],
-    pub standard_library_abi: [u8; 32],
+    pub platform_abi: [u8; 32],
 }
 
 #[derive(Debug)]

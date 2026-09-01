@@ -3,7 +3,7 @@ use super::value::{ReferenceValue, RuntimeValue};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionError {
     CompilerAbiMismatch,
-    StandardLibraryAbiMismatch,
+    PlatformAbiMismatch,
     MissingCapability {
         index: u8,
     },

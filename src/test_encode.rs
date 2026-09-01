@@ -194,7 +194,7 @@ fn encode_manifest(value: &Manifest) -> Vec<u8> {
         u32le(&mut bytes, field);
     }
     bytes.extend(value.compiler_abi);
-    bytes.extend(value.standard_library_abi);
+    bytes.extend(value.platform_abi);
     u64le(&mut bytes, 0);
     bytes
 }

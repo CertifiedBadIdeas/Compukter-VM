@@ -712,7 +712,7 @@ impl Encoder {
 fn admission_code(error: AdmissionError) -> u16 {
     match error {
         AdmissionError::CompilerAbiMismatch => 0,
-        AdmissionError::StandardLibraryAbiMismatch => 1,
+        AdmissionError::PlatformAbiMismatch => 1,
         AdmissionError::MissingCapability { .. } => 2,
         AdmissionError::HeapLimit { .. } => 3,
         AdmissionError::InvalidHeapSize { .. } => 4,
