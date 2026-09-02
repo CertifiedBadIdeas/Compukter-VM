@@ -57,6 +57,7 @@ pub(crate) fn valid_instruction_form(opcode: u8, form: u8) -> bool {
         0x20..=0x21 => matches!(form, 1..=6),
         0x22..=0x25 => matches!(form, 1..=4 | 6),
         0x26..=0x27 => form == 7,
+        0x68 => matches!(form, 1 | 5 | 6),
         _ => form == 0,
     }
 }

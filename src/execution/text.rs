@@ -8,6 +8,11 @@ use super::{
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum StringBacking {
+    Inline {
+        units: [u16; 11],
+        start: u8,
+        length: u8,
+    },
     Literal(ResolvedLiteral),
     Managed {
         reference: ReferenceValue,
@@ -23,6 +28,7 @@ pub(super) enum StringBacking {
 impl StringBacking {
     fn length(self) -> u32 {
         match self {
+            Self::Inline { length, .. } => u32::from(length),
             Self::Literal(literal) => literal.code_units,
             Self::Managed { length, .. } => length,
             Self::CharArray { length, .. } => length,
@@ -207,6 +213,38 @@ pub(super) struct PendingConcat {
 }
 
 impl PendingConcat {
+    pub(super) fn scalar(
+        value: RuntimeValue,
+        form: u8,
+        destination: u16,
+    ) -> Result<Self, TextError> {
+        let (units, start, length) = scalar_units(value, form)?;
+        let source = StringBacking::Inline {
+            units,
+            start,
+            length,
+        };
+        Ok(Self {
+            lhs: source,
+            lhs_start: 0,
+            lhs_length: u32::from(length),
+            rhs: StringBacking::Inline {
+                units: [0; 11],
+                start: 0,
+                length: 0,
+            },
+            rhs_start: 0,
+            rhs_length: 0,
+            destination,
+            scan: 0,
+            latin1: true,
+            reservation: None,
+            layout: None,
+            written: 0,
+            collection_attempted: false,
+        })
+    }
+
     pub(super) fn new(
         image: &ExecutionImage,
         heap: &Heap,
@@ -951,6 +989,9 @@ pub(super) fn encoding(
     value: RuntimeValue,
 ) -> Result<Option<StringEncoding>, TextError> {
     Ok(match backing(image, heap, value)? {
+        StringBacking::Inline { .. } => {
+            return Err(TextError::Fault(VmFault::InvalidReference));
+        }
         StringBacking::Literal(_) => None,
         StringBacking::Managed { encoding, .. } => Some(encoding),
         StringBacking::CharArray { .. } => {
@@ -1004,6 +1045,9 @@ fn code_unit(
     index: u32,
 ) -> Result<u16, TextError> {
     match value {
+        StringBacking::Inline { units, start, .. } => {
+            Ok(units[usize::from(start) + index as usize])
+        }
         StringBacking::Literal(literal) => {
             let offset = index as usize * 2;
             let bytes = image.literal_bytes(literal);
@@ -1031,5 +1075,41 @@ fn code_unit(
                 .map_err(TextError::Fault)?;
             Ok(u16::from_le_bytes(bytes[..2].try_into().unwrap()))
         }
+    }
+}
+
+fn scalar_units(value: RuntimeValue, form: u8) -> Result<([u16; 11], u8, u8), TextError> {
+    let mut units = [0_u16; 11];
+    match (form, value) {
+        (1, RuntimeValue::I32(value)) => {
+            let negative = value < 0;
+            let mut magnitude = value.unsigned_abs();
+            let mut start = units.len();
+            loop {
+                start -= 1;
+                units[start] = u16::from(b'0') + (magnitude % 10) as u16;
+                magnitude /= 10;
+                if magnitude == 0 {
+                    break;
+                }
+            }
+            if negative {
+                start -= 1;
+                units[start] = u16::from(b'-');
+            }
+            Ok((units, start as u8, (units.len() - start) as u8))
+        }
+        (5, RuntimeValue::Bool(value)) => {
+            let text: &[u8] = if value { b"true" } else { b"false" };
+            for (destination, source) in units.iter_mut().zip(text.iter().copied()) {
+                *destination = u16::from(source);
+            }
+            Ok((units, 0, text.len() as u8))
+        }
+        (6, RuntimeValue::Char(value)) => {
+            units[0] = value;
+            Ok((units, 0, 1))
+        }
+        _ => Err(TextError::Fault(VmFault::InvalidValueType)),
     }
 }

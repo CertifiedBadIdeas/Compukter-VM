@@ -223,6 +223,11 @@ pub(super) enum ResolvedInstruction {
         lhs: u16,
         rhs: u16,
     },
+    StringValueOf {
+        form: u8,
+        dst: u16,
+        source: u16,
+    },
     StringSubstring {
         dst: u16,
         string: u16,
@@ -1582,6 +1587,11 @@ fn resolve_instruction(
             dst: *dst,
             lhs: *lhs,
             rhs: *rhs,
+        },
+        Instruction::StringValueOf { form, dst, source } => ResolvedInstruction::StringValueOf {
+            form: *form,
+            dst: *dst,
+            source: *source,
         },
         Instruction::StringSubstring {
             dst,

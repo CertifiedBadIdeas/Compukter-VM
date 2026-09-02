@@ -300,6 +300,7 @@ fn verify_dataflow(
                 Instruction::NewObject { .. }
                     | Instruction::NewArray { .. }
                     | Instruction::StringConcat { .. }
+                    | Instruction::StringValueOf { .. }
                     | Instruction::StringSubstring { .. }
                     | Instruction::StringFromCharArray { .. }
             );
@@ -401,6 +402,7 @@ fn may_throw(instruction: &Instruction) -> bool {
             | Instruction::CapabilityCallSync { .. }
             | Instruction::Throw { .. }
             | Instruction::CallSuspend { .. }
+            | Instruction::StringValueOf { .. }
             | Instruction::Sleep { .. }
             | Instruction::CoroutineJoin { .. }
             | Instruction::CapabilityCallAsync { .. }
@@ -1173,6 +1175,20 @@ fn verify_instruction(
             read(function, state, *rhs, module_id, function_id, limits)?;
             require_string(artifact, function, *lhs, module_id, function_id, limits)?;
             require_string(artifact, function, *rhs, module_id, function_id, limits)?;
+            require_string(artifact, function, *dst, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::StringValueOf { form, dst, source } => {
+            if !matches!(form, 1 | 5 | 6) {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "unsupported string conversion form",
+                ));
+            }
+            read(function, state, *source, module_id, function_id, limits)?;
+            require_kind(function, *source, *form, module_id, function_id, limits)?;
             require_string(artifact, function, *dst, module_id, function_id, limits)?;
             write(state, *dst, function, module_id, function_id, limits)?;
         }

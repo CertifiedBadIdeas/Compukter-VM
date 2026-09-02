@@ -4,7 +4,7 @@ use super::{
     image::deduplicate_literal_ranges,
     value::{ReferenceDomain, RuntimeValue},
 };
-use crate::artifact::ByteRange;
+use crate::artifact::{ByteRange, Constant};
 
 #[test]
 fn string_literal_loads_as_an_immortal_reference() {
@@ -131,6 +131,80 @@ fn string_concat_creates_a_fresh_compact_dynamic_string() {
         Some(super::layout::StringEncoding::Latin1),
         machine.string_encoding(reference)
     );
+}
+
+#[test]
+fn scalar_string_conversion_matches_kotlin_representations() {
+    let cases = [
+        (1, Constant::I32(0), "0".encode_utf16().collect::<Vec<_>>()),
+        (
+            1,
+            Constant::I32(-42),
+            "-42".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            1,
+            Constant::I32(i32::MIN),
+            "-2147483648".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            5,
+            Constant::Bool(false),
+            "false".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            5,
+            Constant::Bool(true),
+            "true".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (6, Constant::Char(0x78), vec![0x78]),
+        (6, Constant::Char(0x0100), vec![0x0100]),
+    ];
+
+    for (form, value, expected) in cases {
+        let mut machine =
+            fixtures::started_zero_arg(fixtures::scalar_string_value_artifact(form, value));
+        let outcome = loop {
+            let outcome = machine.run_slice(3, 0).unwrap();
+            if outcome != Outcome::SliceExhausted {
+                break outcome;
+            }
+        };
+        let Outcome::Halted(Some(RuntimeValue::Reference(reference))) = outcome else {
+            panic!("scalar string conversion did not return a reference: {outcome:?}");
+        };
+
+        assert_eq!(ReferenceDomain::Managed, reference.domain());
+        assert_eq!(expected.len() as i32, machine.string_length(reference));
+        assert_eq!(
+            expected,
+            (0..machine.string_length(reference))
+                .map(|index| machine.string_get(reference, index))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn scalar_string_conversion_resumes_without_publishing_a_partial_value() {
+    let mut machine = fixtures::started_zero_arg(fixtures::scalar_string_value_artifact(
+        1,
+        Constant::I32(i32::MIN),
+    ));
+
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(3, 0).unwrap());
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(2, 0).unwrap());
+    let outcome = loop {
+        let outcome = machine.run_slice(2, 0).unwrap();
+        if outcome != Outcome::SliceExhausted {
+            break outcome;
+        }
+    };
+
+    assert!(matches!(
+        outcome,
+        Outcome::Halted(Some(RuntimeValue::Reference(_)))
+    ));
 }
 
 #[test]
