@@ -1601,6 +1601,13 @@ fn resolve_symbol(
                     .strings
                     .get(export.name as usize)
                     .is_some_and(|name| name.slice(&artifact.bytes) == source_name)
+                && modules::signatures_match(
+                    artifact,
+                    module_id,
+                    import.expected_signature.0,
+                    target_module,
+                    export.signature.0,
+                )
         })
         .map(|export| (target_module, export.local_symbol as usize))
         .ok_or_else(|| {
@@ -1691,7 +1698,36 @@ pub(super) fn value_assignable(
                         destination.nominal_type,
                     ))
                     .is_some_and(|(source, destination)| {
-                        nominal_assignable(artifact, source, destination)
+                        match (
+                            &artifact.modules[source.0].types[source.1],
+                            &artifact.modules[destination.0].types[destination.1],
+                        ) {
+                            (
+                                NominalType::Array {
+                                    element: source_element,
+                                    ..
+                                },
+                                NominalType::Array {
+                                    element: destination_element,
+                                    ..
+                                },
+                            ) => {
+                                value_assignable(
+                                    artifact,
+                                    source.0,
+                                    *source_element,
+                                    destination.0,
+                                    *destination_element,
+                                ) && value_assignable(
+                                    artifact,
+                                    destination.0,
+                                    *destination_element,
+                                    source.0,
+                                    *source_element,
+                                )
+                            }
+                            _ => nominal_assignable(artifact, source, destination),
+                        }
                     })
         } else {
             true

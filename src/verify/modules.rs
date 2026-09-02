@@ -473,7 +473,7 @@ fn resolve_imports_and_exports(
     Ok(())
 }
 
-fn signatures_match(
+pub(super) fn signatures_match(
     artifact: &DecodedArtifact,
     left_module: usize,
     left: u32,
@@ -539,8 +539,36 @@ pub(super) fn value_types_match(
     left.kind == right.kind
         && left.flags == right.flags
         && if left.kind == 7 {
-            resolved_type(artifact, left_module, left.nominal_type)
-                == resolved_type(artifact, right_module, right.nominal_type)
+            let Some(left_identity) = resolved_type(artifact, left_module, left.nominal_type)
+            else {
+                return false;
+            };
+            let Some(right_identity) = resolved_type(artifact, right_module, right.nominal_type)
+            else {
+                return false;
+            };
+            match (
+                &artifact.modules[left_identity.0].types[left_identity.1],
+                &artifact.modules[right_identity.0].types[right_identity.1],
+            ) {
+                (
+                    crate::artifact::NominalType::Array {
+                        element: left_element,
+                        ..
+                    },
+                    crate::artifact::NominalType::Array {
+                        element: right_element,
+                        ..
+                    },
+                ) => value_types_match(
+                    artifact,
+                    left_identity.0,
+                    *left_element,
+                    right_identity.0,
+                    *right_element,
+                ),
+                _ => left_identity == right_identity,
+            }
         } else {
             true
         }
