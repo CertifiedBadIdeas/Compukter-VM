@@ -546,6 +546,33 @@ fn cfg_accepts_every_typed_string_instruction() {
             },
         ),
         (
+            vec![primitive(1), string],
+            1,
+            crate::artifact::Instruction::StringValueOf {
+                form: 1,
+                dst: 1,
+                source: 0,
+            },
+        ),
+        (
+            vec![primitive(5), string],
+            1,
+            crate::artifact::Instruction::StringValueOf {
+                form: 5,
+                dst: 1,
+                source: 0,
+            },
+        ),
+        (
+            vec![primitive(6), string],
+            1,
+            crate::artifact::Instruction::StringValueOf {
+                form: 6,
+                dst: 1,
+                source: 0,
+            },
+        ),
+        (
             vec![string, primitive(1), primitive(1), string],
             3,
             crate::artifact::Instruction::StringSubstring {
@@ -584,29 +611,37 @@ fn cfg_rejects_string_allocation_after_another_instruction() {
             start: 1,
             end: 2,
         },
+        crate::artifact::Instruction::StringValueOf {
+            form: 1,
+            dst: 1,
+            source: 0,
+        },
     ] {
-        let is_concat = matches!(
-            &instruction,
-            crate::artifact::Instruction::StringConcat { .. }
-        );
-        let registers = match &instruction {
-            crate::artifact::Instruction::StringConcat { .. } => {
+        let (registers, parameter_count) = match &instruction {
+            crate::artifact::Instruction::StringConcat { .. } => (
                 vec![
                     reference(1, false),
                     reference(1, false),
                     reference(1, false),
-                ]
+                ],
+                2,
+            ),
+            crate::artifact::Instruction::StringValueOf { form, .. } => {
+                (vec![primitive(*form), reference(1, false)], 1)
             }
-            _ => vec![
-                reference(1, false),
-                primitive(1),
-                primitive(1),
-                reference(1, false),
-            ],
+            _ => (
+                vec![
+                    reference(1, false),
+                    primitive(1),
+                    primitive(1),
+                    reference(1, false),
+                ],
+                3,
+            ),
         };
         let artifact = string_artifact(
             registers,
-            if is_concat { 2 } else { 3 },
+            parameter_count,
             vec![
                 crate::artifact::Instruction::Nop,
                 instruction,
@@ -616,6 +651,40 @@ fn cfg_rejects_string_allocation_after_another_instruction() {
 
         let error = verify_cfg(&artifact).unwrap_err();
         assert_eq!(error.first().unwrap().code, Code::BadInstruction);
+    }
+}
+
+#[test]
+fn cfg_rejects_scalar_string_conversion_type_mismatches() {
+    for (registers, instruction) in [
+        (
+            vec![primitive(1), reference(1, false)],
+            crate::artifact::Instruction::StringValueOf {
+                form: 5,
+                dst: 1,
+                source: 0,
+            },
+        ),
+        (
+            vec![primitive(1), primitive(1)],
+            crate::artifact::Instruction::StringValueOf {
+                form: 1,
+                dst: 1,
+                source: 0,
+            },
+        ),
+    ] {
+        let artifact = string_artifact(
+            registers,
+            1,
+            vec![
+                instruction,
+                crate::artifact::Instruction::Return { value: u16::MAX },
+            ],
+        );
+
+        let error = verify_cfg(&artifact).unwrap_err();
+        assert_eq!(error.first().unwrap().code, Code::BadType);
     }
 }
 

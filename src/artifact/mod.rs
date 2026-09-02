@@ -537,6 +537,11 @@ pub(crate) enum Instruction {
         lhs: u16,
         rhs: u16,
     },
+    StringValueOf {
+        form: u8,
+        dst: u16,
+        source: u16,
+    },
     StringSubstring {
         dst: u16,
         string: u16,

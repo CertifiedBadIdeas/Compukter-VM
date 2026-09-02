@@ -1657,6 +1657,37 @@ pub(super) fn literal_string_concat_artifact() -> VerifiedArtifact {
     literal_string_concat_units_artifact(&[0x48, 0x69])
 }
 
+pub(super) fn scalar_string_value_artifact(form: u8, value: Constant) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks(
+        string,
+        vec![primitive(form), string],
+        vec![value],
+        &[],
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::StringValueOf {
+                    form,
+                    dst: 1,
+                    source: 0,
+                },
+                Instruction::Return { value: 1 },
+            ],
+        ],
+    )
+}
+
 pub(super) fn literal_string_concat_units_artifact(code_units: &[u16]) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,

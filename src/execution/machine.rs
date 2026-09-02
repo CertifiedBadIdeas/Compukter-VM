@@ -865,6 +865,23 @@ impl Machine {
                             return Ok(outcome);
                         }
                     }
+                    ResolvedInstruction::StringValueOf { form, dst, source } => {
+                        let value = match self.read_register(frame_index, *source) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let pending = match text::PendingConcat::scalar(value, *form, *dst) {
+                            Ok(pending) => pending,
+                            Err(error) => return Ok(self.text_outcome(error)),
+                        };
+                        self.pending_concat_source = Some(self.allocation_source(frame_index));
+                        self.pending_concat = Some(pending);
+                        if let Some(outcome) =
+                            self.resume_pending_concat(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
                     ResolvedInstruction::StringSubstring {
                         dst,
                         string,
