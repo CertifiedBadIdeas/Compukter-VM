@@ -473,7 +473,7 @@ fn resolve_imports_and_exports(
     Ok(())
 }
 
-pub(super) fn signatures_match(
+pub(crate) fn signatures_match(
     artifact: &DecodedArtifact,
     left_module: usize,
     left: u32,

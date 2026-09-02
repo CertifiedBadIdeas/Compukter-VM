@@ -1328,6 +1328,13 @@ fn resolve_function(
                     .strings
                     .get(export.name as usize)
                     .is_some_and(|range| range.slice(&artifact.bytes) == import_name)
+                && crate::verify::modules::signatures_match(
+                    artifact,
+                    module,
+                    import.expected_signature.0,
+                    target_module,
+                    export.signature.0,
+                )
         })
         .and_then(|export| {
             target
@@ -2022,5 +2029,64 @@ mod tests {
         for profile in fixtures::profiles_below_each_manifest_limit() {
             assert!(ExecutionImage::admit(fixtures::scalar_artifact(), profile).is_err());
         }
+    }
+
+    #[test]
+    fn imported_function_resolution_selects_the_matching_overload() {
+        let mut artifact = crate::decode::records::decode_artifact(
+            Arc::from(crate::test_support::two_module_vector()),
+            &crate::ArtifactLimits::default(),
+        )
+        .unwrap();
+        let unit = ValueType {
+            kind: 0,
+            flags: 0,
+            nominal_type: TypeId(u32::MAX),
+        };
+        let i32_type = ValueType {
+            kind: 1,
+            flags: 0,
+            nominal_type: TypeId(u32::MAX),
+        };
+        for module in &mut artifact.modules {
+            module.types.push(NominalType::Function {
+                name: 1,
+                flags: 0,
+                result: unit,
+                parameters: vec![i32_type],
+            });
+        }
+        artifact.modules[0].imports[0].expected_signature = TypeId(1);
+
+        let template = &artifact.modules[1].functions[0];
+        let overload = crate::artifact::Function {
+            owner: template.owner,
+            name: template.name,
+            signature: TypeId(1),
+            flags: template.flags,
+            register_count: 1,
+            parameter_count: 1,
+            first_block: template.first_block,
+            block_count: 0,
+            first_exception: 0,
+            exception_count: 0,
+            registers: vec![i32_type],
+        };
+        artifact.modules[1].functions.push(overload);
+        artifact.modules[1].exports.push(crate::artifact::Export {
+            kind: 1,
+            visibility: 1,
+            name: 1,
+            local_symbol: 1,
+            signature: TypeId(1),
+        });
+
+        assert_eq!(
+            Some(FunctionKey {
+                module: 1,
+                function: 1,
+            }),
+            resolve_function(&artifact, 0, 0x8000_0000),
+        );
     }
 }
