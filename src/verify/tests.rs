@@ -39,6 +39,31 @@ fn module_accepts_acyclic_two_module_bundle() {
 }
 
 #[test]
+fn module_accepts_structurally_equivalent_array_signature_across_modules() {
+    let mut artifact = decoded(support::two_module_vector());
+    for module in &mut artifact.modules {
+        let crate::artifact::NominalType::Function { parameters, .. } = &mut module.types[0] else {
+            panic!("fixture signature must be a function");
+        };
+        parameters.push(crate::artifact::ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: crate::artifact::TypeId(1),
+        });
+        module.types.push(crate::artifact::NominalType::Array {
+            name: 0,
+            element: crate::artifact::ValueType {
+                kind: 1,
+                flags: 0,
+                nominal_type: crate::artifact::TypeId(u32::MAX),
+            },
+        });
+    }
+
+    super::modules::verify_modules(&artifact, &ArtifactLimits::default()).unwrap();
+}
+
+#[test]
 fn module_rejects_import_hash_mismatch() {
     let mut artifact = decoded(support::two_module_vector());
     artifact.modules[0].imports[0].target_hash = [0; 32];
@@ -741,8 +766,106 @@ fn cfg_accepts_imported_direct_call() {
 }
 
 #[test]
+fn cfg_accepts_structurally_equivalent_imported_array_argument() {
+    let mut artifact = decoded(support::two_module_vector());
+    for module in &mut artifact.modules {
+        let crate::artifact::NominalType::Function { parameters, .. } = &mut module.types[0] else {
+            panic!("fixture signature must be a function");
+        };
+        parameters.push(reference(1, false));
+        module.types.push(crate::artifact::NominalType::Array {
+            name: 0,
+            element: primitive(1),
+        });
+    }
+    artifact.modules[1].functions[0].register_count = 1;
+    artifact.modules[1].functions[0].parameter_count = 1;
+    artifact.modules[1].functions[0].registers = vec![reference(1, false)];
+    configure_entry(
+        &mut artifact,
+        vec![reference(1, false)],
+        1,
+        vec![
+            crate::artifact::Instruction::CallDirect {
+                dst: u16::MAX,
+                function_ref: 0x8000_0000,
+                args: vec![0].into_boxed_slice(),
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
+fn cfg_resolves_imported_overload_by_signature() {
+    let mut artifact = decoded(support::two_module_vector());
+    artifact.modules[1]
+        .types
+        .push(crate::artifact::NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: vec![primitive(1)],
+        });
+    let template = &artifact.modules[1].functions[0];
+    let (owner, name, flags) = (template.owner, template.name, template.flags);
+    let first_block = crate::artifact::BlockId(artifact.modules[1].blocks.len() as u32);
+    artifact.modules[1]
+        .functions
+        .push(crate::artifact::Function {
+            owner,
+            name,
+            signature: crate::artifact::TypeId(1),
+            flags: flags | (1 << 3),
+            register_count: 1,
+            parameter_count: 1,
+            first_block,
+            block_count: 0,
+            first_exception: 0,
+            exception_count: 0,
+            registers: vec![primitive(1)],
+        });
+    artifact.modules[1].exports.insert(
+        0,
+        crate::artifact::Export {
+            kind: 1,
+            visibility: 1,
+            name: 1,
+            local_symbol: 1,
+            signature: crate::artifact::TypeId(1),
+        },
+    );
+    configure_entry(
+        &mut artifact,
+        Vec::new(),
+        0,
+        vec![
+            crate::artifact::Instruction::CallDirect {
+                dst: u16::MAX,
+                function_ref: 0x8000_0000,
+                args: Vec::new().into_boxed_slice(),
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
 fn cfg_rejects_wrong_call_argument_count() {
     let mut artifact = decoded(support::two_module_vector());
+    artifact.modules[0]
+        .types
+        .push(crate::artifact::NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: Vec::new(),
+        });
+    artifact.modules[0].imports[0].expected_signature = crate::artifact::TypeId(1);
     configure_entry(
         &mut artifact,
         vec![primitive(1)],
@@ -1054,6 +1177,15 @@ fn exception_rejects_capability_operation_out_of_range() {
 #[test]
 fn exception_rejects_non_suspending_call_suspend_target() {
     let mut artifact = decoded(support::two_module_vector());
+    artifact.modules[0]
+        .types
+        .push(crate::artifact::NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: Vec::new(),
+        });
+    artifact.modules[0].imports[0].expected_signature = crate::artifact::TypeId(1);
     configure_entry(
         &mut artifact,
         Vec::new(),
@@ -1315,6 +1447,15 @@ fn cfg_rejects_value_initialized_on_only_one_join_path() {
 #[test]
 fn cfg_rejects_wrong_call_argument_type() {
     let mut artifact = decoded(support::two_module_vector());
+    artifact.modules[0]
+        .types
+        .push(crate::artifact::NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: vec![primitive(1)],
+        });
+    artifact.modules[0].imports[0].expected_signature = crate::artifact::TypeId(1);
     artifact.modules[1].types[0] = crate::artifact::NominalType::Function {
         name: 1,
         flags: 0,
