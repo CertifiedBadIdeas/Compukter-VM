@@ -11,6 +11,7 @@ use super::{
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     numeric, text,
     value::{EntryArgument, ReferenceDomain, ReferenceValue, RegisterValue, RuntimeValue},
+    TypeKey,
 };
 use sha2::{Digest, Sha256};
 
@@ -21,6 +22,14 @@ enum Lifecycle {
     Terminal(Outcome),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TypeInitializationState {
+    Uninitialized,
+    Initializing,
+    Initialized,
+    Failed,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Frame {
     pub(super) function: usize,
@@ -29,6 +38,7 @@ pub(super) struct Frame {
     pub(super) caller_block: usize,
     pub(super) caller_instruction: usize,
     pub(super) destination: u16,
+    pub(super) initializer: Option<TypeKey>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +56,7 @@ impl Frame {
         caller_block: usize::MAX,
         caller_instruction: 0,
         destination: u16::MAX,
+        initializer: None,
     };
 
     #[cfg(test)]
@@ -57,6 +68,7 @@ impl Frame {
             caller_block: usize::MAX,
             caller_instruction: 0,
             destination: u16::MAX,
+            initializer: None,
         }
     }
 }
@@ -67,6 +79,7 @@ pub(super) struct Machine {
     frames: Box<[Frame]>,
     registers: Box<[RegisterValue]>,
     static_slots: Box<[RuntimeValue]>,
+    type_initialization: Box<[TypeInitializationState]>,
     heap: Heap,
     collector: Collector,
     allocation_retry: Option<AllocationRetry>,
@@ -176,12 +189,25 @@ impl Machine {
                     .ok_or(AdmissionError::InvalidEntry)? = value;
             }
         }
+        let mut type_initialization = Vec::new();
+        type_initialization
+            .try_reserve_exact(image.type_count())
+            .map_err(|_| AdmissionError::AllocationFailed)?;
+        for index in 0..image.type_count() {
+            let key = image.type_key(index).ok_or(AdmissionError::InvalidEntry)?;
+            type_initialization.push(if image.is_class(key) {
+                TypeInitializationState::Uninitialized
+            } else {
+                TypeInitializationState::Initialized
+            });
+        }
         Ok(Self {
             image,
             lifecycle: Lifecycle::Pristine,
             frames: frames.into_boxed_slice(),
             registers: registers.into_boxed_slice(),
             static_slots: static_slots.into_boxed_slice(),
+            type_initialization: type_initialization.into_boxed_slice(),
             heap,
             collector: Collector::new(),
             allocation_retry: None,
@@ -239,6 +265,7 @@ impl Machine {
             caller_block: usize::MAX,
             caller_instruction: 0,
             destination: u16::MAX,
+            initializer: None,
         };
         let width = self.image.registers_per_frame();
         self.registers[..width].fill(RegisterValue::Uninitialized);
@@ -473,6 +500,28 @@ impl Machine {
 
             while self.frames[frame_index].instruction < block_len {
                 let instruction_index = self.frames[frame_index].instruction;
+                let active_type = match &self
+                    .image
+                    .block(block_index)
+                    .ok_or(RunError::NotRunnable)?
+                    .instructions[instruction_index]
+                {
+                    ResolvedInstruction::StaticGet { field, .. }
+                    | ResolvedInstruction::StaticSet { field, .. } => Some(field.owner),
+                    ResolvedInstruction::NewObject { ty, .. } => Some(*ty),
+                    ResolvedInstruction::CallDirect { target, .. } => self
+                        .image
+                        .function(*target)
+                        .and_then(|function| function.static_owner),
+                    _ => None,
+                };
+                if let Some(ty) = active_type {
+                    match self.ensure_type_initialized(ty, frame_index) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(outcome) => return Ok(outcome),
+                    }
+                }
                 let instruction = &self
                     .image
                     .block(block_index)
@@ -509,6 +558,7 @@ impl Machine {
                         let continuation_block = self.frames[frame_index].caller_block;
                         let continuation_instruction = self.frames[frame_index].caller_instruction;
                         let destination = self.frames[frame_index].destination;
+                        let initialized_type = self.frames[frame_index].initializer;
                         if (destination == u16::MAX) != returned.is_none() {
                             return Ok(self.fault(VmFault::InvalidValueType));
                         }
@@ -523,6 +573,12 @@ impl Machine {
                         let caller_index = frame_index - 1;
                         self.frames[caller_index].block = continuation_block;
                         self.frames[caller_index].instruction = continuation_instruction;
+                        if let Some(ty) = initialized_type {
+                            let Some(index) = self.image.type_index(ty) else {
+                                return Ok(self.fault(VmFault::InvalidResolvedId));
+                            };
+                            self.type_initialization[index] = TypeInitializationState::Initialized;
+                        }
                         if let Some(value) = returned {
                             let destination_index = caller_index
                                 .checked_mul(width)
@@ -600,6 +656,7 @@ impl Machine {
                             caller_block,
                             caller_instruction,
                             destination: dst,
+                            initializer: None,
                         };
                         self.frame_depth += 1;
                         self.maximum_observed_frame_depth =
@@ -1348,6 +1405,74 @@ impl Machine {
         }
     }
 
+    fn ensure_type_initialized(
+        &mut self,
+        ty: TypeKey,
+        caller_index: usize,
+    ) -> Result<bool, Outcome> {
+        let Some(type_index) = self.image.type_index(ty) else {
+            return Err(self.fault(VmFault::InvalidResolvedId));
+        };
+        match self.type_initialization[type_index] {
+            TypeInitializationState::Initialized | TypeInitializationState::Initializing => {
+                return Ok(false);
+            }
+            TypeInitializationState::Failed => {
+                return Err(self.fault(VmFault::CorruptLifecycle));
+            }
+            TypeInitializationState::Uninitialized => {}
+        }
+
+        if let Some(superclass) = self.image.type_superclass(ty) {
+            if self.ensure_type_initialized(superclass, caller_index)? {
+                return Ok(true);
+            }
+        }
+
+        let Some(initializer) = self.image.type_initializer(ty) else {
+            self.type_initialization[type_index] = TypeInitializationState::Initialized;
+            return Ok(false);
+        };
+        if self.frame_depth >= self.image.maximum_call_depth() {
+            self.type_initialization[type_index] = TypeInitializationState::Failed;
+            let outcome = Outcome::Crashed(GuestTrap::StackOverflow);
+            self.lifecycle = Lifecycle::Terminal(outcome);
+            return Err(outcome);
+        }
+        let Some(function) = self.image.function(initializer) else {
+            return Err(self.fault(VmFault::InvalidResolvedId));
+        };
+        let callee_index = self.frame_depth;
+        if callee_index >= self.frames.len() {
+            return Err(self.fault(VmFault::InvalidStoragePlan));
+        }
+        let width = self.image.registers_per_frame();
+        let Some(callee_base) = callee_index.checked_mul(width) else {
+            return Err(self.fault(VmFault::InvalidStoragePlan));
+        };
+        let Some(callee_registers) = self
+            .registers
+            .get_mut(callee_base..callee_base.saturating_add(width))
+        else {
+            return Err(self.fault(VmFault::InvalidStoragePlan));
+        };
+        callee_registers.fill(RegisterValue::Uninitialized);
+        let caller = self.frames[caller_index];
+        self.frames[callee_index] = Frame {
+            function: initializer,
+            block: function.first_block,
+            instruction: 0,
+            caller_block: caller.block,
+            caller_instruction: caller.instruction,
+            destination: u16::MAX,
+            initializer: Some(ty),
+        };
+        self.type_initialization[type_index] = TypeInitializationState::Initializing;
+        self.frame_depth += 1;
+        self.maximum_observed_frame_depth = self.maximum_observed_frame_depth.max(self.frame_depth);
+        Ok(true)
+    }
+
     fn allocation_source(&self, frame_index: usize) -> AllocationSource {
         let frame = self.frames[frame_index];
         let key = self
@@ -1370,6 +1495,11 @@ impl Machine {
         self.cancel_pending_allocation();
         self.cancel_pending_concat();
         self.cancel_pending_host_string();
+        for state in &mut self.type_initialization {
+            if *state == TypeInitializationState::Initializing {
+                *state = TypeInitializationState::Failed;
+            }
+        }
         let outcome = Outcome::Faulted(fault);
         self.lifecycle = Lifecycle::Terminal(outcome);
         outcome

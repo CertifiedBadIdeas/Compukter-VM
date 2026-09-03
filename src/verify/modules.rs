@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::{
-    artifact::{format, DecodedArtifact, ModuleId, NominalType, TypeId},
+    artifact::{format, DecodedArtifact, Instruction, ModuleId, NominalType, TypeId, ValueType},
     decode::container::decode_container,
     diagnostic::{Code, Diagnostic, DiagnosticSet, Family},
     limits::ArtifactLimits,
@@ -104,6 +104,7 @@ fn verify_nominal_types(
                     field_count,
                     method_start,
                     method_count,
+                    initializer,
                     ..
                 } => {
                     if flags & 0b11 == 0b11 {
@@ -160,6 +161,79 @@ fn verify_nominal_types(
                         false,
                         limits,
                     )?;
+                    if let Some(initializer) = initializer {
+                        let function =
+                            module
+                                .functions
+                                .get(initializer.0 as usize)
+                                .ok_or_else(|| {
+                                    type_failure(
+                                        limits,
+                                        module_id,
+                                        "class initializer does not resolve",
+                                    )
+                                })?;
+                        let signature = resolved_type(artifact, module_id, function.signature)
+                            .and_then(|(signature_module, signature_type)| {
+                                artifact.modules[signature_module].types.get(signature_type)
+                            });
+                        let valid_signature = matches!(
+                            signature,
+                            Some(NominalType::Function {
+                                flags: 0,
+                                result: ValueType { kind: 0, .. },
+                                parameters,
+                                ..
+                            }) if parameters.is_empty()
+                        );
+                        if function.owner != TypeId(type_id as u32)
+                            || function.flags & 0b1011 != 0b0010
+                            || function.parameter_count != 0
+                            || !valid_signature
+                        {
+                            return Err(type_failure(
+                                limits,
+                                module_id,
+                                "class initializer signature or owner is invalid",
+                            ));
+                        }
+                        let first_block = function.first_block.0 as usize;
+                        let end_block = first_block
+                            .checked_add(function.block_count as usize)
+                            .ok_or_else(|| {
+                                type_failure(
+                                    limits,
+                                    module_id,
+                                    "class initializer block range overflows usize",
+                                )
+                            })?;
+                        let contains_async = module
+                            .code
+                            .get(first_block..end_block)
+                            .ok_or_else(|| {
+                                type_failure(
+                                    limits,
+                                    module_id,
+                                    "class initializer block range does not resolve",
+                                )
+                            })?
+                            .iter()
+                            .flat_map(|code| code.instructions.iter())
+                            .any(|instruction| {
+                                matches!(
+                                    instruction,
+                                    Instruction::CallSuspend { .. }
+                                        | Instruction::CapabilityCallAsync { .. }
+                                )
+                            });
+                        if contains_async {
+                            return Err(type_failure(
+                                limits,
+                                module_id,
+                                "class initializer contains an asynchronous operation",
+                            ));
+                        }
+                    }
                 }
                 NominalType::Interface {
                     super_type,

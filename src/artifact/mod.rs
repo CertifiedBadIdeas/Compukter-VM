@@ -169,6 +169,7 @@ pub(crate) enum NominalType {
         field_count: u32,
         method_start: u32,
         method_count: u32,
+        initializer: Option<FunctionId>,
     },
     Interface {
         flags: u8,

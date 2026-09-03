@@ -241,19 +241,25 @@ fn encode_type(value: &NominalType) -> Vec<u8> {
             field_count,
             method_start,
             method_count,
-        } => encode_classlike(
-            &mut bytes,
-            0,
-            *flags,
-            *generic_arity,
-            *name,
-            super_type.0,
-            interfaces,
-            *field_start,
-            *field_count,
-            *method_start,
-            *method_count,
-        ),
+            initializer,
+        } => {
+            encode_classlike(
+                &mut bytes,
+                0,
+                *flags,
+                *generic_arity,
+                *name,
+                super_type.0,
+                interfaces,
+                *field_start,
+                *field_count,
+                *method_start,
+                *method_count,
+            );
+            if let Some(initializer) = initializer {
+                u32le(&mut bytes, initializer.0);
+            }
+        }
         NominalType::Interface {
             flags,
             generic_arity,
@@ -1121,6 +1127,7 @@ mod tests {
             field_count: 6,
             method_start: 7,
             method_count: 8,
+            initializer: Some(FunctionId(9)),
         };
         let interface = NominalType::Interface {
             flags: 1,
@@ -1151,7 +1158,7 @@ mod tests {
             &encoded[0][8..],
             &[
                 0xff, 0xff, 0xff, 0xff, 1, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 7, 0, 0, 0, 8, 0, 0, 0,
-                4, 0, 0, 0,
+                4, 0, 0, 0, 9, 0, 0, 0,
             ]
         );
         assert_eq!(&encoded[1][..8], &[1, 1, 2, 0, 9, 0, 0, 0]);

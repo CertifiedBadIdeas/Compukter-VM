@@ -8,6 +8,34 @@ use super::{
 use sha2::{Digest, Sha256};
 
 #[test]
+fn active_static_get_runs_its_class_initializer_exactly_once() {
+    let mut machine = fixtures::started_zero_arg(fixtures::lazy_type_initializer_artifact());
+
+    let outcome = machine.run_slice(64, 64).unwrap();
+
+    assert_eq!(outcome, Outcome::Halted(Some(RuntimeValue::Bool(true))));
+}
+
+#[test]
+fn unused_class_does_not_run_its_initializer() {
+    let mut machine =
+        fixtures::started_zero_arg(fixtures::unused_failing_type_initializer_artifact());
+
+    assert_eq!(machine.run_slice(64, 64).unwrap(), Outcome::Halted(None));
+}
+
+#[test]
+fn new_object_propagates_initializer_failure() {
+    let mut machine =
+        fixtures::started_zero_arg(fixtures::actively_used_failing_type_initializer_artifact());
+
+    assert_eq!(
+        machine.run_slice(64, 64).unwrap(),
+        Outcome::Faulted(super::error::VmFault::ReachedUnreachable)
+    );
+}
+
+#[test]
 fn managed_heap_vertical_conformance() {
     fn record(machine: &Machine, digest: &mut Sha256, totals: &mut [u64; 3]) {
         let heap = machine.test_heap_diagnostic();
