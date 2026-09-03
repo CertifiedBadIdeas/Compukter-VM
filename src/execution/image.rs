@@ -52,6 +52,7 @@ pub(super) struct ResolvedFunction {
     pub result: ResolvedValueType,
     pub first_block: usize,
     pub block_count: usize,
+    pub static_owner: Option<TypeKey>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +380,9 @@ struct ExecutionImageInner {
     host_references: Box<[ResolvedHostReference]>,
     type_offsets: Box<[usize]>,
     type_layouts: Box<[RuntimeTypeLayout]>,
+    type_initializers: Box<[Option<usize>]>,
+    type_superclasses: Box<[Option<TypeKey>]>,
+    class_types: Box<[bool]>,
     assignable_types: Box<[Box<[TypeKey]>]>,
     array_element_types: Box<[Option<ResolvedValueType>]>,
     fields: Box<[ResolvedField]>,
@@ -421,6 +425,37 @@ impl ExecutionImage {
                 .map(|module| module.utf16_literals.len()),
         )?;
         let type_layouts = derive_type_layouts(decoded, &type_offsets, &field_offsets)?;
+        let total_types = *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?;
+        let mut type_initializers = reserved(total_types)?;
+        let mut type_superclasses = reserved(total_types)?;
+        let mut class_types = reserved(total_types)?;
+        for (module_id, module) in decoded.modules.iter().enumerate() {
+            for nominal in &module.types {
+                if let NominalType::Class {
+                    super_type,
+                    initializer,
+                    ..
+                } = nominal
+                {
+                    type_initializers.push(
+                        initializer
+                            .map(|initializer| {
+                                function_offsets[module_id]
+                                    .checked_add(initializer.0 as usize)
+                                    .filter(|index| *index < function_offsets[module_id + 1])
+                                    .ok_or(AdmissionError::InvalidEntry)
+                            })
+                            .transpose()?,
+                    );
+                    type_superclasses.push(resolve_type(decoded, module_id, *super_type));
+                    class_types.push(true);
+                } else {
+                    type_initializers.push(None);
+                    type_superclasses.push(None);
+                    class_types.push(false);
+                }
+            }
+        }
         let mut assignable_type_sets =
             reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
         for (module, nominal_types) in decoded.modules.iter().enumerate() {
@@ -533,6 +568,16 @@ impl ExecutionImage {
                         .checked_add(function.first_block.0 as usize)
                         .ok_or(AdmissionError::StoragePlanOverflow)?,
                     block_count: function.block_count as usize,
+                    static_owner: if function.flags & (1 << 1) != 0 {
+                        resolve_type(decoded, module_id, function.owner).filter(|owner| {
+                            matches!(
+                                decoded.modules[owner.module as usize].types[owner.ty as usize],
+                                NominalType::Class { .. }
+                            )
+                        })
+                    } else {
+                        None
+                    },
                 });
             }
         }
@@ -610,6 +655,9 @@ impl ExecutionImage {
             host_references: host_references.into_boxed_slice(),
             type_offsets,
             type_layouts,
+            type_initializers: type_initializers.into_boxed_slice(),
+            type_superclasses: type_superclasses.into_boxed_slice(),
+            class_types: class_types.into_boxed_slice(),
             assignable_types: assignable_type_sets.into_boxed_slice(),
             array_element_types: array_element_types.into_boxed_slice(),
             fields,
@@ -697,6 +745,46 @@ impl ExecutionImage {
     pub(super) fn type_layout(&self, key: TypeKey) -> Option<&RuntimeTypeLayout> {
         let index = checked_global_index(&self.0.type_offsets, key)?;
         self.0.type_layouts.get(index)
+    }
+
+    pub(super) fn type_count(&self) -> usize {
+        self.0.type_layouts.len()
+    }
+
+    pub(super) fn type_index(&self, key: TypeKey) -> Option<usize> {
+        checked_global_index(&self.0.type_offsets, key)
+    }
+
+    pub(super) fn type_key(&self, index: usize) -> Option<TypeKey> {
+        if index >= self.0.type_layouts.len() {
+            return None;
+        }
+        let module = self
+            .0
+            .type_offsets
+            .partition_point(|offset| *offset <= index)
+            .checked_sub(1)?;
+        Some(TypeKey {
+            module: u32::try_from(module).ok()?,
+            ty: u32::try_from(index.checked_sub(self.0.type_offsets[module])?).ok()?,
+        })
+    }
+
+    pub(super) fn is_class(&self, key: TypeKey) -> bool {
+        self.type_index(key)
+            .and_then(|index| self.0.class_types.get(index))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn type_initializer(&self, key: TypeKey) -> Option<usize> {
+        let index = self.type_index(key)?;
+        self.0.type_initializers.get(index).copied().flatten()
+    }
+
+    pub(super) fn type_superclass(&self, key: TypeKey) -> Option<TypeKey> {
+        let index = self.type_index(key)?;
+        self.0.type_superclasses.get(index).copied().flatten()
     }
 
     pub(super) fn is_assignable(&self, actual: TypeKey, target: TypeKey) -> bool {

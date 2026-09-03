@@ -396,6 +396,11 @@ fn parse_types(
                     if flags & !0b11 != 0 {
                         return Err(raw(Code::BadType, "invalid class flags"));
                     }
+                    let initializer = if cursor.position() < record.len() {
+                        Some(FunctionId(ru32(cursor)?))
+                    } else {
+                        None
+                    };
                     NominalType::Class {
                         flags,
                         generic_arity,
@@ -406,6 +411,7 @@ fn parse_types(
                         field_count,
                         method_start,
                         method_count,
+                        initializer,
                     }
                 } else {
                     if flags & !1 != 0 || field_count != 0 {
@@ -1453,6 +1459,7 @@ mod tests {
         for value in [0, u32::MAX, 0, 0, 0, 0, 0] {
             u32(&mut class, value);
         }
+        u32(&mut class, 7);
         let mut interface = vec![1, 1];
         u16(&mut interface, 0);
         for value in [0, u32::MAX, 0, 0, 0, 0, 0] {
@@ -1471,7 +1478,13 @@ mod tests {
         function_type.extend(value_type_bytes(7, 1, 0));
         let (bytes, offsets) = table(&[class, interface, array, function_type], format::TYPES);
         let values = parse_types(&section(format::TYPES, &bytes, offsets), &limits).unwrap();
-        assert!(matches!(values[0], NominalType::Class { .. }));
+        assert!(matches!(
+            values[0],
+            NominalType::Class {
+                initializer: Some(FunctionId(7)),
+                ..
+            }
+        ));
         assert!(matches!(values[1], NominalType::Interface { .. }));
         assert!(matches!(values[2], NominalType::Array { .. }));
         assert!(matches!(values[3], NominalType::Function { .. }));

@@ -127,6 +127,7 @@ fn class(name: u32, flags: u8, super_type: u32) -> crate::artifact::NominalType 
         field_count: 0,
         method_start: 0,
         method_count: 0,
+        initializer: None,
     }
 }
 
@@ -135,6 +136,49 @@ fn module_rejects_abstract_final_class() {
     let mut artifact = decoded(support::minimal_vector());
     artifact.modules[0].types[0] = class(0, 3, u32::MAX);
     let error = super::modules::verify_modules(&artifact, &ArtifactLimits::default()).unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn module_rejects_class_initializer_outside_function_table() {
+    let mut artifact = decoded(support::minimal_vector());
+    let mut initialized = class(0, 2, u32::MAX);
+    let crate::artifact::NominalType::Class { initializer, .. } = &mut initialized else {
+        unreachable!()
+    };
+    *initializer = Some(crate::artifact::FunctionId(99));
+    artifact.modules[0].types.push(initialized);
+    artifact.modules[0].declared_types = 2;
+
+    let error = super::modules::verify_modules(&artifact, &ArtifactLimits::default()).unwrap_err();
+
+    assert_eq!(error.first().unwrap().code, Code::BadType);
+}
+
+#[test]
+fn module_rejects_async_operation_in_class_initializer() {
+    let mut artifact = decoded(support::minimal_vector());
+    let mut initialized = class(0, 2, u32::MAX);
+    let crate::artifact::NominalType::Class { initializer, .. } = &mut initialized else {
+        unreachable!()
+    };
+    *initializer = Some(crate::artifact::FunctionId(0));
+    artifact.modules[0].types.push(initialized);
+    artifact.modules[0].declared_types = 2;
+    artifact.modules[0].functions[0].owner = crate::artifact::TypeId(1);
+    artifact.modules[0].functions[0].flags = 2;
+    artifact.modules[0].code[0].instructions =
+        vec![crate::artifact::Instruction::CapabilityCallAsync {
+            dst: u16::MAX,
+            capability: 0,
+            operation: 0,
+            args: Vec::new().into_boxed_slice(),
+            resume_block: 0,
+        }]
+        .into_boxed_slice();
+
+    let error = super::modules::verify_modules(&artifact, &ArtifactLimits::default()).unwrap_err();
+
     assert_eq!(error.first().unwrap().code, Code::BadType);
 }
 

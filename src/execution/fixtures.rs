@@ -1379,6 +1379,7 @@ fn entry_string_array_artifact(code_unit: Option<(i32, i32)>) -> VerifiedArtifac
             field_count: 0,
             method_start: 0,
             method_count: 0,
+            initializer: None,
         });
         library.exports.insert(
             0,
@@ -2169,6 +2170,7 @@ fn literal_string_program_blocks_configured(
         field_count: 0,
         method_start: 0,
         method_count: 0,
+        initializer: None,
     });
     library.exports.insert(
         0,
@@ -3652,6 +3654,7 @@ pub(super) fn portable_layout_artifact() -> VerifiedArtifact {
                 field_count: 2,
                 method_start: 0,
                 method_count: 0,
+                initializer: None,
             },
             NominalType::Class {
                 flags: 0,
@@ -3663,6 +3666,7 @@ pub(super) fn portable_layout_artifact() -> VerifiedArtifact {
                 field_count: 3,
                 method_start: 0,
                 method_count: 0,
+                initializer: None,
             },
             NominalType::Array {
                 name: 0,
@@ -3730,6 +3734,7 @@ pub(super) fn object_allocation_artifact(field_count: u32) -> VerifiedArtifact {
             field_count,
             method_start: 0,
             method_count: 0,
+            initializer: None,
         });
         artifact.modules[0].declared_types = 2;
         artifact.modules[0].fields = (0..field_count)
@@ -3990,6 +3995,7 @@ pub(super) fn static_roundtrip_artifact() -> VerifiedArtifact {
             field_count: 1,
             method_start: 0,
             method_count: 0,
+            initializer: None,
         });
         artifact.modules[0].declared_types = 2;
         artifact.modules[0].fields = vec![Field {
@@ -4063,6 +4069,7 @@ pub(super) fn field_roundtrip_artifact() -> VerifiedArtifact {
                 field_count: 1,
                 method_start: 0,
                 method_count: 0,
+                initializer: None,
             },
             NominalType::Class {
                 flags: 0,
@@ -4074,6 +4081,7 @@ pub(super) fn field_roundtrip_artifact() -> VerifiedArtifact {
                 field_count: 0,
                 method_start: 0,
                 method_count: 0,
+                initializer: None,
             },
         ]);
         artifact.modules[0].declared_types = 4;
@@ -4648,6 +4656,163 @@ pub(super) fn null_is_type_artifact() -> VerifiedArtifact {
     })
 }
 
+pub(super) fn lazy_type_initializer_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let reference = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types = vec![
+            function_type(primitive(5), Vec::new()),
+            NominalType::Class {
+                flags: 2,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: Vec::new(),
+                field_start: 0,
+                field_count: 1,
+                method_start: 0,
+                method_count: 0,
+                initializer: Some(FunctionId(1)),
+            },
+            function_type(primitive(0), Vec::new()),
+        ];
+        artifact.modules[0].declared_types = 3;
+        artifact.modules[0].fields = vec![Field {
+            owner: TypeId(1),
+            name: 0,
+            value_type: reference,
+            flags: 3,
+        }];
+        artifact.modules[0].functions = vec![
+            function(0, 0, vec![reference, reference, primitive(5)], 0),
+            Function {
+                owner: TypeId(1),
+                name: 1,
+                signature: TypeId(2),
+                flags: 2,
+                register_count: 1,
+                parameter_count: 0,
+                first_block: BlockId(1),
+                block_count: 1,
+                first_exception: 0,
+                exception_count: 0,
+                registers: vec![reference],
+            },
+        ];
+        artifact.modules[0].declared_functions = 2;
+        install_function_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::StaticGet {
+                        dst: 0,
+                        field_ref: 0,
+                    },
+                    Instruction::StaticGet {
+                        dst: 1,
+                        field_ref: 0,
+                    },
+                    Instruction::RefEqual {
+                        dst: 2,
+                        lhs: 0,
+                        rhs: 1,
+                    },
+                    Instruction::Return { value: 2 },
+                ],
+                vec![
+                    Instruction::NewObject {
+                        dst: 0,
+                        type_ref: 1,
+                    },
+                    Instruction::StaticSet {
+                        field_ref: 0,
+                        value: 0,
+                    },
+                    Instruction::Return { value: u16::MAX },
+                ],
+            ],
+        );
+        configure_stack(artifact, 3, 2);
+    })
+}
+
+pub(super) fn unused_failing_type_initializer_artifact() -> VerifiedArtifact {
+    failing_type_initializer_artifact(false)
+}
+
+pub(super) fn actively_used_failing_type_initializer_artifact() -> VerifiedArtifact {
+    failing_type_initializer_artifact(true)
+}
+
+fn failing_type_initializer_artifact(active_use: bool) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let reference = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types = vec![
+            function_type(primitive(0), Vec::new()),
+            NominalType::Class {
+                flags: 0,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: Vec::new(),
+                field_start: 0,
+                field_count: 0,
+                method_start: 0,
+                method_count: 0,
+                initializer: Some(FunctionId(1)),
+            },
+            function_type(primitive(0), Vec::new()),
+        ];
+        artifact.modules[0].declared_types = 3;
+        artifact.modules[0].functions = vec![
+            function(
+                0,
+                0,
+                if active_use {
+                    vec![reference]
+                } else {
+                    Vec::new()
+                },
+                0,
+            ),
+            Function {
+                owner: TypeId(1),
+                name: 1,
+                signature: TypeId(2),
+                flags: 2,
+                register_count: 0,
+                parameter_count: 0,
+                first_block: BlockId(1),
+                block_count: 1,
+                first_exception: 0,
+                exception_count: 0,
+                registers: Vec::new(),
+            },
+        ];
+        artifact.modules[0].declared_functions = 2;
+        let entry = if active_use {
+            vec![
+                Instruction::NewObject {
+                    dst: 0,
+                    type_ref: 1,
+                },
+                Instruction::Return { value: u16::MAX },
+            ]
+        } else {
+            vec![Instruction::Return { value: u16::MAX }]
+        };
+        install_function_blocks(artifact, vec![entry, vec![Instruction::Unreachable]]);
+        configure_stack(artifact, 1, 2);
+    })
+}
+
 fn plain_class(super_type: TypeId, field_start: u32, field_count: u32) -> NominalType {
     NominalType::Class {
         flags: 0,
@@ -4659,6 +4824,7 @@ fn plain_class(super_type: TypeId, field_start: u32, field_count: u32) -> Nomina
         field_count,
         method_start: 0,
         method_count: 0,
+        initializer: None,
     }
 }
 
@@ -4710,6 +4876,7 @@ pub(super) fn reference_entry_case() -> (
             field_count: 0,
             method_start: 0,
             method_count: 0,
+            initializer: None,
         });
         artifact.modules[0].declared_types = 2;
         let function = &mut artifact.modules[0].functions[0];
