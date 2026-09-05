@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod error;
+mod external_roots;
 mod frame;
 mod gc;
 mod heap;

@@ -11,7 +11,7 @@ use crate::{
 use super::{
     image::{AdmittedReference, ExecutionImage, ExecutionProfile},
     machine::Machine,
-    value::{EntryArgument, ReferenceValue, RegisterValue, RuntimeValue},
+    value::{EntryArgument, Ref32, RegisterValue, RuntimeValue},
     TypeKey,
 };
 
@@ -4917,9 +4917,13 @@ pub(super) fn reference_entry_case() -> (
     ]);
     let image = ExecutionImage::admit(artifact, profile).unwrap();
     let reference = |owner, handle, generation| {
-        EntryArgument::owned(
+        EntryArgument::owned_external(
             owner,
-            RuntimeValue::Reference(ReferenceValue::host(handle, generation).unwrap()),
+            Ref32::external(handle).unwrap(),
+            super::external_roots::ExternalHandle {
+                slot: handle,
+                generation,
+            },
         )
     };
     (

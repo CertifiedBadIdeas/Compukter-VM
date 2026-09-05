@@ -3,7 +3,7 @@ use super::{
     fixtures,
     heap::{
         free_size_class, request_size_class, splitmix64, AllocationRequest, BlockOffset, Heap,
-        SizeClass,
+        ManagedObjectHeader, SizeClass,
     },
     heap_ops::{PendingAllocation, PendingState},
     image::{deduplicate_literal_ranges, ExecutionImage},
@@ -16,6 +16,11 @@ use super::{
     TypeKey,
 };
 use crate::artifact::ByteRange;
+
+#[test]
+fn managed_object_header_is_eight_bytes() {
+    assert_eq!(8, core::mem::size_of::<ManagedObjectHeader>());
+}
 
 #[test]
 fn allocator_size_classes_map_free_blocks_down_and_requests_up() {
@@ -51,7 +56,7 @@ fn allocator_plan(heap_bytes: u32) -> StoragePlan {
 fn allocator_request(block_bytes: u32) -> AllocationRequest {
     AllocationRequest {
         block_bytes,
-        ty: TypeKey { module: 0, ty: 1 },
+        type_id: 1,
     }
 }
 
@@ -120,43 +125,52 @@ fn allocator_coalesces_both_neighbors_and_restores_the_arena() -> Result<(), Adm
 }
 
 #[test]
-fn allocator_handles_commit_abort_generation_and_retirement() -> Result<(), AdmissionError> {
+fn allocator_commits_direct_offsets_and_reuses_freed_blocks() -> Result<(), AdmissionError> {
     let mut heap = Heap::new(&allocator_plan(64))?;
     let aborted = heap.reserve(allocator_request(32)).unwrap().unwrap();
     heap.abort(aborted).unwrap();
     let reused = heap.reserve(allocator_request(32)).unwrap().unwrap();
-    assert_eq!(aborted.slot, reused.slot);
-    assert_eq!(aborted.generation, reused.generation);
+    assert_eq!(aborted.block, reused.block);
 
     let first = heap.commit(reused).unwrap();
-    assert_eq!(Some(TypeKey { module: 0, ty: 1 }), heap.runtime_type(first));
+    assert_eq!(16, first.payload());
+    assert_eq!(Some(1), heap.runtime_type(first));
     assert_eq!(Some(splitmix64(1) as u32), heap.identity_hash(first));
     assert!(heap.free(first).unwrap());
     assert_eq!(None, heap.runtime_type(first));
 
     let next = heap.reserve(allocator_request(32)).unwrap().unwrap();
-    assert_eq!(first.slot(), next.slot);
-    assert_eq!(first.generation() + 1, next.generation);
-    heap.abort(next).unwrap();
+    assert_eq!(BlockOffset(0), next.block);
+    let next = heap.commit(next).unwrap();
+    assert_eq!(first, next);
+    assert_eq!(Some(splitmix64(2) as u32), heap.identity_hash(next));
+    Ok(())
+}
 
-    heap.test_set_generation(0, u32::MAX);
-    let retiring = heap.reserve(allocator_request(32)).unwrap().unwrap();
-    let retiring = heap.commit(retiring).unwrap();
-    assert!(heap.free(retiring).unwrap());
-    assert_eq!(1, heap.diagnostic().retired_handles);
-    let survivor = heap.reserve(allocator_request(32)).unwrap().unwrap();
-    assert_eq!(1, survivor.slot);
-    heap.abort(survivor).unwrap();
-    heap.test_set_generation(1, u32::MAX);
-    let retiring = heap.reserve(allocator_request(32)).unwrap().unwrap();
-    let retiring = heap.commit(retiring).unwrap();
-    assert_eq!(Some(splitmix64(3) as u32), heap.identity_hash(retiring));
-    assert!(heap.free(retiring).unwrap());
-    assert_eq!(2, heap.diagnostic().retired_handles);
+#[test]
+fn identity_tokens_wrap_deterministically_and_allow_collisions() -> Result<(), AdmissionError> {
+    let mut heap = Heap::new(&allocator_plan(32))?;
+    heap.test_set_next_ordinal(u64::MAX);
+    let before_wrap = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    let before_wrap = heap.commit(before_wrap).unwrap();
     assert_eq!(
-        Err(VmFault::HandleExhausted),
-        heap.reserve(allocator_request(32))
+        Some(splitmix64(u64::MAX) as u32),
+        heap.identity_hash(before_wrap)
     );
+    assert!(heap.free(before_wrap).unwrap());
+
+    let after_wrap = heap.reserve(allocator_request(32)).unwrap().unwrap();
+    let after_wrap = heap.commit(after_wrap).unwrap();
+    assert_eq!(Some(splitmix64(0) as u32), heap.identity_hash(after_wrap));
+    Ok(())
+}
+
+#[test]
+fn allocator_has_no_managed_handle_capacity() -> Result<(), AdmissionError> {
+    let mut plan = allocator_plan(64);
+    plan.handle_capacity = 0;
+    let mut heap = Heap::new(&plan)?;
+    assert!(heap.reserve(allocator_request(32)).unwrap().is_some());
     Ok(())
 }
 
@@ -240,9 +254,9 @@ fn managed_heap_performance_allocator_and_fragmentation() {
 #[test]
 fn portable_minimum_and_representative_layouts() -> Result<(), AdmissionError> {
     assert_eq!(32, empty_object_layout()?.block_bytes);
-    assert_eq!(48, array_layout(ValueWidth::Char, 9)?.block_bytes);
+    assert_eq!(64, array_layout(ValueWidth::Char, 9)?.block_bytes);
     assert_eq!(48, array_layout(ValueWidth::Ref, 3)?.block_bytes);
-    assert_eq!(32, string_layout(StringEncoding::Latin1, 8)?.block_bytes);
+    assert_eq!(48, string_layout(StringEncoding::Latin1, 8)?.block_bytes);
     assert_eq!(48, string_layout(StringEncoding::Utf16, 8)?.block_bytes);
     Ok(())
 }
@@ -276,9 +290,9 @@ fn portable_object_fields_use_stable_natural_alignment_groups() -> Result<(), Ad
         .iter()
         .map(|field| (field.field, field.offset))
         .collect();
-    assert_eq!(vec![(2, 0), (3, 8), (1, 16), (0, 18)], offsets);
+    assert_eq!(vec![(2, 0), (3, 8), (1, 12), (0, 14)], offsets);
     assert_eq!(&[8], layout.reference_offsets.as_ref());
-    assert_eq!(19, layout.payload_bytes);
+    assert_eq!(15, layout.payload_bytes);
     assert_eq!(48, layout.block_bytes);
     Ok(())
 }
@@ -316,7 +330,7 @@ fn portable_subclass_preserves_the_superclass_prefix() -> Result<(), AdmissionEr
     assert_eq!(8, subclass.fields[2].offset);
     assert_eq!(16, subclass.fields[3].offset);
     assert_eq!(&[16], subclass.reference_offsets.as_ref());
-    assert_eq!(24, subclass.payload_bytes);
+    assert_eq!(20, subclass.payload_bytes);
     assert_eq!(48, subclass.block_bytes);
 
     Ok(())
@@ -341,7 +355,7 @@ fn portable_literal_deduplication_uses_exact_raw_bytes() -> Result<(), Admission
 
 #[test]
 fn portable_block_alignment_covers_15_16_17_byte_edges() -> Result<(), AdmissionError> {
-    for (field_count, expected) in [(15, 32), (16, 32), (17, 48)] {
+    for (field_count, expected) in [(15, 48), (16, 48), (17, 48)] {
         let fields: Vec<_> = (0..field_count)
             .map(|field| FieldSpec {
                 field,
@@ -400,8 +414,8 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
         .iter()
         .map(|field| (field.field, field.offset))
         .collect();
-    assert_eq!(vec![(0, 0), (1, 8), (3, 16), (2, 24)], offsets);
-    assert_eq!(&[16], subclass.reference_offsets.as_ref());
+    assert_eq!(vec![(0, 0), (1, 8), (3, 12), (2, 16)], offsets);
+    assert_eq!(&[12], subclass.reference_offsets.as_ref());
     assert_eq!(48, subclass.block_bytes);
 
     let static_field = image.field(4).expect("resolved static field");
@@ -458,19 +472,13 @@ fn allocation_resumes_without_recharging_or_publishing_a_prefix() {
 
     assert_eq!(Outcome::SliceExhausted, machine.run_slice(1, 0).unwrap());
     assert_eq!(16, machine.test_pending_initialized_bytes());
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(1, 0).unwrap());
-    assert_eq!(32, machine.test_pending_initialized_bytes());
-    assert_eq!(5, machine.consumed_fixed_cost());
-    assert_eq!(2, machine.consumed_dynamic_cost());
-    assert_eq!(None, machine.test_register(0));
-
     let Outcome::Halted(Some(RuntimeValue::Reference(reference))) =
         machine.run_slice(1, 0).unwrap()
     else {
         panic!("allocation must publish and return its reference atomically");
     };
     assert_eq!(5, machine.consumed_fixed_cost());
-    assert_eq!(3, machine.consumed_dynamic_cost());
+    assert_eq!(2, machine.consumed_dynamic_cost());
     assert_eq!(1, machine.test_heap_diagnostic().live_handles);
     assert!(machine
         .test_managed_payload(reference)
@@ -507,7 +515,7 @@ fn allocation_oversized_request_reports_immediate_exhaustion() {
     assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
     assert_eq!(
         Outcome::AllocationExhausted(AllocationExhaustion {
-            exception: super::value::ReferenceValue::emergency(),
+            exception: super::value::Ref32::reserved(0).unwrap(),
             diagnostic: super::error::AllocationDiagnostic {
                 request_kind: super::error::AllocationRequestKind::Array,
                 requested: 108,
@@ -537,7 +545,7 @@ fn allocation_cancellation_rolls_back_private_storage() {
     machine.start(&[]).unwrap();
 
     assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
-    assert_eq!(64, machine.test_heap_diagnostic().total_free);
+    assert_eq!(80, machine.test_heap_diagnostic().total_free);
     machine.test_cancel_pending().unwrap();
     assert_eq!(128, machine.test_heap_diagnostic().total_free);
     assert_eq!(None, machine.test_register(0));

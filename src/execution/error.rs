@@ -1,4 +1,4 @@
-use super::value::{ReferenceValue, RuntimeValue};
+use super::value::{Ref32, RuntimeValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionError {
@@ -127,7 +127,7 @@ pub struct AllocationDiagnostic {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AllocationExhaustion {
-    pub exception: ReferenceValue,
+    pub exception: Ref32,
     pub diagnostic: AllocationDiagnostic,
     pub collection_attempted: bool,
 }

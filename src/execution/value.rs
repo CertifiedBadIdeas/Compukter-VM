@@ -1,76 +1,69 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ReferenceValue {
-    tagged_slot: u32,
-    generation: u32,
-}
+#[repr(transparent)]
+pub(super) struct Ref32(u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub(super) enum ReferenceDomain {
     Managed = 0,
-    Literal = 1,
-    Emergency = 2,
-    Host = 3,
+    Image = 1,
+    External = 2,
+    Reserved = 3,
 }
 
-impl ReferenceValue {
+impl Ref32 {
     const DOMAIN_SHIFT: u32 = 30;
-    pub(super) const MAX_SLOT: u32 = (1 << Self::DOMAIN_SHIFT) - 1;
+    pub(super) const MAX_PAYLOAD: u32 = (1 << Self::DOMAIN_SHIFT) - 1;
 
-    pub(super) const fn new(domain: ReferenceDomain, slot: u32, generation: u32) -> Option<Self> {
-        if slot > Self::MAX_SLOT {
+    const fn new(domain: ReferenceDomain, payload: u32) -> Option<Self> {
+        if payload > Self::MAX_PAYLOAD {
             return None;
         }
-        Some(Self {
-            tagged_slot: ((domain as u32) << Self::DOMAIN_SHIFT) | slot,
-            generation,
-        })
-    }
-
-    pub(super) const fn managed(slot: u32, generation: u32) -> Option<Self> {
-        Self::new(ReferenceDomain::Managed, slot, generation)
-    }
-
-    pub(super) const fn literal(slot: u32) -> Option<Self> {
-        Self::new(ReferenceDomain::Literal, slot, 0)
-    }
-
-    pub(super) const fn emergency() -> Self {
-        Self {
-            tagged_slot: (ReferenceDomain::Emergency as u32) << Self::DOMAIN_SHIFT,
-            generation: 0,
+        let bits = ((domain as u32) << Self::DOMAIN_SHIFT) | payload;
+        if bits == 0 {
+            return None;
         }
+        Some(Self(bits))
     }
 
-    pub(super) const fn host(slot: u32, generation: u32) -> Option<Self> {
-        Self::new(ReferenceDomain::Host, slot, generation)
+    pub(super) const fn managed(object_header_offset: u32) -> Option<Self> {
+        Self::new(ReferenceDomain::Managed, object_header_offset)
+    }
+
+    pub(super) const fn image(index: u32) -> Option<Self> {
+        Self::new(ReferenceDomain::Image, index)
+    }
+
+    pub(super) const fn external(slot: u32) -> Option<Self> {
+        Self::new(ReferenceDomain::External, slot)
+    }
+
+    pub(super) const fn reserved(payload: u32) -> Option<Self> {
+        Self::new(ReferenceDomain::Reserved, payload)
     }
 
     pub(super) const fn domain(self) -> ReferenceDomain {
-        match self.tagged_slot >> Self::DOMAIN_SHIFT {
+        match self.0 >> Self::DOMAIN_SHIFT {
             0 => ReferenceDomain::Managed,
-            1 => ReferenceDomain::Literal,
-            2 => ReferenceDomain::Emergency,
-            _ => ReferenceDomain::Host,
+            1 => ReferenceDomain::Image,
+            2 => ReferenceDomain::External,
+            _ => ReferenceDomain::Reserved,
         }
     }
 
-    pub(super) const fn slot(self) -> u32 {
-        self.tagged_slot & Self::MAX_SLOT
+    pub(super) const fn payload(self) -> u32 {
+        self.0 & Self::MAX_PAYLOAD
     }
 
-    pub(super) const fn generation(self) -> u32 {
-        self.generation
+    pub(super) const fn to_bits(self) -> u32 {
+        self.0
     }
 
-    pub(super) const fn to_bits(self) -> u64 {
-        (self.tagged_slot as u64) | ((self.generation as u64) << 32)
-    }
-
-    pub(super) const fn from_bits(bits: u64) -> Self {
-        Self {
-            tagged_slot: bits as u32,
-            generation: (bits >> 32) as u32,
+    pub(super) const fn from_bits(bits: u32) -> Option<Self> {
+        if bits == 0 {
+            None
+        } else {
+            Some(Self(bits))
         }
     }
 }
@@ -84,7 +77,7 @@ pub(super) enum RuntimeValue {
     Bool(bool),
     Char(u16),
     Null,
-    Reference(ReferenceValue),
+    Reference(Ref32),
 }
 
 impl RuntimeValue {
@@ -97,7 +90,7 @@ impl RuntimeValue {
             Self::Bool(value) => u64::from(value),
             Self::Char(value) => u64::from(value),
             Self::Null => 0,
-            Self::Reference(value) => value.slot() as u64,
+            Self::Reference(value) => value.payload() as u64,
         }
     }
 
@@ -121,7 +114,7 @@ impl RuntimeValue {
             Self::I64(_) | Self::F64(_) => 8,
             Self::Bool(_) => 1,
             Self::Null => 0,
-            Self::Reference(_) => 16,
+            Self::Reference(_) => 12,
         }
     }
 }
@@ -130,17 +123,35 @@ impl RuntimeValue {
 pub(super) struct EntryArgument {
     pub owner: Option<[u8; 32]>,
     pub value: RuntimeValue,
+    pub external_handle: Option<super::external_roots::ExternalHandle>,
 }
 
 impl EntryArgument {
     pub(super) const fn unowned(value: RuntimeValue) -> Self {
-        Self { owner: None, value }
+        Self {
+            owner: None,
+            value,
+            external_handle: None,
+        }
     }
 
     pub(super) const fn owned(owner: [u8; 32], value: RuntimeValue) -> Self {
         Self {
             owner: Some(owner),
             value,
+            external_handle: None,
+        }
+    }
+
+    pub(super) const fn owned_external(
+        owner: [u8; 32],
+        value: Ref32,
+        handle: super::external_roots::ExternalHandle,
+    ) -> Self {
+        Self {
+            owner: Some(owner),
+            value: RuntimeValue::Reference(value),
+            external_handle: Some(handle),
         }
     }
 }

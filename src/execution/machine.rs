@@ -3,14 +3,15 @@ use super::{
         AdmissionError, AllocationDiagnostic, AllocationExhaustion, AllocationRequestKind,
         AllocationSource, EntryArgumentLimit, GuestTrap, Outcome, RunError, VmFault,
     },
-    gc::Collector,
+    external_roots::ExternalRootTable,
+    gc::{Collector, RootSet},
     heap::{AllocationRequest, Heap},
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
     host::EntryArgumentLimits,
     image::{ExecutionImage, ResolvedInstruction, ResolvedValueType},
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     numeric, text,
-    value::{EntryArgument, ReferenceDomain, ReferenceValue, RegisterValue, RuntimeValue},
+    value::{EntryArgument, Ref32, ReferenceDomain, RegisterValue, RuntimeValue},
     TypeKey,
 };
 use sha2::{Digest, Sha256};
@@ -81,6 +82,7 @@ pub(super) struct Machine {
     static_slots: Box<[RuntimeValue]>,
     type_initialization: Box<[TypeInitializationState]>,
     heap: Heap,
+    external_roots: ExternalRootTable,
     collector: Collector,
     allocation_retry: Option<AllocationRetry>,
     pending_allocation: Option<PendingAllocation>,
@@ -90,7 +92,7 @@ pub(super) struct Machine {
     pending_host_string: Option<text::PendingHostString>,
     pending_host_string_source: Option<AllocationSource>,
     string_collection_pending: Option<StringCollectionTarget>,
-    emergency_oom: Option<super::value::ReferenceValue>,
+    emergency_oom: Option<super::value::Ref32>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
     consumed_dynamic_cost: u64,
@@ -133,11 +135,7 @@ enum StringCollectionTarget {
 
 impl AllocationRetry {
     fn reserve(self, heap: &mut Heap) -> Result<Option<PendingAllocation>, VmFault> {
-        let reservation = match heap.reserve(self.request) {
-            Ok(reservation) => reservation,
-            Err(VmFault::HandleExhausted) => None,
-            Err(fault) => return Err(fault),
-        };
+        let reservation = heap.reserve(self.request)?;
         let Some(reservation) = reservation else {
             return Ok(None);
         };
@@ -160,6 +158,7 @@ impl AllocationRetry {
 impl Machine {
     pub(super) fn new(image: ExecutionImage) -> Result<Self, AdmissionError> {
         let heap = Heap::new(&image.storage_plan())?;
+        let external_roots = ExternalRootTable::new(image.external_root_capacity())?;
         let frame_count = image.maximum_call_depth();
         let register_count = frame_count
             .checked_mul(image.registers_per_frame())
@@ -209,6 +208,7 @@ impl Machine {
             static_slots: static_slots.into_boxed_slice(),
             type_initialization: type_initialization.into_boxed_slice(),
             heap,
+            external_roots,
             collector: Collector::new(),
             allocation_retry: None,
             pending_allocation: None,
@@ -218,7 +218,7 @@ impl Machine {
             pending_host_string: None,
             pending_host_string_source: None,
             string_collection_pending: None,
-            emergency_oom: Some(super::value::ReferenceValue::emergency()),
+            emergency_oom: Some(super::value::Ref32::reserved(0).unwrap()),
             frame_depth: 0,
             consumed_fixed_cost: 0,
             consumed_dynamic_cost: 0,
@@ -369,7 +369,10 @@ impl Machine {
         })?;
         let reservation = match self.heap.reserve(AllocationRequest {
             block_bytes: layout.block_bytes,
-            ty: array_type,
+            type_id: self
+                .image
+                .type_id(array_type)
+                .ok_or(RunError::NotRunnable)?,
         }) {
             Ok(Some(reservation)) => reservation,
             _ => {
@@ -379,11 +382,11 @@ impl Machine {
         };
         let initialize = (|| {
             self.heap
-                .zero_reserved_payload(reservation, 0, layout.block_bytes - 16)?;
+                .zero_reserved_payload(reservation, 0, layout.block_bytes - 24)?;
             self.heap.write_reserved_u32(reservation, 0, count)?;
             for (index, reference) in strings.iter().copied().enumerate() {
                 let offset = 8_u32
-                    .checked_add((index as u32).checked_mul(8).ok_or(VmFault::CorruptHeap)?)
+                    .checked_add((index as u32).checked_mul(4).ok_or(VmFault::CorruptHeap)?)
                     .ok_or(VmFault::CorruptHeap)?;
                 self.heap.write_reserved(
                     reservation,
@@ -407,7 +410,7 @@ impl Machine {
         ))
     }
 
-    fn rollback_entry_references(&mut self, references: &[ReferenceValue]) {
+    fn rollback_entry_references(&mut self, references: &[Ref32]) {
         for reference in references.iter().rev().copied() {
             let _ = self.heap.free(reference);
         }
@@ -709,22 +712,12 @@ impl Machine {
                         };
                         let request = AllocationRequest {
                             block_bytes: layout.block_bytes,
-                            ty: *ty,
+                            type_id: self.image.type_id(*ty).ok_or(RunError::NotRunnable)?,
                         };
                         let logical_bytes = layout.payload_bytes;
                         let reservation = match self.heap.reserve(request) {
                             Ok(Some(reservation)) => reservation,
                             Ok(None) => {
-                                let retry = AllocationRetry {
-                                    request,
-                                    destination: *dst,
-                                    logical_bytes,
-                                    shape: AllocationShape::Object,
-                                    source: self.allocation_source(frame_index),
-                                };
-                                return self.start_collection(retry, maintenance_budget);
-                            }
-                            Err(VmFault::HandleExhausted) => {
                                 let retry = AllocationRetry {
                                     request,
                                     destination: *dst,
@@ -843,7 +836,7 @@ impl Machine {
                         };
                         let request = AllocationRequest {
                             block_bytes: layout.block_bytes,
-                            ty: *ty,
+                            type_id: self.image.type_id(*ty).ok_or(RunError::NotRunnable)?,
                         };
                         if request.block_bytes > self.image.storage_plan().heap_bytes {
                             return Ok(self.allocation_exhausted(
@@ -856,18 +849,6 @@ impl Machine {
                         let reservation = match self.heap.reserve(request) {
                             Ok(Some(reservation)) => reservation,
                             Ok(None) => {
-                                let retry = AllocationRetry {
-                                    request,
-                                    destination: *dst,
-                                    logical_bytes: layout.payload_bytes,
-                                    shape: AllocationShape::Array {
-                                        length: layout.length,
-                                    },
-                                    source: self.allocation_source(frame_index),
-                                };
-                                return self.start_collection(retry, maintenance_budget);
-                            }
-                            Err(VmFault::HandleExhausted) => {
                                 let retry = AllocationRetry {
                                     request,
                                     destination: *dst,
@@ -1097,7 +1078,10 @@ impl Machine {
                             Err(fault) => return Ok(self.fault(fault)),
                         };
                         let actual = match self.heap.managed_type(receiver) {
-                            Ok(actual) => actual,
+                            Ok(actual) => match self.image.type_key(actual as usize) {
+                                Some(actual) => actual,
+                                None => return Ok(self.fault(VmFault::InvalidResolvedId)),
+                            },
                             Err(fault) => return Ok(self.fault(fault)),
                         };
                         if !self.image.is_assignable(actual, field.owner) {
@@ -1148,7 +1132,10 @@ impl Machine {
                             _ => return Ok(self.fault(VmFault::InvalidValueType)),
                         };
                         let actual = match self.heap.managed_type(receiver) {
-                            Ok(actual) => actual,
+                            Ok(actual) => match self.image.type_key(actual as usize) {
+                                Some(actual) => actual,
+                                None => return Ok(self.fault(VmFault::InvalidResolvedId)),
+                            },
                             Err(fault) => return Ok(self.fault(fault)),
                         };
                         if !self.image.is_assignable(actual, field.owner)
@@ -1563,10 +1550,13 @@ impl Machine {
             match self.collector.step(
                 &mut self.heap,
                 &self.image,
-                &self.static_slots,
-                &self.frames,
-                &self.registers,
-                self.frame_depth,
+                RootSet {
+                    static_slots: &self.static_slots,
+                    frames: &self.frames,
+                    registers: &self.registers,
+                    frame_depth: self.frame_depth,
+                    external: &self.external_roots,
+                },
             ) {
                 Ok(1) => {}
                 Ok(_) => return Ok(self.fault(VmFault::CorruptLifecycle)),
@@ -1804,21 +1794,24 @@ impl Machine {
         }
     }
 
-    fn reference_type(
-        &self,
-        reference: super::value::ReferenceValue,
-    ) -> Result<super::TypeKey, VmFault> {
+    fn reference_type(&self, reference: super::value::Ref32) -> Result<super::TypeKey, VmFault> {
         match reference.domain() {
-            super::value::ReferenceDomain::Managed => self.heap.managed_type(reference),
-            super::value::ReferenceDomain::Host => self
+            super::value::ReferenceDomain::Managed => {
+                self.heap.managed_type(reference).and_then(|type_id| {
+                    self.image
+                        .type_key(type_id as usize)
+                        .ok_or(VmFault::InvalidResolvedId)
+                })
+            }
+            super::value::ReferenceDomain::External => self
                 .image
                 .reference_type(reference)
                 .ok_or(VmFault::InvalidReference),
-            super::value::ReferenceDomain::Literal => self
+            super::value::ReferenceDomain::Image => self
                 .image
                 .reference_type(reference)
                 .ok_or(VmFault::InvalidReference),
-            super::value::ReferenceDomain::Emergency => Err(VmFault::InvalidReference),
+            super::value::ReferenceDomain::Reserved => Err(VmFault::InvalidReference),
         }
     }
 
@@ -1846,15 +1839,7 @@ impl Machine {
     fn resolve_array(
         &self,
         value: RuntimeValue,
-    ) -> Result<
-        (
-            super::value::ReferenceValue,
-            super::TypeKey,
-            ValueWidth,
-            i32,
-        ),
-        InstructionFailure,
-    > {
+    ) -> Result<(super::value::Ref32, super::TypeKey, ValueWidth, i32), InstructionFailure> {
         let reference = match value {
             RuntimeValue::Null => return Err(InstructionFailure::Trap(GuestTrap::NullReference)),
             RuntimeValue::Reference(reference) => reference,
@@ -1863,7 +1848,12 @@ impl Machine {
         let ty = self
             .heap
             .managed_type(reference)
-            .map_err(InstructionFailure::Fault)?;
+            .map_err(InstructionFailure::Fault)
+            .and_then(|type_id| {
+                self.image
+                    .type_key(type_id as usize)
+                    .ok_or(InstructionFailure::Fault(VmFault::InvalidResolvedId))
+            })?;
         let element = match self.image.type_layout(ty) {
             Some(RuntimeTypeLayout::Array { element }) => *element,
             _ => return Err(InstructionFailure::Fault(VmFault::InvalidReference)),
@@ -2153,14 +2143,14 @@ impl Machine {
     }
 
     #[cfg(test)]
-    pub(super) fn string_length(&self, reference: super::value::ReferenceValue) -> i32 {
+    pub(super) fn string_length(&self, reference: super::value::Ref32) -> i32 {
         text::length(&self.image, &self.heap, RuntimeValue::Reference(reference))
             .ok()
             .unwrap()
     }
 
     #[cfg(test)]
-    pub(super) fn string_get(&self, reference: super::value::ReferenceValue, index: i32) -> u16 {
+    pub(super) fn string_get(&self, reference: super::value::Ref32, index: i32) -> u16 {
         text::get(
             &self.image,
             &self.heap,
@@ -2174,7 +2164,7 @@ impl Machine {
     #[cfg(test)]
     pub(super) fn string_encoding(
         &self,
-        reference: super::value::ReferenceValue,
+        reference: super::value::Ref32,
     ) -> Option<super::layout::StringEncoding> {
         text::encoding(&self.image, &self.heap, RuntimeValue::Reference(reference))
             .ok()
@@ -2285,18 +2275,27 @@ impl Machine {
                         let actual = self
                             .heap
                             .managed_type(value)
-                            .map_err(|_| RunError::DeadReference { parameter })?;
+                            .ok()
+                            .and_then(|type_id| self.image.type_key(type_id as usize))
+                            .ok_or(RunError::DeadReference { parameter })?;
                         if self.image.is_assignable(actual, expected_type) {
                             Ok(())
                         } else {
                             Err(RunError::EntryType { parameter })
                         }
                     }
-                    ReferenceDomain::Host => {
+                    ReferenceDomain::External => {
                         let admitted = self
                             .image
                             .host_reference(value)
-                            .filter(|value| value.live)
+                            .filter(|value| {
+                                value.live
+                                    && argument.external_handle
+                                        == Some(super::external_roots::ExternalHandle {
+                                            slot: value.value.payload(),
+                                            generation: value.generation,
+                                        })
+                            })
                             .ok_or(RunError::DeadReference { parameter })?;
                         if admitted.assignable_to.contains(&expected_type) {
                             Ok(())
@@ -2304,7 +2303,7 @@ impl Machine {
                             Err(RunError::EntryType { parameter })
                         }
                     }
-                    ReferenceDomain::Literal | ReferenceDomain::Emergency => {
+                    ReferenceDomain::Image | ReferenceDomain::Reserved => {
                         Err(RunError::EntryType { parameter })
                     }
                 }
@@ -2341,10 +2340,7 @@ impl Machine {
     }
 
     #[cfg(test)]
-    pub(super) fn test_managed_payload(
-        &self,
-        reference: super::value::ReferenceValue,
-    ) -> Option<Box<[u8]>> {
+    pub(super) fn test_managed_payload(&self, reference: super::value::Ref32) -> Option<Box<[u8]>> {
         self.heap.test_managed_payload(reference)
     }
 
@@ -2367,17 +2363,13 @@ impl Machine {
     }
 
     #[cfg(test)]
-    pub(super) fn test_exhaust_handle_capacity(&mut self) {
-        self.heap.test_exhaust_handle_capacity();
-    }
-
-    #[cfg(test)]
     pub(super) fn test_reserved_bytes(&self) -> usize {
         core::mem::size_of::<Self>()
             + self.frames.len() * core::mem::size_of::<Frame>()
             + self.registers.len() * core::mem::size_of::<RegisterValue>()
             + self.static_slots.len() * core::mem::size_of::<RuntimeValue>()
             + self.heap.test_reserved_bytes()
+            + self.external_roots.reserved_bytes()
     }
 
     #[cfg(test)]
@@ -2486,8 +2478,7 @@ fn trace_register(
                     let ty = reference_type.ok_or(RunError::NotRunnable)?;
                     trace.update(ty.module.to_le_bytes());
                     trace.update(ty.ty.to_le_bytes());
-                    trace.update(value.slot().to_le_bytes());
-                    trace.update(value.generation().to_le_bytes());
+                    trace.update(value.payload().to_le_bytes());
                 }
             }
         }

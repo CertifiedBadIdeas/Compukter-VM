@@ -3,7 +3,7 @@ use super::{
     heap::{AllocationRequest, Heap, ReservedAllocation},
     image::{ExecutionImage, ResolvedLiteral},
     layout::{string_layout, StringEncoding, StringLayout},
-    value::{ReferenceValue, RuntimeValue},
+    value::{Ref32, RuntimeValue},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -15,12 +15,12 @@ pub(super) enum StringBacking {
     },
     Literal(ResolvedLiteral),
     Managed {
-        reference: ReferenceValue,
+        reference: Ref32,
         length: u32,
         encoding: StringEncoding,
     },
     CharArray {
-        reference: ReferenceValue,
+        reference: Ref32,
         length: u32,
     },
 }
@@ -312,7 +312,7 @@ impl PendingConcat {
     }
 
     pub(super) fn char_array(
-        reference: ReferenceValue,
+        reference: Ref32,
         length: i32,
         start: i32,
         end: i32,
@@ -374,10 +374,11 @@ impl PendingConcat {
                 .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?;
             self.reservation = match heap.reserve(AllocationRequest {
                 block_bytes: layout.block_bytes,
-                ty,
+                type_id: image
+                    .type_id(ty)
+                    .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?,
             }) {
                 Ok(reservation) => reservation,
-                Err(VmFault::HandleExhausted) => None,
                 Err(fault) => return Err(TextError::Fault(fault)),
             };
             if self.reservation.is_none() {
@@ -396,7 +397,7 @@ impl PendingConcat {
         let reservation = self
             .reservation
             .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
-        let initialized_bytes = layout.block_bytes - 16;
+        let initialized_bytes = layout.block_bytes - 24;
         while self.written < initialized_bytes && used < budget {
             let end = self.written.saturating_add(16).min(initialized_bytes);
             let mut chunk = [0_u8; 16];
@@ -528,10 +529,11 @@ impl PendingHostString {
                 .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?;
             self.reservation = match heap.reserve(AllocationRequest {
                 block_bytes: layout.block_bytes,
-                ty,
+                type_id: image
+                    .type_id(ty)
+                    .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?,
             }) {
                 Ok(reservation) => reservation,
-                Err(VmFault::HandleExhausted) => None,
                 Err(fault) => return Err(TextError::Fault(fault)),
             };
             if self.reservation.is_none() {
@@ -550,7 +552,7 @@ impl PendingHostString {
         let reservation = self
             .reservation
             .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
-        let initialized_bytes = layout.block_bytes - 16;
+        let initialized_bytes = layout.block_bytes - 24;
         while self.written < initialized_bytes && used < budget {
             let end = self.written.saturating_add(16).min(initialized_bytes);
             let mut chunk = [0_u8; 16];
@@ -1018,6 +1020,7 @@ fn backing(
     if heap.managed_type(reference).map_err(TextError::Fault)?
         != image
             .string_type()
+            .and_then(|ty| image.type_id(ty))
             .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?
     {
         return Err(TextError::Fault(VmFault::InvalidReference));

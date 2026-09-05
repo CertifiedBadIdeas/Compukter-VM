@@ -10,7 +10,7 @@ use super::{
     frame::{FrameLayout, SafepointMap},
     host::{HostValueType, ResolvedCapability},
     layout::{object_layout, FieldSpec, RuntimeTypeLayout, StoragePlan, ValueWidth},
-    value::{ReferenceValue, RuntimeValue},
+    value::{Ref32, RuntimeValue},
     FunctionKey, TypeKey,
 };
 
@@ -354,7 +354,8 @@ pub(super) struct ResolvedBlock {
 
 #[derive(Debug)]
 pub(super) struct ResolvedHostReference {
-    pub value: ReferenceValue,
+    pub value: Ref32,
+    pub generation: u32,
     pub ty: TypeKey,
     pub live: bool,
     pub assignable_to: Box<[TypeKey]>,
@@ -402,6 +403,7 @@ struct ExecutionImageInner {
     storage_plan: StoragePlan,
     registers_per_frame: usize,
     maximum_call_depth: usize,
+    external_root_capacity: u32,
     minimum_slice_cost: u32,
     maximum_slice_budget: u32,
 }
@@ -690,16 +692,17 @@ impl ExecutionImage {
         let mut host_references = reserved(profile.host_references.len())?;
         for (index, reference) in profile.host_references.iter().enumerate() {
             if !type_exists(decoded, reference.ty)
-                || profile.host_references[..index].iter().any(|prior| {
-                    prior.handle == reference.handle && prior.generation == reference.generation
-                })
+                || profile.host_references[..index]
+                    .iter()
+                    .any(|prior| prior.handle == reference.handle)
             {
                 return Err(AdmissionError::InvalidEntry);
             }
             let assignable_to = assignable_types(decoded, reference.ty)?;
             host_references.push(ResolvedHostReference {
-                value: ReferenceValue::host(reference.handle, reference.generation)
+                value: Ref32::external(reference.handle)
                     .ok_or(AdmissionError::StoragePlanOverflow)?,
+                generation: reference.generation,
                 ty: reference.ty,
                 live: reference.live,
                 assignable_to,
@@ -734,6 +737,7 @@ impl ExecutionImage {
             storage_plan,
             registers_per_frame,
             maximum_call_depth: decoded.manifest.maximum_call_depth as usize,
+            external_root_capacity: decoded.manifest.maximum_host_requests,
             minimum_slice_cost: decoded.manifest.minimum_slice_cost,
             maximum_slice_budget: profile.maximum_slice_budget,
         })))
@@ -792,6 +796,10 @@ impl ExecutionImage {
         self.0.maximum_call_depth
     }
 
+    pub(super) fn external_root_capacity(&self) -> u32 {
+        self.0.external_root_capacity
+    }
+
     pub(super) fn minimum_slice_cost(&self) -> u32 {
         self.0.minimum_slice_cost
     }
@@ -800,23 +808,23 @@ impl ExecutionImage {
         self.0.maximum_slice_budget
     }
 
-    pub(super) fn host_reference(&self, value: ReferenceValue) -> Option<&ResolvedHostReference> {
+    pub(super) fn host_reference(&self, value: Ref32) -> Option<&ResolvedHostReference> {
         self.0
             .host_references
             .iter()
             .find(|reference| reference.value == value)
     }
 
-    pub(super) fn reference_type(&self, value: ReferenceValue) -> Option<TypeKey> {
+    pub(super) fn reference_type(&self, value: Ref32) -> Option<TypeKey> {
         match value.domain() {
-            super::value::ReferenceDomain::Host => self
+            super::value::ReferenceDomain::External => self
                 .host_reference(value)
                 .filter(|entry| entry.live)
                 .map(|entry| entry.ty),
-            super::value::ReferenceDomain::Literal => {
+            super::value::ReferenceDomain::Image => {
                 self.literal_reference(value).and(self.0.string_type)
             }
-            super::value::ReferenceDomain::Managed | super::value::ReferenceDomain::Emergency => {
+            super::value::ReferenceDomain::Managed | super::value::ReferenceDomain::Reserved => {
                 None
             }
         }
@@ -837,6 +845,10 @@ impl ExecutionImage {
 
     pub(super) fn type_index(&self, key: TypeKey) -> Option<usize> {
         checked_global_index(&self.0.type_offsets, key)
+    }
+
+    pub(super) fn type_id(&self, key: TypeKey) -> Option<u32> {
+        u32::try_from(self.type_index(key)?).ok()
     }
 
     pub(super) fn type_key(&self, index: usize) -> Option<TypeKey> {
@@ -899,9 +911,9 @@ impl ExecutionImage {
         literal.bytes.slice(&self.0.artifact_bytes)
     }
 
-    pub(super) fn literal_reference(&self, value: ReferenceValue) -> Option<ResolvedLiteral> {
-        (value.domain() == super::value::ReferenceDomain::Literal)
-            .then(|| self.0.literals.get(value.slot() as usize).copied())
+    pub(super) fn literal_reference(&self, value: Ref32) -> Option<ResolvedLiteral> {
+        (value.domain() == super::value::ReferenceDomain::Image)
+            .then(|| self.0.literals.get(value.payload() as usize).copied())
             .flatten()
     }
 
@@ -915,9 +927,7 @@ impl ExecutionImage {
             .literals
             .iter()
             .position(|literal| literal.code_units == 0)?;
-        Some(RuntimeValue::Reference(ReferenceValue::literal(
-            index as u32,
-        )?))
+        Some(RuntimeValue::Reference(Ref32::image(index as u32)?))
     }
 }
 
@@ -1384,7 +1394,7 @@ fn resolve_constant(
                 .get(source)
                 .ok_or(AdmissionError::InvalidEntry)?;
             RuntimeValue::Reference(
-                ReferenceValue::literal(
+                Ref32::image(
                     u32::try_from(canonical).map_err(|_| AdmissionError::StoragePlanOverflow)?,
                 )
                 .ok_or(AdmissionError::StoragePlanOverflow)?,

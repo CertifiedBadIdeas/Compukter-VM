@@ -1,11 +1,12 @@
 use super::{
     error::VmFault,
+    external_roots::ExternalRootTable,
     heap::Heap,
     heap_ops::load_value,
     image::ExecutionImage,
     layout::{RuntimeTypeLayout, ValueWidth},
     machine::Frame,
-    value::{ReferenceValue, RegisterValue, RuntimeValue},
+    value::{Ref32, RegisterValue, RuntimeValue},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14,6 +15,14 @@ pub(super) enum CollectorPhase {
     Roots,
     Mark,
     Sweep,
+}
+
+pub(super) struct RootSet<'a> {
+    pub static_slots: &'a [RuntimeValue],
+    pub frames: &'a [Frame],
+    pub registers: &'a [RegisterValue],
+    pub frame_depth: usize,
+    pub external: &'a ExternalRootTable,
 }
 
 #[cfg(test)]
@@ -30,11 +39,11 @@ pub(super) enum CollectorAction {
 #[derive(Clone, Copy, Debug)]
 enum Scan {
     Object {
-        reference: ReferenceValue,
+        reference: Ref32,
         next: usize,
     },
     ReferenceArray {
-        reference: ReferenceValue,
+        reference: Ref32,
         next: u32,
         length: u32,
     },
@@ -43,6 +52,7 @@ enum Scan {
 pub(super) struct Collector {
     phase: CollectorPhase,
     epoch: u32,
+    external_root: usize,
     static_field: usize,
     frame: usize,
     register: usize,
@@ -59,6 +69,7 @@ impl Collector {
         Self {
             phase: CollectorPhase::Idle,
             epoch: 0,
+            external_root: 0,
             static_field: 0,
             frame: 0,
             register: 0,
@@ -75,6 +86,7 @@ impl Collector {
         debug_assert_eq!(self.phase, CollectorPhase::Idle);
         self.epoch = if self.epoch == 1 { 2 } else { 1 };
         self.phase = CollectorPhase::Roots;
+        self.external_root = 0;
         self.static_field = 0;
         self.frame = 0;
         self.register = 0;
@@ -100,10 +112,7 @@ impl Collector {
         &mut self,
         heap: &mut Heap,
         image: &ExecutionImage,
-        static_slots: &[RuntimeValue],
-        frames: &[Frame],
-        registers: &[RegisterValue],
-        frame_depth: usize,
+        roots: RootSet<'_>,
     ) -> Result<u32, VmFault> {
         #[cfg(test)]
         {
@@ -112,9 +121,14 @@ impl Collector {
         match self.phase {
             CollectorPhase::Idle => Ok(0),
             CollectorPhase::Roots => {
-                if let Some(root) =
-                    self.next_root(image, static_slots, frames, registers, frame_depth)?
-                {
+                if let Some(root) = self.next_root(
+                    image,
+                    roots.static_slots,
+                    roots.frames,
+                    roots.registers,
+                    roots.frame_depth,
+                    roots.external,
+                )? {
                     self.enqueue_value(heap, root)?;
                     #[cfg(test)]
                     {
@@ -159,7 +173,15 @@ impl Collector {
         frames: &[Frame],
         registers: &[RegisterValue],
         frame_depth: usize,
+        external_roots: &ExternalRootTable,
     ) -> Result<Option<RuntimeValue>, VmFault> {
+        while self.external_root < external_roots.len() {
+            let index = self.external_root;
+            self.external_root += 1;
+            if let Some(reference) = external_roots.root(index) {
+                return Ok(Some(RuntimeValue::Reference(reference)));
+            }
+        }
         while let Some(field) = image.fields().get(self.static_field) {
             self.static_field += 1;
             if field.value_type.kind == 7 && field.static_slot.is_some() {
@@ -218,7 +240,9 @@ impl Collector {
         if let Some(scan) = self.scan {
             match scan {
                 Scan::Object { reference, next } => {
-                    let ty = heap.managed_type(reference)?;
+                    let ty = image
+                        .type_key(heap.managed_type(reference)? as usize)
+                        .ok_or(VmFault::InvalidResolvedId)?;
                     let RuntimeTypeLayout::Object(layout) =
                         image.type_layout(ty).ok_or(VmFault::InvalidResolvedId)?
                     else {
@@ -246,7 +270,7 @@ impl Collector {
                     length,
                 } => {
                     let offset = 8_u32
-                        .checked_add(next.checked_mul(8).ok_or(VmFault::CorruptHeap)?)
+                        .checked_add(next.checked_mul(4).ok_or(VmFault::CorruptHeap)?)
                         .ok_or(VmFault::CorruptHeap)?;
                     let value = load_value(heap, reference, offset, ValueWidth::Ref)?;
                     self.enqueue_value(heap, value)?;
@@ -264,7 +288,8 @@ impl Collector {
             return Ok(());
         }
 
-        let Some((reference, ty)) = heap.dequeue_gray(&mut self.gray_head, &mut self.gray_tail)?
+        let Some((reference, type_id)) =
+            heap.dequeue_gray(&mut self.gray_head, &mut self.gray_tail)?
         else {
             self.phase = CollectorPhase::Sweep;
             self.sweep_offset = 0;
@@ -276,8 +301,11 @@ impl Collector {
         };
         #[cfg(test)]
         {
-            self.last_action = Some(CollectorAction::Dequeue(reference.slot()));
+            self.last_action = Some(CollectorAction::Dequeue(reference.payload()));
         }
+        let ty = image
+            .type_key(type_id as usize)
+            .ok_or(VmFault::InvalidResolvedId)?;
         match image.type_layout(ty).ok_or(VmFault::InvalidResolvedId)? {
             RuntimeTypeLayout::Object(layout) if !layout.reference_offsets.is_empty() => {
                 self.scan = Some(Scan::Object { reference, next: 0 });
@@ -300,7 +328,7 @@ impl Collector {
             | RuntimeTypeLayout::NonHeap => {
                 #[cfg(test)]
                 {
-                    self.last_action = Some(CollectorAction::Leaf(reference.slot()));
+                    self.last_action = Some(CollectorAction::Leaf(reference.payload()));
                 }
             }
         }
