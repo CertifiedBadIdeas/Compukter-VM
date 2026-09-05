@@ -169,7 +169,7 @@ fn verify_signature<'a>(
     function: &Function,
     limits: &ArtifactLimits,
 ) -> Result<(usize, &'a ValueType, &'a [ValueType]), DiagnosticSet> {
-    if function.register_count as usize != function.registers.len()
+    if function.register_count as usize != function.values.len()
         || function.parameter_count > function.register_count
     {
         return Err(type_failure(
@@ -212,8 +212,14 @@ fn verify_signature<'a>(
             "function flags or parameter count disagree with signature",
         ));
     }
-    for (register, parameter) in function.registers.iter().zip(parameters) {
-        if !modules::value_types_match(artifact, module_id, *register, identity.0, *parameter) {
+    for (register, parameter) in function.values.iter().zip(parameters) {
+        if !modules::value_types_match(
+            artifact,
+            module_id,
+            register.semantic_type,
+            identity.0,
+            *parameter,
+        ) {
             return Err(type_failure(
                 limits,
                 module_id,
@@ -1964,9 +1970,9 @@ fn register_type(
     limits: &ArtifactLimits,
 ) -> Result<ValueType, DiagnosticSet> {
     function
-        .registers
+        .values
         .get(register as usize)
-        .copied()
+        .map(|value| value.semantic_type)
         .ok_or_else(|| {
             failure(
                 limits,

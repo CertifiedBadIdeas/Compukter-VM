@@ -7,8 +7,8 @@ use crate::{
     limits::ArtifactLimits,
 };
 
-const MODULE_DOMAIN: &[u8] = b"Compukter module v1\0";
-const SEMANTIC_MODULE_SECTIONS: [u16; 11] = [
+const MODULE_DOMAIN: &[u8] = b"Compukter module v2\0";
+const SEMANTIC_MODULE_SECTIONS: [u16; 12] = [
     format::STRINGS,
     format::TYPES,
     format::CONSTANTS,
@@ -20,6 +20,7 @@ const SEMANTIC_MODULE_SECTIONS: [u16; 11] = [
     format::CODE,
     format::EXCEPTIONS,
     format::UTF16_LITERALS,
+    format::SAFEPOINT_ROOTS,
 ];
 
 pub(crate) fn verify_modules(

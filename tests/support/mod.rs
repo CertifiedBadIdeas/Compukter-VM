@@ -20,6 +20,44 @@ fn push_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+fn function_value(mut semantic_type: Vec<u8>, atom: u8) -> Vec<u8> {
+    push_u16(&mut semantic_type, 1);
+    push_u16(&mut semantic_type, 0);
+    semantic_type.push(atom);
+    semantic_type
+}
+
+fn empty_safepoint_roots(block_instruction_counts: &[u32]) -> Vec<u8> {
+    let roots: Vec<_> = block_instruction_counts
+        .iter()
+        .copied()
+        .enumerate()
+        .flat_map(|(block, instruction_count)| {
+            (0..instruction_count).map(move |boundary| (block as u32, boundary, &[][..]))
+        })
+        .collect();
+    safepoint_roots(&roots)
+}
+
+fn safepoint_roots(records: &[(u32, u32, &[(u16, u16)])]) -> Vec<u8> {
+    let mut encoded_records = Vec::new();
+    for &(block, boundary, references) in records {
+        let mut record = Vec::new();
+        push_u32(&mut record, 0);
+        push_u32(&mut record, block);
+        push_u32(&mut record, boundary);
+        push_u16(&mut record, references.len() as u16);
+        push_u16(&mut record, 0);
+        for &(value, component) in references {
+            push_u16(&mut record, value);
+            push_u16(&mut record, component);
+        }
+        encoded_records.push(record);
+    }
+    let refs: Vec<&[u8]> = encoded_records.iter().map(Vec::as_slice).collect();
+    indexed(&refs)
+}
+
 fn indexed(records: &[&[u8]]) -> Vec<u8> {
     let record_bytes = records.iter().map(|record| record.len()).sum::<usize>();
     let mut bytes = Vec::new();
@@ -79,7 +117,7 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
     for value in [0, 2, 0, 1] {
         push_u32(&mut function, value);
     }
-    function.extend(value_type(7, 0, 0));
+    function.extend(function_value(value_type(7, 0, 0), 4));
     let functions = indexed(&[&function]);
 
     let mut protected = Vec::new();
@@ -118,6 +156,7 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
         (0x0108, code, 2),
         (0x0109, exceptions, 1),
         (0x010a, empty.clone(), 0),
+        (0x010b, empty_safepoint_roots(&[2, 1]), 3),
     ];
     let module_hash = semantic_hash(&semantic_sections);
 
@@ -204,7 +243,14 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
         push_u32(&mut function, value);
     }
     for register in registers {
-        function.extend(register);
+        let atom = match register[0] {
+            2 => 1,
+            3 => 2,
+            4 => 3,
+            7 => 4,
+            _ => 0,
+        };
+        function.extend(function_value(register, atom));
     }
     let functions = indexed(&[&function]);
 
@@ -273,6 +319,26 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
         (0x0108, code, 5),
         (0x0109, exceptions, 1),
         (0x010a, empty.clone(), 0),
+        (
+            0x010b,
+            safepoint_roots(&[
+                (0, 0, &[]),
+                (0, 1, &[]),
+                (0, 2, &[(1, 0)]),
+                (0, 3, &[(1, 0)]),
+                (0, 4, &[(1, 0)]),
+                (0, 5, &[]),
+                (1, 0, &[]),
+                (1, 1, &[(4, 0)]),
+                (1, 2, &[(4, 0)]),
+                (1, 3, &[]),
+                (2, 0, &[]),
+                (2, 1, &[(6, 0)]),
+                (3, 0, &[]),
+                (4, 0, &[]),
+            ]),
+            14,
+        ),
     ];
     single_module_artifact(semantic_sections, None, 1 << 0, 1, 3, 10)
 }
@@ -326,7 +392,8 @@ pub(crate) fn debug_vector() -> Vec<u8> {
         (0x0107, blocks, 1),
         (0x0108, code, 1),
         (0x0109, empty.clone(), 0),
-        (0x010a, empty, 0),
+        (0x010a, empty.clone(), 0),
+        (0x010b, empty_safepoint_roots(&[2]), 2),
     ];
 
     let path = b"src/main.kts";
@@ -487,13 +554,14 @@ fn minimal_module_sections(
         (0x0107, blocks, 1),
         (0x0108, code, 1),
         (0x0109, empty.clone(), 0),
-        (0x010a, empty, 0),
+        (0x010a, empty.clone(), 0),
+        (0x010b, empty_safepoint_roots(&[1]), 1),
     ]
 }
 
 fn semantic_hash(sections: &[(u16, Vec<u8>, u32)]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"Compukter module v1\0");
+    hasher.update(b"Compukter module v2\0");
     for (kind, payload, _) in sections {
         hasher.update(kind.to_le_bytes());
         hasher.update((payload.len() as u64).to_le_bytes());
@@ -594,7 +662,7 @@ fn assemble(sections: Vec<(u16, u32, Vec<u8>, u32)>, semantic_features: u32) -> 
     let payload_end = entries.last().unwrap().2 + entries.last().unwrap().3;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"CPKT");
-    for value in [2_u16, 0, 1, 0, 64, 32] {
+    for value in [3_u16, 0, 1, 0, 64, 32] {
         push_u16(&mut bytes, value);
     }
     push_u32(&mut bytes, sections.len() as u32);
@@ -693,10 +761,11 @@ fn vector_with_tables(
         (0x0108, code.clone()),
         (0x0109, empty.clone()),
         (0x010a, utf16_literals),
+        (0x010b, empty_safepoint_roots(&[1])),
     ];
 
     let mut module_hasher = Sha256::new();
-    module_hasher.update(b"Compukter module v1\0");
+    module_hasher.update(b"Compukter module v2\0");
     for (kind, payload) in &module_sections {
         module_hasher.update(kind.to_le_bytes());
         module_hasher.update((payload.len() as u64).to_le_bytes());
@@ -728,7 +797,7 @@ fn vector_with_tables(
         let count = match kind {
             0x0100 => 2,
             0x0102 => constant_records.len() as u32,
-            0x0101 | 0x0106 | 0x0107 | 0x0108 => 1,
+            0x0101 | 0x0106 | 0x0107 | 0x0108 | 0x010b => 1,
             0x010a => utf16_literal_records.len() as u32,
             _ => 0,
         };
@@ -746,7 +815,7 @@ fn vector_with_tables(
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"CPKT");
-    for value in [2_u16, 0, 1, 0, 64, 32] {
+    for value in [3_u16, 0, 1, 0, 64, 32] {
         push_u16(&mut bytes, value);
     }
     push_u32(&mut bytes, sections.len() as u32);

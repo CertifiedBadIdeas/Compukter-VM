@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod error;
+mod frame;
 mod gc;
 mod heap;
 mod heap_ops;

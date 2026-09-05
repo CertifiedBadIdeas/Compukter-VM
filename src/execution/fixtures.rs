@@ -188,7 +188,7 @@ pub(super) fn recursive_suspend_artifact(maximum_call_depth: u32) -> VerifiedArt
         let function = &mut artifact.modules[0].functions[0];
         function.flags = 1;
         function.register_count = 1;
-        function.registers = vec![i32_type];
+        function.values = crate::artifact::scalar_values(vec![i32_type]);
         function.block_count = 2;
         let programs = [
             vec![
@@ -410,7 +410,7 @@ pub(crate) fn redstone_i32_artifact(
     function.flags = u32::from(asynchronous);
     function.register_count = (arguments.len() + 1) as u16;
     function.parameter_count = 0;
-    function.registers = vec![i32_type; arguments.len() + 1];
+    function.values = crate::artifact::scalar_values(vec![i32_type; arguments.len() + 1]);
     let mut first = arguments
         .iter()
         .enumerate()
@@ -487,7 +487,7 @@ pub(crate) fn redstone_unit_artifact(operation: u32, arguments: &[i32]) -> Verif
     function.flags = 1;
     function.register_count = arguments.len() as u16;
     function.parameter_count = 0;
-    function.registers = vec![i32_type; arguments.len()];
+    function.values = crate::artifact::scalar_values(vec![i32_type; arguments.len()]);
     let mut first = arguments
         .iter()
         .enumerate()
@@ -541,7 +541,7 @@ pub(super) fn scalar_capability_artifact(
         function.flags = 1;
         function.register_count = 2;
         function.parameter_count = 0;
-        function.registers = vec![value_type, value_type];
+        function.values = crate::artifact::scalar_values(vec![value_type, value_type]);
         function.first_block = BlockId(0);
         function.block_count = 2;
         let first = vec![
@@ -1084,8 +1084,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 2,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(7))),
             digest: [
-                151, 108, 90, 222, 201, 3, 54, 117, 188, 106, 18, 217, 130, 135, 42, 203, 128, 100,
-                20, 138, 15, 232, 16, 80, 214, 121, 142, 153, 176, 26, 7, 178,
+                130, 247, 11, 159, 19, 81, 241, 126, 113, 207, 203, 8, 46, 24, 240, 52, 77, 229,
+                210, 75, 228, 119, 37, 185, 163, 98, 101, 54, 126, 206, 163, 211,
             ],
             fixed_cost: 2,
         },
@@ -1096,8 +1096,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 64,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(10))),
             digest: [
-                244, 209, 2, 74, 20, 210, 35, 144, 0, 113, 50, 177, 169, 80, 239, 240, 172, 42, 89,
-                92, 112, 31, 70, 210, 58, 92, 218, 58, 52, 156, 181, 249,
+                240, 102, 68, 1, 30, 47, 57, 99, 167, 239, 90, 236, 70, 220, 191, 92, 125, 42, 83,
+                140, 178, 109, 197, 174, 166, 183, 227, 141, 1, 198, 237, 157,
             ],
             fixed_cost: 3,
         },
@@ -1108,8 +1108,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 64,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(20))),
             digest: [
-                211, 66, 210, 200, 71, 142, 65, 251, 248, 217, 13, 67, 251, 243, 197, 163, 196, 91,
-                239, 129, 28, 37, 192, 254, 217, 187, 60, 196, 38, 164, 238, 204,
+                209, 187, 149, 14, 175, 90, 91, 173, 54, 63, 192, 189, 74, 151, 139, 57, 139, 204,
+                143, 223, 133, 199, 10, 153, 71, 11, 211, 127, 21, 123, 192, 56,
             ],
             fixed_cost: 5,
         },
@@ -1120,8 +1120,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 128,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(42))),
             digest: [
-                201, 119, 75, 39, 178, 10, 57, 219, 215, 36, 205, 152, 146, 42, 127, 132, 68, 81,
-                143, 149, 175, 30, 3, 9, 154, 210, 194, 158, 118, 123, 93, 87,
+                207, 166, 214, 172, 19, 131, 203, 144, 243, 186, 64, 28, 241, 73, 252, 231, 189,
+                14, 81, 111, 157, 82, 207, 78, 41, 201, 205, 255, 246, 197, 112, 134,
             ],
             fixed_cost: 17,
         },
@@ -1132,8 +1132,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 7,
             outcome: super::error::Outcome::Crashed(super::error::GuestTrap::DivisionByZero),
             digest: [
-                35, 202, 17, 96, 145, 125, 133, 203, 249, 195, 128, 149, 104, 107, 165, 79, 153,
-                192, 62, 78, 177, 11, 129, 129, 182, 210, 124, 57, 3, 57, 234, 43,
+                176, 243, 1, 105, 202, 133, 245, 103, 74, 55, 155, 223, 188, 186, 26, 77, 230, 182,
+                170, 55, 78, 172, 125, 14, 143, 128, 155, 189, 80, 104, 40, 143,
             ],
             fixed_cost: 7,
         },
@@ -1144,8 +1144,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 8,
             outcome: super::error::Outcome::Halted(None),
             digest: [
-                215, 252, 250, 124, 85, 228, 249, 2, 87, 112, 107, 148, 86, 120, 171, 246, 233,
-                219, 187, 107, 60, 7, 135, 23, 169, 239, 247, 121, 78, 79, 206, 76,
+                178, 137, 19, 129, 145, 169, 17, 162, 85, 159, 13, 174, 192, 21, 95, 180, 227, 186,
+                108, 87, 125, 99, 30, 141, 63, 45, 48, 254, 181, 231, 140, 124,
             ],
             fixed_cost: 8,
         },
@@ -1156,8 +1156,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 7,
             outcome: super::error::Outcome::SliceExhausted,
             digest: [
-                34, 19, 23, 229, 33, 41, 193, 18, 208, 220, 222, 159, 225, 186, 88, 105, 11, 116,
-                4, 213, 124, 241, 190, 107, 205, 191, 20, 193, 142, 89, 94, 144,
+                146, 248, 34, 222, 97, 178, 167, 56, 201, 175, 71, 80, 88, 44, 131, 21, 248, 162,
+                223, 147, 194, 66, 194, 126, 177, 97, 212, 239, 125, 100, 135, 127,
             ],
             fixed_cost: 3,
         },
@@ -1168,8 +1168,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 10,
             outcome: super::error::Outcome::SliceExhausted,
             digest: [
-                149, 254, 246, 115, 98, 218, 144, 42, 127, 35, 58, 243, 181, 22, 123, 44, 194, 229,
-                69, 98, 0, 80, 8, 87, 172, 24, 216, 24, 87, 189, 85, 95,
+                200, 107, 125, 99, 42, 185, 194, 56, 4, 94, 85, 89, 142, 187, 201, 241, 2, 164,
+                190, 217, 140, 165, 66, 124, 133, 191, 241, 8, 43, 183, 236, 85,
             ],
             fixed_cost: 9,
         },
@@ -1469,7 +1469,7 @@ fn entry_string_array_artifact(code_unit: Option<(i32, i32)>) -> VerifiedArtifac
         let function = &mut module.functions[0];
         function.register_count = registers.len() as u16;
         function.parameter_count = 1;
-        function.registers = registers;
+        function.values = crate::artifact::scalar_values(registers);
         module.constants = constants;
         artifact.header.entry_arguments = crate::artifact::EntryArguments::StringArray;
         install_entry_blocks(&mut artifact, vec![instructions]);
@@ -2217,7 +2217,7 @@ fn literal_string_program_blocks_configured(
     let function = &mut application.functions[0];
     function.register_count = register_count as u16;
     function.parameter_count = 0;
-    function.registers = registers;
+    function.values = crate::artifact::scalar_values(registers);
     function.first_block = BlockId(0);
     function.block_count = programs.len() as u32;
     application.blocks.clear();
@@ -3747,7 +3747,7 @@ pub(super) fn object_allocation_artifact(field_count: u32) -> VerifiedArtifact {
             .collect();
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 1;
-        function.registers = vec![reference];
+        function.values = crate::artifact::scalar_values(vec![reference]);
         let instructions = vec![
             Instruction::NewObject {
                 dst: 0,
@@ -3788,7 +3788,7 @@ pub(super) fn gc_retry_artifact() -> VerifiedArtifact {
         artifact.modules[0].declared_types = 2;
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 1;
-        function.registers = vec![reference];
+        function.values = crate::artifact::scalar_values(vec![reference]);
         install_entry_blocks(
             artifact,
             vec![
@@ -3836,7 +3836,7 @@ pub(super) fn gc_failed_retry_artifact() -> VerifiedArtifact {
         artifact.modules[0].declared_types = 2;
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 2;
-        function.registers = vec![reference, reference];
+        function.values = crate::artifact::scalar_values(vec![reference, reference]);
         install_entry_blocks(
             artifact,
             vec![
@@ -3900,7 +3900,7 @@ pub(super) fn gc_graph_artifact() -> VerifiedArtifact {
         ];
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 1;
-        function.registers = vec![reference];
+        function.values = crate::artifact::scalar_values(vec![reference]);
         install_entry_blocks(
             artifact,
             vec![vec![Instruction::Return { value: u16::MAX }]],
@@ -3930,7 +3930,7 @@ pub(crate) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
         artifact.modules[0].constants = vec![Constant::I32(length)];
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 2;
-        function.registers = vec![primitive(1), reference];
+        function.values = crate::artifact::scalar_values(vec![primitive(1), reference]);
         function.block_count = 2;
         let programs = [
             vec![
@@ -4007,7 +4007,8 @@ pub(super) fn static_roundtrip_artifact() -> VerifiedArtifact {
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 3;
         function.parameter_count = 2;
-        function.registers = vec![primitive(5), primitive(1), primitive(1)];
+        function.values =
+            crate::artifact::scalar_values(vec![primitive(5), primitive(1), primitive(1)]);
         install_entry_blocks(
             artifact,
             vec![
@@ -4094,7 +4095,12 @@ pub(super) fn field_roundtrip_artifact() -> VerifiedArtifact {
         artifact.modules[0].constants = vec![Constant::I32(42)];
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 4;
-        function.registers = vec![subclass, primitive(1), primitive(1), primitive(5)];
+        function.values = crate::artifact::scalar_values(vec![
+            subclass,
+            primitive(1),
+            primitive(1),
+            primitive(5),
+        ]);
         install_entry_blocks(
             artifact,
             vec![
@@ -4181,14 +4187,14 @@ fn primitive_array_roundtrip_artifact(
         artifact.modules[0].constants = vec![Constant::I32(0), Constant::I32(1), constant];
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 6;
-        function.registers = vec![
+        function.values = crate::artifact::scalar_values(vec![
             primitive(1),
             primitive(1),
             element,
             array,
             element,
             primitive(1),
-        ];
+        ]);
         install_entry_blocks(
             artifact,
             vec![
@@ -4268,7 +4274,8 @@ pub(super) fn reference_array_roundtrip_artifact() -> VerifiedArtifact {
         artifact.modules[0].constants = vec![Constant::I32(0), Constant::I32(1)];
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 5;
-        function.registers = vec![primitive(1), primitive(1), subclass, array, base];
+        function.values =
+            crate::artifact::scalar_values(vec![primitive(1), primitive(1), subclass, array, base]);
         install_entry_blocks(
             artifact,
             vec![
@@ -4336,7 +4343,8 @@ pub(super) fn array_bounds_artifact() -> VerifiedArtifact {
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 4;
         function.parameter_count = 1;
-        function.registers = vec![primitive(1), primitive(1), primitive(1), array];
+        function.values =
+            crate::artifact::scalar_values(vec![primitive(1), primitive(1), primitive(1), array]);
         install_entry_blocks(
             artifact,
             vec![
@@ -4395,7 +4403,7 @@ pub(super) fn nonnull_zero_field_artifact() -> VerifiedArtifact {
         }];
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 2;
-        function.registers = vec![reference, reference];
+        function.values = crate::artifact::scalar_values(vec![reference, reference]);
         install_entry_blocks(
             artifact,
             vec![vec![
@@ -4441,7 +4449,7 @@ pub(super) fn nullable_cast_artifact(destination_nullable: bool) -> VerifiedArti
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 2;
         function.parameter_count = 1;
-        function.registers = vec![source, destination];
+        function.values = crate::artifact::scalar_values(vec![source, destination]);
         install_entry_blocks(
             artifact,
             vec![vec![
@@ -4482,7 +4490,7 @@ pub(super) fn incompatible_cast_artifact() -> VerifiedArtifact {
         artifact.modules[0].declared_types = 3;
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 2;
-        function.registers = vec![source, target];
+        function.values = crate::artifact::scalar_values(vec![source, target]);
         install_entry_blocks(
             artifact,
             vec![vec![
@@ -4527,7 +4535,7 @@ pub(super) fn reference_field_roundtrip_artifact() -> VerifiedArtifact {
         }];
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 3;
-        function.registers = vec![reference, reference, reference];
+        function.values = crate::artifact::scalar_values(vec![reference, reference, reference]);
         install_entry_blocks(
             artifact,
             vec![
@@ -4586,7 +4594,8 @@ pub(super) fn failed_array_store_artifact() -> VerifiedArtifact {
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 4;
         function.parameter_count = 1;
-        function.registers = vec![primitive(1), primitive(1), array, primitive(1)];
+        function.values =
+            crate::artifact::scalar_values(vec![primitive(1), primitive(1), array, primitive(1)]);
         install_entry_blocks(
             artifact,
             vec![
@@ -4639,7 +4648,7 @@ pub(super) fn null_is_type_artifact() -> VerifiedArtifact {
         artifact.modules[0].declared_types = 2;
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 2;
-        function.registers = vec![nullable, primitive(5)];
+        function.values = crate::artifact::scalar_values(vec![nullable, primitive(5)]);
         install_entry_blocks(
             artifact,
             vec![vec![
@@ -4699,7 +4708,7 @@ pub(super) fn lazy_type_initializer_artifact() -> VerifiedArtifact {
                 block_count: 1,
                 first_exception: 0,
                 exception_count: 0,
-                registers: vec![reference],
+                values: crate::artifact::scalar_values(vec![reference]),
             },
         ];
         artifact.modules[0].declared_functions = 2;
@@ -4793,7 +4802,7 @@ fn failing_type_initializer_artifact(active_use: bool) -> VerifiedArtifact {
                 block_count: 1,
                 first_exception: 0,
                 exception_count: 0,
-                registers: Vec::new(),
+                values: Vec::new(),
             },
         ];
         artifact.modules[0].declared_functions = 2;
@@ -4843,7 +4852,7 @@ pub(crate) fn typed_entry_artifact() -> VerifiedArtifact {
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 1;
         function.parameter_count = 1;
-        function.registers = vec![primitive(1)];
+        function.values = crate::artifact::scalar_values(vec![primitive(1)]);
         artifact.manifest.required_stack_bytes = 48;
     })
 }
@@ -4882,11 +4891,11 @@ pub(super) fn reference_entry_case() -> (
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 1;
         function.parameter_count = 1;
-        function.registers = vec![ValueType {
+        function.values = crate::artifact::scalar_values(vec![ValueType {
             kind: 7,
             flags: 0,
             nominal_type: TypeId(1),
-        }];
+        }]);
         artifact.manifest.required_stack_bytes = 48;
     });
     let hash = artifact.content_hash();
@@ -4999,7 +5008,7 @@ fn verified_program(
         let register_count = registers.len() as u16;
         artifact.modules[0].functions[0].register_count = register_count;
         artifact.modules[0].functions[0].parameter_count = parameter_count as u16;
-        artifact.modules[0].functions[0].registers = registers;
+        artifact.modules[0].functions[0].values = crate::artifact::scalar_values(registers);
         let fixed_cost = instructions
             .iter()
             .map(|instruction| instruction.fixed_cost().unwrap())
@@ -5035,7 +5044,7 @@ fn verified_blocks(
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = register_count;
         function.parameter_count = parameter_count as u16;
-        function.registers = registers;
+        function.values = crate::artifact::scalar_values(registers);
         function.first_block = BlockId(0);
         function.block_count = blocks.len() as u32;
         let mut block_records = Vec::new();
@@ -5097,7 +5106,7 @@ fn function(
         block_count: 1,
         first_exception: 0,
         exception_count: 0,
-        registers,
+        values: crate::artifact::scalar_values(registers),
     }
 }
 

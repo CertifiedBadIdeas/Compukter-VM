@@ -5,8 +5,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     artifact::{
         format, Block, BlockId, ByteRange, Capability, Constant, DebugEntry, DecodedArtifact,
-        DecodedCode, DecodedModule, ExceptionEntry, Export, Field, Function, FunctionId, Import,
-        Manifest, ModuleId, NominalType, TypeId, Utf16LiteralId, ValueType,
+        DecodedCode, DecodedModule, ExceptionEntry, Export, Field, Function, FunctionId,
+        FunctionValue, Import, Manifest, ModuleId, NominalType, PhysicalAtom, SafepointRoots,
+        TypeId, Utf16LiteralId, ValueComponent, ValueType,
     },
     bytes::Cursor,
     decode::{container::decode_container, indexed::IndexedSection},
@@ -166,6 +167,7 @@ pub(crate) fn decode_artifact(
         let code_section = indexed(&container, scope, format::CODE, limits)?;
         let exceptions_section = indexed(&container, scope, format::EXCEPTIONS, limits)?;
         let utf16_literals_section = indexed(&container, scope, format::UTF16_LITERALS, limits)?;
+        let safepoint_roots_section = indexed(&container, scope, format::SAFEPOINT_ROOTS, limits)?;
         add_to_limit(
             &mut total_imports,
             imports_section.len(),
@@ -225,6 +227,7 @@ pub(crate) fn decode_artifact(
         let blocks = parse_blocks(&blocks_section, limits)?;
         let code = parse_code(&code_section, &blocks, limits)?;
         let exceptions = parse_exceptions(&exceptions_section, limits)?;
+        let safepoint_roots = parse_safepoint_roots(&safepoint_roots_section, limits)?;
         let utf16_literals = parse_utf16_literals(
             &utf16_literals_section,
             &mut total_utf16_literal_code_units,
@@ -264,6 +267,7 @@ pub(crate) fn decode_artifact(
             blocks,
             code,
             exceptions,
+            safepoint_roots,
             debug,
         });
     }
@@ -586,12 +590,44 @@ fn parse_functions(
         if register_count as usize > limits.registers_per_function {
             return Err(raw(Code::LimitExceeded, "register limit exceeded"));
         }
-        let mut registers = Vec::new();
-        registers
+        let mut values = Vec::new();
+        values
             .try_reserve_exact(register_count as usize)
-            .map_err(|_| raw(Code::LimitExceeded, "cannot reserve registers"))?;
+            .map_err(|_| raw(Code::LimitExceeded, "cannot reserve function values"))?;
         for _ in 0..register_count {
-            registers.push(value_type(cursor)?);
+            let semantic_type = value_type(cursor)?;
+            let component_count = ru16(cursor)? as usize;
+            let reserved = ru16(cursor)?;
+            if component_count == 0 || component_count > limits.physical_components_per_value {
+                return Err(raw(
+                    Code::LimitExceeded,
+                    "physical component count is empty or exceeds limit",
+                ));
+            }
+            if reserved != 0 {
+                return Err(raw(
+                    Code::BadRecord,
+                    "function value reserved field is non-zero",
+                ));
+            }
+            let mut components = Vec::new();
+            components
+                .try_reserve_exact(component_count)
+                .map_err(|_| raw(Code::LimitExceeded, "cannot reserve physical components"))?;
+            for _ in 0..component_count {
+                components.push(match ru8(cursor)? {
+                    0 => PhysicalAtom::I32,
+                    1 => PhysicalAtom::I64,
+                    2 => PhysicalAtom::F32,
+                    3 => PhysicalAtom::F64,
+                    4 => PhysicalAtom::Ref32,
+                    _ => return Err(raw(Code::BadRecord, "unknown physical atom tag")),
+                });
+            }
+            values.push(FunctionValue {
+                semantic_type,
+                components,
+            });
         }
         finish(cursor, record, flags & !0b1111 == 0)?;
         Ok(Function {
@@ -605,7 +641,40 @@ fn parse_functions(
             block_count,
             first_exception,
             exception_count,
-            registers,
+            values,
+        })
+    })
+}
+
+fn parse_safepoint_roots(
+    section: &IndexedSection<'_>,
+    limits: &ArtifactLimits,
+) -> Result<Vec<SafepointRoots>, DiagnosticSet> {
+    parse_each(section, limits, |cursor, record| {
+        let function = FunctionId(ru32(cursor)?);
+        let block = BlockId(ru32(cursor)?);
+        let instruction_boundary = ru32(cursor)?;
+        let root_count = ru16(cursor)? as usize;
+        let reserved = ru16(cursor)?;
+        if root_count > limits.roots_per_safepoint {
+            return Err(raw(Code::LimitExceeded, "safepoint root limit exceeded"));
+        }
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(root_count)
+            .map_err(|_| raw(Code::LimitExceeded, "cannot reserve safepoint roots"))?;
+        for _ in 0..root_count {
+            references.push(ValueComponent {
+                value: ru16(cursor)?,
+                component: ru16(cursor)?,
+            });
+        }
+        finish(cursor, record, reserved == 0)?;
+        Ok(SafepointRoots {
+            function,
+            block,
+            instruction_boundary,
+            references,
         })
     })
 }
@@ -1078,9 +1147,73 @@ fn validate_module_tables(
             format::FUNCTIONS,
             "function exception range is out of bounds",
         )?;
-        for register in &function.registers {
-            value_type_ref(module, *register, limits)?;
+        for value in &function.values {
+            value_type_ref(module, value.semantic_type, limits)?;
         }
+    }
+    if module.safepoint_roots.windows(2).any(|pair| {
+        (
+            pair[0].function,
+            pair[0].block,
+            pair[0].instruction_boundary,
+        ) >= (
+            pair[1].function,
+            pair[1].block,
+            pair[1].instruction_boundary,
+        )
+    }) {
+        return Err(record_error(
+            limits,
+            format::SAFEPOINT_ROOTS,
+            "safepoint maps are not strictly ordered",
+        ));
+    }
+    for (function_id, function) in module.functions.iter().enumerate() {
+        let function_roots = module
+            .safepoint_roots
+            .iter()
+            .filter(|roots| roots.function.0 as usize == function_id)
+            .collect::<Vec<_>>();
+        if function_roots.len() > limits.safepoints_per_function {
+            return Err(record_error(
+                limits,
+                format::SAFEPOINT_ROOTS,
+                "safepoint limit exceeded",
+            ));
+        }
+        for roots in function_roots {
+            if roots.references.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(record_error(
+                    limits,
+                    format::SAFEPOINT_ROOTS,
+                    "safepoint roots are not strictly ordered",
+                ));
+            }
+            for reference in &roots.references {
+                let component = function
+                    .values
+                    .get(reference.value as usize)
+                    .and_then(|value| value.components.get(reference.component as usize));
+                if component != Some(&PhysicalAtom::Ref32) {
+                    return Err(record_error(
+                        limits,
+                        format::SAFEPOINT_ROOTS,
+                        "safepoint root is not a Ref32 component",
+                    ));
+                }
+            }
+        }
+    }
+    if module
+        .safepoint_roots
+        .iter()
+        .any(|roots| roots.function.0 as usize >= module.functions.len())
+    {
+        return Err(record_error(
+            limits,
+            format::SAFEPOINT_ROOTS,
+            "safepoint owner function is out of range",
+        ));
     }
     for (block_id, block) in module.blocks.iter().enumerate() {
         if block.owner_function.0 as usize >= module.functions.len()
@@ -1438,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_every_v1_record_shape() {
+    fn decodes_every_record_shape() {
         let limits = ArtifactLimits::default();
 
         let mut capability = Vec::new();
@@ -1552,14 +1685,43 @@ mod tests {
             u32(&mut function, value);
         }
         function.extend(value_type_bytes(7, 0, 0));
+        u16(&mut function, 2);
+        u16(&mut function, 0);
+        function.extend([0, 4]);
         let (bytes, offsets) = table(&[function], format::FUNCTIONS);
         assert_eq!(
             parse_functions(&section(format::FUNCTIONS, &bytes, offsets), &limits).unwrap()[0]
-                .registers,
-            [ValueType {
-                kind: 7,
-                flags: 0,
-                nominal_type: TypeId(0)
+                .values,
+            [FunctionValue {
+                semantic_type: ValueType {
+                    kind: 7,
+                    flags: 0,
+                    nominal_type: TypeId(0)
+                },
+                components: vec![PhysicalAtom::I32, PhysicalAtom::Ref32],
+            }]
+        );
+
+        let mut roots = Vec::new();
+        for value in [0, 0, 3] {
+            u32(&mut roots, value);
+        }
+        u16(&mut roots, 1);
+        u16(&mut roots, 0);
+        u16(&mut roots, 0);
+        u16(&mut roots, 1);
+        let (bytes, offsets) = table(&[roots], format::SAFEPOINT_ROOTS);
+        assert_eq!(
+            parse_safepoint_roots(&section(format::SAFEPOINT_ROOTS, &bytes, offsets), &limits,)
+                .unwrap(),
+            [SafepointRoots {
+                function: FunctionId(0),
+                block: BlockId(0),
+                instruction_boundary: 3,
+                references: vec![ValueComponent {
+                    value: 0,
+                    component: 1,
+                }],
             }]
         );
 
