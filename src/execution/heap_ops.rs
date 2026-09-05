@@ -2,7 +2,7 @@ use super::{
     error::VmFault,
     heap::{AllocationRequest, Heap, ReservedAllocation},
     layout::ValueWidth,
-    value::{ReferenceValue, RuntimeValue},
+    value::{Ref32, RuntimeValue},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -18,7 +18,7 @@ pub(super) struct PendingState {
 
 pub(super) fn load_value(
     heap: &Heap,
-    reference: ReferenceValue,
+    reference: Ref32,
     offset: u32,
     width: ValueWidth,
 ) -> Result<RuntimeValue, VmFault> {
@@ -31,19 +31,15 @@ pub(super) fn load_value(
         ValueWidth::I64 => RuntimeValue::I64(i64::from_le_bytes(bytes)),
         ValueWidth::F64 => RuntimeValue::F64(u64::from_le_bytes(bytes)),
         ValueWidth::Ref => {
-            let bits = u64::from_le_bytes(bytes);
-            if bits == 0 {
-                RuntimeValue::Null
-            } else {
-                RuntimeValue::Reference(ReferenceValue::from_bits(bits))
-            }
+            let bits = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            Ref32::from_bits(bits).map_or(RuntimeValue::Null, RuntimeValue::Reference)
         }
     })
 }
 
 pub(super) fn store_value(
     heap: &mut Heap,
-    reference: ReferenceValue,
+    reference: Ref32,
     offset: u32,
     width: ValueWidth,
     value: RuntimeValue,
@@ -68,7 +64,7 @@ pub(super) fn store_value(
             heap.write_payload(reference, offset, &value.to_le_bytes())
         }
         (ValueWidth::Ref, RuntimeValue::Null) => {
-            heap.write_payload(reference, offset, &0_u64.to_le_bytes())
+            heap.write_payload(reference, offset, &0_u32.to_le_bytes())
         }
         (ValueWidth::Ref, RuntimeValue::Reference(value)) => {
             heap.write_payload(reference, offset, &value.to_bits().to_le_bytes())
@@ -104,7 +100,7 @@ impl PendingAllocation {
         &mut self,
         heap: &mut Heap,
         budget: u32,
-    ) -> Result<(u32, Option<ReferenceValue>), VmFault> {
+    ) -> Result<(u32, Option<Ref32>), VmFault> {
         let array_length = match *self {
             Self::Array { length, .. } => Some(length),
             Self::Object(_) => None,
@@ -119,7 +115,7 @@ impl PendingAllocation {
         let physical_payload = state
             .request
             .block_bytes
-            .checked_sub(16)
+            .checked_sub(24)
             .ok_or(VmFault::InvalidStoragePlan)?;
         if units != 0 {
             let end = state

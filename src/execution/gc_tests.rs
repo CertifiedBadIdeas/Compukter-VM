@@ -1,7 +1,8 @@
 use super::{
     error::{AllocationExhaustion, Outcome, VmFault},
+    external_roots::ExternalRootTable,
     fixtures,
-    gc::{Collector, CollectorAction, CollectorPhase},
+    gc::{Collector, CollectorAction, CollectorPhase, RootSet},
     heap::{AllocationRequest, Heap},
     heap_ops::store_value,
     image::ExecutionImage,
@@ -11,9 +12,12 @@ use super::{
     TypeKey,
 };
 
-fn allocate(heap: &mut Heap, ty: TypeKey, block_bytes: u32) -> super::value::ReferenceValue {
+fn allocate(heap: &mut Heap, ty: TypeKey, block_bytes: u32) -> super::value::Ref32 {
     let reservation = heap
-        .reserve(AllocationRequest { block_bytes, ty })
+        .reserve(AllocationRequest {
+            block_bytes,
+            type_id: ty.ty,
+        })
         .unwrap()
         .unwrap();
     heap.commit(reservation).unwrap()
@@ -27,18 +31,91 @@ fn collect(
     frames: &[Frame],
     registers: &[RegisterValue],
 ) -> Vec<CollectorAction> {
+    let external_roots = ExternalRootTable::new(0).unwrap();
+    collect_with_external_roots(
+        collector,
+        heap,
+        image,
+        statics,
+        frames,
+        registers,
+        &external_roots,
+    )
+}
+
+fn collect_with_external_roots(
+    collector: &mut Collector,
+    heap: &mut Heap,
+    image: &ExecutionImage,
+    statics: &[RuntimeValue],
+    frames: &[Frame],
+    registers: &[RegisterValue],
+    external_roots: &ExternalRootTable,
+) -> Vec<CollectorAction> {
     let mut actions = Vec::new();
     collector.start();
     while collector.is_active() {
         assert_eq!(
             1,
             collector
-                .step(heap, image, statics, frames, registers, frames.len())
+                .step(
+                    heap,
+                    image,
+                    RootSet {
+                        static_slots: statics,
+                        frames,
+                        registers,
+                        frame_depth: frames.len(),
+                        external: external_roots,
+                    },
+                )
                 .unwrap()
         );
         actions.push(collector.test_last_action().unwrap());
     }
     actions
+}
+
+#[test]
+fn collector_keeps_a_managed_value_while_an_external_handle_is_active() {
+    let image = ExecutionImage::admit(
+        fixtures::reference_field_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let mut heap = Heap::new(&image.storage_plan()).unwrap();
+    let ty = TypeKey { module: 0, ty: 1 };
+    let RuntimeTypeLayout::Object(layout) = image.type_layout(ty).unwrap() else {
+        unreachable!()
+    };
+    let retained = allocate(&mut heap, ty, layout.block_bytes);
+    let dead = allocate(&mut heap, ty, layout.block_bytes);
+    let mut external_roots = ExternalRootTable::new(1).unwrap();
+    let handle = external_roots.retain(retained).unwrap();
+
+    collect_with_external_roots(
+        &mut Collector::new(),
+        &mut heap,
+        &image,
+        &[],
+        &[],
+        &[],
+        &external_roots,
+    );
+    assert!(heap.managed_type(retained).is_ok());
+    assert!(heap.managed_type(dead).is_err());
+
+    assert_eq!(Some(retained), external_roots.release(handle));
+    collect_with_external_roots(
+        &mut Collector::new(),
+        &mut heap,
+        &image,
+        &[],
+        &[],
+        &[],
+        &external_roots,
+    );
+    assert!(heap.managed_type(retained).is_err());
 }
 
 #[test]
@@ -69,11 +146,22 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
     let mut registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
     registers[0] = RegisterValue::Initialized(RuntimeValue::Reference(root));
     let mut collector = Collector::new();
+    let external_roots = ExternalRootTable::new(0).unwrap();
 
     assert_eq!(
         0,
         collector
-            .step(&mut heap, &image, &[], &frames, &registers, 1)
+            .step(
+                &mut heap,
+                &image,
+                RootSet {
+                    static_slots: &[],
+                    frames: &frames,
+                    registers: &registers,
+                    frame_depth: 1,
+                    external: &external_roots,
+                },
+            )
             .unwrap()
     );
     collector.start();
@@ -83,7 +171,17 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
         assert_eq!(
             1,
             collector
-                .step(&mut heap, &image, &[], &frames, &registers, 1)
+                .step(
+                    &mut heap,
+                    &image,
+                    RootSet {
+                        static_slots: &[],
+                        frames: &frames,
+                        registers: &registers,
+                        frame_depth: 1,
+                        external: &external_roots,
+                    },
+                )
                 .unwrap()
         );
     }
@@ -94,7 +192,17 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
     assert_eq!(
         0,
         collector
-            .step(&mut heap, &image, &[], &frames, &registers, 1)
+            .step(
+                &mut heap,
+                &image,
+                RootSet {
+                    static_slots: &[],
+                    frames: &frames,
+                    registers: &registers,
+                    frame_depth: 1,
+                    external: &external_roots,
+                },
+            )
             .unwrap()
     );
 }
@@ -154,7 +262,7 @@ fn machine_reports_one_failed_post_collection_retry() {
     };
     assert_eq!(
         Outcome::AllocationExhausted(AllocationExhaustion {
-            exception: super::value::ReferenceValue::emergency(),
+            exception: super::value::Ref32::reserved(0).unwrap(),
             diagnostic: super::error::AllocationDiagnostic {
                 request_kind: super::error::AllocationRequestKind::Object,
                 requested: 0,
@@ -193,7 +301,7 @@ fn oom_delivery_reuses_the_immortal_emergency_identity() {
     let Outcome::AllocationExhausted(exhaustion) = outcome else {
         panic!("allocation did not deliver OOM");
     };
-    assert_eq!(ReferenceDomain::Emergency, exhaustion.exception.domain());
+    assert_eq!(ReferenceDomain::Reserved, exhaustion.exception.domain());
     let Outcome::AllocationExhausted(repeated) = machine.run_slice(minimum, 1).unwrap() else {
         panic!("terminal OOM was not stable");
     };
@@ -241,7 +349,7 @@ fn oom_delivery_allocates_nothing() {
     let Outcome::AllocationExhausted(exhaustion) = outcome else {
         panic!("oversized request did not deliver OOM");
     };
-    assert_eq!(ReferenceDomain::Emergency, exhaustion.exception.domain());
+    assert_eq!(ReferenceDomain::Reserved, exhaustion.exception.domain());
     assert_eq!(0, allocations);
     assert_eq!(0, machine.consumed_maintenance_cost());
 }
@@ -322,7 +430,7 @@ fn oom_oversized_string_request_skips_collection_and_reports_its_source() {
 #[test]
 fn oom_string_allocation_collects_once_then_reports_a_failed_retry() {
     let mut profile = fixtures::profile();
-    profile.heap_bytes = 32;
+    profile.heap_bytes = 48;
     let image = ExecutionImage::admit(fixtures::repeated_concat_artifact(false), profile).unwrap();
     let minimum = image.minimum_slice_cost();
     let mut machine = super::machine::Machine::new(image).unwrap();
@@ -347,7 +455,7 @@ fn oom_string_allocation_collects_once_then_reports_a_failed_retry() {
         super::error::AllocationDiagnostic {
             request_kind: super::error::AllocationRequestKind::String,
             requested: 12,
-            live: 32,
+            live: 48,
             total_free: 0,
             largest_free_block: 0,
             source: super::error::AllocationSource {
@@ -361,34 +469,6 @@ fn oom_string_allocation_collects_once_then_reports_a_failed_retry() {
     );
     assert!(exhaustion.collection_attempted);
     assert!(machine.consumed_maintenance_cost() > 0);
-}
-
-#[test]
-fn oom_capacity_failure_collects_once_and_preserves_free_space_diagnostics() {
-    let mut profile = fixtures::profile();
-    profile.heap_bytes = 64;
-    let image = ExecutionImage::admit(fixtures::object_allocation_artifact(0), profile).unwrap();
-    let minimum = image.minimum_slice_cost();
-    let mut machine = super::machine::Machine::new(image).unwrap();
-    machine.start(&[]).unwrap();
-    machine.test_exhaust_handle_capacity();
-
-    let outcome = loop {
-        let outcome = machine.run_slice(minimum, 1).unwrap();
-        if outcome.is_terminal() {
-            break outcome;
-        }
-    };
-    let Outcome::AllocationExhausted(exhaustion) = outcome else {
-        panic!("handle-capacity failure did not deliver OOM");
-    };
-    assert_eq!(
-        super::error::AllocationRequestKind::Object,
-        exhaustion.diagnostic.request_kind
-    );
-    assert_eq!(64, exhaustion.diagnostic.total_free);
-    assert_eq!(64, exhaustion.diagnostic.largest_free_block);
-    assert!(exhaustion.collection_attempted);
 }
 
 #[test]
@@ -424,7 +504,7 @@ fn oom_fragmentation_survives_full_collection_with_sufficient_total_free() {
     assert!(heap
         .reserve(AllocationRequest {
             block_bytes: 48,
-            ty,
+            type_id: ty.ty,
         })
         .unwrap()
         .is_none());
@@ -500,7 +580,12 @@ fn collector_handles_cycles_diamonds_duplicate_roots_statics_and_multiple_frames
         })
         .collect();
     assert_eq!(
-        vec![shared.slot(), root.slot(), left.slot(), right.slot()],
+        vec![
+            shared.payload(),
+            root.payload(),
+            left.payload(),
+            right.payload(),
+        ],
         dequeued
     );
     let swept: Vec<_> = actions
@@ -560,7 +645,7 @@ fn collector_scans_reference_arrays() {
     store_value(
         &mut heap,
         array,
-        16,
+        12,
         ValueWidth::Ref,
         RuntimeValue::Reference(second),
     )
@@ -600,11 +685,22 @@ fn collector_steady_state_allocates_nothing() {
     let frames = [Frame::test_entry(image.entry_index())];
     let registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
     let mut collector = Collector::new();
+    let external_roots = ExternalRootTable::new(0).unwrap();
     super::tests::allocation_counter::reset_and_enable();
     collector.start();
     while collector.is_active() {
         collector
-            .step(&mut heap, &image, &[], &frames, &registers, 1)
+            .step(
+                &mut heap,
+                &image,
+                RootSet {
+                    static_slots: &[],
+                    frames: &frames,
+                    registers: &registers,
+                    frame_depth: 1,
+                    external: &external_roots,
+                },
+            )
             .unwrap();
     }
     let allocations = super::tests::allocation_counter::disable_and_read();
@@ -650,6 +746,7 @@ fn managed_heap_performance_gc_units() {
     let registers = [RegisterValue::Initialized(RuntimeValue::Reference(root))];
     let statics = [RuntimeValue::Reference(shared)];
     let mut collector = Collector::new();
+    let external_roots = ExternalRootTable::new(0).unwrap();
     let mut counts = [0_u64; 6];
 
     let started = Instant::now();
@@ -659,7 +756,17 @@ fn managed_heap_performance_gc_units() {
             assert_eq!(
                 1,
                 collector
-                    .step(&mut heap, &image, &statics, &frames, &registers, 1)
+                    .step(
+                        &mut heap,
+                        &image,
+                        RootSet {
+                            static_slots: &statics,
+                            frames: &frames,
+                            registers: &registers,
+                            frame_depth: 1,
+                            external: &external_roots,
+                        },
+                    )
                     .unwrap()
             );
             let index = match collector.test_last_action().unwrap() {
@@ -710,10 +817,13 @@ fn managed_heap_performance_gc_units() {
                 .step(
                     &mut leaf_heap,
                     &leaf_image,
-                    &[],
-                    &leaf_frames,
-                    &leaf_registers,
-                    1,
+                    RootSet {
+                        static_slots: &[],
+                        frames: &leaf_frames,
+                        registers: &leaf_registers,
+                        frame_depth: 1,
+                        external: &external_roots,
+                    },
                 )
                 .unwrap();
             leaf_units += u64::from(matches!(

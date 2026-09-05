@@ -1,6 +1,7 @@
 use super::error::AdmissionError;
 
 const BLOCK_HEADER_BYTES: u32 = 16;
+const MANAGED_HEADER_BYTES: u32 = 8;
 const INDEXED_HEADER_BYTES: u32 = 8;
 const BLOCK_ALIGNMENT: u32 = 16;
 const MINIMUM_BLOCK_BYTES: u32 = 32;
@@ -191,8 +192,8 @@ impl ValueWidth {
         match self {
             Self::Bool => 1,
             Self::Char => 2,
-            Self::I32 | Self::F32 => 4,
-            Self::I64 | Self::F64 | Self::Ref => 8,
+            Self::I32 | Self::F32 | Self::Ref => 4,
+            Self::I64 | Self::F64 => 8,
         }
     }
 }
@@ -208,7 +209,8 @@ impl StringEncoding {
 
 fn block_bytes(payload_bytes: u32) -> Result<u32, AdmissionError> {
     let unaligned = BLOCK_HEADER_BYTES
-        .checked_add(payload_bytes)
+        .checked_add(MANAGED_HEADER_BYTES)
+        .and_then(|value| value.checked_add(payload_bytes))
         .ok_or(AdmissionError::StoragePlanOverflow)?;
     Ok(align_up(unaligned, BLOCK_ALIGNMENT)?.max(MINIMUM_BLOCK_BYTES))
 }

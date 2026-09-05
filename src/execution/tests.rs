@@ -3,7 +3,7 @@ use super::{
     fixtures,
     image::ExecutionImage,
     machine::Machine,
-    value::{EntryArgument, ReferenceDomain, ReferenceValue, RuntimeValue},
+    value::{EntryArgument, Ref32, ReferenceDomain, RuntimeValue},
 };
 use sha2::{Digest, Sha256};
 
@@ -137,10 +137,10 @@ fn managed_heap_vertical_conformance() {
     let observation = (totals, <[u8; 32]>::from(digest.finalize()));
     assert_eq!(
         (
-            [69, 7, 12],
+            [69, 9, 12],
             [
-                246, 79, 97, 206, 220, 215, 7, 151, 50, 116, 233, 120, 210, 61, 5, 239, 176, 25,
-                124, 1, 167, 76, 48, 55, 253, 203, 252, 89, 149, 162, 13, 186,
+                55, 76, 95, 79, 132, 79, 136, 143, 189, 254, 117, 131, 19, 32, 223, 14, 187, 129,
+                6, 255, 15, 145, 138, 125, 139, 1, 52, 249, 223, 39, 158, 98,
             ],
         ),
         observation
@@ -211,24 +211,23 @@ static TEST_ALLOCATOR: allocation_counter::CountingAllocator =
     allocation_counter::CountingAllocator;
 
 #[test]
-fn compact_reference_token_is_eight_bytes() {
-    assert_eq!(8, core::mem::size_of::<ReferenceValue>());
+fn compact_reference_token_is_four_bytes() {
+    assert_eq!(4, core::mem::size_of::<Ref32>());
 
-    let managed = ReferenceValue::managed(1, 7).unwrap();
-    let literal = ReferenceValue::literal(1).unwrap();
-    let emergency = ReferenceValue::emergency();
-    let host = ReferenceValue::host(1, 7).unwrap();
+    let managed = Ref32::managed(16).unwrap();
+    let image = Ref32::image(1).unwrap();
+    let external = Ref32::external(1).unwrap();
+    let reserved = Ref32::reserved(1).unwrap();
     assert_eq!(ReferenceDomain::Managed, managed.domain());
-    assert_eq!(ReferenceDomain::Literal, literal.domain());
-    assert_eq!(ReferenceDomain::Emergency, emergency.domain());
-    assert_eq!(ReferenceDomain::Host, host.domain());
-    assert_ne!(managed, literal);
-    assert_ne!(managed, host);
-    assert_ne!(managed, ReferenceValue::managed(1, 8).unwrap());
-    assert_eq!(1, managed.slot());
-    assert_eq!(7, managed.generation());
-    assert!(ReferenceValue::managed(ReferenceValue::MAX_SLOT, 0).is_some());
-    assert!(ReferenceValue::managed(ReferenceValue::MAX_SLOT + 1, 0).is_none());
+    assert_eq!(ReferenceDomain::Image, image.domain());
+    assert_eq!(ReferenceDomain::External, external.domain());
+    assert_eq!(ReferenceDomain::Reserved, reserved.domain());
+    assert_ne!(managed, image);
+    assert_ne!(managed, external);
+    assert_eq!(16, managed.payload());
+    assert!(Ref32::managed(Ref32::MAX_PAYLOAD).is_some());
+    assert!(Ref32::managed(Ref32::MAX_PAYLOAD + 1).is_none());
+    assert!(Ref32::from_bits(0).is_none());
 }
 
 #[test]

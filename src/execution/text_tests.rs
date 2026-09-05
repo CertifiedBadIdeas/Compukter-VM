@@ -15,8 +15,7 @@ fn string_literal_loads_as_an_immortal_reference() {
         panic!("string program did not return a reference");
     };
 
-    assert_eq!(ReferenceDomain::Literal, reference.domain());
-    assert_eq!(0, reference.generation());
+    assert_eq!(ReferenceDomain::Image, reference.domain());
 }
 
 #[test]
@@ -243,7 +242,7 @@ fn string_concat_resumes_without_publishing_a_prefix() {
     else {
         panic!("concat did not publish its completed result");
     };
-    assert_eq!(11, machine.consumed_dynamic_cost());
+    assert_eq!(12, machine.consumed_dynamic_cost());
     assert_eq!(50, machine.string_length(reference));
 }
 
@@ -256,7 +255,7 @@ fn string_substring_preserves_full_identity_and_freshens_proper_ranges() {
     else {
         panic!("full substring did not return a reference");
     };
-    assert_eq!(ReferenceDomain::Literal, full_reference.domain());
+    assert_eq!(ReferenceDomain::Image, full_reference.domain());
 
     let mut proper = fixtures::started_zero_arg(fixtures::literal_string_substring_artifact(0, 1));
     assert_eq!(Outcome::SliceExhausted, proper.run_slice(4, 0).unwrap());
@@ -333,7 +332,7 @@ fn empty_substring_returns_the_canonical_empty_literal() {
     else {
         panic!("empty substring did not return a reference");
     };
-    assert_eq!(ReferenceDomain::Literal, reference.domain());
+    assert_eq!(ReferenceDomain::Image, reference.domain());
     assert_eq!(0, machine.string_length(reference));
 }
 

@@ -1,18 +1,22 @@
 use super::{
     error::{AdmissionError, VmFault},
     layout::StoragePlan,
-    value::{ReferenceDomain, ReferenceValue},
-    TypeKey,
+    value::{Ref32, ReferenceDomain},
 };
 
 const NULL_OFFSET: u32 = u32::MAX;
 const CLASS_COUNT: usize = 32 * 8;
 const ALLOCATED: u32 = 1;
+const MARKED: u32 = 2;
+const LIVE: u32 = 4;
 const SIZE_MASK: u32 = !15;
 const SIZE_FLAGS: u32 = 0;
 const PREVIOUS_SIZE: u32 = 4;
 const NEXT_FREE: u32 = 8;
 const PREVIOUS_FREE: u32 = 12;
+const OBJECT_TYPE_ID: u32 = 16;
+const OBJECT_IDENTITY_TOKEN: u32 = 20;
+const USER_PAYLOAD: u32 = 24;
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -34,14 +38,20 @@ pub(super) struct SizeClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AllocationRequest {
     pub block_bytes: u32,
-    pub ty: TypeKey,
+    pub type_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ReservedAllocation {
     pub block: BlockOffset,
-    pub slot: u32,
-    pub generation: u32,
+    pub type_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(super) struct ManagedObjectHeader {
+    pub type_id: u32,
+    pub identity_token: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -52,69 +62,28 @@ pub(super) struct HeapDiagnostic {
     pub retired_handles: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HandleState {
-    Free,
-    Reserved,
-    Live,
-    Retired,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct HandleEntry {
-    pub state: HandleState,
-    pub generation: u32,
-    pub block: BlockOffset,
-    pub ty: TypeKey,
-    pub identity_hash: u32,
-    pub next_free: u32,
-    pub gray_next: u32,
-    pub mark_epoch: u32,
-}
-
-impl HandleEntry {
-    const EMPTY: Self = Self {
-        state: HandleState::Free,
-        generation: 1,
-        block: BlockOffset(NULL_OFFSET),
-        ty: TypeKey {
-            module: u32::MAX,
-            ty: u32::MAX,
-        },
-        identity_hash: 0,
-        next_free: NULL_OFFSET,
-        gray_next: NULL_OFFSET,
-        mark_epoch: 0,
-    };
-}
-
 pub(super) struct Heap {
     arena: Box<[ArenaUnit]>,
     arena_bytes: u32,
     class_heads: Box<[u32]>,
     first_bitmap: u32,
     second_bitmaps: [u8; 32],
-    handles: Box<[HandleEntry]>,
-    free_handle: u32,
     next_ordinal: u64,
     total_free: u32,
-    live_handles: u32,
-    retired_handles: u32,
+    live_objects: u32,
 }
 
 impl Heap {
     pub(super) fn new(plan: &StoragePlan) -> Result<Self, AdmissionError> {
         if plan.heap_bytes < 32
             || !plan.heap_bytes.is_multiple_of(16)
-            || plan.handle_capacity != plan.heap_bytes / 32
+            || plan.heap_bytes > Ref32::MAX_PAYLOAD
         {
             return Err(AdmissionError::InvalidHeapSize {
                 supplied: plan.heap_bytes,
             });
         }
         let arena_len = usize::try_from(plan.heap_bytes / 16)
-            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
-        let handle_count = usize::try_from(plan.handle_capacity)
             .map_err(|_| AdmissionError::StoragePlanOverflow)?;
         let mut arena = Vec::new();
         arena
@@ -126,31 +95,15 @@ impl Heap {
             .try_reserve_exact(CLASS_COUNT)
             .map_err(|_| AdmissionError::AllocationFailed)?;
         class_heads.resize(CLASS_COUNT, NULL_OFFSET);
-        let mut handles = Vec::new();
-        handles
-            .try_reserve_exact(handle_count)
-            .map_err(|_| AdmissionError::AllocationFailed)?;
-        handles.resize(handle_count, HandleEntry::EMPTY);
-        for (slot, entry) in handles.iter_mut().enumerate() {
-            entry.next_free = if slot + 1 < handle_count {
-                u32::try_from(slot + 1).map_err(|_| AdmissionError::StoragePlanOverflow)?
-            } else {
-                NULL_OFFSET
-            };
-        }
-
         let mut heap = Self {
             arena: arena.into_boxed_slice(),
             arena_bytes: plan.heap_bytes,
             class_heads: class_heads.into_boxed_slice(),
             first_bitmap: 0,
             second_bitmaps: [0; 32],
-            handles: handles.into_boxed_slice(),
-            free_handle: 0,
             next_ordinal: 1,
             total_free: plan.heap_bytes,
-            live_handles: 0,
-            retired_handles: 0,
+            live_objects: 0,
         };
         heap.write_header(BlockOffset(0), plan.heap_bytes, 0, false)
             .map_err(|_| AdmissionError::StoragePlanOverflow)?;
@@ -169,18 +122,6 @@ impl Heap {
         let Some(block) = self.find_suitable(request.block_bytes)? else {
             return Ok(None);
         };
-        if self.free_handle == NULL_OFFSET {
-            return Err(VmFault::HandleExhausted);
-        }
-        let slot = self.free_handle;
-        let entry = *self
-            .handles
-            .get(slot as usize)
-            .ok_or(VmFault::CorruptHeap)?;
-        if entry.state != HandleState::Free {
-            return Err(VmFault::CorruptHeap);
-        }
-
         let block_size = self.block_size(block)?;
         if block_size < request.block_bytes {
             return Err(VmFault::CorruptHeap);
@@ -203,67 +144,40 @@ impl Heap {
             block_size
         };
         self.write_header(block, allocated_size, previous_size, true)?;
-        self.write_word(block, NEXT_FREE, slot)?;
         self.total_free = self
             .total_free
             .checked_sub(allocated_size)
             .ok_or(VmFault::CorruptHeap)?;
-
-        self.free_handle = entry.next_free;
-        let handle = self
-            .handles
-            .get_mut(slot as usize)
-            .ok_or(VmFault::CorruptHeap)?;
-        handle.state = HandleState::Reserved;
-        handle.block = block;
-        handle.ty = request.ty;
-        handle.identity_hash = 0;
-        handle.next_free = NULL_OFFSET;
         Ok(Some(ReservedAllocation {
             block,
-            slot,
-            generation: handle.generation,
+            type_id: request.type_id,
         }))
     }
 
-    pub(super) fn commit(
-        &mut self,
-        reservation: ReservedAllocation,
-    ) -> Result<ReferenceValue, VmFault> {
-        let entry = self
-            .handles
-            .get_mut(reservation.slot as usize)
-            .ok_or(VmFault::CorruptHeap)?;
-        if entry.state != HandleState::Reserved
-            || entry.generation != reservation.generation
-            || entry.block != reservation.block
-        {
-            return Err(VmFault::CorruptHeap);
-        }
-        entry.state = HandleState::Live;
-        entry.identity_hash = splitmix64(self.next_ordinal) as u32;
+    pub(super) fn commit(&mut self, reservation: ReservedAllocation) -> Result<Ref32, VmFault> {
+        self.validate_reservation(reservation)?;
+        let header = ManagedObjectHeader {
+            type_id: reservation.type_id,
+            identity_token: splitmix64(self.next_ordinal) as u32,
+        };
+        self.write_object_header(reservation.block, header)?;
+        let flags = self.read_word(reservation.block, SIZE_FLAGS)?;
+        self.write_word(reservation.block, SIZE_FLAGS, flags | LIVE)?;
         self.next_ordinal = self.next_ordinal.wrapping_add(1);
-        self.live_handles = self
-            .live_handles
+        self.live_objects = self
+            .live_objects
             .checked_add(1)
             .ok_or(VmFault::CorruptHeap)?;
-        ReferenceValue::managed(reservation.slot, reservation.generation)
-            .ok_or(VmFault::CorruptHeap)
+        let object_header = reservation
+            .block
+            .0
+            .checked_add(16)
+            .ok_or(VmFault::CorruptHeap)?;
+        Ref32::managed(object_header).ok_or(VmFault::CorruptHeap)
     }
 
     pub(super) fn abort(&mut self, reservation: ReservedAllocation) -> Result<(), VmFault> {
-        let entry = self
-            .handles
-            .get(reservation.slot as usize)
-            .copied()
-            .ok_or(VmFault::CorruptHeap)?;
-        if entry.state != HandleState::Reserved
-            || entry.generation != reservation.generation
-            || entry.block != reservation.block
-        {
-            return Err(VmFault::CorruptHeap);
-        }
-        self.release_unpublished_handle(reservation.slot)?;
+        self.validate_reservation(reservation)?;
         self.free_block(reservation.block)
     }
 
@@ -276,7 +190,7 @@ impl Heap {
         self.validate_reservation(reservation)?;
         let capacity = self
             .block_size(reservation.block)?
-            .checked_sub(16)
+            .checked_sub(USER_PAYLOAD)
             .ok_or(VmFault::CorruptHeap)?;
         let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
         if end > capacity {
@@ -285,7 +199,7 @@ impl Heap {
         let start = reservation
             .block
             .0
-            .checked_add(16)
+            .checked_add(USER_PAYLOAD)
             .and_then(|value| value.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         for byte in start..start + length {
@@ -307,7 +221,7 @@ impl Heap {
         self.validate_reservation(reservation)?;
         let capacity = self
             .block_size(reservation.block)?
-            .checked_sub(16)
+            .checked_sub(USER_PAYLOAD)
             .ok_or(VmFault::CorruptHeap)?;
         if offset.checked_add(4).ok_or(VmFault::CorruptHeap)? > capacity {
             return Err(VmFault::CorruptHeap);
@@ -315,7 +229,7 @@ impl Heap {
         let start = reservation
             .block
             .0
-            .checked_add(16)
+            .checked_add(USER_PAYLOAD)
             .and_then(|base| base.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
@@ -340,7 +254,7 @@ impl Heap {
         self.validate_reservation(reservation)?;
         let capacity = self
             .block_size(reservation.block)?
-            .checked_sub(16)
+            .checked_sub(USER_PAYLOAD)
             .ok_or(VmFault::CorruptHeap)?;
         let length = u32::try_from(bytes.len()).map_err(|_| VmFault::CorruptHeap)?;
         if offset.checked_add(length).ok_or(VmFault::CorruptHeap)? > capacity {
@@ -349,7 +263,7 @@ impl Heap {
         let start = reservation
             .block
             .0
-            .checked_add(16)
+            .checked_add(USER_PAYLOAD)
             .and_then(|base| base.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         for (index, byte) in bytes.iter().copied().enumerate() {
@@ -364,13 +278,8 @@ impl Heap {
     }
 
     fn validate_reservation(&self, reservation: ReservedAllocation) -> Result<(), VmFault> {
-        let entry = self
-            .handles
-            .get(reservation.slot as usize)
-            .ok_or(VmFault::CorruptHeap)?;
-        if entry.state == HandleState::Reserved
-            && entry.generation == reservation.generation
-            && entry.block == reservation.block
+        if self.block_allocated(reservation.block)?
+            && self.read_word(reservation.block, SIZE_FLAGS)? & LIVE == 0
         {
             Ok(())
         } else {
@@ -378,89 +287,48 @@ impl Heap {
         }
     }
 
-    pub(super) fn free(&mut self, reference: ReferenceValue) -> Result<bool, VmFault> {
+    pub(super) fn free(&mut self, reference: Ref32) -> Result<bool, VmFault> {
         if reference.domain() != ReferenceDomain::Managed {
             return Ok(false);
         }
-        let slot = reference.slot();
-        let entry = self
-            .handles
-            .get(slot as usize)
-            .copied()
-            .ok_or(VmFault::CorruptHeap)?;
-        if entry.state != HandleState::Live || entry.generation != reference.generation() {
+        let Ok(block) = self.live_block(reference) else {
             return Ok(false);
-        }
-        self.live_handles = self
-            .live_handles
+        };
+        self.live_objects = self
+            .live_objects
             .checked_sub(1)
             .ok_or(VmFault::CorruptHeap)?;
-        let next_generation = entry.generation.checked_add(1);
-        if let Some(generation) = next_generation {
-            let free_head = self.free_handle;
-            let handle = self
-                .handles
-                .get_mut(slot as usize)
-                .ok_or(VmFault::CorruptHeap)?;
-            *handle = HandleEntry {
-                generation,
-                next_free: free_head,
-                ..HandleEntry::EMPTY
-            };
-            self.free_handle = slot;
-        } else {
-            let handle = self
-                .handles
-                .get_mut(slot as usize)
-                .ok_or(VmFault::CorruptHeap)?;
-            handle.state = HandleState::Retired;
-            handle.next_free = NULL_OFFSET;
-            self.retired_handles = self
-                .retired_handles
-                .checked_add(1)
-                .ok_or(VmFault::CorruptHeap)?;
-        }
-        self.free_block(entry.block)?;
+        self.free_block(block)?;
         Ok(true)
     }
 
-    pub(super) fn runtime_type(&self, reference: ReferenceValue) -> Option<TypeKey> {
+    pub(super) fn runtime_type(&self, reference: Ref32) -> Option<u32> {
         self.managed_type(reference).ok()
     }
 
-    pub(super) fn managed_type(&self, reference: ReferenceValue) -> Result<TypeKey, VmFault> {
-        if reference.domain() != ReferenceDomain::Managed {
-            return Err(VmFault::InvalidReference);
-        }
-        let entry = self
-            .handles
-            .get(reference.slot() as usize)
-            .ok_or(VmFault::InvalidReference)?;
-        if entry.state != HandleState::Live || entry.generation != reference.generation() {
-            return Err(VmFault::InvalidReference);
-        }
-        Ok(entry.ty)
+    pub(super) fn managed_type(&self, reference: Ref32) -> Result<u32, VmFault> {
+        let block = self.live_block(reference)?;
+        self.read_word(block, OBJECT_TYPE_ID)
     }
 
     pub(super) fn read_payload(
         &self,
-        reference: ReferenceValue,
+        reference: Ref32,
         offset: u32,
         length: u32,
     ) -> Result<[u8; 8], VmFault> {
-        let entry = self.live_entry(reference)?;
+        let block = self.live_block(reference)?;
         let capacity = self
-            .block_size(entry.block)?
-            .checked_sub(16)
+            .block_size(block)?
+            .checked_sub(USER_PAYLOAD)
             .ok_or(VmFault::CorruptHeap)?;
         let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
         if length > 8 || end > capacity {
             return Err(VmFault::CorruptHeap);
         }
-        let start = entry
-            .block
+        let start = block
             .0
-            .checked_add(16)
+            .checked_add(USER_PAYLOAD)
             .and_then(|base| base.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         let mut bytes = [0; 8];
@@ -477,24 +345,23 @@ impl Heap {
 
     pub(super) fn write_payload(
         &mut self,
-        reference: ReferenceValue,
+        reference: Ref32,
         offset: u32,
         bytes: &[u8],
     ) -> Result<(), VmFault> {
-        let entry = *self.live_entry(reference)?;
+        let block = self.live_block(reference)?;
         let length = u32::try_from(bytes.len()).map_err(|_| VmFault::CorruptHeap)?;
         let capacity = self
-            .block_size(entry.block)?
-            .checked_sub(16)
+            .block_size(block)?
+            .checked_sub(USER_PAYLOAD)
             .ok_or(VmFault::CorruptHeap)?;
         let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
         if end > capacity {
             return Err(VmFault::CorruptHeap);
         }
-        let start = entry
-            .block
+        let start = block
             .0
-            .checked_add(16)
+            .checked_add(USER_PAYLOAD)
             .and_then(|base| base.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         for (index, byte) in bytes.iter().copied().enumerate() {
@@ -508,23 +375,32 @@ impl Heap {
         Ok(())
     }
 
-    fn live_entry(&self, reference: ReferenceValue) -> Result<&HandleEntry, VmFault> {
-        self.managed_type(reference)?;
-        self.handles
-            .get(reference.slot() as usize)
-            .ok_or(VmFault::InvalidReference)
+    fn live_block(&self, reference: Ref32) -> Result<BlockOffset, VmFault> {
+        if reference.domain() != ReferenceDomain::Managed
+            || reference.payload() < OBJECT_TYPE_ID
+            || !reference.payload().is_multiple_of(16)
+        {
+            return Err(VmFault::InvalidReference);
+        }
+        let block = BlockOffset(
+            reference
+                .payload()
+                .checked_sub(16)
+                .ok_or(VmFault::InvalidReference)?,
+        );
+        if block.0 >= self.arena_bytes
+            || !self.block_allocated(block)?
+            || self.read_word(block, SIZE_FLAGS)? & LIVE == 0
+        {
+            return Err(VmFault::InvalidReference);
+        }
+        Ok(block)
     }
 
-    pub(super) fn identity_hash(&self, reference: ReferenceValue) -> Option<u32> {
-        if reference.domain() != ReferenceDomain::Managed {
-            return None;
-        }
-        self.handles
-            .get(reference.slot() as usize)
-            .and_then(|entry| {
-                (entry.state == HandleState::Live && entry.generation == reference.generation())
-                    .then_some(entry.identity_hash)
-            })
+    pub(super) fn identity_hash(&self, reference: Ref32) -> Option<u32> {
+        self.live_block(reference)
+            .ok()
+            .and_then(|block| self.read_word(block, OBJECT_IDENTITY_TOKEN).ok())
     }
 
     pub(super) fn diagnostic(&self) -> HeapDiagnostic {
@@ -547,43 +423,36 @@ impl Heap {
         HeapDiagnostic {
             total_free: self.total_free,
             largest_free_block,
-            live_handles: self.live_handles,
-            retired_handles: self.retired_handles,
+            live_handles: self.live_objects,
+            retired_handles: 0,
         }
     }
 
     pub(super) fn enqueue_gray(
         &mut self,
-        reference: ReferenceValue,
-        epoch: u32,
+        reference: Ref32,
+        _epoch: u32,
         head: &mut Option<u32>,
         tail: &mut Option<u32>,
     ) -> Result<(), VmFault> {
         if reference.domain() != ReferenceDomain::Managed {
             return Ok(());
         }
-        let slot = reference.slot();
-        let entry = self
-            .handles
-            .get_mut(slot as usize)
-            .ok_or(VmFault::InvalidReference)?;
-        if entry.state != HandleState::Live || entry.generation != reference.generation() {
-            return Err(VmFault::InvalidReference);
-        }
-        if entry.mark_epoch == epoch {
+        let block = self.live_block(reference)?;
+        let flags = self.read_word(block, SIZE_FLAGS)?;
+        if flags & MARKED != 0 {
             return Ok(());
         }
-        entry.mark_epoch = epoch;
-        entry.gray_next = NULL_OFFSET;
+        self.write_word(block, SIZE_FLAGS, flags | MARKED)?;
+        self.write_word(block, NEXT_FREE, NULL_OFFSET)?;
         if let Some(previous) = *tail {
-            self.handles
-                .get_mut(previous as usize)
-                .ok_or(VmFault::CorruptHeap)?
-                .gray_next = slot;
+            let previous = Ref32::managed(previous).ok_or(VmFault::CorruptHeap)?;
+            let previous_block = self.live_block(previous)?;
+            self.write_word(previous_block, NEXT_FREE, reference.payload())?;
         } else {
-            *head = Some(slot);
+            *head = Some(reference.payload());
         }
-        *tail = Some(slot);
+        *tail = Some(reference.payload());
         Ok(())
     }
 
@@ -591,33 +460,26 @@ impl Heap {
         &mut self,
         head: &mut Option<u32>,
         tail: &mut Option<u32>,
-    ) -> Result<Option<(ReferenceValue, TypeKey)>, VmFault> {
-        let Some(slot) = *head else {
+    ) -> Result<Option<(Ref32, u32)>, VmFault> {
+        let Some(payload) = *head else {
             return Ok(None);
         };
-        let entry = self
-            .handles
-            .get_mut(slot as usize)
-            .ok_or(VmFault::CorruptHeap)?;
-        if entry.state != HandleState::Live {
-            return Err(VmFault::CorruptHeap);
-        }
-        let next = entry.gray_next;
-        entry.gray_next = NULL_OFFSET;
+        let reference = Ref32::managed(payload).ok_or(VmFault::CorruptHeap)?;
+        let block = self.live_block(reference)?;
+        let next = self.read_word(block, NEXT_FREE)?;
+        self.write_word(block, NEXT_FREE, NULL_OFFSET)?;
         *head = (next != NULL_OFFSET).then_some(next);
         if head.is_none() {
             *tail = None;
         }
-        let reference =
-            ReferenceValue::managed(slot, entry.generation).ok_or(VmFault::CorruptHeap)?;
-        Ok(Some((reference, entry.ty)))
+        Ok(Some((reference, self.managed_type(reference)?)))
     }
 
     pub(super) fn arena_bytes(&self) -> u32 {
         self.arena_bytes
     }
 
-    pub(super) fn sweep_block(&mut self, offset: u32, epoch: u32) -> Result<u32, VmFault> {
+    pub(super) fn sweep_block(&mut self, offset: u32, _epoch: u32) -> Result<u32, VmFault> {
         if offset >= self.arena_bytes {
             return Err(VmFault::CorruptHeap);
         }
@@ -626,17 +488,13 @@ impl Heap {
         if !self.block_allocated(block)? {
             return offset.checked_add(size).ok_or(VmFault::CorruptHeap);
         }
-        let slot = self.read_word(block, NEXT_FREE)?;
-        let entry = self
-            .handles
-            .get(slot as usize)
-            .copied()
-            .ok_or(VmFault::CorruptHeap)?;
-        if entry.state != HandleState::Live || entry.block != block {
+        let flags = self.read_word(block, SIZE_FLAGS)?;
+        if flags & LIVE == 0 {
             return Err(VmFault::CorruptHeap);
         }
-        if entry.mark_epoch == epoch {
-            self.handles[slot as usize].gray_next = NULL_OFFSET;
+        if flags & MARKED != 0 {
+            self.write_word(block, SIZE_FLAGS, flags & !MARKED)?;
+            self.write_word(block, NEXT_FREE, NULL_OFFSET)?;
             return offset.checked_add(size).ok_or(VmFault::CorruptHeap);
         }
 
@@ -655,8 +513,8 @@ impl Heap {
         } else {
             block
         };
-        let reference =
-            ReferenceValue::managed(slot, entry.generation).ok_or(VmFault::CorruptHeap)?;
+        let reference = Ref32::managed(offset.checked_add(16).ok_or(VmFault::CorruptHeap)?)
+            .ok_or(VmFault::CorruptHeap)?;
         if !self.free(reference)? {
             return Err(VmFault::CorruptHeap);
         }
@@ -667,27 +525,6 @@ impl Heap {
     }
 
     #[cfg(test)]
-    pub(super) fn test_set_generation(&mut self, slot: u32, generation: u32) {
-        if let Some(entry) = self.handles.get_mut(slot as usize) {
-            if entry.state == HandleState::Free {
-                entry.generation = generation;
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_exhaust_handle_capacity(&mut self) {
-        self.free_handle = NULL_OFFSET;
-        self.retired_handles = self.handles.len() as u32;
-        for entry in &mut self.handles {
-            if entry.state == HandleState::Free {
-                entry.state = HandleState::Retired;
-                entry.next_free = NULL_OFFSET;
-            }
-        }
-    }
-
-    #[cfg(test)]
     pub(super) fn test_arena_address(&self) -> usize {
         self.arena.as_ptr() as usize
     }
@@ -695,20 +532,18 @@ impl Heap {
     #[cfg(test)]
     pub(super) fn test_reserved_bytes(&self) -> usize {
         self.arena.len() * core::mem::size_of::<u128>()
-            + self.handles.len() * core::mem::size_of::<HandleEntry>()
     }
 
     #[cfg(test)]
-    pub(super) fn test_managed_payload(&self, reference: ReferenceValue) -> Option<Box<[u8]>> {
-        let entry = self.handles.get(reference.slot() as usize)?;
-        if reference.domain() != ReferenceDomain::Managed
-            || entry.state != HandleState::Live
-            || entry.generation != reference.generation()
-        {
-            return None;
-        }
-        let length = self.block_size(entry.block).ok()?.checked_sub(16)?;
-        let start = entry.block.0.checked_add(16)?;
+    pub(super) fn test_set_next_ordinal(&mut self, ordinal: u64) {
+        self.next_ordinal = ordinal;
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_managed_payload(&self, reference: Ref32) -> Option<Box<[u8]>> {
+        let block = self.live_block(reference).ok()?;
+        let length = self.block_size(block).ok()?.checked_sub(USER_PAYLOAD)?;
+        let start = block.0.checked_add(USER_PAYLOAD)?;
         let mut bytes = Vec::with_capacity(length as usize);
         for position in start..start + length {
             let unit = self.arena.get((position / 16) as usize)?;
@@ -839,6 +674,13 @@ impl Heap {
             }
         }
 
+        // A direct managed reference names the object header at block + 16. If
+        // this block is absorbed into its free predecessor, its old allocator
+        // header becomes interior storage and must no longer look allocated.
+        if merged != block {
+            self.write_word(block, SIZE_FLAGS, 0)?;
+        }
+
         self.write_header(merged, merged_size, previous_size, false)?;
         self.update_next_previous_size(merged, merged_size)?;
         self.insert_free(merged)?;
@@ -846,22 +688,6 @@ impl Heap {
             .total_free
             .checked_add(original_size)
             .ok_or(VmFault::CorruptHeap)?;
-        Ok(())
-    }
-
-    fn release_unpublished_handle(&mut self, slot: u32) -> Result<(), VmFault> {
-        let free_head = self.free_handle;
-        let entry = self
-            .handles
-            .get_mut(slot as usize)
-            .ok_or(VmFault::CorruptHeap)?;
-        let generation = entry.generation;
-        *entry = HandleEntry {
-            generation,
-            next_free: free_head,
-            ..HandleEntry::EMPTY
-        };
-        self.free_handle = slot;
         Ok(())
     }
 
@@ -914,6 +740,15 @@ impl Heap {
             .try_into()
             .map_err(|_| VmFault::CorruptHeap)?;
         Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn write_object_header(
+        &mut self,
+        block: BlockOffset,
+        header: ManagedObjectHeader,
+    ) -> Result<(), VmFault> {
+        self.write_word(block, OBJECT_TYPE_ID, header.type_id)?;
+        self.write_word(block, OBJECT_IDENTITY_TOKEN, header.identity_token)
     }
 
     fn write_word(&mut self, block: BlockOffset, field: u32, value: u32) -> Result<(), VmFault> {
