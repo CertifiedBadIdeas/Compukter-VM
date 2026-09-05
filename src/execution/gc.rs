@@ -1,12 +1,13 @@
 use super::{
     error::VmFault,
     external_roots::ExternalRootTable,
+    frame::FrameArena,
     heap::Heap,
     heap_ops::load_value,
     image::ExecutionImage,
     layout::{RuntimeTypeLayout, ValueWidth},
     machine::Frame,
-    value::{Ref32, RegisterValue, RuntimeValue},
+    value::{Ref32, RuntimeValue},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,7 +21,7 @@ pub(super) enum CollectorPhase {
 pub(super) struct RootSet<'a> {
     pub static_slots: &'a [RuntimeValue],
     pub frames: &'a [Frame],
-    pub registers: &'a [RegisterValue],
+    pub frame_arena: &'a FrameArena,
     pub frame_depth: usize,
     pub external: &'a ExternalRootTable,
 }
@@ -125,7 +126,7 @@ impl Collector {
                     image,
                     roots.static_slots,
                     roots.frames,
-                    roots.registers,
+                    roots.frame_arena,
                     roots.frame_depth,
                     roots.external,
                 )? {
@@ -171,7 +172,7 @@ impl Collector {
         image: &ExecutionImage,
         static_slots: &[RuntimeValue],
         frames: &[Frame],
-        registers: &[RegisterValue],
+        frame_arena: &FrameArena,
         frame_depth: usize,
         external_roots: &ExternalRootTable,
     ) -> Result<Option<RuntimeValue>, VmFault> {
@@ -206,16 +207,11 @@ impl Collector {
                     .get(register)
                     .is_some_and(|ty| ty.kind == 7)
                 {
-                    let index = self
-                        .frame
-                        .checked_mul(image.registers_per_frame())
-                        .and_then(|base| base.checked_add(register))
-                        .ok_or(VmFault::InvalidStoragePlan)?;
-                    return Ok(Some(match registers.get(index) {
-                        Some(RegisterValue::Initialized(value)) => *value,
-                        Some(RegisterValue::Uninitialized) => RuntimeValue::Null,
-                        None => return Err(VmFault::InvalidStoragePlan),
-                    }));
+                    let reference =
+                        frame_arena.read_ref32(frame.base, &function.frame_layout, register, 0)?;
+                    return Ok(Some(
+                        reference.map_or(RuntimeValue::Null, RuntimeValue::Reference),
+                    ));
                 }
             }
             self.frame += 1;

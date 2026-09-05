@@ -4,11 +4,12 @@ use super::{
         AllocationSource, EntryArgumentLimit, GuestTrap, Outcome, RunError, VmFault,
     },
     external_roots::ExternalRootTable,
+    frame::{FrameArena, FrameReservation},
     gc::{Collector, RootSet},
     heap::{AllocationRequest, Heap},
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
     host::EntryArgumentLimits,
-    image::{ExecutionImage, ResolvedInstruction, ResolvedValueType},
+    image::{ExecutionImage, ResolvedFunction, ResolvedInstruction, ResolvedValueType},
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     numeric, text,
     value::{EntryArgument, Ref32, ReferenceDomain, RegisterValue, RuntimeValue},
@@ -34,6 +35,8 @@ enum TypeInitializationState {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Frame {
     pub(super) function: usize,
+    pub(super) base: u32,
+    pub(super) byte_len: u32,
     pub(super) block: usize,
     pub(super) instruction: usize,
     pub(super) caller_block: usize,
@@ -52,6 +55,8 @@ pub(super) struct CapabilitySuspension<'a> {
 impl Frame {
     const EMPTY: Self = Self {
         function: usize::MAX,
+        base: 0,
+        byte_len: 0,
         block: usize::MAX,
         instruction: 0,
         caller_block: usize::MAX,
@@ -64,6 +69,8 @@ impl Frame {
     pub(super) const fn test_entry(function: usize) -> Self {
         Self {
             function,
+            base: 0,
+            byte_len: 0,
             block: 0,
             instruction: 0,
             caller_block: usize::MAX,
@@ -74,11 +81,105 @@ impl Frame {
     }
 }
 
+pub(super) fn read_frame_value(
+    arena: &FrameArena,
+    frame: Frame,
+    function: &ResolvedFunction,
+    register: u16,
+) -> Result<RuntimeValue, VmFault> {
+    let register = register as usize;
+    let value_type = *function
+        .registers
+        .get(register)
+        .ok_or(VmFault::InvalidStoragePlan)?;
+    match value_type.kind {
+        1 => arena
+            .read_i32(frame.base, &function.frame_layout, register, 0)
+            .map(RuntimeValue::I32),
+        2 => arena
+            .read_i64(frame.base, &function.frame_layout, register, 0)
+            .map(RuntimeValue::I64),
+        3 => arena
+            .read_f32(frame.base, &function.frame_layout, register, 0)
+            .map(RuntimeValue::F32),
+        4 => arena
+            .read_f64(frame.base, &function.frame_layout, register, 0)
+            .map(RuntimeValue::F64),
+        5 => arena
+            .read_i32(frame.base, &function.frame_layout, register, 0)
+            .and_then(|value| match value {
+                0 => Ok(RuntimeValue::Bool(false)),
+                1 => Ok(RuntimeValue::Bool(true)),
+                _ => Err(VmFault::InvalidValueType),
+            }),
+        6 => arena
+            .read_i32(frame.base, &function.frame_layout, register, 0)
+            .and_then(|value| {
+                u16::try_from(value)
+                    .map(RuntimeValue::Char)
+                    .map_err(|_| VmFault::InvalidValueType)
+            }),
+        7 => arena
+            .read_ref32(frame.base, &function.frame_layout, register, 0)
+            .map(|value| value.map_or(RuntimeValue::Null, RuntimeValue::Reference)),
+        _ => Err(VmFault::InvalidValueType),
+    }
+}
+
+pub(super) fn write_frame_value(
+    arena: &mut FrameArena,
+    frame: Frame,
+    function: &ResolvedFunction,
+    register: u16,
+    value: RuntimeValue,
+) -> Result<(), VmFault> {
+    let register = register as usize;
+    let value_type = *function
+        .registers
+        .get(register)
+        .ok_or(VmFault::InvalidStoragePlan)?;
+    match (value_type.kind, value) {
+        (1, RuntimeValue::I32(value)) => {
+            arena.write_i32(frame.base, &function.frame_layout, register, 0, value)
+        }
+        (2, RuntimeValue::I64(value)) => {
+            arena.write_i64(frame.base, &function.frame_layout, register, 0, value)
+        }
+        (3, RuntimeValue::F32(value)) => {
+            arena.write_f32(frame.base, &function.frame_layout, register, 0, value)
+        }
+        (4, RuntimeValue::F64(value)) => {
+            arena.write_f64(frame.base, &function.frame_layout, register, 0, value)
+        }
+        (5, RuntimeValue::Bool(value)) => arena.write_i32(
+            frame.base,
+            &function.frame_layout,
+            register,
+            0,
+            i32::from(value),
+        ),
+        (6, RuntimeValue::Char(value)) => arena.write_i32(
+            frame.base,
+            &function.frame_layout,
+            register,
+            0,
+            i32::from(value),
+        ),
+        (7, RuntimeValue::Null) => {
+            arena.write_ref32(frame.base, &function.frame_layout, register, 0, None)
+        }
+        (7, RuntimeValue::Reference(value)) => {
+            arena.write_ref32(frame.base, &function.frame_layout, register, 0, Some(value))
+        }
+        _ => Err(VmFault::InvalidValueType),
+    }
+}
+
 pub(super) struct Machine {
     image: ExecutionImage,
     lifecycle: Lifecycle,
     frames: Box<[Frame]>,
-    registers: Box<[RegisterValue]>,
+    frame_arena: FrameArena,
     static_slots: Box<[RuntimeValue]>,
     type_initialization: Box<[TypeInitializationState]>,
     heap: Heap,
@@ -160,19 +261,23 @@ impl Machine {
         let heap = Heap::new(&image.storage_plan())?;
         let external_roots = ExternalRootTable::new(image.external_root_capacity())?;
         let frame_count = image.maximum_call_depth();
-        let register_count = frame_count
-            .checked_mul(image.registers_per_frame())
+        let largest_frame = image
+            .functions()
+            .iter()
+            .map(|function| u64::from(function.frame_layout.byte_len).saturating_add(7) & !7)
+            .max()
+            .unwrap_or(0);
+        let frame_arena_bytes = largest_frame
+            .checked_mul(frame_count as u64)
+            .and_then(|bytes| u32::try_from(bytes).ok())
             .ok_or(AdmissionError::StoragePlanOverflow)?;
+        let frame_arena =
+            FrameArena::new(frame_arena_bytes).map_err(|_| AdmissionError::AllocationFailed)?;
         let mut frames = Vec::new();
         frames
             .try_reserve_exact(frame_count)
             .map_err(|_| AdmissionError::AllocationFailed)?;
         frames.resize(frame_count, Frame::EMPTY);
-        let mut registers = Vec::new();
-        registers
-            .try_reserve_exact(register_count)
-            .map_err(|_| AdmissionError::AllocationFailed)?;
-        registers.resize(register_count, RegisterValue::Uninitialized);
         let static_count = usize::try_from(image.storage_plan().static_slot_count)
             .map_err(|_| AdmissionError::StoragePlanOverflow)?;
         let mut static_slots = Vec::new();
@@ -204,7 +309,7 @@ impl Machine {
             image,
             lifecycle: Lifecycle::Pristine,
             frames: frames.into_boxed_slice(),
-            registers: registers.into_boxed_slice(),
+            frame_arena,
             static_slots: static_slots.into_boxed_slice(),
             type_initialization: type_initialization.into_boxed_slice(),
             heap,
@@ -258,8 +363,14 @@ impl Machine {
             .image
             .function(entry_index)
             .ok_or(RunError::NotRunnable)?;
+        let reservation = self
+            .frame_arena
+            .push(&entry.frame_layout)
+            .map_err(|_| RunError::NotRunnable)?;
         self.frames[0] = Frame {
             function: entry_index,
+            base: reservation.base,
+            byte_len: reservation.byte_len,
             block: entry.first_block,
             instruction: 0,
             caller_block: usize::MAX,
@@ -267,10 +378,20 @@ impl Machine {
             destination: u16::MAX,
             initializer: None,
         };
-        let width = self.image.registers_per_frame();
-        self.registers[..width].fill(RegisterValue::Uninitialized);
-        for (slot, argument) in self.registers.iter_mut().zip(arguments) {
-            *slot = RegisterValue::Initialized(argument.value);
+        for (parameter, argument) in arguments.iter().enumerate() {
+            if write_frame_value(
+                &mut self.frame_arena,
+                self.frames[0],
+                entry,
+                parameter as u16,
+                argument.value,
+            )
+            .is_err()
+            {
+                self.frames[0] = Frame::EMPTY;
+                let _ = self.frame_arena.pop(reservation);
+                return Err(RunError::NotRunnable);
+            }
         }
         self.frame_depth = 1;
         self.maximum_observed_frame_depth = 1;
@@ -565,12 +686,13 @@ impl Machine {
                         if (destination == u16::MAX) != returned.is_none() {
                             return Ok(self.fault(VmFault::InvalidValueType));
                         }
-                        let width = self.image.registers_per_frame();
-                        let callee_base = frame_index
-                            .checked_mul(width)
-                            .ok_or(RunError::NotRunnable)?;
-                        self.registers[callee_base..callee_base + width]
-                            .fill(RegisterValue::Uninitialized);
+                        let callee = self.frames[frame_index];
+                        if let Err(fault) = self.frame_arena.pop(FrameReservation {
+                            base: callee.base,
+                            byte_len: callee.byte_len,
+                        }) {
+                            return Ok(self.fault(fault));
+                        }
                         self.frames[frame_index] = Frame::EMPTY;
                         self.frame_depth = frame_index;
                         let caller_index = frame_index - 1;
@@ -583,14 +705,11 @@ impl Machine {
                             self.type_initialization[index] = TypeInitializationState::Initialized;
                         }
                         if let Some(value) = returned {
-                            let destination_index = caller_index
-                                .checked_mul(width)
-                                .and_then(|base| base.checked_add(destination as usize))
-                                .ok_or(RunError::NotRunnable)?;
-                            let Some(slot) = self.registers.get_mut(destination_index) else {
-                                return Ok(self.fault(VmFault::InvalidStoragePlan));
-                            };
-                            *slot = RegisterValue::Initialized(value);
+                            if let Err(fault) =
+                                self.write_register(caller_index, destination, value)
+                            {
+                                return Ok(self.fault(fault));
+                            }
                         }
                         break;
                     }
@@ -633,27 +752,15 @@ impl Machine {
                         if callee_index >= self.frames.len() {
                             return Ok(self.fault(VmFault::InvalidStoragePlan));
                         }
-                        let width = self.image.registers_per_frame();
-                        let callee_base = callee_index
-                            .checked_mul(width)
-                            .ok_or(RunError::NotRunnable)?;
-                        let Some(callee_registers) = self
-                            .registers
-                            .get_mut(callee_base..callee_base.saturating_add(width))
-                        else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        let reservation = match self.frame_arena.push(&target_function.frame_layout)
+                        {
+                            Ok(reservation) => reservation,
+                            Err(fault) => return Ok(self.fault(fault)),
                         };
-                        callee_registers.fill(RegisterValue::Uninitialized);
-                        for (parameter, source) in args.iter().enumerate() {
-                            let value = match self.read_register(frame_index, *source) {
-                                Ok(value) => value,
-                                Err(fault) => return Ok(self.fault(fault)),
-                            };
-                            self.registers[callee_base + parameter] =
-                                RegisterValue::Initialized(value);
-                        }
-                        self.frames[callee_index] = Frame {
+                        let callee = Frame {
                             function: target,
+                            base: reservation.base,
+                            byte_len: reservation.byte_len,
                             block: target_function.first_block,
                             instruction: 0,
                             caller_block,
@@ -661,6 +768,26 @@ impl Machine {
                             destination: dst,
                             initializer: None,
                         };
+                        for (parameter, source) in args.iter().enumerate() {
+                            let value = match self.read_register(frame_index, *source) {
+                                Ok(value) => value,
+                                Err(fault) => {
+                                    let _ = self.frame_arena.pop(reservation);
+                                    return Ok(self.fault(fault));
+                                }
+                            };
+                            if let Err(fault) = write_frame_value(
+                                &mut self.frame_arena,
+                                callee,
+                                target_function,
+                                parameter as u16,
+                                value,
+                            ) {
+                                let _ = self.frame_arena.pop(reservation);
+                                return Ok(self.fault(fault));
+                            }
+                        }
+                        self.frames[callee_index] = callee;
                         self.frame_depth += 1;
                         self.maximum_observed_frame_depth =
                             self.maximum_observed_frame_depth.max(self.frame_depth);
@@ -949,12 +1076,9 @@ impl Machine {
                             *dst,
                         ) {
                             Ok(text::SubstringPlan::Identity(value)) => {
-                                let index =
-                                    frame_index * self.image.registers_per_frame() + *dst as usize;
-                                let Some(slot) = self.registers.get_mut(index) else {
-                                    return Ok(self.fault(VmFault::InvalidStoragePlan));
-                                };
-                                *slot = RegisterValue::Initialized(value);
+                                if let Err(fault) = self.write_register(frame_index, *dst, value) {
+                                    return Ok(self.fault(fault));
+                                }
                                 self.frames[frame_index].instruction += 1;
                             }
                             Ok(text::SubstringPlan::Build(pending)) => {
@@ -971,12 +1095,9 @@ impl Machine {
                                 let Some(value) = self.image.empty_string() else {
                                     return Ok(self.fault(VmFault::InvalidResolvedId));
                                 };
-                                let index =
-                                    frame_index * self.image.registers_per_frame() + *dst as usize;
-                                let Some(slot) = self.registers.get_mut(index) else {
-                                    return Ok(self.fault(VmFault::InvalidStoragePlan));
-                                };
-                                *slot = RegisterValue::Initialized(value);
+                                if let Err(fault) = self.write_register(frame_index, *dst, value) {
+                                    return Ok(self.fault(fault));
+                                }
                                 self.frames[frame_index].instruction += 1;
                             }
                             Err(error) => return Ok(self.text_outcome(error)),
@@ -1041,11 +1162,9 @@ impl Machine {
                             self.lifecycle = Lifecycle::Terminal(outcome);
                             return Ok(outcome);
                         }
-                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
-                        let Some(slot) = self.registers.get_mut(index) else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
-                        };
-                        *slot = RegisterValue::Initialized(value);
+                        if let Err(fault) = self.write_register(frame_index, *dst, value) {
+                            return Ok(self.fault(fault));
+                        }
                         self.frames[frame_index].instruction += 1;
                     }
                     ResolvedInstruction::StaticSet { field, value } => {
@@ -1102,11 +1221,9 @@ impl Machine {
                             self.lifecycle = Lifecycle::Terminal(outcome);
                             return Ok(outcome);
                         }
-                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
-                        let Some(slot) = self.registers.get_mut(index) else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
-                        };
-                        *slot = RegisterValue::Initialized(value);
+                        if let Err(fault) = self.write_register(frame_index, *dst, value) {
+                            return Ok(self.fault(fault));
+                        }
                         self.frames[frame_index].instruction += 1;
                     }
                     ResolvedInstruction::FieldSet {
@@ -1172,11 +1289,11 @@ impl Machine {
                             }
                             _ => return Ok(self.fault(VmFault::InvalidValueType)),
                         };
-                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
-                        let Some(slot) = self.registers.get_mut(index) else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
-                        };
-                        *slot = RegisterValue::Initialized(RuntimeValue::Bool(result));
+                        if let Err(fault) =
+                            self.write_register(frame_index, *dst, RuntimeValue::Bool(result))
+                        {
+                            return Ok(self.fault(fault));
+                        }
                         self.frames[frame_index].instruction += 1;
                     }
                     ResolvedInstruction::CheckedCast { dst, value, ty } => {
@@ -1210,11 +1327,9 @@ impl Machine {
                             }
                             _ => return Ok(self.fault(VmFault::InvalidValueType)),
                         }
-                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
-                        let Some(slot) = self.registers.get_mut(index) else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
-                        };
-                        *slot = RegisterValue::Initialized(value);
+                        if let Err(fault) = self.write_register(frame_index, *dst, value) {
+                            return Ok(self.fault(fault));
+                        }
                         self.frames[frame_index].instruction += 1;
                     }
                     ResolvedInstruction::ArrayLength { dst, array } => {
@@ -1231,11 +1346,11 @@ impl Machine {
                             }
                             Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
                         };
-                        let index = frame_index * self.image.registers_per_frame() + *dst as usize;
-                        let Some(slot) = self.registers.get_mut(index) else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
-                        };
-                        *slot = RegisterValue::Initialized(RuntimeValue::I32(length));
+                        if let Err(fault) =
+                            self.write_register(frame_index, *dst, RuntimeValue::I32(length))
+                        {
+                            return Ok(self.fault(fault));
+                        }
                         self.frames[frame_index].instruction += 1;
                     }
                     ResolvedInstruction::ArrayLoad { dst, array, index } => {
@@ -1280,12 +1395,9 @@ impl Machine {
                             self.lifecycle = Lifecycle::Terminal(outcome);
                             return Ok(outcome);
                         }
-                        let destination =
-                            frame_index * self.image.registers_per_frame() + *dst as usize;
-                        let Some(slot) = self.registers.get_mut(destination) else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
-                        };
-                        *slot = RegisterValue::Initialized(value);
+                        if let Err(fault) = self.write_register(frame_index, *dst, value) {
+                            return Ok(self.fault(fault));
+                        }
                         self.frames[frame_index].instruction += 1;
                     }
                     ResolvedInstruction::ArrayStore {
@@ -1347,18 +1459,16 @@ impl Machine {
                         return Ok(self.fault(VmFault::ReachedUnreachable));
                     }
                     _ => {
-                        let width = self.image.registers_per_frame();
-                        let base = frame_index * width;
-                        let registers = &mut self.registers[base..base + width];
-                        let register_types = &self
+                        let frame = self.frames[frame_index];
+                        let function = self
                             .image
-                            .function(self.frames[frame_index].function)
-                            .ok_or(RunError::NotRunnable)?
-                            .registers;
+                            .function(frame.function)
+                            .ok_or(RunError::NotRunnable)?;
                         match execute_scalar(
                             instruction,
-                            registers,
-                            register_types,
+                            &mut self.frame_arena,
+                            frame,
+                            function,
                             &self.image,
                             &self.heap,
                         ) {
@@ -1382,14 +1492,34 @@ impl Machine {
     }
 
     fn read_register(&self, frame: usize, register: u16) -> Result<RuntimeValue, VmFault> {
-        let index = frame
-            .checked_mul(self.image.registers_per_frame())
-            .and_then(|base| base.checked_add(register as usize))
+        let frame = *self
+            .frames
+            .get(frame)
+            .filter(|frame| frame.function != usize::MAX)
             .ok_or(VmFault::InvalidStoragePlan)?;
-        match self.registers.get(index) {
-            Some(RegisterValue::Initialized(value)) => Ok(*value),
-            _ => Err(VmFault::InvalidValueType),
-        }
+        let function = self
+            .image
+            .function(frame.function)
+            .ok_or(VmFault::InvalidResolvedId)?;
+        read_frame_value(&self.frame_arena, frame, function, register)
+    }
+
+    fn write_register(
+        &mut self,
+        frame: usize,
+        register: u16,
+        value: RuntimeValue,
+    ) -> Result<(), VmFault> {
+        let frame = *self
+            .frames
+            .get(frame)
+            .filter(|frame| frame.function != usize::MAX)
+            .ok_or(VmFault::InvalidStoragePlan)?;
+        let function = self
+            .image
+            .function(frame.function)
+            .ok_or(VmFault::InvalidResolvedId)?;
+        write_frame_value(&mut self.frame_arena, frame, function, register, value)
     }
 
     fn ensure_type_initialized(
@@ -1433,20 +1563,15 @@ impl Machine {
         if callee_index >= self.frames.len() {
             return Err(self.fault(VmFault::InvalidStoragePlan));
         }
-        let width = self.image.registers_per_frame();
-        let Some(callee_base) = callee_index.checked_mul(width) else {
-            return Err(self.fault(VmFault::InvalidStoragePlan));
+        let reservation = match self.frame_arena.push(&function.frame_layout) {
+            Ok(reservation) => reservation,
+            Err(fault) => return Err(self.fault(fault)),
         };
-        let Some(callee_registers) = self
-            .registers
-            .get_mut(callee_base..callee_base.saturating_add(width))
-        else {
-            return Err(self.fault(VmFault::InvalidStoragePlan));
-        };
-        callee_registers.fill(RegisterValue::Uninitialized);
         let caller = self.frames[caller_index];
         self.frames[callee_index] = Frame {
             function: initializer,
+            base: reservation.base,
+            byte_len: reservation.byte_len,
             block: function.first_block,
             instruction: 0,
             caller_block: caller.block,
@@ -1553,7 +1678,7 @@ impl Machine {
                 RootSet {
                     static_slots: &self.static_slots,
                     frames: &self.frames,
-                    registers: &self.registers,
+                    frame_arena: &self.frame_arena,
                     frame_depth: self.frame_depth,
                     external: &self.external_roots,
                 },
@@ -1608,17 +1733,6 @@ impl Machine {
         let mut pending = self.pending_allocation.take()?;
         let destination = pending.state().destination;
         let collection_attempted = pending.state().collection_attempted;
-        let index = match frame_index
-            .checked_mul(self.image.registers_per_frame())
-            .and_then(|base| base.checked_add(destination as usize))
-            .filter(|index| *index < self.registers.len())
-        {
-            Some(index) => index,
-            None => {
-                let _ = pending.abort(&mut self.heap);
-                return Some(self.fault(VmFault::InvalidStoragePlan));
-            }
-        };
         let expected_units = pending.units_for_budget(*remaining);
         let Some(consumed_dynamic_cost) = self
             .consumed_dynamic_cost
@@ -1642,7 +1756,11 @@ impl Machine {
             self.pending_allocation = Some(pending);
             return Some(Outcome::SliceExhausted);
         };
-        self.registers[index] = RegisterValue::Initialized(RuntimeValue::Reference(reference));
+        if let Err(fault) =
+            self.write_register(frame_index, destination, RuntimeValue::Reference(reference))
+        {
+            return Some(self.fault(fault));
+        }
         self.frames[frame_index].instruction += 1;
         None
     }
@@ -1662,11 +1780,9 @@ impl Machine {
             self.pending_text = Some(pending);
             return Some(Outcome::SliceExhausted);
         };
-        let index = frame_index * self.image.registers_per_frame() + destination as usize;
-        let Some(slot) = self.registers.get_mut(index) else {
-            return Some(self.fault(VmFault::InvalidStoragePlan));
-        };
-        *slot = RegisterValue::Initialized(value);
+        if let Err(fault) = self.write_register(frame_index, destination, value) {
+            return Some(self.fault(fault));
+        }
         self.frames[frame_index].instruction += 1;
         None
     }
@@ -1743,12 +1859,10 @@ impl Machine {
             self.pending_concat = Some(pending);
             return Some(Outcome::SliceExhausted);
         };
-        let index = frame_index * self.image.registers_per_frame() + destination as usize;
-        let Some(slot) = self.registers.get_mut(index) else {
+        if let Err(fault) = self.write_register(frame_index, destination, value) {
             let _ = pending.abort(&mut self.heap);
-            return Some(self.fault(VmFault::InvalidStoragePlan));
-        };
-        *slot = RegisterValue::Initialized(value);
+            return Some(self.fault(fault));
+        }
         self.pending_concat_source = None;
         self.frames[frame_index].instruction += 1;
         None
@@ -1978,14 +2092,7 @@ impl Machine {
             if !self.runtime_value_matches(value, expected) {
                 return Err(VmFault::InvalidValueType);
             }
-            let index = frame_index
-                .checked_mul(self.image.registers_per_frame())
-                .and_then(|base| base.checked_add(destination as usize))
-                .ok_or(VmFault::InvalidStoragePlan)?;
-            *self
-                .registers
-                .get_mut(index)
-                .ok_or(VmFault::InvalidStoragePlan)? = RegisterValue::Initialized(value);
+            self.write_register(frame_index, destination, value)?;
         }
         let frame = self
             .frames
@@ -2215,11 +2322,11 @@ impl Machine {
         trace_field(&mut self.trace, &remaining.to_le_bytes());
         trace_field(&mut self.trace, &self.consumed_fixed_cost.to_le_bytes());
         trace_field(&mut self.trace, &self.consumed_dynamic_cost.to_le_bytes());
-        let width = self.image.registers_per_frame();
         for active_frame in 0..self.frame_depth {
+            let frame = self.frames[active_frame];
             let active_function = self
                 .image
-                .function(self.frames[active_frame].function)
+                .function(frame.function)
                 .ok_or(RunError::NotRunnable)?;
             trace_field(
                 &mut self.trace,
@@ -2227,18 +2334,22 @@ impl Machine {
                     .map_err(|_| RunError::NotRunnable)?
                     .to_le_bytes(),
             );
-            let base = active_frame
-                .checked_mul(width)
-                .ok_or(RunError::NotRunnable)?;
-            for register in &self.registers[base..base + active_function.register_count] {
-                let reference_type = match register {
-                    RegisterValue::Initialized(RuntimeValue::Reference(reference)) => Some(
-                        self.reference_type(*reference)
+            for register in 0..active_function.register_count {
+                let value =
+                    read_frame_value(&self.frame_arena, frame, active_function, register as u16)
+                        .map_err(|_| RunError::NotRunnable)?;
+                let reference_type = match value {
+                    RuntimeValue::Reference(reference) => Some(
+                        self.reference_type(reference)
                             .map_err(|_| RunError::NotRunnable)?,
                     ),
                     _ => None,
                 };
-                trace_register(&mut self.trace, *register, reference_type)?;
+                trace_register(
+                    &mut self.trace,
+                    RegisterValue::Initialized(value),
+                    reference_type,
+                )?;
             }
         }
         Ok(())
@@ -2322,10 +2433,19 @@ impl Machine {
 
     #[cfg(test)]
     pub(super) fn test_register(&self, register: usize) -> Option<RuntimeValue> {
-        match self.registers.get(register) {
-            Some(RegisterValue::Initialized(value)) => Some(*value),
-            _ => None,
+        let width = self.image.registers_per_frame();
+        let frame_index = register.checked_div(width)?;
+        let local = register.checked_rem(width)?;
+        let frame = *self.frames.get(frame_index)?;
+        let function = self.image.function(frame.function)?;
+        if local >= function.register_count
+            || !self
+                .frame_arena
+                .is_value_initialized(frame.base, &function.frame_layout, local)
+        {
+            return None;
         }
+        read_frame_value(&self.frame_arena, frame, function, local as u16).ok()
     }
 
     #[cfg(test)]
@@ -2366,7 +2486,7 @@ impl Machine {
     pub(super) fn test_reserved_bytes(&self) -> usize {
         core::mem::size_of::<Self>()
             + self.frames.len() * core::mem::size_of::<Frame>()
-            + self.registers.len() * core::mem::size_of::<RegisterValue>()
+            + self.frame_arena.reserved_bytes()
             + self.static_slots.len() * core::mem::size_of::<RuntimeValue>()
             + self.heap.test_reserved_bytes()
             + self.external_roots.reserved_bytes()
@@ -2374,6 +2494,20 @@ impl Machine {
 
     #[cfg(test)]
     pub(super) fn test_snapshot(&self) -> (u8, usize, Box<[RegisterValue]>) {
+        let width = self.image.registers_per_frame();
+        let mut registers = vec![RegisterValue::Uninitialized; self.frames.len() * width];
+        for frame_index in 0..self.frame_depth {
+            let frame = self.frames[frame_index];
+            let Some(function) = self.image.function(frame.function) else {
+                continue;
+            };
+            for register in 0..function.register_count {
+                let flat = frame_index * width + register;
+                if let Some(value) = self.test_register(flat) {
+                    registers[flat] = RegisterValue::Initialized(value);
+                }
+            }
+        }
         (
             match self.lifecycle {
                 Lifecycle::Pristine => 0,
@@ -2381,7 +2515,7 @@ impl Machine {
                 Lifecycle::Terminal(_) => 2,
             },
             self.frame_depth,
-            self.registers.clone(),
+            registers.into_boxed_slice(),
         )
     }
 
@@ -2389,7 +2523,12 @@ impl Machine {
     pub(super) fn test_active_registers(&self) -> Box<[RegisterValue]> {
         let width = self.image.registers_per_frame();
         let base = self.frame_depth.saturating_sub(1) * width;
-        self.registers[base..base + width].into()
+        (0..width)
+            .map(|register| {
+                self.test_register(base + register)
+                    .map_or(RegisterValue::Uninitialized, RegisterValue::Initialized)
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -2493,51 +2632,56 @@ enum InstructionFailure {
 
 fn execute_scalar(
     instruction: &ResolvedInstruction,
-    registers: &mut [RegisterValue],
-    register_types: &[ResolvedValueType],
+    arena: &mut FrameArena,
+    frame: Frame,
+    function: &ResolvedFunction,
     image: &ExecutionImage,
     heap: &Heap,
 ) -> Result<(), InstructionFailure> {
-    let read = |register: u16| match registers.get(register as usize) {
-        Some(RegisterValue::Initialized(value)) => Ok(*value),
-        _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
-    };
-    let write = |registers: &mut [RegisterValue], register: u16, value| {
-        let slot = registers
-            .get_mut(register as usize)
-            .ok_or(InstructionFailure::Fault(VmFault::InvalidStoragePlan))?;
-        *slot = RegisterValue::Initialized(value);
-        Ok(())
-    };
     macro_rules! binary {
         ($dst:expr, $lhs:expr, $rhs:expr, $body:expr) => {{
-            let lhs = read(*$lhs)?;
-            let rhs = read(*$rhs)?;
+            let lhs = read_frame_value(arena, frame, function, *$lhs)
+                .map_err(InstructionFailure::Fault)?;
+            let rhs = read_frame_value(arena, frame, function, *$rhs)
+                .map_err(InstructionFailure::Fault)?;
             let value = ($body)(lhs, rhs)?;
-            write(registers, *$dst, value)
+            write_frame_value(arena, frame, function, *$dst, value)
+                .map_err(InstructionFailure::Fault)
         }};
     }
     match instruction {
         ResolvedInstruction::Nop => Ok(()),
         ResolvedInstruction::Move { dst, src } => {
-            let value = read(*src)?;
-            write(registers, *dst, value)
+            let value = read_frame_value(arena, frame, function, *src)
+                .map_err(InstructionFailure::Fault)?;
+            write_frame_value(arena, frame, function, *dst, value)
+                .map_err(InstructionFailure::Fault)
         }
-        ResolvedInstruction::Const { dst, constant } => write(
-            registers,
+        ResolvedInstruction::Const { dst, constant } => write_frame_value(
+            arena,
+            frame,
+            function,
             *dst,
             image
                 .constant(*constant)
                 .ok_or(InstructionFailure::Fault(VmFault::InvalidResolvedId))?,
-        ),
-        ResolvedInstruction::Null { dst } => write(registers, *dst, RuntimeValue::Null),
+        )
+        .map_err(InstructionFailure::Fault),
+        ResolvedInstruction::Null { dst } => {
+            write_frame_value(arena, frame, function, *dst, RuntimeValue::Null)
+                .map_err(InstructionFailure::Fault)
+        }
         ResolvedInstruction::Convert { dst, src } => {
-            let destination = register_types
+            let destination = function
+                .registers
                 .get(*dst as usize)
                 .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?
                 .kind;
-            let value = convert(read(*src)?, destination)?;
-            write(registers, *dst, value)
+            let source = read_frame_value(arena, frame, function, *src)
+                .map_err(InstructionFailure::Fault)?;
+            let value = convert(source, destination)?;
+            write_frame_value(arena, frame, function, *dst, value)
+                .map_err(InstructionFailure::Fault)
         }
         ResolvedInstruction::Add {
             form,
@@ -2595,8 +2739,11 @@ fn execute_scalar(
             Arithmetic::Rem
         )),
         ResolvedInstruction::Neg { form, dst, src } => {
-            let value = negate(*form, read(*src)?)?;
-            write(registers, *dst, value)
+            let source = read_frame_value(arena, frame, function, *src)
+                .map_err(InstructionFailure::Fault)?;
+            let value = negate(*form, source)?;
+            write_frame_value(arena, frame, function, *dst, value)
+                .map_err(InstructionFailure::Fault)
         }
         ResolvedInstruction::BitAnd {
             form,
@@ -2705,28 +2852,35 @@ fn execute_scalar(
             binary!(dst, lhs, rhs, |a, b| Ok(RuntimeValue::Bool(a != b)))
         }
         ResolvedInstruction::StringLength { dst, string } => {
-            let value = text::length(image, heap, read(*string)?).map_err(|error| match error {
+            let string = read_frame_value(arena, frame, function, *string)
+                .map_err(InstructionFailure::Fault)?;
+            let value = text::length(image, heap, string).map_err(|error| match error {
                 text::TextError::Trap(trap) => InstructionFailure::Trap(trap),
                 text::TextError::Fault(fault) => InstructionFailure::Fault(fault),
                 text::TextError::Exhausted { .. } => {
                     InstructionFailure::Fault(VmFault::CorruptLifecycle)
                 }
             })?;
-            write(registers, *dst, RuntimeValue::I32(value))
+            write_frame_value(arena, frame, function, *dst, RuntimeValue::I32(value))
+                .map_err(InstructionFailure::Fault)
         }
         ResolvedInstruction::StringGet { dst, string, index } => {
-            let RuntimeValue::I32(index) = read(*index)? else {
+            let index_value = read_frame_value(arena, frame, function, *index)
+                .map_err(InstructionFailure::Fault)?;
+            let RuntimeValue::I32(index) = index_value else {
                 return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
             };
-            let value =
-                text::get(image, heap, read(*string)?, index).map_err(|error| match error {
-                    text::TextError::Trap(trap) => InstructionFailure::Trap(trap),
-                    text::TextError::Fault(fault) => InstructionFailure::Fault(fault),
-                    text::TextError::Exhausted { .. } => {
-                        InstructionFailure::Fault(VmFault::CorruptLifecycle)
-                    }
-                })?;
-            write(registers, *dst, RuntimeValue::Char(value))
+            let string = read_frame_value(arena, frame, function, *string)
+                .map_err(InstructionFailure::Fault)?;
+            let value = text::get(image, heap, string, index).map_err(|error| match error {
+                text::TextError::Trap(trap) => InstructionFailure::Trap(trap),
+                text::TextError::Fault(fault) => InstructionFailure::Fault(fault),
+                text::TextError::Exhausted { .. } => {
+                    InstructionFailure::Fault(VmFault::CorruptLifecycle)
+                }
+            })?;
+            write_frame_value(arena, frame, function, *dst, RuntimeValue::Char(value))
+                .map_err(InstructionFailure::Fault)
         }
         _ => Err(InstructionFailure::Fault(VmFault::UnsupportedInstruction)),
     }
