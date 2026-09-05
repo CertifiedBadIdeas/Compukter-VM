@@ -3,6 +3,8 @@ use sha2::{Digest, Sha256};
 const HEADER_SIZE: usize = 64;
 const DIRECTORY_ENTRY_SIZE: usize = 32;
 const DIGEST_SIZE: usize = 32;
+type RootLocation = (u16, u16);
+type SafepointRootRecord<'a> = (u32, u32, &'a [RootLocation]);
 
 fn align8(value: usize) -> usize {
     (value + 7) & !7
@@ -39,7 +41,7 @@ fn empty_safepoint_roots(block_instruction_counts: &[u32]) -> Vec<u8> {
     safepoint_roots(&roots)
 }
 
-fn safepoint_roots(records: &[(u32, u32, &[(u16, u16)])]) -> Vec<u8> {
+fn safepoint_roots(records: &[SafepointRootRecord<'_>]) -> Vec<u8> {
     let mut encoded_records = Vec::new();
     for &(block, boundary, references) in records {
         let mut record = Vec::new();
