@@ -9,7 +9,7 @@ use super::{
     image::ExecutionImage,
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     machine::{write_frame_value, Frame},
-    value::{ReferenceDomain, RegisterValue, RuntimeValue},
+    value::{ReferenceDomain, RuntimeValue},
     TypeKey,
 };
 
@@ -27,7 +27,7 @@ fn allocate(heap: &mut Heap, ty: TypeKey, block_bytes: u32) -> super::value::Ref
 fn compact_roots(
     image: &ExecutionImage,
     frames: &[Frame],
-    registers: &[RegisterValue],
+    registers: &[Option<RuntimeValue>],
 ) -> (Box<[Frame]>, FrameArena) {
     let capacity = image
         .functions()
@@ -45,9 +45,7 @@ fn compact_roots(
         frame.base = reservation.base;
         frame.byte_len = reservation.byte_len;
         for register in 0..function.register_count {
-            if let Some(RegisterValue::Initialized(value)) =
-                registers.get(frame_index * width + register)
-            {
+            if let Some(Some(value)) = registers.get(frame_index * width + register) {
                 write_frame_value(&mut arena, *frame, function, register as u16, *value).unwrap();
             }
         }
@@ -74,7 +72,7 @@ fn collect(
     image: &ExecutionImage,
     statics: &[RuntimeValue],
     frames: &[Frame],
-    registers: &[RegisterValue],
+    registers: &[Option<RuntimeValue>],
 ) -> Vec<CollectorAction> {
     let external_roots = ExternalRootTable::new(0).unwrap();
     collect_with_external_roots(
@@ -94,7 +92,7 @@ fn collect_with_external_roots(
     image: &ExecutionImage,
     statics: &[RuntimeValue],
     frames: &[Frame],
-    registers: &[RegisterValue],
+    registers: &[Option<RuntimeValue>],
     external_roots: &ExternalRootTable,
 ) -> Vec<CollectorAction> {
     let (frames, frame_arena) = compact_roots(image, frames, registers);
@@ -224,7 +222,7 @@ fn collector_ignores_reference_bytes_absent_from_the_exact_safepoint_map() {
     };
     let dead = allocate(&mut heap, ty, layout.block_bytes);
     let frames = [Frame::test_entry(entry)];
-    let registers = [RegisterValue::Initialized(RuntimeValue::Reference(dead))];
+    let registers = [Some(RuntimeValue::Reference(dead))];
     collect(
         &mut Collector::new(),
         &mut heap,
@@ -253,7 +251,7 @@ fn collector_faults_on_missing_or_out_of_frame_root_maps() {
         }
         let mut heap = Heap::new(&image.storage_plan()).unwrap();
         let frames = [Frame::test_entry(entry)];
-        let registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
+        let registers = vec![None; image.registers_per_frame()];
         let (frames, frame_arena) = compact_roots(&image, &frames, &registers);
         let statics = compact_statics(&image, &[]);
         let external = ExternalRootTable::new(0).unwrap();
@@ -302,8 +300,8 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
     .unwrap();
 
     let frames = [Frame::test_entry(image.entry_index())];
-    let mut registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
-    registers[0] = RegisterValue::Initialized(RuntimeValue::Reference(root));
+    let mut registers = vec![None; image.registers_per_frame()];
+    registers[0] = Some(RuntimeValue::Reference(root));
     let (frames, frame_arena) = compact_roots(&image, &frames, &registers);
     let statics = compact_statics(&image, &[]);
     let mut collector = Collector::new();
@@ -642,12 +640,7 @@ fn oom_fragmentation_survives_full_collection_with_sufficient_total_free() {
         fixtures::profile(),
     )
     .unwrap();
-    let mut heap = Heap::new(&super::layout::StoragePlan {
-        heap_bytes: 128,
-        handle_capacity: 4,
-        ..image.storage_plan()
-    })
-    .unwrap();
+    let mut heap = Heap::new(&image.storage_plan().with_heap_arena_bytes(128)).unwrap();
     let ty = TypeKey { module: 0, ty: 1 };
     let references = [
         allocate(&mut heap, ty, 32),
@@ -656,9 +649,9 @@ fn oom_fragmentation_survives_full_collection_with_sufficient_total_free() {
         allocate(&mut heap, ty, 32),
     ];
     let frames = [Frame::test_entry(image.entry_index())];
-    let mut registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
-    registers[0] = RegisterValue::Initialized(RuntimeValue::Reference(references[1]));
-    registers[1] = RegisterValue::Initialized(RuntimeValue::Reference(references[3]));
+    let mut registers = vec![None; image.registers_per_frame()];
+    registers[0] = Some(RuntimeValue::Reference(references[1]));
+    registers[1] = Some(RuntimeValue::Reference(references[3]));
     let mut collector = Collector::new();
 
     collect(&mut collector, &mut heap, &image, &[], &frames, &registers);
@@ -715,8 +708,8 @@ fn collector_handles_cycles_diamonds_duplicate_roots_statics_and_multiple_frames
         Frame::test_entry(image.entry_index()),
     ];
     let registers = [
-        RegisterValue::Initialized(RuntimeValue::Reference(root)),
-        RegisterValue::Initialized(RuntimeValue::Reference(root)),
+        Some(RuntimeValue::Reference(root)),
+        Some(RuntimeValue::Reference(root)),
     ];
     let statics = [RuntimeValue::Reference(shared)];
     let mut collector = Collector::new();
@@ -815,8 +808,8 @@ fn collector_scans_reference_arrays() {
     )
     .unwrap();
     let frames = [Frame::test_entry(image.entry_index())];
-    let mut registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
-    registers[3] = RegisterValue::Initialized(RuntimeValue::Reference(array));
+    let mut registers = vec![None; image.registers_per_frame()];
+    registers[3] = Some(RuntimeValue::Reference(array));
     let actions = collect(
         &mut Collector::new(),
         &mut heap,
@@ -847,7 +840,7 @@ fn collector_steady_state_allocates_nothing() {
     .unwrap();
     let mut heap = Heap::new(&image.storage_plan()).unwrap();
     let frames = [Frame::test_entry(image.entry_index())];
-    let registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
+    let registers = vec![None; image.registers_per_frame()];
     let (frames, frame_arena) = compact_roots(&image, &frames, &registers);
     let statics = compact_statics(&image, &[]);
     let mut collector = Collector::new();
@@ -910,7 +903,7 @@ fn managed_heap_performance_gc_units() {
         .unwrap();
     }
     let frames = [Frame::test_entry(image.entry_index())];
-    let registers = [RegisterValue::Initialized(RuntimeValue::Reference(root))];
+    let registers = [Some(RuntimeValue::Reference(root))];
     let (frames, frame_arena) = compact_roots(&image, &frames, &registers);
     let statics = [RuntimeValue::Reference(shared)];
     let statics = compact_statics(&image, &statics);
@@ -976,7 +969,7 @@ fn managed_heap_performance_gc_units() {
     let mut leaf_heap = Heap::new(&leaf_image.storage_plan()).unwrap();
     let leaf = allocate(&mut leaf_heap, TypeKey { module: 0, ty: 1 }, 32);
     let leaf_frames = [Frame::test_entry(leaf_image.entry_index())];
-    let leaf_registers = [RegisterValue::Initialized(RuntimeValue::Reference(leaf))];
+    let leaf_registers = [Some(RuntimeValue::Reference(leaf))];
     let (leaf_frames, leaf_frame_arena) = compact_roots(&leaf_image, &leaf_frames, &leaf_registers);
     let leaf_statics = compact_statics(&leaf_image, &[]);
     let mut leaf_collector = Collector::new();

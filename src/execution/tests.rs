@@ -139,8 +139,8 @@ fn managed_heap_vertical_conformance() {
         (
             [69, 9, 12],
             [
-                180, 173, 148, 71, 216, 78, 62, 11, 243, 163, 254, 214, 238, 163, 82, 91, 32, 195,
-                110, 21, 52, 86, 134, 49, 42, 12, 170, 118, 25, 245, 34, 27,
+                181, 35, 205, 216, 134, 211, 218, 232, 162, 249, 127, 147, 3, 97, 124, 255, 141,
+                230, 168, 78, 12, 187, 54, 222, 157, 75, 40, 150, 78, 224, 86, 181,
             ],
         ),
         observation
@@ -335,8 +335,8 @@ fn straight_line_trace_digest_matches_documented_field_encoding() {
     field(&mut trace, &[1, 1, 7, 0, 0, 0]);
     assert_eq!(
         [
-            130, 247, 11, 159, 19, 81, 241, 126, 113, 207, 203, 8, 46, 24, 240, 52, 77, 229, 210,
-            75, 228, 119, 37, 185, 163, 98, 101, 54, 126, 206, 163, 211
+            125, 245, 183, 244, 187, 145, 237, 216, 12, 157, 49, 16, 51, 179, 3, 192, 113, 42, 117,
+            19, 147, 27, 222, 24, 10, 206, 96, 251, 99, 173, 81, 9
         ],
         <[u8; 32]>::from(trace.finalize())
     );
@@ -497,6 +497,7 @@ fn managed_heap_performance_operations_and_idle_instances() {
     let idle_heap_bytes = idle_profile.heap_bytes;
     let idle_image =
         ExecutionImage::admit(fixtures::object_allocation_artifact(0), idle_profile).unwrap();
+    let idle_plan = idle_image.storage_plan();
     let started = Instant::now();
     let mut instances = Vec::with_capacity(ITERATIONS as usize);
     for _ in 0..ITERATIONS {
@@ -513,9 +514,32 @@ fn managed_heap_performance_operations_and_idle_instances() {
         f64::from(ITERATIONS) / elapsed.as_secs_f64(),
     );
     println!(
-        "idle_zero_work\tinstances={ITERATIONS}\tmaintenance_units=0\tmachine_struct_bytes={}\theap_bytes_per_instance={}\tinstance_reserved_bytes={resident_reserved_bytes}\tshared_image=excluded\tallocator_overhead=excluded",
-        core::mem::size_of::<Machine>(),
-        idle_heap_bytes,
+        "idle_zero_work\tinstances={ITERATIONS}\tmaintenance_units=0\theap_arena={}\theap_allocator={}\tframe_arena={}\tframe_records={}\tstatics={}\ttype_initialization={}\texternal_roots={}\tpending_state={}\tmachine_fixed={}\tinstance_reserved_bytes={}\ttotal_reserved_bytes={resident_reserved_bytes}\tshared_image=excluded\tnative_allocator_bookkeeping=excluded",
+        idle_plan.heap_arena_bytes,
+        idle_plan.heap_allocator_bytes,
+        idle_plan.frame_arena_bytes,
+        idle_plan.frame_record_bytes,
+        idle_plan.static_bytes,
+        idle_plan.type_initialization_bytes,
+        idle_plan.external_root_bytes,
+        idle_plan.pending_state_bytes,
+        idle_plan.machine_fixed_bytes,
+        idle_plan.mutable_resident_bytes(),
+    );
+    assert_eq!(u64::from(idle_heap_bytes), idle_plan.heap_arena_bytes);
+
+    let mut maximum_depth_profile = fixtures::profile();
+    maximum_depth_profile.heap_bytes = 32;
+    let maximum_depth_plan =
+        ExecutionImage::admit(fixtures::recursive_artifact(64), maximum_depth_profile)
+            .unwrap()
+            .storage_plan();
+    println!(
+        "maximum_depth_storage\tdepth=64\tframe_arena={}\tframe_records={}\theap_arena={}\tinstance_reserved_bytes={}",
+        maximum_depth_plan.frame_arena_bytes,
+        maximum_depth_plan.frame_record_bytes,
+        maximum_depth_plan.heap_arena_bytes,
+        maximum_depth_plan.mutable_resident_bytes(),
     );
 }
 

@@ -1,4 +1,4 @@
-use super::error::AdmissionError;
+use super::error::{AdmissionError, ResidentStorageComponent};
 
 const BLOCK_HEADER_BYTES: u32 = 16;
 const MANAGED_HEADER_BYTES: u32 = 8;
@@ -68,15 +68,115 @@ pub(super) enum RuntimeTypeLayout {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct StorageCharges {
+    pub heap_arena_bytes: u64,
+    pub heap_allocator_bytes: u64,
+    pub frame_arena_bytes: u64,
+    pub frame_record_bytes: u64,
+    pub static_bytes: u64,
+    pub type_initialization_bytes: u64,
+    pub external_root_bytes: u64,
+    pub pending_state_bytes: u64,
+    pub machine_fixed_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct StoragePlan {
-    pub heap_bytes: u32,
-    pub handle_capacity: u32,
-    pub type_count: u32,
-    pub field_count: u32,
-    pub static_slot_count: u32,
-    pub literal_count: u32,
-    pub literal_id_count: u32,
-    pub reference_offset_count: u32,
+    pub heap_arena_bytes: u64,
+    pub heap_allocator_bytes: u64,
+    pub frame_arena_bytes: u64,
+    pub frame_record_bytes: u64,
+    pub static_bytes: u64,
+    pub type_initialization_bytes: u64,
+    pub external_root_bytes: u64,
+    pub pending_state_bytes: u64,
+    pub machine_fixed_bytes: u64,
+    mutable_resident_bytes: u64,
+}
+
+impl StoragePlan {
+    #[cfg(test)]
+    pub(super) fn heap_only(heap_arena_bytes: u64) -> Self {
+        Self::checked(StorageCharges {
+            heap_arena_bytes,
+            ..StorageCharges::default()
+        })
+        .expect("test heap storage plan must fit")
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_heap_arena_bytes(self, heap_arena_bytes: u64) -> Self {
+        Self::checked(StorageCharges {
+            heap_arena_bytes,
+            heap_allocator_bytes: self.heap_allocator_bytes,
+            frame_arena_bytes: self.frame_arena_bytes,
+            frame_record_bytes: self.frame_record_bytes,
+            static_bytes: self.static_bytes,
+            type_initialization_bytes: self.type_initialization_bytes,
+            external_root_bytes: self.external_root_bytes,
+            pending_state_bytes: self.pending_state_bytes,
+            machine_fixed_bytes: self.machine_fixed_bytes,
+        })
+        .expect("test storage plan must fit")
+    }
+
+    pub(super) fn checked(charges: StorageCharges) -> Result<Self, AdmissionError> {
+        let StorageCharges {
+            heap_arena_bytes,
+            heap_allocator_bytes,
+            frame_arena_bytes,
+            frame_record_bytes,
+            static_bytes,
+            type_initialization_bytes,
+            external_root_bytes,
+            pending_state_bytes,
+            machine_fixed_bytes,
+        } = charges;
+        let components = [
+            (ResidentStorageComponent::HeapArena, heap_arena_bytes),
+            (
+                ResidentStorageComponent::HeapAllocator,
+                heap_allocator_bytes,
+            ),
+            (ResidentStorageComponent::FrameArena, frame_arena_bytes),
+            (ResidentStorageComponent::FrameRecords, frame_record_bytes),
+            (ResidentStorageComponent::Statics, static_bytes),
+            (
+                ResidentStorageComponent::TypeInitialization,
+                type_initialization_bytes,
+            ),
+            (ResidentStorageComponent::ExternalRoots, external_root_bytes),
+            (ResidentStorageComponent::PendingState, pending_state_bytes),
+            (
+                ResidentStorageComponent::MachineFixedState,
+                machine_fixed_bytes,
+            ),
+        ];
+        let mutable_resident_bytes =
+            components
+                .into_iter()
+                .try_fold(0_u64, |total, (component, bytes)| {
+                    total
+                        .checked_add(bytes)
+                        .ok_or(AdmissionError::ResidentStorageOverflow { component })
+                })?;
+        Ok(Self {
+            heap_arena_bytes,
+            heap_allocator_bytes,
+            frame_arena_bytes,
+            frame_record_bytes,
+            static_bytes,
+            type_initialization_bytes,
+            external_root_bytes,
+            pending_state_bytes,
+            machine_fixed_bytes,
+            mutable_resident_bytes,
+        })
+    }
+
+    pub(super) const fn mutable_resident_bytes(self) -> u64 {
+        self.mutable_resident_bytes
+    }
 }
 
 pub(super) fn empty_object_layout() -> Result<ObjectLayout, AdmissionError> {
@@ -221,4 +321,23 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, AdmissionError> {
         .checked_add(alignment - 1)
         .map(|sum| sum & !(alignment - 1))
         .ok_or(AdmissionError::StoragePlanOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AdmissionError, ResidentStorageComponent, StorageCharges, StoragePlan};
+
+    #[test]
+    fn resident_total_overflow_names_the_component_that_crosses_the_bound() {
+        assert_eq!(
+            Err(AdmissionError::ResidentStorageOverflow {
+                component: ResidentStorageComponent::HeapAllocator,
+            }),
+            StoragePlan::checked(StorageCharges {
+                heap_arena_bytes: u64::MAX,
+                heap_allocator_bytes: 1,
+                ..StorageCharges::default()
+            }),
+        );
+    }
 }

@@ -75,7 +75,7 @@ pub use execution::{
     HostFailureKind, HostMergeEntry, HostMergeEntrySource, HostMergeGroup, HostMergeSchema,
     HostRequestBatchView, HostRequestView, HostResponse, HostValueInput, HostValueType,
     HostValueView, ManagedAllocationFailure, OperationSchema, QuotaExhaustion, QuotaKind,
-    RequestId, ResumeError, RunError, Session, TaskId, VmFault,
+    RequestId, ResidentStorageComponent, ResumeError, RunError, Session, TaskId, VmFault,
 };
 pub use filesystem::{
     recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, ExecutableRevision,

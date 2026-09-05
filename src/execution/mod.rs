@@ -16,7 +16,9 @@ mod session;
 mod text;
 mod value;
 
-pub use error::{AdmissionError, EntryArgumentLimit, GuestTrap, RunError, VmFault};
+pub use error::{
+    AdmissionError, EntryArgumentLimit, GuestTrap, ResidentStorageComponent, RunError, VmFault,
+};
 pub use host::{
     AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
     ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostMergeEntry,

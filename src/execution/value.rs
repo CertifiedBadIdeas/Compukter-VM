@@ -155,9 +155,3 @@ impl EntryArgument {
         }
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum RegisterValue {
-    Uninitialized,
-    Initialized(RuntimeValue),
-}

@@ -1,7 +1,8 @@
 use super::{
     error::{
         AdmissionError, AllocationDiagnostic, AllocationExhaustion, AllocationRequestKind,
-        AllocationSource, EntryArgumentLimit, GuestTrap, Outcome, RunError, VmFault,
+        AllocationSource, EntryArgumentLimit, GuestTrap, Outcome, ResidentStorageComponent,
+        RunError, VmFault,
     },
     external_roots::ExternalRootTable,
     frame::{FrameArena, FrameReservation, StaticArena},
@@ -12,7 +13,7 @@ use super::{
     image::{ExecutionImage, ResolvedFunction, ResolvedInstruction, ResolvedValueType},
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     numeric, text,
-    value::{EntryArgument, Ref32, ReferenceDomain, RegisterValue, RuntimeValue},
+    value::{EntryArgument, Ref32, ReferenceDomain, RuntimeValue},
     TypeKey,
 };
 use sha2::{Digest, Sha256};
@@ -25,7 +26,7 @@ enum Lifecycle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TypeInitializationState {
+pub(super) enum TypeInitializationState {
     Uninitialized,
     Initializing,
     Initialized,
@@ -257,20 +258,30 @@ impl AllocationRetry {
 }
 
 impl Machine {
+    pub(super) const fn pending_state_bytes() -> u64 {
+        (core::mem::size_of::<Option<AllocationRetry>>()
+            + core::mem::size_of::<Option<PendingAllocation>>()
+            + core::mem::size_of::<Option<text::PendingText>>()
+            + core::mem::size_of::<Option<text::PendingConcat>>()
+            + core::mem::size_of::<Option<AllocationSource>>() * 2
+            + core::mem::size_of::<Option<text::PendingHostString>>()
+            + core::mem::size_of::<Option<StringCollectionTarget>>()) as u64
+    }
+
+    pub(super) const fn fixed_state_bytes() -> u64 {
+        core::mem::size_of::<Self>() as u64 - Self::pending_state_bytes()
+    }
+
     pub(super) fn new(image: ExecutionImage) -> Result<Self, AdmissionError> {
         let heap = Heap::new(&image.storage_plan())?;
         let external_roots = ExternalRootTable::new(image.external_root_capacity())?;
         let frame_count = image.maximum_call_depth();
-        let largest_frame = image
-            .functions()
-            .iter()
-            .map(|function| u64::from(function.frame_layout.byte_len).saturating_add(7) & !7)
-            .max()
-            .unwrap_or(0);
-        let frame_arena_bytes = largest_frame
-            .checked_mul(frame_count as u64)
-            .and_then(|bytes| u32::try_from(bytes).ok())
-            .ok_or(AdmissionError::StoragePlanOverflow)?;
+        let frame_arena_bytes =
+            u32::try_from(image.storage_plan().frame_arena_bytes).map_err(|_| {
+                AdmissionError::ResidentStorageOverflow {
+                    component: ResidentStorageComponent::FrameArena,
+                }
+            })?;
         let frame_arena =
             FrameArena::new(frame_arena_bytes).map_err(|_| AdmissionError::AllocationFailed)?;
         let mut frames = Vec::new();
@@ -952,7 +963,9 @@ impl Machine {
                             block_bytes: layout.block_bytes,
                             type_id: self.image.type_id(*ty).ok_or(RunError::NotRunnable)?,
                         };
-                        if request.block_bytes > self.image.storage_plan().heap_bytes {
+                        if u64::from(request.block_bytes)
+                            > self.image.storage_plan().heap_arena_bytes
+                        {
                             return Ok(self.allocation_exhausted(
                                 AllocationRequestKind::Array,
                                 layout.payload_bytes,
@@ -1625,7 +1638,9 @@ impl Machine {
                 live: self
                     .image
                     .storage_plan()
-                    .heap_bytes
+                    .heap_arena_bytes
+                    .try_into()
+                    .unwrap_or(u32::MAX)
                     .saturating_sub(diagnostic.total_free),
                 total_free: diagnostic.total_free,
                 largest_free_block: diagnostic.largest_free_block,
@@ -1812,7 +1827,7 @@ impl Machine {
                     let _ = pending.abort(&mut self.heap);
                     return Some(self.fault(VmFault::CorruptLifecycle));
                 };
-                if block_bytes > self.image.storage_plan().heap_bytes {
+                if u64::from(block_bytes) > self.image.storage_plan().heap_arena_bytes {
                     let _ = pending.abort(&mut self.heap);
                     self.pending_concat_source = None;
                     return Some(self.allocation_exhausted(
@@ -2203,7 +2218,9 @@ impl Machine {
                     let _ = pending.abort(&mut self.heap);
                     return Ok(self.fault(VmFault::CorruptLifecycle));
                 };
-                if block_bytes > self.image.storage_plan().heap_bytes || collection_attempted {
+                if u64::from(block_bytes) > self.image.storage_plan().heap_arena_bytes
+                    || collection_attempted
+                {
                     let _ = pending.abort(&mut self.heap);
                     self.pending_host_string_source = None;
                     return Ok(self.allocation_exhausted(
@@ -2355,11 +2372,7 @@ impl Machine {
                     ),
                     _ => None,
                 };
-                trace_register(
-                    &mut self.trace,
-                    RegisterValue::Initialized(value),
-                    reference_type,
-                )?;
+                trace_register(&mut self.trace, Some(value), reference_type)?;
             }
         }
         Ok(())
@@ -2498,14 +2511,15 @@ impl Machine {
             + self.frames.len() * core::mem::size_of::<Frame>()
             + self.frame_arena.reserved_bytes()
             + self.statics.reserved_bytes()
+            + self.type_initialization.len() * core::mem::size_of::<TypeInitializationState>()
             + self.heap.test_reserved_bytes()
             + self.external_roots.reserved_bytes()
     }
 
     #[cfg(test)]
-    pub(super) fn test_snapshot(&self) -> (u8, usize, Box<[RegisterValue]>) {
+    pub(super) fn test_snapshot(&self) -> (u8, usize, Box<[Option<RuntimeValue>]>) {
         let width = self.image.registers_per_frame();
-        let mut registers = vec![RegisterValue::Uninitialized; self.frames.len() * width];
+        let mut registers = vec![None; self.frames.len() * width];
         for frame_index in 0..self.frame_depth {
             let frame = self.frames[frame_index];
             let Some(function) = self.image.function(frame.function) else {
@@ -2514,7 +2528,7 @@ impl Machine {
             for register in 0..function.register_count {
                 let flat = frame_index * width + register;
                 if let Some(value) = self.test_register(flat) {
-                    registers[flat] = RegisterValue::Initialized(value);
+                    registers[flat] = Some(value);
                 }
             }
         }
@@ -2530,14 +2544,11 @@ impl Machine {
     }
 
     #[cfg(test)]
-    pub(super) fn test_active_registers(&self) -> Box<[RegisterValue]> {
+    pub(super) fn test_active_registers(&self) -> Box<[Option<RuntimeValue>]> {
         let width = self.image.registers_per_frame();
         let base = self.frame_depth.saturating_sub(1) * width;
         (0..width)
-            .map(|register| {
-                self.test_register(base + register)
-                    .map_or(RegisterValue::Uninitialized, RegisterValue::Initialized)
-            })
+            .map(|register| self.test_register(base + register))
             .collect()
     }
 
@@ -2594,12 +2605,12 @@ fn text_fault(error: text::TextError) -> VmFault {
 
 fn trace_register(
     trace: &mut Sha256,
-    register: RegisterValue,
+    register: Option<RuntimeValue>,
     reference_type: Option<super::TypeKey>,
 ) -> Result<(), RunError> {
     match register {
-        RegisterValue::Uninitialized => trace_field(trace, &[0]),
-        RegisterValue::Initialized(value) => {
+        None => trace_field(trace, &[0]),
+        Some(value) => {
             trace.update((2 + value.trace_payload_len()).to_le_bytes());
             trace.update([1, value.trace_tag()]);
             match value {

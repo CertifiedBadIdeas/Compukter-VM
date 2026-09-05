@@ -1,5 +1,5 @@
 use super::{
-    error::{AdmissionError, VmFault},
+    error::{AdmissionError, ResidentStorageComponent, VmFault},
     layout::StoragePlan,
     value::{Ref32, ReferenceDomain},
 };
@@ -74,17 +74,23 @@ pub(super) struct Heap {
 }
 
 impl Heap {
+    pub(super) const fn allocator_resident_bytes() -> u64 {
+        (CLASS_COUNT * core::mem::size_of::<u32>()) as u64
+    }
+
     pub(super) fn new(plan: &StoragePlan) -> Result<Self, AdmissionError> {
-        if plan.heap_bytes < 32
-            || !plan.heap_bytes.is_multiple_of(16)
-            || plan.heap_bytes > Ref32::MAX_PAYLOAD
-        {
+        let heap_bytes = u32::try_from(plan.heap_arena_bytes).map_err(|_| {
+            AdmissionError::ResidentStorageOverflow {
+                component: ResidentStorageComponent::HeapArena,
+            }
+        })?;
+        if heap_bytes < 32 || !heap_bytes.is_multiple_of(16) || heap_bytes > Ref32::MAX_PAYLOAD {
             return Err(AdmissionError::InvalidHeapSize {
-                supplied: plan.heap_bytes,
+                supplied: heap_bytes,
             });
         }
-        let arena_len = usize::try_from(plan.heap_bytes / 16)
-            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+        let arena_len =
+            usize::try_from(heap_bytes / 16).map_err(|_| AdmissionError::StoragePlanOverflow)?;
         let mut arena = Vec::new();
         arena
             .try_reserve_exact(arena_len)
@@ -97,15 +103,15 @@ impl Heap {
         class_heads.resize(CLASS_COUNT, NULL_OFFSET);
         let mut heap = Self {
             arena: arena.into_boxed_slice(),
-            arena_bytes: plan.heap_bytes,
+            arena_bytes: heap_bytes,
             class_heads: class_heads.into_boxed_slice(),
             first_bitmap: 0,
             second_bitmaps: [0; 32],
             next_ordinal: 1,
-            total_free: plan.heap_bytes,
+            total_free: heap_bytes,
             live_objects: 0,
         };
-        heap.write_header(BlockOffset(0), plan.heap_bytes, 0, false)
+        heap.write_header(BlockOffset(0), heap_bytes, 0, false)
             .map_err(|_| AdmissionError::StoragePlanOverflow)?;
         heap.insert_free(BlockOffset(0))
             .map_err(|_| AdmissionError::StoragePlanOverflow)?;
@@ -532,6 +538,7 @@ impl Heap {
     #[cfg(test)]
     pub(super) fn test_reserved_bytes(&self) -> usize {
         self.arena.len() * core::mem::size_of::<u128>()
+            + self.class_heads.len() * core::mem::size_of::<u32>()
     }
 
     #[cfg(test)]

@@ -1,5 +1,6 @@
 use super::{
     error::{AdmissionError, AllocationExhaustion, GuestTrap, Outcome, VmFault},
+    external_roots::ExternalRootTable,
     fixtures,
     heap::{
         free_size_class, request_size_class, splitmix64, AllocationRequest, BlockOffset, Heap,
@@ -11,7 +12,7 @@ use super::{
         array_layout, empty_object_layout, object_layout, string_layout, FieldSpec,
         RuntimeTypeLayout, StoragePlan, StringEncoding, ValueWidth,
     },
-    machine::Machine,
+    machine::{Frame, Machine, TypeInitializationState},
     value::{EntryArgument, RuntimeValue},
     TypeKey,
 };
@@ -46,11 +47,7 @@ fn allocator_size_classes_map_free_blocks_down_and_requests_up() {
 }
 
 fn allocator_plan(heap_bytes: u32) -> StoragePlan {
-    StoragePlan {
-        heap_bytes,
-        handle_capacity: heap_bytes / 32,
-        ..StoragePlan::default()
-    }
+    StoragePlan::heap_only(u64::from(heap_bytes))
 }
 
 fn allocator_request(block_bytes: u32) -> AllocationRequest {
@@ -167,9 +164,7 @@ fn identity_tokens_wrap_deterministically_and_allow_collisions() -> Result<(), A
 
 #[test]
 fn allocator_has_no_managed_handle_capacity() -> Result<(), AdmissionError> {
-    let mut plan = allocator_plan(64);
-    plan.handle_capacity = 0;
-    let mut heap = Heap::new(&plan)?;
+    let mut heap = Heap::new(&allocator_plan(64))?;
     assert!(heap.reserve(allocator_request(32)).unwrap().is_some());
     Ok(())
 }
@@ -255,7 +250,9 @@ fn managed_heap_performance_allocator_and_fragmentation() {
 fn portable_minimum_and_representative_layouts() -> Result<(), AdmissionError> {
     assert_eq!(32, empty_object_layout()?.block_bytes);
     assert_eq!(64, array_layout(ValueWidth::Char, 9)?.block_bytes);
-    assert_eq!(48, array_layout(ValueWidth::Ref, 3)?.block_bytes);
+    let references = array_layout(ValueWidth::Ref, 3)?;
+    assert_eq!(4, references.element_bytes);
+    assert_eq!(48, references.block_bytes);
     assert_eq!(48, string_layout(StringEncoding::Latin1, 8)?.block_bytes);
     assert_eq!(48, string_layout(StringEncoding::Utf16, 8)?.block_bytes);
     Ok(())
@@ -389,18 +386,41 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
     profile.heap_bytes = 1024;
     let image = ExecutionImage::admit(fixtures::portable_layout_artifact(), profile)?;
 
+    let plan = image.storage_plan();
+    assert_eq!(1024, plan.heap_arena_bytes);
+    assert_eq!(Heap::allocator_resident_bytes(), plan.heap_allocator_bytes);
+    assert_eq!(0, plan.frame_arena_bytes);
     assert_eq!(
-        StoragePlan {
-            heap_bytes: 1024,
-            handle_capacity: 32,
-            type_count: 4,
-            field_count: 5,
-            static_slot_count: 1,
-            literal_count: 1,
-            literal_id_count: 1,
-            reference_offset_count: 1,
-        },
-        image.storage_plan()
+        core::mem::size_of::<Frame>() as u64 * image.maximum_call_depth() as u64,
+        plan.frame_record_bytes,
+    );
+    assert_eq!(8, plan.static_bytes);
+    assert_eq!(
+        core::mem::size_of::<TypeInitializationState>() as u64 * 4,
+        plan.type_initialization_bytes,
+    );
+    assert_eq!(
+        ExternalRootTable::resident_bytes(image.external_root_capacity()).unwrap(),
+        plan.external_root_bytes,
+    );
+    assert_eq!(Machine::pending_state_bytes(), plan.pending_state_bytes);
+    assert_eq!(Machine::fixed_state_bytes(), plan.machine_fixed_bytes);
+    assert_eq!(
+        plan.heap_arena_bytes
+            + plan.heap_allocator_bytes
+            + plan.frame_arena_bytes
+            + plan.frame_record_bytes
+            + plan.static_bytes
+            + plan.type_initialization_bytes
+            + plan.external_root_bytes
+            + plan.pending_state_bytes
+            + plan.machine_fixed_bytes,
+        plan.mutable_resident_bytes(),
+    );
+    let machine = Machine::new(image.clone())?;
+    assert_eq!(
+        plan.mutable_resident_bytes(),
+        machine.test_reserved_bytes() as u64
     );
 
     let RuntimeTypeLayout::Object(subclass) = image
@@ -432,6 +452,28 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
         }),
         image.type_layout(TypeKey { module: 0, ty: 3 })
     );
+    Ok(())
+}
+
+#[test]
+fn call_depth_only_grows_compact_frame_storage() -> Result<(), AdmissionError> {
+    let shallow =
+        ExecutionImage::admit(fixtures::recursive_artifact(1), fixtures::profile())?.storage_plan();
+    let deep =
+        ExecutionImage::admit(fixtures::recursive_artifact(4), fixtures::profile())?.storage_plan();
+
+    assert_eq!(shallow.heap_arena_bytes, deep.heap_arena_bytes);
+    assert_eq!(shallow.heap_allocator_bytes, deep.heap_allocator_bytes);
+    assert_eq!(shallow.static_bytes, deep.static_bytes);
+    assert_eq!(
+        shallow.type_initialization_bytes,
+        deep.type_initialization_bytes,
+    );
+    assert_eq!(shallow.external_root_bytes, deep.external_root_bytes);
+    assert_eq!(shallow.pending_state_bytes, deep.pending_state_bytes);
+    assert_eq!(shallow.machine_fixed_bytes, deep.machine_fixed_bytes);
+    assert_eq!(shallow.frame_arena_bytes * 4, deep.frame_arena_bytes);
+    assert_eq!(shallow.frame_record_bytes * 4, deep.frame_record_bytes);
     Ok(())
 }
 

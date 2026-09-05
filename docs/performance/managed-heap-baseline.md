@@ -61,10 +61,23 @@ actions in 175,730 ns (56,905,480 leaf units/s).
 
 ## Idle resident bound
 
-Constructing 10,000 idle instances took 3,387,340 ns (2,952,169 instances/s).
-All instances reported exactly zero maintenance units. Each has a 32-byte guest
-arena; the test-only reservation accounting reported 9,160,000 bytes total,
-or 916 bytes per instance. Of that, 792 bytes are the inline `Machine` value;
-the remainder is its arena, handles, frames, registers, and static-slot boxed
-storage. The shared immutable execution image and native allocator bookkeeping
-are explicitly excluded.
+Compact mutable-resident accounting was remeasured on 2026-09-05 with:
+
+```sh
+COMPUKTER_BENCH_CPU="x86_64 local" cargo test --release --locked --offline managed_heap_performance_operations_and_idle_instances -- --ignored --nocapture --test-threads=1
+```
+
+Constructing 10,000 idle instances took 4,012,216 ns (2,492,388 instances/s).
+All instances reported exactly zero maintenance units. Each instance reserves
+2,058 bytes: 32 bytes of guest heap arena, 1,024 bytes of allocator class-head
+storage, 8 bytes of compact frame arena, 64 bytes of frame records, 2 bytes of
+type-initialization state, 345 bytes of inline pending-operation state, and 583
+bytes of other fixed `Machine` state. This fixture has no statics or external
+roots. A representative depth-64 recursive fixture reserves 512 frame-arena
+bytes and 4,096 frame-record bytes, for 6,593 mutable resident bytes in total;
+its guest heap remains exactly 32 bytes.
+
+The total includes allocator tables and object/block headers inside the guest
+arena, so `heap_arena` is a reservation rather than a claim that every byte is
+available as user payload. The shared immutable execution image and native
+allocator bookkeeping remain explicitly excluded.

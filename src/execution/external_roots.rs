@@ -16,7 +16,10 @@
  * limitations under the License.
  */
 
-use super::{error::AdmissionError, value::Ref32};
+use super::{
+    error::{AdmissionError, ResidentStorageComponent},
+    value::Ref32,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ExternalHandle {
@@ -35,6 +38,14 @@ pub(super) struct ExternalRootTable {
 }
 
 impl ExternalRootTable {
+    pub(super) fn resident_bytes(capacity: u32) -> Result<u64, AdmissionError> {
+        u64::from(capacity)
+            .checked_mul(core::mem::size_of::<ExternalRootEntry>() as u64)
+            .ok_or(AdmissionError::ResidentStorageOverflow {
+                component: ResidentStorageComponent::ExternalRoots,
+            })
+    }
+
     pub(super) fn new(capacity: u32) -> Result<Self, AdmissionError> {
         let capacity =
             usize::try_from(capacity).map_err(|_| AdmissionError::StoragePlanOverflow)?;

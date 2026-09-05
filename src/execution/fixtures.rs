@@ -11,7 +11,7 @@ use crate::{
 use super::{
     image::{AdmittedReference, ExecutionImage, ExecutionProfile},
     machine::Machine,
-    value::{EntryArgument, Ref32, RegisterValue, RuntimeValue},
+    value::{EntryArgument, Ref32, RuntimeValue},
     TypeKey,
 };
 
@@ -258,8 +258,8 @@ pub(super) fn recursive_artifact(maximum_call_depth: u32) -> VerifiedArtifact {
     })
 }
 
-pub(super) fn recursive_pre_call_state() -> Box<[RegisterValue]> {
-    Box::new([RegisterValue::Initialized(RuntimeValue::I32(7))])
+pub(super) fn recursive_pre_call_state() -> Box<[Option<RuntimeValue>]> {
+    Box::new([Some(RuntimeValue::I32(7))])
 }
 
 pub(crate) fn two_block_artifact(first_cost: u32, second_cost: u32) -> VerifiedArtifact {
@@ -978,12 +978,8 @@ pub(crate) fn trap_after_write_artifact(cost: u32) -> VerifiedArtifact {
     )
 }
 
-pub(super) fn pre_trap_registers() -> Box<[RegisterValue]> {
-    Box::new([
-        RegisterValue::Initialized(RuntimeValue::I32(1)),
-        RegisterValue::Initialized(RuntimeValue::I32(0)),
-        RegisterValue::Uninitialized,
-    ])
+pub(super) fn pre_trap_registers() -> Box<[Option<RuntimeValue>]> {
+    Box::new([Some(RuntimeValue::I32(1)), Some(RuntimeValue::I32(0)), None])
 }
 
 pub(super) fn branch_switch_artifact(key: i32) -> (VerifiedArtifact, Box<[EntryArgument]>) {
@@ -1084,8 +1080,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 2,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(7))),
             digest: [
-                130, 247, 11, 159, 19, 81, 241, 126, 113, 207, 203, 8, 46, 24, 240, 52, 77, 229,
-                210, 75, 228, 119, 37, 185, 163, 98, 101, 54, 126, 206, 163, 211,
+                125, 245, 183, 244, 187, 145, 237, 216, 12, 157, 49, 16, 51, 179, 3, 192, 113, 42,
+                117, 19, 147, 27, 222, 24, 10, 206, 96, 251, 99, 173, 81, 9,
             ],
             fixed_cost: 2,
         },
@@ -1096,8 +1092,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 64,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(10))),
             digest: [
-                236, 106, 15, 35, 196, 61, 202, 121, 119, 4, 57, 135, 43, 76, 158, 104, 16, 153,
-                204, 243, 148, 14, 74, 108, 96, 248, 240, 251, 198, 131, 253, 31,
+                71, 198, 200, 100, 233, 105, 34, 203, 239, 38, 83, 17, 248, 224, 66, 44, 169, 29,
+                55, 246, 74, 150, 239, 237, 86, 239, 200, 76, 251, 55, 13, 183,
             ],
             fixed_cost: 3,
         },
@@ -1108,8 +1104,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 64,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(20))),
             digest: [
-                20, 171, 169, 171, 112, 155, 242, 221, 36, 51, 76, 62, 252, 129, 235, 51, 9, 91,
-                192, 3, 237, 58, 107, 132, 77, 193, 74, 174, 190, 181, 114, 128,
+                0, 92, 85, 174, 150, 240, 15, 149, 112, 86, 216, 134, 119, 180, 110, 128, 116, 107,
+                29, 222, 23, 126, 163, 171, 26, 96, 176, 207, 154, 33, 153, 92,
             ],
             fixed_cost: 5,
         },
@@ -1120,8 +1116,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 128,
             outcome: super::error::Outcome::Halted(Some(RuntimeValue::I32(42))),
             digest: [
-                223, 236, 145, 64, 210, 204, 78, 82, 5, 37, 238, 67, 55, 218, 223, 219, 28, 25, 42,
-                163, 202, 45, 158, 102, 238, 161, 10, 54, 41, 191, 188, 205,
+                189, 149, 168, 154, 78, 174, 59, 129, 50, 102, 54, 224, 18, 0, 154, 56, 156, 83,
+                149, 33, 5, 114, 232, 188, 104, 37, 198, 220, 191, 218, 238, 213,
             ],
             fixed_cost: 17,
         },
@@ -1132,8 +1128,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 7,
             outcome: super::error::Outcome::Crashed(super::error::GuestTrap::DivisionByZero),
             digest: [
-                124, 143, 91, 46, 78, 43, 238, 209, 193, 217, 196, 252, 82, 31, 191, 28, 241, 237,
-                22, 4, 253, 9, 141, 120, 22, 242, 22, 161, 211, 12, 151, 24,
+                52, 214, 180, 35, 126, 102, 33, 17, 93, 32, 64, 129, 128, 82, 111, 107, 253, 0, 67,
+                38, 188, 80, 201, 234, 229, 233, 79, 24, 23, 239, 164, 246,
             ],
             fixed_cost: 7,
         },
@@ -1144,8 +1140,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 8,
             outcome: super::error::Outcome::Halted(None),
             digest: [
-                178, 137, 19, 129, 145, 169, 17, 162, 85, 159, 13, 174, 192, 21, 95, 180, 227, 186,
-                108, 87, 125, 99, 30, 141, 63, 45, 48, 254, 181, 231, 140, 124,
+                170, 193, 194, 167, 225, 0, 250, 156, 55, 223, 73, 105, 254, 245, 79, 135, 44, 84,
+                103, 41, 123, 145, 62, 168, 182, 210, 216, 181, 242, 205, 233, 18,
             ],
             fixed_cost: 8,
         },
@@ -1156,8 +1152,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 7,
             outcome: super::error::Outcome::SliceExhausted,
             digest: [
-                146, 248, 34, 222, 97, 178, 167, 56, 201, 175, 71, 80, 88, 44, 131, 21, 248, 162,
-                223, 147, 194, 66, 194, 126, 177, 97, 212, 239, 125, 100, 135, 127,
+                11, 148, 19, 126, 127, 198, 33, 204, 88, 49, 173, 73, 158, 54, 195, 27, 48, 62,
+                236, 164, 203, 113, 147, 143, 161, 135, 239, 90, 142, 68, 63, 96,
             ],
             fixed_cost: 3,
         },
@@ -1168,8 +1164,8 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             budget: 10,
             outcome: super::error::Outcome::SliceExhausted,
             digest: [
-                200, 107, 125, 99, 42, 185, 194, 56, 4, 94, 85, 89, 142, 187, 201, 241, 2, 164,
-                190, 217, 140, 165, 66, 124, 133, 191, 241, 8, 43, 183, 236, 85,
+                38, 133, 88, 147, 81, 123, 207, 187, 84, 68, 188, 78, 75, 128, 26, 21, 162, 243,
+                119, 175, 218, 190, 193, 175, 208, 89, 32, 33, 82, 190, 114, 41,
             ],
             fixed_cost: 9,
         },
@@ -2245,7 +2241,7 @@ fn literal_string_program_blocks_configured(
     decoded.manifest.maximum_block_cost = maximum_block_cost;
     decoded.manifest.minimum_slice_cost = maximum_block_cost;
     decoded.manifest.required_stack_bytes =
-        super::image::frame_charge(register_count as u64).unwrap() as u32;
+        super::image::frame_charge(&application.functions[0].values).unwrap() as u32;
     configure(&mut decoded);
     canonicalize_module_strings(&mut decoded, 0);
 
@@ -4959,9 +4955,6 @@ pub(super) fn profiles_below_each_manifest_limit() -> Vec<ExecutionProfile> {
     let mut platform = profile();
     platform.platform_abi = [1; 32];
     profiles.push(platform);
-    let mut frame_storage = profile();
-    frame_storage.frame_storage_bytes = 31;
-    profiles.push(frame_storage);
     let mut call_depth = profile();
     call_depth.maximum_call_depth = 0;
     profiles.push(call_depth);
@@ -5024,7 +5017,7 @@ fn verified_program(
         artifact.manifest.maximum_block_cost = fixed_cost;
         artifact.manifest.minimum_slice_cost = fixed_cost;
         artifact.manifest.required_stack_bytes =
-            super::image::frame_charge(register_count.into()).unwrap() as u32;
+            super::image::frame_charge(&artifact.modules[0].functions[0].values).unwrap() as u32;
     })
 }
 
@@ -5079,7 +5072,7 @@ fn verified_blocks(
         artifact.manifest.minimum_slice_cost = maximum_block_cost;
         artifact.manifest.maximum_call_depth = maximum_call_depth;
         artifact.manifest.required_stack_bytes =
-            (super::image::frame_charge(register_count.into()).unwrap()
+            (super::image::frame_charge(&artifact.modules[0].functions[0].values).unwrap()
                 * u64::from(maximum_call_depth)) as u32;
     })
 }
@@ -5183,13 +5176,18 @@ fn install_entry_blocks(
 
 fn configure_stack(
     artifact: &mut crate::artifact::DecodedArtifact,
-    registers_per_frame: u64,
+    _registers_per_frame: u64,
     maximum_call_depth: u32,
 ) {
     artifact.manifest.maximum_call_depth = maximum_call_depth;
-    artifact.manifest.required_stack_bytes = (super::image::frame_charge(registers_per_frame)
-        .unwrap()
-        * u64::from(maximum_call_depth)) as u32;
+    let largest_frame = artifact
+        .modules
+        .iter()
+        .flat_map(|module| &module.functions)
+        .map(|function| super::image::frame_charge(&function.values).unwrap())
+        .max()
+        .unwrap_or(0);
+    artifact.manifest.required_stack_bytes = (largest_frame * u64::from(maximum_call_depth)) as u32;
 }
 
 fn primitive(kind: u8) -> ValueType {
