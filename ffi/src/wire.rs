@@ -23,6 +23,8 @@ use crate::bridge::{
     CreateError, OwnedMerge, OwnedOutcome, OwnedRequest, OwnedValue, StoreCreateError,
 };
 use crate::handle_table::HandleError;
+#[cfg(test)]
+use compukter_vm::ResidentStorageComponent;
 
 pub(crate) fn encode_create(outcome: Result<u64, CreateError>) -> Vec<u8> {
     let encoder = match outcome {
@@ -729,6 +731,7 @@ fn admission_code(error: AdmissionError) -> u16 {
         AdmissionError::CapabilityOperationCount { .. } => 15,
         AdmissionError::CapabilitySchema { .. } => 16,
         AdmissionError::SynchronousCapabilityUnsupported => 17,
+        AdmissionError::ResidentStorageOverflow { .. } => 18,
     }
 }
 
@@ -808,6 +811,18 @@ mod tests {
         assert_eq!(
             vec![3, 11, 0],
             encode_create(Err(CreateError::Run(RunError::EntryAllocationFailed))),
+        );
+    }
+
+    #[test]
+    fn resident_storage_overflow_has_a_stable_wire_code() {
+        assert_eq!(
+            vec![2, 18, 0],
+            encode_create(Err(CreateError::Admission(
+                AdmissionError::ResidentStorageOverflow {
+                    component: ResidentStorageComponent::FrameArena,
+                },
+            ))),
         );
     }
 
