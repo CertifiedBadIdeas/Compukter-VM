@@ -1,7 +1,7 @@
 use super::{
     error::VmFault,
     external_roots::ExternalRootTable,
-    frame::FrameArena,
+    frame::{FrameArena, StaticArena},
     heap::Heap,
     heap_ops::load_value,
     image::ExecutionImage,
@@ -18,11 +18,13 @@ pub(super) enum CollectorPhase {
     Sweep,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct RootSet<'a> {
-    pub static_slots: &'a [RuntimeValue],
+    pub statics: &'a StaticArena,
     pub frames: &'a [Frame],
     pub frame_arena: &'a FrameArena,
     pub frame_depth: usize,
+    pub runtime_roots: &'a [Option<Ref32>],
     pub external: &'a ExternalRootTable,
 }
 
@@ -53,6 +55,7 @@ enum Scan {
 pub(super) struct Collector {
     phase: CollectorPhase,
     epoch: u32,
+    runtime_root: usize,
     external_root: usize,
     static_field: usize,
     frame: usize,
@@ -70,6 +73,7 @@ impl Collector {
         Self {
             phase: CollectorPhase::Idle,
             epoch: 0,
+            runtime_root: 0,
             external_root: 0,
             static_field: 0,
             frame: 0,
@@ -87,6 +91,7 @@ impl Collector {
         debug_assert_eq!(self.phase, CollectorPhase::Idle);
         self.epoch = if self.epoch == 1 { 2 } else { 1 };
         self.phase = CollectorPhase::Roots;
+        self.runtime_root = 0;
         self.external_root = 0;
         self.static_field = 0;
         self.frame = 0;
@@ -122,14 +127,7 @@ impl Collector {
         match self.phase {
             CollectorPhase::Idle => Ok(0),
             CollectorPhase::Roots => {
-                if let Some(root) = self.next_root(
-                    image,
-                    roots.static_slots,
-                    roots.frames,
-                    roots.frame_arena,
-                    roots.frame_depth,
-                    roots.external,
-                )? {
+                if let Some(root) = self.next_root(image, roots)? {
                     self.enqueue_value(heap, root)?;
                     #[cfg(test)]
                     {
@@ -170,16 +168,19 @@ impl Collector {
     fn next_root(
         &mut self,
         image: &ExecutionImage,
-        static_slots: &[RuntimeValue],
-        frames: &[Frame],
-        frame_arena: &FrameArena,
-        frame_depth: usize,
-        external_roots: &ExternalRootTable,
+        roots: RootSet<'_>,
     ) -> Result<Option<RuntimeValue>, VmFault> {
-        while self.external_root < external_roots.len() {
+        while self.runtime_root < roots.runtime_roots.len() {
+            let index = self.runtime_root;
+            self.runtime_root += 1;
+            if let Some(reference) = roots.runtime_roots[index] {
+                return Ok(Some(RuntimeValue::Reference(reference)));
+            }
+        }
+        while self.external_root < roots.external.len() {
             let index = self.external_root;
             self.external_root += 1;
-            if let Some(reference) = external_roots.root(index) {
+            if let Some(reference) = roots.external.root(index) {
                 return Ok(Some(RuntimeValue::Reference(reference)));
             }
         }
@@ -187,15 +188,17 @@ impl Collector {
             self.static_field += 1;
             if field.value_type.kind == 7 && field.static_slot.is_some() {
                 let slot = field.static_slot.ok_or(VmFault::InvalidStoragePlan)?;
-                return static_slots
-                    .get(slot as usize)
-                    .copied()
-                    .map(Some)
-                    .ok_or(VmFault::InvalidStoragePlan);
+                let reference = roots.statics.reference(slot)?;
+                return Ok(Some(
+                    reference.map_or(RuntimeValue::Null, RuntimeValue::Reference),
+                ));
             }
         }
-        while self.frame < frame_depth {
-            let frame = frames.get(self.frame).ok_or(VmFault::CorruptLifecycle)?;
+        while self.frame < roots.frame_depth {
+            let frame = roots
+                .frames
+                .get(self.frame)
+                .ok_or(VmFault::CorruptLifecycle)?;
             let function = image
                 .function(frame.function)
                 .ok_or(VmFault::CorruptLifecycle)?;
@@ -207,8 +210,12 @@ impl Collector {
                     .get(register)
                     .is_some_and(|ty| ty.kind == 7)
                 {
-                    let reference =
-                        frame_arena.read_ref32(frame.base, &function.frame_layout, register, 0)?;
+                    let reference = roots.frame_arena.read_ref32(
+                        frame.base,
+                        &function.frame_layout,
+                        register,
+                        0,
+                    )?;
                     return Ok(Some(
                         reference.map_or(RuntimeValue::Null, RuntimeValue::Reference),
                     ));

@@ -2,7 +2,8 @@ use super::{
     error::{GuestTrap, Outcome},
     fixtures,
     image::deduplicate_literal_ranges,
-    value::{ReferenceDomain, RuntimeValue},
+    text::PendingConcat,
+    value::{Ref32, ReferenceDomain, RuntimeValue},
 };
 use crate::artifact::{ByteRange, Constant};
 
@@ -16,6 +17,17 @@ fn string_literal_loads_as_an_immortal_reference() {
     };
 
     assert_eq!(ReferenceDomain::Image, reference.domain());
+}
+
+#[test]
+fn pending_concat_enumerates_managed_source_roots_without_runtime_value_storage() {
+    let reference = Ref32::managed(16).unwrap();
+    let Ok(pending) = PendingConcat::char_array(reference, 2, 0, 2, 0) else {
+        panic!("valid character-array range was rejected");
+    };
+    let mut roots = Vec::new();
+    pending.visit_roots(|root| roots.push(root));
+    assert_eq!(vec![reference, reference], roots);
 }
 
 #[test]
