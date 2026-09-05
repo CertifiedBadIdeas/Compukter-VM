@@ -91,9 +91,9 @@ pub(crate) fn verify_exceptions(
                     ));
                 }
                 let register = function
-                    .registers
+                    .values
                     .get(entry.exception_register as usize)
-                    .copied()
+                    .map(|value| value.semantic_type)
                     .ok_or_else(|| {
                         failure(
                             limits,

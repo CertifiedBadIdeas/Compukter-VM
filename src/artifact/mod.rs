@@ -147,6 +147,7 @@ pub(crate) struct DecodedModule {
     pub blocks: Vec<Block>,
     pub code: Vec<DecodedCode>,
     pub exceptions: Vec<ExceptionEntry>,
+    pub safepoint_roots: Vec<SafepointRoots>,
     pub debug: Vec<DebugEntry>,
 }
 
@@ -155,6 +156,44 @@ pub(crate) struct ValueType {
     pub kind: u8,
     pub flags: u8,
     pub nominal_type: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PhysicalAtom {
+    I32,
+    I64,
+    F32,
+    F64,
+    Ref32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct FunctionValue {
+    pub semantic_type: ValueType,
+    pub components: Vec<PhysicalAtom>,
+}
+
+impl FunctionValue {
+    #[cfg(test)]
+    pub(crate) fn scalar(semantic_type: ValueType) -> Self {
+        let atom = match semantic_type.kind {
+            1 | 5 | 6 => PhysicalAtom::I32,
+            2 => PhysicalAtom::I64,
+            3 => PhysicalAtom::F32,
+            4 => PhysicalAtom::F64,
+            7 => PhysicalAtom::Ref32,
+            _ => panic!("Unit and unknown types have no scalar physical shape"),
+        };
+        Self {
+            semantic_type,
+            components: vec![atom],
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scalar_values(values: Vec<ValueType>) -> Vec<FunctionValue> {
+    values.into_iter().map(FunctionValue::scalar).collect()
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -252,7 +291,21 @@ pub(crate) struct Function {
     pub block_count: u32,
     pub first_exception: u32,
     pub exception_count: u32,
-    pub registers: Vec<ValueType>,
+    pub values: Vec<FunctionValue>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ValueComponent {
+    pub value: u16,
+    pub component: u16,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SafepointRoots {
+    pub function: FunctionId,
+    pub block: BlockId,
+    pub instruction_boundary: u32,
+    pub references: Vec<ValueComponent>,
 }
 
 #[derive(Debug, Eq, PartialEq)]

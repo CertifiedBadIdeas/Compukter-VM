@@ -2,7 +2,7 @@ pub(crate) const HEADER_SIZE: usize = 64;
 pub(crate) const DIRECTORY_ENTRY_SIZE: usize = 32;
 pub(crate) const DIGEST_SIZE: usize = 32;
 
-pub(crate) const FORMAT_MAJOR: u16 = 2;
+pub(crate) const FORMAT_MAJOR: u16 = 3;
 pub(crate) const RUNTIME_ABI_MAJOR: u16 = 1;
 pub(crate) const RUNTIME_ABI_MINOR: u16 = 0;
 
@@ -25,6 +25,7 @@ pub(crate) const BLOCKS: u16 = 0x0107;
 pub(crate) const CODE: u16 = 0x0108;
 pub(crate) const EXCEPTIONS: u16 = 0x0109;
 pub(crate) const UTF16_LITERALS: u16 = 0x010a;
+pub(crate) const SAFEPOINT_ROOTS: u16 = 0x010b;
 pub(crate) const DEBUG: u16 = 0x0110;
 pub(crate) const OPTIONAL_EXTENSION_START: u16 = 0x8000;
 
@@ -46,6 +47,7 @@ pub(crate) fn is_module(kind: u16) -> bool {
             | CODE
             | EXCEPTIONS
             | UTF16_LITERALS
+            | SAFEPOINT_ROOTS
             | DEBUG
     )
 }

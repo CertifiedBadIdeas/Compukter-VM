@@ -7,6 +7,7 @@ use crate::VerifiedArtifact;
 
 use super::{
     error::AdmissionError,
+    frame::{FrameLayout, SafepointMap},
     host::{HostValueType, ResolvedCapability},
     layout::{object_layout, FieldSpec, RuntimeTypeLayout, StoragePlan, ValueWidth},
     value::{ReferenceValue, RuntimeValue},
@@ -49,10 +50,19 @@ pub(super) struct ResolvedFunction {
     pub register_count: usize,
     pub parameter_count: usize,
     pub registers: Box<[ResolvedValueType]>,
+    pub frame_layout: FrameLayout,
+    pub safepoints: Box<[ResolvedSafepoint]>,
     pub result: ResolvedValueType,
     pub first_block: usize,
     pub block_count: usize,
     pub static_owner: Option<TypeKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedSafepoint {
+    pub block: usize,
+    pub instruction_boundary: u32,
+    pub map: SafepointMap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,9 +560,64 @@ impl ExecutionImage {
                 else {
                     return Err(AdmissionError::InvalidEntry);
                 };
-                let mut registers = reserved(function.registers.len())?;
-                for value_type in &function.registers {
-                    registers.push(resolve_value_type(decoded, module_id, *value_type)?);
+                let mut registers = reserved(function.values.len())?;
+                for value in &function.values {
+                    registers.push(resolve_value_type(decoded, module_id, value.semantic_type)?);
+                }
+                let frame_layout = FrameLayout::derive(&function.values)
+                    .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+                let local_roots = module
+                    .safepoint_roots
+                    .iter()
+                    .filter(|roots| roots.function.0 as usize == function_id);
+                let mut safepoints = Vec::new();
+                let first_block = function.first_block.0 as usize;
+                let block_end = first_block
+                    .checked_add(function.block_count as usize)
+                    .ok_or(AdmissionError::StoragePlanOverflow)?;
+                let expected_safepoints = (first_block..block_end)
+                    .try_fold(0_usize, |total, block| {
+                        total.checked_add(module.code.get(block)?.instructions.len())
+                    })
+                    .ok_or(AdmissionError::InvalidEntry)?;
+                safepoints
+                    .try_reserve_exact(expected_safepoints)
+                    .map_err(|_| AdmissionError::AllocationFailed)?;
+                for roots in local_roots {
+                    let local_block = roots.block.0 as usize;
+                    let code = module
+                        .code
+                        .get(local_block)
+                        .ok_or(AdmissionError::InvalidEntry)?;
+                    if module
+                        .blocks
+                        .get(local_block)
+                        .is_none_or(|block| block.owner_function.0 as usize != function_id)
+                        || roots.instruction_boundary as usize >= code.instructions.len()
+                    {
+                        return Err(AdmissionError::InvalidEntry);
+                    }
+                    let block = block_offsets[module_id]
+                        .checked_add(local_block)
+                        .ok_or(AdmissionError::StoragePlanOverflow)?;
+                    if safepoints
+                        .last()
+                        .is_some_and(|previous: &ResolvedSafepoint| {
+                            (previous.block, previous.instruction_boundary)
+                                >= (block, roots.instruction_boundary)
+                        })
+                    {
+                        return Err(AdmissionError::InvalidEntry);
+                    }
+                    safepoints.push(ResolvedSafepoint {
+                        block,
+                        instruction_boundary: roots.instruction_boundary,
+                        map: SafepointMap::derive(&frame_layout, &roots.references)
+                            .map_err(|_| AdmissionError::InvalidEntry)?,
+                    });
+                }
+                if safepoints.len() != expected_safepoints {
+                    return Err(AdmissionError::InvalidEntry);
                 }
                 registers_per_frame = registers_per_frame.max(registers.len());
                 functions.push(ResolvedFunction {
@@ -563,6 +628,8 @@ impl ExecutionImage {
                     register_count: function.register_count as usize,
                     parameter_count: function.parameter_count as usize,
                     registers: registers.into_boxed_slice(),
+                    frame_layout,
+                    safepoints: safepoints.into_boxed_slice(),
                     result: resolve_value_type(decoded, signature_key.module as usize, *result)?,
                     first_block: block_offsets[module_id]
                         .checked_add(function.first_block.0 as usize)
@@ -694,6 +761,23 @@ impl ExecutionImage {
 
     pub(super) fn block(&self, index: usize) -> Option<&ResolvedBlock> {
         self.0.blocks.get(index)
+    }
+
+    pub(super) fn safepoint_map(
+        &self,
+        function: usize,
+        block: usize,
+        instruction_boundary: u32,
+    ) -> Option<&SafepointMap> {
+        self.0
+            .functions
+            .get(function)?
+            .safepoints
+            .binary_search_by_key(&(block, instruction_boundary), |safepoint| {
+                (safepoint.block, safepoint.instruction_boundary)
+            })
+            .ok()
+            .map(|index| &self.0.functions[function].safepoints[index].map)
     }
 
     pub(super) fn constant(&self, index: usize) -> Option<RuntimeValue> {
@@ -2120,6 +2204,116 @@ mod tests {
     }
 
     #[test]
+    fn admission_installs_compact_frame_and_safepoint_layouts() {
+        let mut decoded = crate::decode::records::decode_artifact(
+            Arc::from(crate::test_support::minimal_vector()),
+            &crate::ArtifactLimits::default(),
+        )
+        .unwrap();
+        decoded.manifest.required_stack_bytes = 80;
+        let primitive = |kind| crate::artifact::ValueType {
+            kind,
+            flags: 0,
+            nominal_type: crate::artifact::TypeId(u32::MAX),
+        };
+        decoded.modules[0].functions[0].register_count = 3;
+        decoded.modules[0].functions[0].values = vec![
+            crate::artifact::FunctionValue {
+                semantic_type: primitive(1),
+                components: vec![crate::artifact::PhysicalAtom::I32],
+            },
+            crate::artifact::FunctionValue {
+                semantic_type: primitive(2),
+                components: vec![crate::artifact::PhysicalAtom::I64],
+            },
+            crate::artifact::FunctionValue {
+                semantic_type: primitive(1),
+                components: vec![crate::artifact::PhysicalAtom::Ref32],
+            },
+        ];
+        decoded.modules[0].safepoint_roots[0].references = vec![crate::artifact::ValueComponent {
+            value: 2,
+            component: 0,
+        }];
+        let image = ExecutionImage::admit(
+            crate::artifact::VerifiedArtifact::new(decoded),
+            fixtures::profile(),
+        )
+        .unwrap();
+        let function = &image.functions()[image.entry_index()];
+
+        assert_eq!(function.frame_layout.byte_len, 24);
+        assert_eq!(function.frame_layout.alignment, 8);
+        assert_eq!(function.frame_layout.values[0].components[0].offset, 0);
+        assert_eq!(function.frame_layout.values[1].components[0].offset, 8);
+        assert_eq!(function.frame_layout.values[2].components[0].offset, 16);
+        assert_eq!(
+            &*image
+                .safepoint_map(image.entry_index(), function.first_block, 0)
+                .unwrap()
+                .reference_offsets,
+            &[16],
+        );
+    }
+
+    #[test]
+    fn admission_rejects_missing_duplicate_and_non_reference_roots() {
+        let decoded = || {
+            let mut decoded = crate::decode::records::decode_artifact(
+                Arc::from(crate::test_support::minimal_vector()),
+                &crate::ArtifactLimits::default(),
+            )
+            .unwrap();
+            decoded.manifest.required_stack_bytes = 32;
+            decoded
+        };
+
+        let mut missing = decoded();
+        missing.modules[0].safepoint_roots.clear();
+        assert_eq!(
+            Err(AdmissionError::InvalidEntry),
+            ExecutionImage::admit(
+                crate::artifact::VerifiedArtifact::new(missing),
+                fixtures::profile(),
+            )
+            .map(|_| ())
+        );
+
+        let mut duplicate = decoded();
+        duplicate.modules[0]
+            .safepoint_roots
+            .push(crate::artifact::SafepointRoots {
+                function: crate::artifact::FunctionId(0),
+                block: crate::artifact::BlockId(0),
+                instruction_boundary: 0,
+                references: Vec::new(),
+            });
+        assert_eq!(
+            Err(AdmissionError::InvalidEntry),
+            ExecutionImage::admit(
+                crate::artifact::VerifiedArtifact::new(duplicate),
+                fixtures::profile(),
+            )
+            .map(|_| ())
+        );
+
+        let mut wrong_atom = decoded();
+        wrong_atom.modules[0].safepoint_roots[0].references =
+            vec![crate::artifact::ValueComponent {
+                value: 0,
+                component: 0,
+            }];
+        assert_eq!(
+            Err(AdmissionError::InvalidEntry),
+            ExecutionImage::admit(
+                crate::artifact::VerifiedArtifact::new(wrong_atom),
+                fixtures::profile(),
+            )
+            .map(|_| ())
+        );
+    }
+
+    #[test]
     fn imported_function_resolution_selects_the_matching_overload() {
         let mut artifact = crate::decode::records::decode_artifact(
             Arc::from(crate::test_support::two_module_vector()),
@@ -2158,7 +2352,7 @@ mod tests {
             block_count: 0,
             first_exception: 0,
             exception_count: 0,
-            registers: vec![i32_type],
+            values: crate::artifact::scalar_values(vec![i32_type]),
         };
         artifact.modules[1].functions.push(overload);
         artifact.modules[1].exports.push(crate::artifact::Export {

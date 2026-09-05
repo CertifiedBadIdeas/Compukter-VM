@@ -264,7 +264,7 @@ fn cfg_rejects_uninitialized_register_read() {
     artifact.manifest.minimum_slice_cost = 2;
     let function = &mut artifact.modules[0].functions[0];
     function.register_count = 2;
-    function.registers = vec![
+    function.values = crate::artifact::scalar_values(vec![
         crate::artifact::ValueType {
             kind: 1,
             flags: 0,
@@ -275,7 +275,7 @@ fn cfg_rejects_uninitialized_register_read() {
             flags: 0,
             nominal_type: crate::artifact::TypeId(u32::MAX),
         },
-    ];
+    ]);
     artifact.modules[0].blocks[0].instruction_count = 2;
     artifact.modules[0].blocks[0].declared_fixed_cost = 2;
     artifact.modules[0].code[0].instructions = vec![
@@ -316,7 +316,7 @@ fn cfg_rejects_wrong_destination_type() {
     let function = &mut artifact.modules[0].functions[0];
     function.register_count = 2;
     function.parameter_count = 2;
-    function.registers = vec![bool_type, i32_type];
+    function.values = crate::artifact::scalar_values(vec![bool_type, i32_type]);
     artifact.modules[0].blocks[0].instruction_count = 2;
     artifact.modules[0].blocks[0].declared_fixed_cost = 2;
     artifact.modules[0].code[0].instructions = vec![
@@ -402,7 +402,7 @@ fn configure_entry(
     let function = &mut artifact.modules[0].functions[0];
     function.register_count = registers.len() as u16;
     function.parameter_count = parameter_count;
-    function.registers = registers;
+    function.values = crate::artifact::scalar_values(registers);
     let fixed_cost = instructions
         .iter()
         .map(|instruction| instruction.fixed_cost().unwrap())
@@ -893,7 +893,8 @@ fn cfg_accepts_structurally_equivalent_imported_array_argument() {
     }
     artifact.modules[1].functions[0].register_count = 1;
     artifact.modules[1].functions[0].parameter_count = 1;
-    artifact.modules[1].functions[0].registers = vec![reference(1, false)];
+    artifact.modules[1].functions[0].values =
+        crate::artifact::scalar_values(vec![reference(1, false)]);
     configure_entry(
         &mut artifact,
         vec![reference(1, false)],
@@ -938,7 +939,7 @@ fn cfg_resolves_imported_overload_by_signature() {
             block_count: 0,
             first_exception: 0,
             exception_count: 0,
-            registers: vec![primitive(1)],
+            values: crate::artifact::scalar_values(vec![primitive(1)]),
         });
     artifact.modules[1].exports.insert(
         0,
@@ -1098,7 +1099,7 @@ fn add_exception_register(
     value_type: crate::artifact::ValueType,
 ) {
     artifact.modules[0].functions[0].register_count = 1;
-    artifact.modules[0].functions[0].registers = vec![value_type];
+    artifact.modules[0].functions[0].values = crate::artifact::scalar_values(vec![value_type]);
     artifact.modules[0].functions[0].first_exception = 0;
     artifact.modules[0].functions[0].exception_count = 1;
 }
@@ -1369,7 +1370,8 @@ fn exception_handler_artifact(reads_uninitialized_local: bool) -> crate::artifac
     artifact.header.semantic_features = 1;
     artifact.modules[0].types.push(class(0, 0, u32::MAX));
     artifact.modules[0].functions[0].register_count = 2;
-    artifact.modules[0].functions[0].registers = vec![reference(1, false), primitive(1)];
+    artifact.modules[0].functions[0].values =
+        crate::artifact::scalar_values(vec![reference(1, false), primitive(1)]);
     artifact.modules[0].functions[0].block_count = 2;
     artifact.modules[0].functions[0].first_exception = 0;
     artifact.modules[0].functions[0].exception_count = 1;
@@ -1493,7 +1495,8 @@ fn cfg_rejects_value_initialized_on_only_one_join_path() {
     let function = &mut artifact.modules[0].functions[0];
     function.register_count = 3;
     function.parameter_count = 1;
-    function.registers = vec![primitive(5), primitive(1), primitive(1)];
+    function.values =
+        crate::artifact::scalar_values(vec![primitive(5), primitive(1), primitive(1)]);
     function.block_count = 3;
     artifact.manifest.maximum_block_cost = 2;
     artifact.manifest.minimum_slice_cost = 2;
@@ -1577,7 +1580,7 @@ fn cfg_rejects_wrong_call_argument_type() {
     };
     artifact.modules[1].functions[0].register_count = 1;
     artifact.modules[1].functions[0].parameter_count = 1;
-    artifact.modules[1].functions[0].registers = vec![primitive(1)];
+    artifact.modules[1].functions[0].values = crate::artifact::scalar_values(vec![primitive(1)]);
     configure_entry(
         &mut artifact,
         vec![primitive(5)],

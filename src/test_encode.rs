@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use crate::artifact::{
     format, Block, Capability, Constant, DebugEntry, DecodedArtifact, DecodedModule,
     ExceptionEntry, Export, Field, Function, Import, Instruction, Manifest, NominalType,
-    Utf16LiteralId, ValueType,
+    PhysicalAtom, SafepointRoots, Utf16LiteralId, ValueType,
 };
 
 #[derive(Debug)]
@@ -88,6 +88,7 @@ pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, Enc
 pub(crate) fn encode_artifact_rehashed(
     mut artifact: DecodedArtifact,
 ) -> Result<Vec<u8>, EncodeError> {
+    install_conservative_test_roots(&mut artifact)?;
     for _ in 0..=artifact.modules.len() {
         let hashes = artifact
             .modules
@@ -113,6 +114,52 @@ pub(crate) fn encode_artifact_rehashed(
         }
     }
     Err(EncodeError("module hashes did not stabilize"))
+}
+
+fn install_conservative_test_roots(artifact: &mut DecodedArtifact) -> Result<(), EncodeError> {
+    for module in &mut artifact.modules {
+        let mut roots = Vec::new();
+        for (function_id, function) in module.functions.iter().enumerate() {
+            let references = function
+                .values
+                .iter()
+                .enumerate()
+                .flat_map(|(value, layout)| {
+                    layout
+                        .components
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, atom)| **atom == PhysicalAtom::Ref32)
+                        .map(move |(component, _)| crate::artifact::ValueComponent {
+                            value: value as u16,
+                            component: component as u16,
+                        })
+                })
+                .collect::<Vec<_>>();
+            let first = function.first_block.0 as usize;
+            let end = first
+                .checked_add(function.block_count as usize)
+                .ok_or(EncodeError("test function block range overflows"))?;
+            for block in first..end {
+                let instruction_count = module
+                    .code
+                    .get(block)
+                    .ok_or(EncodeError("test function block is out of range"))?
+                    .instructions
+                    .len();
+                for instruction_boundary in 0..instruction_count {
+                    roots.push(SafepointRoots {
+                        function: crate::artifact::FunctionId(function_id as u32),
+                        block: crate::artifact::BlockId(block as u32),
+                        instruction_boundary: instruction_boundary as u32,
+                        references: references.clone(),
+                    });
+                }
+            }
+        }
+        module.safepoint_roots = roots;
+    }
+    Ok(())
 }
 
 fn encode_module(
@@ -154,6 +201,11 @@ fn encode_module(
         .iter()
         .map(encode_exception)
         .collect::<Vec<_>>();
+    let safepoint_roots = module
+        .safepoint_roots
+        .iter()
+        .map(encode_safepoint_roots)
+        .collect::<Vec<_>>();
 
     let records = [
         (format::STRINGS, strings),
@@ -167,6 +219,7 @@ fn encode_module(
         (format::CODE, code),
         (format::EXCEPTIONS, exceptions),
         (format::UTF16_LITERALS, utf16_literals),
+        (format::SAFEPOINT_ROOTS, safepoint_roots),
     ];
     let mut sections = Vec::new();
     for (kind, records) in records {
@@ -411,8 +464,39 @@ fn encode_function(value: &Function) -> Vec<u8> {
     ] {
         u32le(&mut bytes, field);
     }
-    for register in &value.registers {
-        encode_value_type(&mut bytes, *register);
+    for value in &value.values {
+        encode_value_type(&mut bytes, value.semantic_type);
+        u16le(
+            &mut bytes,
+            u16::try_from(value.components.len()).expect("test physical shape exceeds u16"),
+        );
+        u16le(&mut bytes, 0);
+        for component in &value.components {
+            bytes.push(match component {
+                PhysicalAtom::I32 => 0,
+                PhysicalAtom::I64 => 1,
+                PhysicalAtom::F32 => 2,
+                PhysicalAtom::F64 => 3,
+                PhysicalAtom::Ref32 => 4,
+            });
+        }
+    }
+    bytes
+}
+
+fn encode_safepoint_roots(value: &SafepointRoots) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    u32le(&mut bytes, value.function.0);
+    u32le(&mut bytes, value.block.0);
+    u32le(&mut bytes, value.instruction_boundary);
+    u16le(
+        &mut bytes,
+        u16::try_from(value.references.len()).expect("test root map exceeds u16"),
+    );
+    u16le(&mut bytes, 0);
+    for reference in &value.references {
+        u16le(&mut bytes, reference.value);
+        u16le(&mut bytes, reference.component);
     }
     bytes
 }
@@ -987,7 +1071,7 @@ fn indexed(records: Vec<Vec<u8>>) -> Result<Vec<u8>, EncodeError> {
 
 fn semantic_hash(sections: &[ModuleSection]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"Compukter module v1\0");
+    hasher.update(b"Compukter module v2\0");
     for (kind, payload, _) in sections {
         hasher.update(kind.to_le_bytes());
         hasher.update((payload.len() as u64).to_le_bytes());
@@ -1249,7 +1333,7 @@ mod tests {
             block_count: 4,
             first_exception: 5,
             exception_count: 6,
-            registers: vec![primitive(1)],
+            values: crate::artifact::scalar_values(vec![primitive(1)]),
         };
         let block = Block {
             owner_function: FunctionId(1),
@@ -1291,7 +1375,7 @@ mod tests {
             [1, 1, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]
         );
         assert_eq!(encode_field(&field).len(), 24);
-        assert_eq!(encode_function(&function).len(), 44);
+        assert_eq!(encode_function(&function).len(), 49);
         assert_eq!(
             encode_block(&block),
             [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
