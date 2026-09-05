@@ -220,6 +220,30 @@ impl FrameArena {
         )?)))
     }
 
+    pub(super) fn read_ref32_offset(
+        &self,
+        frame: FrameReservation,
+        offset: u32,
+    ) -> Result<Option<Ref32>, VmFault> {
+        let relative_end = offset.checked_add(4).ok_or(VmFault::InvalidRootMap)?;
+        if relative_end > frame.byte_len {
+            return Err(VmFault::InvalidRootMap);
+        }
+        let start = frame
+            .base
+            .checked_add(offset)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(VmFault::InvalidRootMap)?;
+        let end = start.checked_add(4).ok_or(VmFault::InvalidRootMap)?;
+        let bytes: [u8; 4] = self
+            .bytes
+            .get(start..end)
+            .ok_or(VmFault::InvalidRootMap)?
+            .try_into()
+            .map_err(|_| VmFault::InvalidRootMap)?;
+        Ok(Ref32::from_bits(u32::from_le_bytes(bytes)))
+    }
+
     pub(super) fn write_i32(
         &mut self,
         base: u32,

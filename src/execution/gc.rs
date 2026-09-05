@@ -199,27 +199,27 @@ impl Collector {
                 .frames
                 .get(self.frame)
                 .ok_or(VmFault::CorruptLifecycle)?;
-            let function = image
-                .function(frame.function)
-                .ok_or(VmFault::CorruptLifecycle)?;
-            while self.register < function.register_count {
-                let register = self.register;
+            let boundary = u32::try_from(frame.instruction).map_err(|_| VmFault::InvalidRootMap)?;
+            let map = image
+                .safepoint_map(frame.function, frame.block, boundary)
+                .ok_or(VmFault::InvalidRootMap)?;
+            if self.register < map.reference_offsets.len() {
+                let root = self.register;
                 self.register += 1;
-                if function
-                    .registers
-                    .get(register)
-                    .is_some_and(|ty| ty.kind == 7)
-                {
-                    let reference = roots.frame_arena.read_ref32(
-                        frame.base,
-                        &function.frame_layout,
-                        register,
-                        0,
-                    )?;
-                    return Ok(Some(
-                        reference.map_or(RuntimeValue::Null, RuntimeValue::Reference),
-                    ));
-                }
+                let offset = *map
+                    .reference_offsets
+                    .get(root)
+                    .ok_or(VmFault::InvalidRootMap)?;
+                let reference = roots.frame_arena.read_ref32_offset(
+                    super::frame::FrameReservation {
+                        base: frame.base,
+                        byte_len: frame.byte_len,
+                    },
+                    offset,
+                )?;
+                return Ok(Some(
+                    reference.map_or(RuntimeValue::Null, RuntimeValue::Reference),
+                ));
             }
             self.frame += 1;
             self.register = 0;

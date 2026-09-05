@@ -794,6 +794,31 @@ impl ExecutionImage {
             .map(|index| &self.0.functions[function].safepoints[index].map)
     }
 
+    #[cfg(test)]
+    pub(super) fn test_replace_safepoint_offsets(
+        &mut self,
+        function: usize,
+        block: usize,
+        instruction_boundary: u32,
+        offsets: Box<[u32]>,
+    ) {
+        let inner = Arc::get_mut(&mut self.0).expect("test image must be uniquely owned");
+        let safepoint = inner.functions[function]
+            .safepoints
+            .iter_mut()
+            .find(|safepoint| {
+                safepoint.block == block && safepoint.instruction_boundary == instruction_boundary
+            })
+            .expect("test safepoint must exist");
+        safepoint.map.reference_offsets = offsets;
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_remove_safepoints(&mut self, function: usize) {
+        let inner = Arc::get_mut(&mut self.0).expect("test image must be uniquely owned");
+        inner.functions[function].safepoints = Box::default();
+    }
+
     pub(super) fn constant(&self, index: usize) -> Option<RuntimeValue> {
         self.0.constants.get(index).copied()
     }
