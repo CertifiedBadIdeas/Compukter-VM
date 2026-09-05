@@ -2,7 +2,7 @@ use super::{
     error::{AllocationExhaustion, Outcome, VmFault},
     external_roots::ExternalRootTable,
     fixtures,
-    frame::FrameArena,
+    frame::{FrameArena, StaticArena},
     gc::{Collector, CollectorAction, CollectorPhase, RootSet},
     heap::{AllocationRequest, Heap},
     heap_ops::store_value,
@@ -55,6 +55,19 @@ fn compact_roots(
     (compact_frames.into_boxed_slice(), arena)
 }
 
+fn compact_statics(image: &ExecutionImage, values: &[RuntimeValue]) -> StaticArena {
+    let mut statics = StaticArena::new(image.static_layout().clone()).unwrap();
+    for field in image.fields() {
+        let Some(slot) = field.static_slot else {
+            continue;
+        };
+        if let Some(value) = values.get(slot as usize) {
+            statics.write(slot, field.value_type.kind, *value).unwrap();
+        }
+    }
+    statics
+}
+
 fn collect(
     collector: &mut Collector,
     heap: &mut Heap,
@@ -85,6 +98,7 @@ fn collect_with_external_roots(
     external_roots: &ExternalRootTable,
 ) -> Vec<CollectorAction> {
     let (frames, frame_arena) = compact_roots(image, frames, registers);
+    let statics = compact_statics(image, statics);
     let mut actions = Vec::new();
     collector.start();
     while collector.is_active() {
@@ -95,10 +109,11 @@ fn collect_with_external_roots(
                     heap,
                     image,
                     RootSet {
-                        static_slots: statics,
+                        statics: &statics,
                         frames: &frames,
                         frame_arena: &frame_arena,
                         frame_depth: frames.len(),
+                        runtime_roots: &[],
                         external: external_roots,
                     },
                 )
@@ -152,6 +167,46 @@ fn collector_keeps_a_managed_value_while_an_external_handle_is_active() {
 }
 
 #[test]
+fn collector_keeps_explicit_pending_runtime_roots() {
+    let image = ExecutionImage::admit(
+        fixtures::reference_field_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let mut heap = Heap::new(&image.storage_plan()).unwrap();
+    let ty = TypeKey { module: 0, ty: 1 };
+    let RuntimeTypeLayout::Object(layout) = image.type_layout(ty).unwrap() else {
+        unreachable!()
+    };
+    let retained = allocate(&mut heap, ty, layout.block_bytes);
+    let dead = allocate(&mut heap, ty, layout.block_bytes);
+    let statics = compact_statics(&image, &[]);
+    let frame_arena = FrameArena::new(0).unwrap();
+    let external_roots = ExternalRootTable::new(0).unwrap();
+    let runtime_roots = [Some(retained)];
+    let mut collector = Collector::new();
+    collector.start();
+    while collector.is_active() {
+        collector
+            .step(
+                &mut heap,
+                &image,
+                RootSet {
+                    statics: &statics,
+                    frames: &[],
+                    frame_arena: &frame_arena,
+                    frame_depth: 0,
+                    runtime_roots: &runtime_roots,
+                    external: &external_roots,
+                },
+            )
+            .unwrap();
+    }
+    assert!(heap.managed_type(retained).is_ok());
+    assert!(heap.managed_type(dead).is_err());
+}
+
+#[test]
 fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
     let image = ExecutionImage::admit(
         fixtures::reference_field_roundtrip_artifact(),
@@ -179,6 +234,7 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
     let mut registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
     registers[0] = RegisterValue::Initialized(RuntimeValue::Reference(root));
     let (frames, frame_arena) = compact_roots(&image, &frames, &registers);
+    let statics = compact_statics(&image, &[]);
     let mut collector = Collector::new();
     let external_roots = ExternalRootTable::new(0).unwrap();
 
@@ -189,10 +245,11 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                 &mut heap,
                 &image,
                 RootSet {
-                    static_slots: &[],
+                    statics: &statics,
                     frames: &frames,
                     frame_arena: &frame_arena,
                     frame_depth: 1,
+                    runtime_roots: &[],
                     external: &external_roots,
                 },
             )
@@ -209,10 +266,11 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                     &mut heap,
                     &image,
                     RootSet {
-                        static_slots: &[],
+                        statics: &statics,
                         frames: &frames,
                         frame_arena: &frame_arena,
                         frame_depth: 1,
+                        runtime_roots: &[],
                         external: &external_roots,
                     },
                 )
@@ -230,10 +288,11 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                 &mut heap,
                 &image,
                 RootSet {
-                    static_slots: &[],
+                    statics: &statics,
                     frames: &frames,
                     frame_arena: &frame_arena,
                     frame_depth: 1,
+                    runtime_roots: &[],
                     external: &external_roots,
                 },
             )
@@ -719,6 +778,7 @@ fn collector_steady_state_allocates_nothing() {
     let frames = [Frame::test_entry(image.entry_index())];
     let registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
     let (frames, frame_arena) = compact_roots(&image, &frames, &registers);
+    let statics = compact_statics(&image, &[]);
     let mut collector = Collector::new();
     let external_roots = ExternalRootTable::new(0).unwrap();
     super::tests::allocation_counter::reset_and_enable();
@@ -729,10 +789,11 @@ fn collector_steady_state_allocates_nothing() {
                 &mut heap,
                 &image,
                 RootSet {
-                    static_slots: &[],
+                    statics: &statics,
                     frames: &frames,
                     frame_arena: &frame_arena,
                     frame_depth: 1,
+                    runtime_roots: &[],
                     external: &external_roots,
                 },
             )
@@ -781,6 +842,7 @@ fn managed_heap_performance_gc_units() {
     let registers = [RegisterValue::Initialized(RuntimeValue::Reference(root))];
     let (frames, frame_arena) = compact_roots(&image, &frames, &registers);
     let statics = [RuntimeValue::Reference(shared)];
+    let statics = compact_statics(&image, &statics);
     let mut collector = Collector::new();
     let external_roots = ExternalRootTable::new(0).unwrap();
     let mut counts = [0_u64; 6];
@@ -796,10 +858,11 @@ fn managed_heap_performance_gc_units() {
                         &mut heap,
                         &image,
                         RootSet {
-                            static_slots: &statics,
+                            statics: &statics,
                             frames: &frames,
                             frame_arena: &frame_arena,
                             frame_depth: 1,
+                            runtime_roots: &[],
                             external: &external_roots,
                         },
                     )
@@ -844,6 +907,7 @@ fn managed_heap_performance_gc_units() {
     let leaf_frames = [Frame::test_entry(leaf_image.entry_index())];
     let leaf_registers = [RegisterValue::Initialized(RuntimeValue::Reference(leaf))];
     let (leaf_frames, leaf_frame_arena) = compact_roots(&leaf_image, &leaf_frames, &leaf_registers);
+    let leaf_statics = compact_statics(&leaf_image, &[]);
     let mut leaf_collector = Collector::new();
     let started = Instant::now();
     let mut leaf_units = 0_u64;
@@ -855,10 +919,11 @@ fn managed_heap_performance_gc_units() {
                     &mut leaf_heap,
                     &leaf_image,
                     RootSet {
-                        static_slots: &[],
+                        statics: &leaf_statics,
                         frames: &leaf_frames,
                         frame_arena: &leaf_frame_arena,
                         frame_depth: 1,
+                        runtime_roots: &[],
                         external: &external_roots,
                     },
                 )

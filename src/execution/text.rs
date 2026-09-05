@@ -34,6 +34,13 @@ impl StringBacking {
             Self::CharArray { length, .. } => length,
         }
     }
+
+    fn visit_root(self, visit: &mut impl FnMut(Ref32)) {
+        match self {
+            Self::Managed { reference, .. } | Self::CharArray { reference, .. } => visit(reference),
+            Self::Inline { .. } | Self::Literal(_) => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +66,16 @@ pub(super) enum PendingText {
 }
 
 impl PendingText {
+    pub(super) fn visit_roots(self, mut visit: impl FnMut(Ref32)) {
+        match self {
+            Self::Hash { value, .. } => value.visit_root(&mut visit),
+            Self::Equals { lhs, rhs, .. } | Self::Compare { lhs, rhs, .. } => {
+                lhs.visit_root(&mut visit);
+                rhs.visit_root(&mut visit);
+            }
+        }
+    }
+
     pub(super) fn hash(
         image: &ExecutionImage,
         heap: &Heap,
@@ -213,6 +230,11 @@ pub(super) struct PendingConcat {
 }
 
 impl PendingConcat {
+    pub(super) fn visit_roots(self, mut visit: impl FnMut(Ref32)) {
+        self.lhs.visit_root(&mut visit);
+        self.rhs.visit_root(&mut visit);
+    }
+
     pub(super) fn scalar(
         value: RuntimeValue,
         form: u8,

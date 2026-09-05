@@ -4,7 +4,7 @@ use super::{
         AllocationSource, EntryArgumentLimit, GuestTrap, Outcome, RunError, VmFault,
     },
     external_roots::ExternalRootTable,
-    frame::{FrameArena, FrameReservation},
+    frame::{FrameArena, FrameReservation, StaticArena},
     gc::{Collector, RootSet},
     heap::{AllocationRequest, Heap},
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
@@ -180,7 +180,7 @@ pub(super) struct Machine {
     lifecycle: Lifecycle,
     frames: Box<[Frame]>,
     frame_arena: FrameArena,
-    static_slots: Box<[RuntimeValue]>,
+    statics: StaticArena,
     type_initialization: Box<[TypeInitializationState]>,
     heap: Heap,
     external_roots: ExternalRootTable,
@@ -278,21 +278,8 @@ impl Machine {
             .try_reserve_exact(frame_count)
             .map_err(|_| AdmissionError::AllocationFailed)?;
         frames.resize(frame_count, Frame::EMPTY);
-        let static_count = usize::try_from(image.storage_plan().static_slot_count)
-            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
-        let mut static_slots = Vec::new();
-        static_slots
-            .try_reserve_exact(static_count)
+        let statics = StaticArena::new(image.static_layout().clone())
             .map_err(|_| AdmissionError::AllocationFailed)?;
-        static_slots.resize(static_count, RuntimeValue::Null);
-        for field in image.fields() {
-            if let Some(slot) = field.static_slot {
-                let value = zero_value(field.value_type)?;
-                *static_slots
-                    .get_mut(slot as usize)
-                    .ok_or(AdmissionError::InvalidEntry)? = value;
-            }
-        }
         let mut type_initialization = Vec::new();
         type_initialization
             .try_reserve_exact(image.type_count())
@@ -310,7 +297,7 @@ impl Machine {
             lifecycle: Lifecycle::Pristine,
             frames: frames.into_boxed_slice(),
             frame_arena,
-            static_slots: static_slots.into_boxed_slice(),
+            statics,
             type_initialization: type_initialization.into_boxed_slice(),
             heap,
             external_roots,
@@ -1153,9 +1140,9 @@ impl Machine {
                         let Some(static_slot) = field.static_slot else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));
                         };
-                        let Some(value) = self.static_slots.get(static_slot as usize).copied()
-                        else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        let value = match self.statics.read(static_slot, field.value_type.kind) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
                         };
                         if value == RuntimeValue::Null && !field.value_type.nullable {
                             let outcome = Outcome::Crashed(GuestTrap::NullReference);
@@ -1175,10 +1162,12 @@ impl Machine {
                         let Some(static_slot) = field.static_slot else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));
                         };
-                        let Some(slot) = self.static_slots.get_mut(static_slot as usize) else {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
-                        };
-                        *slot = value;
+                        if let Err(fault) =
+                            self.statics
+                                .write(static_slot, field.value_type.kind, value)
+                        {
+                            return Ok(self.fault(fault));
+                        }
                         self.frames[frame_index].instruction += 1;
                     }
                     ResolvedInstruction::FieldGet {
@@ -1672,14 +1661,26 @@ impl Machine {
             };
             remaining -= 1;
             self.consumed_maintenance_cost = consumed;
+            let mut runtime_roots = [None; 4];
+            let mut runtime_root_count = 0_usize;
+            self.visit_runtime_roots(|reference| {
+                if let Some(slot) = runtime_roots.get_mut(runtime_root_count) {
+                    *slot = Some(reference);
+                }
+                runtime_root_count += 1;
+            });
+            if runtime_root_count > runtime_roots.len() {
+                return Ok(self.fault(VmFault::InvalidStoragePlan));
+            }
             match self.collector.step(
                 &mut self.heap,
                 &self.image,
                 RootSet {
-                    static_slots: &self.static_slots,
+                    statics: &self.statics,
                     frames: &self.frames,
                     frame_arena: &self.frame_arena,
                     frame_depth: self.frame_depth,
+                    runtime_roots: &runtime_roots[..runtime_root_count],
                     external: &self.external_roots,
                 },
             ) {
@@ -1947,6 +1948,15 @@ impl Machine {
                 })
                 .is_some_and(|(actual, target)| self.image.is_assignable(actual, target)),
             RuntimeValue::Reference(_) => false,
+        }
+    }
+
+    fn visit_runtime_roots(&self, mut visit: impl FnMut(Ref32)) {
+        if let Some(pending) = self.pending_text {
+            pending.visit_roots(&mut visit);
+        }
+        if let Some(pending) = self.pending_concat {
+            pending.visit_roots(&mut visit);
         }
     }
 
@@ -2487,7 +2497,7 @@ impl Machine {
         core::mem::size_of::<Self>()
             + self.frames.len() * core::mem::size_of::<Frame>()
             + self.frame_arena.reserved_bytes()
-            + self.static_slots.len() * core::mem::size_of::<RuntimeValue>()
+            + self.statics.reserved_bytes()
             + self.heap.test_reserved_bytes()
             + self.external_roots.reserved_bytes()
     }
@@ -2541,19 +2551,6 @@ impl Drop for Machine {
     fn drop(&mut self) {
         self.cancel_pending_allocation();
         self.cancel_pending_concat();
-    }
-}
-
-fn zero_value(value_type: ResolvedValueType) -> Result<RuntimeValue, AdmissionError> {
-    match value_type.kind {
-        1 => Ok(RuntimeValue::I32(0)),
-        2 => Ok(RuntimeValue::I64(0)),
-        3 => Ok(RuntimeValue::F32(0)),
-        4 => Ok(RuntimeValue::F64(0)),
-        5 => Ok(RuntimeValue::Bool(false)),
-        6 => Ok(RuntimeValue::Char(0)),
-        7 => Ok(RuntimeValue::Null),
-        _ => Err(AdmissionError::InvalidEntry),
     }
 }
 

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::artifact::{
-    ByteRange, Constant, DecodedArtifact, Instruction, NominalType, SwitchCase, TypeId, ValueType,
+    ByteRange, Constant, DecodedArtifact, Instruction, NominalType, PhysicalAtom, SwitchCase,
+    TypeId, ValueType,
 };
 use crate::VerifiedArtifact;
 
@@ -397,6 +398,7 @@ struct ExecutionImageInner {
     assignable_types: Box<[Box<[TypeKey]>]>,
     array_element_types: Box<[Option<ResolvedValueType>]>,
     fields: Box<[ResolvedField]>,
+    static_layout: FrameLayout,
     literals: Box<[ResolvedLiteral]>,
     literal_ids: Box<[usize]>,
     string_type: Option<TypeKey>,
@@ -495,6 +497,13 @@ impl ExecutionImage {
         }
         let (fields, static_slot_count) =
             resolve_fields(decoded, &type_offsets, &field_offsets, &type_layouts)?;
+        let static_atoms = fields
+            .iter()
+            .filter(|field| field.static_slot.is_some())
+            .map(|field| physical_atom(field.value_type))
+            .collect::<Result<Vec<_>, _>>()?;
+        let static_layout = FrameLayout::derive_scalars(&static_atoms)
+            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
         let string_type = resolve_standard_string_type(decoded)?;
         let (mut literals, literal_ids) = resolve_literals(decoded, &literal_offsets)?;
         if string_type.is_some() && !literals.iter().any(|literal| literal.code_units == 0) {
@@ -731,6 +740,7 @@ impl ExecutionImage {
             assignable_types: assignable_type_sets.into_boxed_slice(),
             array_element_types: array_element_types.into_boxed_slice(),
             fields,
+            static_layout,
             literals,
             literal_ids,
             string_type,
@@ -900,6 +910,10 @@ impl ExecutionImage {
 
     pub(super) fn fields(&self) -> &[ResolvedField] {
         &self.0.fields
+    }
+
+    pub(super) fn static_layout(&self) -> &FrameLayout {
+        &self.0.static_layout
     }
 
     pub(super) fn literal(&self, index: usize) -> Option<&ResolvedLiteral> {
@@ -1420,6 +1434,17 @@ fn resolve_value_type(
             None
         },
     })
+}
+
+fn physical_atom(value: ResolvedValueType) -> Result<PhysicalAtom, AdmissionError> {
+    match value.kind {
+        1 | 5 | 6 => Ok(PhysicalAtom::I32),
+        2 => Ok(PhysicalAtom::I64),
+        3 => Ok(PhysicalAtom::F32),
+        4 => Ok(PhysicalAtom::F64),
+        7 => Ok(PhysicalAtom::Ref32),
+        _ => Err(AdmissionError::InvalidEntry),
+    }
 }
 
 fn resolve_type(artifact: &DecodedArtifact, module: usize, reference: TypeId) -> Option<TypeKey> {

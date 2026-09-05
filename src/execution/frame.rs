@@ -18,7 +18,10 @@
 
 use crate::artifact::{FunctionValue, PhysicalAtom, ValueComponent};
 
-use super::{error::VmFault, value::Ref32};
+use super::{
+    error::VmFault,
+    value::{Ref32, RuntimeValue},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ComponentLayout {
@@ -75,6 +78,12 @@ pub(super) struct FrameArena {
     used: u32,
     #[cfg(test)]
     initialized: Box<[bool]>,
+}
+
+pub(super) struct StaticArena {
+    arena: FrameArena,
+    layout: FrameLayout,
+    reservation: FrameReservation,
 }
 
 impl FrameArena {
@@ -422,6 +431,118 @@ impl FrameArena {
     }
 }
 
+impl StaticArena {
+    pub(super) fn new(layout: FrameLayout) -> Result<Self, VmFault> {
+        let capacity = align(layout.byte_len, 8).map_err(|_| VmFault::InvalidStoragePlan)?;
+        let mut arena = FrameArena::new(capacity)?;
+        let reservation = arena.push(&layout)?;
+        Ok(Self {
+            arena,
+            layout,
+            reservation,
+        })
+    }
+
+    pub(super) fn read(&self, slot: u32, kind: u8) -> Result<RuntimeValue, VmFault> {
+        let slot = slot as usize;
+        match kind {
+            1 => self
+                .arena
+                .read_i32(self.reservation.base, &self.layout, slot, 0)
+                .map(RuntimeValue::I32),
+            2 => self
+                .arena
+                .read_i64(self.reservation.base, &self.layout, slot, 0)
+                .map(RuntimeValue::I64),
+            3 => self
+                .arena
+                .read_f32(self.reservation.base, &self.layout, slot, 0)
+                .map(RuntimeValue::F32),
+            4 => self
+                .arena
+                .read_f64(self.reservation.base, &self.layout, slot, 0)
+                .map(RuntimeValue::F64),
+            5 => self
+                .arena
+                .read_i32(self.reservation.base, &self.layout, slot, 0)
+                .map(|value| RuntimeValue::Bool(value != 0)),
+            6 => self
+                .arena
+                .read_i32(self.reservation.base, &self.layout, slot, 0)
+                .and_then(|value| {
+                    u16::try_from(value)
+                        .map(RuntimeValue::Char)
+                        .map_err(|_| VmFault::InvalidValueType)
+                }),
+            7 => self
+                .arena
+                .read_ref32(self.reservation.base, &self.layout, slot, 0)
+                .map(|value| value.map_or(RuntimeValue::Null, RuntimeValue::Reference)),
+            _ => Err(VmFault::InvalidValueType),
+        }
+    }
+
+    pub(super) fn write(
+        &mut self,
+        slot: u32,
+        kind: u8,
+        value: RuntimeValue,
+    ) -> Result<(), VmFault> {
+        let slot = slot as usize;
+        match (kind, value) {
+            (1, RuntimeValue::I32(value)) => {
+                self.arena
+                    .write_i32(self.reservation.base, &self.layout, slot, 0, value)
+            }
+            (2, RuntimeValue::I64(value)) => {
+                self.arena
+                    .write_i64(self.reservation.base, &self.layout, slot, 0, value)
+            }
+            (3, RuntimeValue::F32(value)) => {
+                self.arena
+                    .write_f32(self.reservation.base, &self.layout, slot, 0, value)
+            }
+            (4, RuntimeValue::F64(value)) => {
+                self.arena
+                    .write_f64(self.reservation.base, &self.layout, slot, 0, value)
+            }
+            (5, RuntimeValue::Bool(value)) => self.arena.write_i32(
+                self.reservation.base,
+                &self.layout,
+                slot,
+                0,
+                i32::from(value),
+            ),
+            (6, RuntimeValue::Char(value)) => self.arena.write_i32(
+                self.reservation.base,
+                &self.layout,
+                slot,
+                0,
+                i32::from(value),
+            ),
+            (7, RuntimeValue::Null) => {
+                self.arena
+                    .write_ref32(self.reservation.base, &self.layout, slot, 0, None)
+            }
+            (7, RuntimeValue::Reference(value)) => {
+                self.arena
+                    .write_ref32(self.reservation.base, &self.layout, slot, 0, Some(value))
+            }
+            _ => Err(VmFault::InvalidValueType),
+        }
+    }
+
+    pub(super) fn reference(&self, slot: u32) -> Result<Option<Ref32>, VmFault> {
+        self.arena
+            .read_ref32(self.reservation.base, &self.layout, slot as usize, 0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserved_bytes(&self) -> usize {
+        self.arena.reserved_bytes()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FrameLayoutError {
     Overflow,
@@ -476,6 +597,34 @@ impl FrameLayout {
             values: layouts.into_boxed_slice(),
         })
     }
+
+    pub(super) fn derive_scalars(atoms: &[PhysicalAtom]) -> Result<Self, FrameLayoutError> {
+        let mut offset = 0_u32;
+        let mut frame_alignment = 1_u32;
+        let mut layouts = Vec::new();
+        layouts
+            .try_reserve_exact(atoms.len())
+            .map_err(|_| FrameLayoutError::Overflow)?;
+        for atom in atoms {
+            let alignment = atom.alignment();
+            frame_alignment = frame_alignment.max(alignment);
+            offset = align(offset, alignment)?;
+            layouts.push(ValueLayout {
+                components: Box::new([ComponentLayout {
+                    offset,
+                    atom: *atom,
+                }]),
+            });
+            offset = offset
+                .checked_add(atom.byte_size())
+                .ok_or(FrameLayoutError::Overflow)?;
+        }
+        Ok(Self {
+            byte_len: align(offset, frame_alignment)?,
+            alignment: frame_alignment as u8,
+            values: layouts.into_boxed_slice(),
+        })
+    }
 }
 
 impl SafepointMap {
@@ -519,8 +668,13 @@ fn align(value: u32, alignment: u32) -> Result<u32, FrameLayoutError> {
 mod tests {
     use crate::artifact::{FunctionValue, PhysicalAtom, TypeId, ValueComponent, ValueType};
 
-    use super::{align, FrameArena, FrameLayout, FrameLayoutError, PhysicalValue, SafepointMap};
-    use crate::execution::{error::VmFault, value::Ref32};
+    use super::{
+        align, FrameArena, FrameLayout, FrameLayoutError, PhysicalValue, SafepointMap, StaticArena,
+    };
+    use crate::execution::{
+        error::VmFault,
+        value::{Ref32, RuntimeValue},
+    };
 
     fn value(components: Vec<PhysicalAtom>) -> FunctionValue {
         FunctionValue {
@@ -648,5 +802,30 @@ mod tests {
             )
         );
         assert_eq!(7, arena.read_i32(frame.base, &layout, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn static_arena_stores_mixed_width_values_without_runtime_value_cells() {
+        let layout = FrameLayout::derive_scalars(&[
+            PhysicalAtom::I32,
+            PhysicalAtom::I64,
+            PhysicalAtom::Ref32,
+        ])
+        .unwrap();
+        let mut statics = StaticArena::new(layout).unwrap();
+        assert_eq!(RuntimeValue::I32(0), statics.read(0, 1).unwrap());
+        assert_eq!(RuntimeValue::I64(0), statics.read(1, 2).unwrap());
+        assert_eq!(RuntimeValue::Null, statics.read(2, 7).unwrap());
+
+        let reference = Ref32::managed(16).unwrap();
+        statics.write(0, 1, RuntimeValue::I32(7)).unwrap();
+        statics.write(1, 2, RuntimeValue::I64(11)).unwrap();
+        statics
+            .write(2, 7, RuntimeValue::Reference(reference))
+            .unwrap();
+        assert_eq!(RuntimeValue::I32(7), statics.read(0, 1).unwrap());
+        assert_eq!(RuntimeValue::I64(11), statics.read(1, 2).unwrap());
+        assert_eq!(Some(reference), statics.reference(2).unwrap());
+        assert_eq!(24, statics.reserved_bytes());
     }
 }
