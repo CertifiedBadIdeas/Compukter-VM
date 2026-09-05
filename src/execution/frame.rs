@@ -113,16 +113,9 @@ impl FrameArena {
             base: self.used,
             byte_len,
         };
+        self.bytes[reservation.base as usize..end as usize].fill(0);
         #[cfg(test)]
         self.initialized[reservation.base as usize..end as usize].fill(false);
-        for value in &layout.values {
-            for component in &value.components {
-                if component.atom == PhysicalAtom::Ref32 {
-                    let range = self.component_range(reservation.base, component)?;
-                    self.bytes[range].fill(0);
-                }
-            }
-        }
         self.used = end;
         Ok(reservation)
     }
@@ -786,6 +779,8 @@ mod tests {
         arena.pop(frame).unwrap();
         let reused = arena.push(&layout).unwrap();
         assert_eq!(frame, reused);
+        assert_eq!(0, arena.read_i32(reused.base, &layout, 0, 0).unwrap());
+        assert_eq!(0, arena.read_i64(reused.base, &layout, 1, 0).unwrap());
         assert_eq!(None, arena.read_ref32(reused.base, &layout, 2, 0).unwrap());
     }
 
