@@ -1,16 +1,21 @@
 use std::sync::Arc;
 
 use crate::artifact::{
-    ByteRange, Constant, DecodedArtifact, Instruction, NominalType, PhysicalAtom, SwitchCase,
-    TypeId, ValueType,
+    ByteRange, Constant, DecodedArtifact, FunctionValue, Instruction, NominalType, PhysicalAtom,
+    SwitchCase, TypeId, ValueType,
 };
 use crate::VerifiedArtifact;
 
 use super::{
-    error::AdmissionError,
+    error::{AdmissionError, ResidentStorageComponent},
+    external_roots::ExternalRootTable,
     frame::{FrameLayout, SafepointMap},
+    heap::Heap,
     host::{HostValueType, ResolvedCapability},
-    layout::{object_layout, FieldSpec, RuntimeTypeLayout, StoragePlan, ValueWidth},
+    layout::{
+        object_layout, FieldSpec, RuntimeTypeLayout, StorageCharges, StoragePlan, ValueWidth,
+    },
+    machine::{Frame, Machine, TypeInitializationState},
     value::{Ref32, RuntimeValue},
     FunctionKey, TypeKey,
 };
@@ -495,7 +500,7 @@ impl ExecutionImage {
                 });
             }
         }
-        let (fields, static_slot_count) =
+        let (fields, _static_slot_count) =
             resolve_fields(decoded, &type_offsets, &field_offsets, &type_layouts)?;
         let static_atoms = fields
             .iter()
@@ -517,26 +522,6 @@ impl ExecutionImage {
             });
             literals = with_empty.into_boxed_slice();
         }
-        let storage_plan = StoragePlan {
-            heap_bytes: profile.heap_bytes,
-            handle_capacity: profile.heap_bytes / 32,
-            type_count: checked_u32(type_layouts.len())?,
-            field_count: checked_u32(fields.len())?,
-            static_slot_count,
-            literal_count: checked_u32(literals.len())?,
-            literal_id_count: checked_u32(literal_ids.len())?,
-            reference_offset_count: checked_u32(
-                type_layouts
-                    .iter()
-                    .map(|layout| match layout {
-                        RuntimeTypeLayout::Object(object) => object.reference_offsets.len(),
-                        RuntimeTypeLayout::Array { .. } | RuntimeTypeLayout::NonHeap => 0,
-                    })
-                    .try_fold(0_usize, |total, count| total.checked_add(count))
-                    .ok_or(AdmissionError::StoragePlanOverflow)?,
-            )?,
-        };
-
         let mut constants = reserved(
             *constant_offsets
                 .last()
@@ -659,6 +644,43 @@ impl ExecutionImage {
                 });
             }
         }
+
+        let maximum_frame_bytes = functions
+            .iter()
+            .map(|function| align_u64(u64::from(function.frame_layout.byte_len), 8))
+            .try_fold(0_u64, |largest, bytes| {
+                bytes.map(|bytes| largest.max(bytes))
+            })?;
+        let maximum_call_depth = u64::from(decoded.manifest.maximum_call_depth);
+        let frame_arena_bytes = maximum_frame_bytes.checked_mul(maximum_call_depth).ok_or(
+            AdmissionError::ResidentStorageOverflow {
+                component: ResidentStorageComponent::FrameArena,
+            },
+        )?;
+        let frame_record_bytes = (core::mem::size_of::<Frame>() as u64)
+            .checked_mul(maximum_call_depth)
+            .ok_or(AdmissionError::ResidentStorageOverflow {
+                component: ResidentStorageComponent::FrameRecords,
+            })?;
+        let static_bytes = align_u64(u64::from(static_layout.byte_len), 8)?;
+        let type_initialization_bytes = (core::mem::size_of::<TypeInitializationState>() as u64)
+            .checked_mul(checked_u32(type_layouts.len())?.into())
+            .ok_or(AdmissionError::ResidentStorageOverflow {
+                component: ResidentStorageComponent::TypeInitialization,
+            })?;
+        let external_root_bytes =
+            ExternalRootTable::resident_bytes(decoded.manifest.maximum_host_requests)?;
+        let storage_plan = StoragePlan::checked(StorageCharges {
+            heap_arena_bytes: u64::from(profile.heap_bytes),
+            heap_allocator_bytes: Heap::allocator_resident_bytes(),
+            frame_arena_bytes,
+            frame_record_bytes,
+            static_bytes,
+            type_initialization_bytes,
+            external_root_bytes,
+            pending_state_bytes: Machine::pending_state_bytes(),
+            machine_fixed_bytes: Machine::fixed_state_bytes(),
+        })?;
 
         let mut blocks = reserved(*block_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
         let instruction_resolution = InstructionResolution {
@@ -1255,6 +1277,13 @@ fn checked_u32(value: usize) -> Result<u32, AdmissionError> {
     u32::try_from(value).map_err(|_| AdmissionError::StoragePlanOverflow)
 }
 
+fn align_u64(value: u64, alignment: u64) -> Result<u64, AdmissionError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or(AdmissionError::StoragePlanOverflow)
+}
+
 fn value_width(value: ValueType) -> Result<ValueWidth, AdmissionError> {
     match value.kind {
         1 => Ok(ValueWidth::I32),
@@ -1268,15 +1297,9 @@ fn value_width(value: ValueType) -> Result<ValueWidth, AdmissionError> {
     }
 }
 
-pub(super) fn frame_charge(registers: u64) -> Result<u64, AdmissionError> {
-    let bytes = registers
-        .checked_mul(16)
-        .and_then(|value| value.checked_add(32))
-        .ok_or(AdmissionError::StoragePlanOverflow)?;
-    bytes
-        .checked_add(15)
-        .map(|value| value & !15)
-        .ok_or(AdmissionError::StoragePlanOverflow)
+pub(super) fn frame_charge(values: &[FunctionValue]) -> Result<u64, AdmissionError> {
+    let layout = FrameLayout::derive(values).map_err(|_| AdmissionError::StoragePlanOverflow)?;
+    align_u64(u64::from(layout.byte_len), 8)
 }
 
 fn check_profile(
@@ -1349,15 +1372,16 @@ fn check_profile(
             available,
         },
     )?;
-    let largest_register_count = artifact
+    let largest_frame_charge = artifact
         .modules
         .iter()
         .flat_map(|module| &module.functions)
         .filter(|function| function.flags & (1 << 3) == 0)
-        .map(|function| u64::from(function.register_count))
-        .max()
-        .ok_or(AdmissionError::InvalidEntry)?;
-    let reservation = frame_charge(largest_register_count)?
+        .map(|function| frame_charge(&function.values))
+        .try_fold(0_u64, |largest, charge| {
+            charge.map(|charge| largest.max(charge))
+        })?;
+    let reservation = largest_frame_charge
         .checked_mul(u64::from(manifest.maximum_call_depth))
         .ok_or(AdmissionError::StoragePlanOverflow)?;
     if u64::from(manifest.required_stack_bytes) < reservation {
@@ -2223,14 +2247,32 @@ mod tests {
     use crate::execution::{error::AdmissionError, fixtures, FunctionKey};
 
     #[test]
-    fn portable_frame_charge_is_checked_and_aligned() {
-        assert_eq!(48, frame_charge(1).unwrap());
-        assert_eq!(64, frame_charge(2).unwrap());
-        assert_eq!(160, frame_charge(8).unwrap());
-        assert_eq!(
-            Err(AdmissionError::StoragePlanOverflow),
-            frame_charge(u64::MAX)
-        );
+    fn portable_frame_charge_uses_physical_shapes() {
+        let i32_value = crate::artifact::scalar_values(vec![ValueType {
+            kind: 1,
+            flags: 0,
+            nominal_type: TypeId(u32::MAX),
+        }]);
+        let i64_value = crate::artifact::scalar_values(vec![ValueType {
+            kind: 2,
+            flags: 0,
+            nominal_type: TypeId(u32::MAX),
+        }]);
+        assert_eq!(8, frame_charge(&i32_value).unwrap());
+        assert_eq!(8, frame_charge(&i64_value).unwrap());
+        let mixed = crate::artifact::scalar_values(vec![
+            ValueType {
+                kind: 1,
+                flags: 0,
+                nominal_type: TypeId(u32::MAX),
+            },
+            ValueType {
+                kind: 2,
+                flags: 0,
+                nominal_type: TypeId(u32::MAX),
+            },
+        ]);
+        assert_eq!(16, frame_charge(&mixed).unwrap());
     }
 
     #[test]
@@ -2261,6 +2303,11 @@ mod tests {
         for profile in fixtures::profiles_below_each_manifest_limit() {
             assert!(ExecutionImage::admit(fixtures::scalar_artifact(), profile).is_err());
         }
+        let mut profile = fixtures::profile();
+        profile.frame_storage_bytes = 7;
+        assert!(
+            ExecutionImage::admit(fixtures::scalar_cases().remove(0).artifact, profile).is_err()
+        );
     }
 
     #[test]

@@ -1,6 +1,19 @@
 use super::value::{Ref32, RuntimeValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidentStorageComponent {
+    HeapArena,
+    HeapAllocator,
+    FrameArena,
+    FrameRecords,
+    Statics,
+    TypeInitialization,
+    ExternalRoots,
+    PendingState,
+    MachineFixedState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionError {
     CompilerAbiMismatch,
     PlatformAbiMismatch,
@@ -39,6 +52,9 @@ pub enum AdmissionError {
         available: u32,
     },
     StoragePlanOverflow,
+    ResidentStorageOverflow {
+        component: ResidentStorageComponent,
+    },
     AllocationFailed,
     InvalidEntry,
     DuplicateCapabilityBinding,
