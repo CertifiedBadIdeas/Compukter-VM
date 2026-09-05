@@ -207,6 +207,77 @@ fn collector_keeps_explicit_pending_runtime_roots() {
 }
 
 #[test]
+fn collector_ignores_reference_bytes_absent_from_the_exact_safepoint_map() {
+    let mut image = ExecutionImage::admit(
+        fixtures::reference_field_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let entry = image.entry_index();
+    let block = image.function(entry).unwrap().first_block;
+    image.test_replace_safepoint_offsets(entry, block, 0, Box::default());
+
+    let mut heap = Heap::new(&image.storage_plan()).unwrap();
+    let ty = TypeKey { module: 0, ty: 1 };
+    let RuntimeTypeLayout::Object(layout) = image.type_layout(ty).unwrap() else {
+        unreachable!()
+    };
+    let dead = allocate(&mut heap, ty, layout.block_bytes);
+    let frames = [Frame::test_entry(entry)];
+    let registers = [RegisterValue::Initialized(RuntimeValue::Reference(dead))];
+    collect(
+        &mut Collector::new(),
+        &mut heap,
+        &image,
+        &[],
+        &frames,
+        &registers,
+    );
+    assert!(heap.managed_type(dead).is_err());
+}
+
+#[test]
+fn collector_faults_on_missing_or_out_of_frame_root_maps() {
+    for missing in [false, true] {
+        let mut image = ExecutionImage::admit(
+            fixtures::reference_field_roundtrip_artifact(),
+            fixtures::profile(),
+        )
+        .unwrap();
+        let entry = image.entry_index();
+        let block = image.function(entry).unwrap().first_block;
+        if missing {
+            image.test_remove_safepoints(entry);
+        } else {
+            image.test_replace_safepoint_offsets(entry, block, 0, Box::new([u32::MAX]));
+        }
+        let mut heap = Heap::new(&image.storage_plan()).unwrap();
+        let frames = [Frame::test_entry(entry)];
+        let registers = vec![RegisterValue::Uninitialized; image.registers_per_frame()];
+        let (frames, frame_arena) = compact_roots(&image, &frames, &registers);
+        let statics = compact_statics(&image, &[]);
+        let external = ExternalRootTable::new(0).unwrap();
+        let mut collector = Collector::new();
+        collector.start();
+        assert_eq!(
+            Err(VmFault::InvalidRootMap),
+            collector.step(
+                &mut heap,
+                &image,
+                RootSet {
+                    statics: &statics,
+                    frames: &frames,
+                    frame_arena: &frame_arena,
+                    frame_depth: 1,
+                    runtime_roots: &[],
+                    external: &external,
+                },
+            )
+        );
+    }
+}
+
+#[test]
 fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
     let image = ExecutionImage::admit(
         fixtures::reference_field_roundtrip_artifact(),

@@ -145,6 +145,7 @@ pub enum VmFault {
     HandleExhausted,
     CorruptHeap,
     InvalidReference,
+    InvalidRootMap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
