@@ -1457,6 +1457,12 @@ impl Machine {
                     | ResolvedInstruction::CapabilityCallAsync { .. } => {
                         return Ok(Outcome::HostRequest);
                     }
+                    ResolvedInstruction::Throw { trap } => {
+                        let outcome = Outcome::Crashed(*trap);
+                        self.lifecycle = Lifecycle::Terminal(outcome);
+                        self.frame_depth = 0;
+                        return Ok(outcome);
+                    }
                     ResolvedInstruction::Unreachable => {
                         return Ok(self.fault(VmFault::ReachedUnreachable));
                     }

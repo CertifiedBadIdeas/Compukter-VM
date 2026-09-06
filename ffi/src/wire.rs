@@ -925,6 +925,10 @@ mod tests {
             encode_outcome(OwnedOutcome::Crashed(GuestTrap::DivisionByZero))
         );
         assert_eq!(
+            vec![5, 7],
+            encode_outcome(OwnedOutcome::Crashed(GuestTrap::InvalidArgument))
+        );
+        assert_eq!(
             vec![6, 7],
             encode_outcome(OwnedOutcome::Faulted(VmFault::HandleExhausted))
         );
