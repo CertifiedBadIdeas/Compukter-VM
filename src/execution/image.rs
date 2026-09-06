@@ -7,7 +7,7 @@ use crate::artifact::{
 use crate::VerifiedArtifact;
 
 use super::{
-    error::{AdmissionError, ResidentStorageComponent},
+    error::{AdmissionError, GuestTrap, ResidentStorageComponent},
     external_roots::ExternalRootTable,
     frame::{FrameLayout, SafepointMap},
     heap::Heap,
@@ -347,6 +347,9 @@ pub(super) enum ResolvedInstruction {
     },
     Return {
         value: u16,
+    },
+    Throw {
+        trap: GuestTrap,
     },
     Unreachable,
 }
@@ -2100,9 +2103,37 @@ fn resolve_instruction(
             }
         }
         Instruction::Return { value } => ResolvedInstruction::Return { value: *value },
+        Instruction::Throw { exception } => {
+            let ty = resolution
+                .functions
+                .get(function)
+                .and_then(|function| function.registers.get(*exception as usize))
+                .and_then(|register| register.nominal)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            match nominal_type_name(artifact, ty) {
+                Some(b"runtime.IllegalArgumentException") => ResolvedInstruction::Throw {
+                    trap: GuestTrap::InvalidArgument,
+                },
+                _ => return Err(AdmissionError::InvalidEntry),
+            }
+        }
         Instruction::Unreachable => ResolvedInstruction::Unreachable,
         _ => return Err(AdmissionError::InvalidEntry),
     })
+}
+
+fn nominal_type_name(artifact: &DecodedArtifact, key: TypeKey) -> Option<&[u8]> {
+    let module = artifact.modules.get(key.module as usize)?;
+    let name = match module.types.get(key.ty as usize)? {
+        NominalType::Class { name, .. }
+        | NominalType::Interface { name, .. }
+        | NominalType::Array { name, .. }
+        | NominalType::Function { name, .. } => *name,
+    };
+    module
+        .strings
+        .get(name as usize)
+        .map(|range| range.slice(&artifact.bytes))
 }
 
 fn validate_capability_call(
