@@ -30,6 +30,64 @@ use super::{
     PersistenceCodecError, StoreError, StoreHealth,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistenceAtomicTarget {
+    Object,
+    Journal,
+    Confirmed,
+    Tombstone,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistenceAtomicPhase {
+    TemporaryCreated,
+    BytesWritten,
+    FileSynced,
+    Renamed,
+    DirectorySynced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistenceCrashPoint {
+    Atomic {
+        target: PersistenceAtomicTarget,
+        phase: PersistenceAtomicPhase,
+    },
+    TombstoneRemoved,
+    TombstoneRemovalDirectorySynced,
+    ObjectRemoved,
+    ObjectRemovalDirectorySynced,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PersistenceCrashInjector {
+    #[cfg(feature = "persistence-crash-testing")]
+    point: Option<PersistenceCrashPoint>,
+}
+
+impl PersistenceCrashInjector {
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            #[cfg(feature = "persistence-crash-testing")]
+            point: None,
+        }
+    }
+
+    #[cfg(feature = "persistence-crash-testing")]
+    pub(crate) const fn armed(point: PersistenceCrashPoint) -> Self {
+        Self { point: Some(point) }
+    }
+
+    pub(crate) fn hit(self, point: PersistenceCrashPoint) {
+        #[cfg(feature = "persistence-crash-testing")]
+        if self.point == Some(point) {
+            std::process::exit(86);
+        }
+        #[cfg(not(feature = "persistence-crash-testing"))]
+        let _ = (self, point);
+    }
+}
+
 #[derive(Debug)]
 struct QueueState {
     health: StoreHealth,
@@ -53,6 +111,7 @@ struct Shared {
 #[derive(Clone, Debug)]
 pub(crate) struct PersistenceGate {
     shared: Arc<Shared>,
+    crash_injector: PersistenceCrashInjector,
 }
 
 #[derive(Clone, Debug)]
@@ -212,7 +271,11 @@ impl Drop for QueueReservation {
 }
 
 impl PersistenceGate {
-    pub fn start(root: PathBuf, limits: &FileSystemLimits) -> io::Result<(Self, JoinHandle<()>)> {
+    pub fn start(
+        root: PathBuf,
+        limits: &FileSystemLimits,
+        crash_injector: PersistenceCrashInjector,
+    ) -> io::Result<(Self, JoinHandle<()>)> {
         let mut queue = VecDeque::new();
         queue
             .try_reserve(
@@ -238,6 +301,7 @@ impl PersistenceGate {
                 }),
                 changed: Condvar::new(),
             }),
+            crash_injector,
         };
         let worker_gate = gate.clone();
         let handle = thread::Builder::new()
@@ -496,7 +560,7 @@ fn worker_loop(gate: PersistenceGate, root: PathBuf) {
         };
         match command {
             Command::Mutation(command) => {
-                if persist_mutation(&root, &command).is_err() {
+                if persist_mutation(&root, &command, gate.crash_injector).is_err() {
                     fault_worker(&gate);
                 } else {
                     let mut state = gate
@@ -511,15 +575,20 @@ fn worker_loop(gate: PersistenceGate, root: PathBuf) {
                 }
             }
             Command::Tombstone(command) => {
-                let result = persist_tombstone(&root, command.computer_id, command.present)
-                    .map_err(|_| StoreError::StorageFaulted);
+                let result = persist_tombstone(
+                    &root,
+                    command.computer_id,
+                    command.present,
+                    gate.crash_injector,
+                )
+                .map_err(|_| StoreError::StorageFaulted);
                 if result.is_err() {
                     fault_worker(&gate);
                 }
                 command.completion.complete(result);
             }
             Command::Collect(command) => {
-                let result = collect_objects(&root, &command.objects)
+                let result = collect_objects(&root, &command.objects, gate.crash_injector)
                     .map_err(|_| StoreError::StorageFaulted);
                 if result.is_err() {
                     fault_worker(&gate);
@@ -545,7 +614,12 @@ fn fault_worker(gate: &PersistenceGate) {
     gate.shared.changed.notify_all();
 }
 
-fn persist_tombstone(root: &Path, id: ComputerId, present: bool) -> io::Result<()> {
+fn persist_tombstone(
+    root: &Path,
+    id: ComputerId,
+    present: bool,
+    crash_injector: PersistenceCrashInjector,
+) -> io::Result<()> {
     let computer = computer_path(root, id);
     let path = computer.join("tombstone");
     if present {
@@ -554,23 +628,41 @@ fn persist_tombstone(root: &Path, id: ComputerId, present: bool) -> io::Result<(
         bytes.extend_from_slice(&id.into_bytes());
         let digest = Sha256::digest(&bytes);
         bytes.extend_from_slice(&digest);
-        write_atomic(&path, &bytes)
+        write_atomic(
+            &path,
+            &bytes,
+            PersistenceAtomicTarget::Tombstone,
+            crash_injector,
+        )
     } else {
         std::fs::remove_file(path)?;
-        sync_directory(&computer)
+        crash_injector.hit(PersistenceCrashPoint::TombstoneRemoved);
+        sync_directory(&computer)?;
+        crash_injector.hit(PersistenceCrashPoint::TombstoneRemovalDirectorySynced);
+        Ok(())
     }
 }
 
-fn collect_objects(root: &Path, objects: &[[u8; 32]]) -> io::Result<usize> {
+fn collect_objects(
+    root: &Path,
+    objects: &[[u8; 32]],
+    crash_injector: PersistenceCrashInjector,
+) -> io::Result<usize> {
     for object in objects {
         let path = object_path(root, *object);
         std::fs::remove_file(&path)?;
+        crash_injector.hit(PersistenceCrashPoint::ObjectRemoved);
         sync_directory(path.parent().expect("fixed object shard"))?;
+        crash_injector.hit(PersistenceCrashPoint::ObjectRemovalDirectorySynced);
     }
     Ok(objects.len())
 }
 
-fn persist_mutation(root: &Path, command: &MutationCommand) -> io::Result<()> {
+fn persist_mutation(
+    root: &Path,
+    command: &MutationCommand,
+    crash_injector: PersistenceCrashInjector,
+) -> io::Result<()> {
     if let Some((object_id, object)) = &command.object {
         if Sha256::digest(object).as_slice() != object_id {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "object digest"));
@@ -579,7 +671,12 @@ fn persist_mutation(root: &Path, command: &MutationCommand) -> io::Result<()> {
         if object_path.exists() {
             verify_object(&object_path, *object_id)?;
         } else {
-            write_atomic(&object_path, object)?;
+            write_atomic(
+                &object_path,
+                object,
+                PersistenceAtomicTarget::Object,
+                crash_injector,
+            )?;
         }
     }
 
@@ -587,19 +684,46 @@ fn persist_mutation(root: &Path, command: &MutationCommand) -> io::Result<()> {
     let journal = computer.join("journal");
     std::fs::create_dir_all(&journal)?;
     let record_path = journal.join(format!("{:016x}", command.generation));
-    write_atomic(&record_path, &command.journal)?;
-    write_confirmed(&computer.join("confirmed"), command.generation)?;
+    write_atomic(
+        &record_path,
+        &command.journal,
+        PersistenceAtomicTarget::Journal,
+        crash_injector,
+    )?;
+    write_confirmed_with_injector(
+        &computer.join("confirmed"),
+        command.generation,
+        crash_injector,
+    )?;
     Ok(())
 }
 
 pub(crate) fn write_confirmed(path: &Path, generation: u64) -> io::Result<()> {
+    write_confirmed_with_injector(path, generation, PersistenceCrashInjector::disabled())
+}
+
+fn write_confirmed_with_injector(
+    path: &Path,
+    generation: u64,
+    crash_injector: PersistenceCrashInjector,
+) -> io::Result<()> {
     let mut bytes = generation.to_le_bytes().to_vec();
     let digest = Sha256::digest(&bytes);
     bytes.extend_from_slice(&digest);
-    write_atomic(path, &bytes)
+    write_atomic(
+        path,
+        &bytes,
+        PersistenceAtomicTarget::Confirmed,
+        crash_injector,
+    )
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    target: PersistenceAtomicTarget,
+    crash_injector: PersistenceCrashInjector,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
@@ -612,10 +736,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .write(true)
         .create_new(true)
         .open(&temporary)?;
+    crash_injector.hit(PersistenceCrashPoint::Atomic {
+        target,
+        phase: PersistenceAtomicPhase::TemporaryCreated,
+    });
     file.write_all(bytes)?;
+    crash_injector.hit(PersistenceCrashPoint::Atomic {
+        target,
+        phase: PersistenceAtomicPhase::BytesWritten,
+    });
     file.sync_all()?;
+    crash_injector.hit(PersistenceCrashPoint::Atomic {
+        target,
+        phase: PersistenceAtomicPhase::FileSynced,
+    });
     std::fs::rename(&temporary, path)?;
+    crash_injector.hit(PersistenceCrashPoint::Atomic {
+        target,
+        phase: PersistenceAtomicPhase::Renamed,
+    });
     sync_directory(parent)?;
+    crash_injector.hit(PersistenceCrashPoint::Atomic {
+        target,
+        phase: PersistenceAtomicPhase::DirectorySynced,
+    });
     Ok(())
 }
 
@@ -758,6 +902,7 @@ mod tests {
                 }),
                 changed: Condvar::new(),
             }),
+            crash_injector: PersistenceCrashInjector::disabled(),
         };
 
         fault_worker(&gate);

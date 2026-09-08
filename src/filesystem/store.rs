@@ -25,7 +25,12 @@ use std::thread::JoinHandle;
 
 use sha2::{Digest, Sha256};
 
-use super::worker::{computer_path, object_path, verify_object, write_confirmed, PersistenceGate};
+#[cfg(feature = "persistence-crash-testing")]
+use super::worker::PersistenceCrashPoint;
+use super::worker::{
+    computer_path, object_path, verify_object, write_confirmed, PersistenceCrashInjector,
+    PersistenceGate,
+};
 use super::{
     recover, ComputerFileSystem, ComputerId, FileSystemLimits, RecoveryCheckpoint, RecoveryInput,
     RecoveryJournalRecord, RomImage, StoreHealth,
@@ -70,6 +75,24 @@ pub struct WorldFileSystemStore {
 
 impl WorldFileSystemStore {
     pub fn open(root: &Path, limits: FileSystemLimits) -> Result<Arc<Self>, StoreOpenError> {
+        Self::open_with_crash_injector(root, limits, PersistenceCrashInjector::disabled())
+    }
+
+    #[cfg(feature = "persistence-crash-testing")]
+    #[doc(hidden)]
+    pub fn open_with_persistence_crash_point(
+        root: &Path,
+        limits: FileSystemLimits,
+        point: PersistenceCrashPoint,
+    ) -> Result<Arc<Self>, StoreOpenError> {
+        Self::open_with_crash_injector(root, limits, PersistenceCrashInjector::armed(point))
+    }
+
+    fn open_with_crash_injector(
+        root: &Path,
+        limits: FileSystemLimits,
+        crash_injector: PersistenceCrashInjector,
+    ) -> Result<Arc<Self>, StoreOpenError> {
         if !root.is_absolute() {
             return Err(StoreOpenError::RootNotAbsolute);
         }
@@ -88,7 +111,8 @@ impl WorldFileSystemStore {
         std::fs::create_dir_all(root.join("objects")).map_err(|_| StoreOpenError::Io)?;
         std::fs::create_dir_all(root.join("computers")).map_err(|_| StoreOpenError::Io)?;
         let (persistence, worker) =
-            PersistenceGate::start(root.to_owned(), &limits).map_err(|_| StoreOpenError::Io)?;
+            PersistenceGate::start(root.to_owned(), &limits, crash_injector)
+                .map_err(|_| StoreOpenError::Io)?;
         Ok(Arc::new(Self {
             root: root.to_owned(),
             lock_file: Mutex::new(Some(lock_file)),
@@ -189,6 +213,7 @@ impl WorldFileSystemStore {
         }
 
         let mut stored = Vec::new();
+        let mut scanned_objects = 0_usize;
         for shard in std::fs::read_dir(self.root.join("objects")).map_err(|_| StoreError::Io)? {
             let shard = shard.map_err(|_| StoreError::Io)?;
             let shard_type = shard.file_type().map_err(|_| StoreError::Io)?;
@@ -202,18 +227,23 @@ impl WorldFileSystemStore {
             }
             for object in std::fs::read_dir(shard.path()).map_err(|_| StoreError::Io)? {
                 let object = object.map_err(|_| StoreError::Io)?;
+                scanned_objects = scanned_objects.checked_add(1).ok_or(StoreError::Busy)?;
+                if scanned_objects > maximum_objects {
+                    return Err(StoreError::Busy);
+                }
                 let object_type = object.file_type().map_err(|_| StoreError::Io)?;
                 if object_type.is_symlink() || !object_type.is_file() {
                     return Err(StoreError::StorageFaulted);
                 }
-                if stored.len() >= maximum_objects {
-                    return Err(StoreError::Busy);
-                }
                 let name = object.file_name();
                 let name = name.to_str().ok_or(StoreError::StorageFaulted)?;
-                let id = decode_hex::<32>(name).ok_or(StoreError::StorageFaulted)?;
-                if &name[..2] != shard_name {
+                let canonical_name = name.strip_suffix(".tmp").unwrap_or(name);
+                let id = decode_hex::<32>(canonical_name).ok_or(StoreError::StorageFaulted)?;
+                if &canonical_name[..2] != shard_name {
                     return Err(StoreError::StorageFaulted);
+                }
+                if name.ends_with(".tmp") {
+                    continue;
                 }
                 stored.push(id);
             }
@@ -391,20 +421,21 @@ fn read_generation_files(
         let entry = entry.map_err(|_| StoreError::Io)?;
         let name = entry.file_name();
         let name = name.to_str().ok_or(StoreError::StorageFaulted)?;
-        if name.ends_with(".tmp") {
-            continue;
-        }
         *recovery_records = recovery_records
             .checked_add(1)
             .ok_or(StoreError::StorageFaulted)?;
         if *recovery_records > maximum_recovery_records {
             return Err(StoreError::StorageFaulted);
         }
-        if name.len() != 16 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let canonical_name = name.strip_suffix(".tmp").unwrap_or(name);
+        if canonical_name.len() != 16
+            || !canonical_name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
             return Err(StoreError::StorageFaulted);
         }
-        let generation = u64::from_str_radix(name, 16).map_err(|_| StoreError::StorageFaulted)?;
-        if format!("{generation:016x}") != name {
+        let generation =
+            u64::from_str_radix(canonical_name, 16).map_err(|_| StoreError::StorageFaulted)?;
+        if format!("{generation:016x}") != canonical_name {
             return Err(StoreError::StorageFaulted);
         }
         let file_type = entry.file_type().map_err(|_| StoreError::Io)?;
@@ -418,6 +449,9 @@ fn read_generation_files(
             .ok_or(StoreError::StorageFaulted)?;
         if length > maximum_file_bytes || *recovery_bytes > maximum_recovery_bytes {
             return Err(StoreError::StorageFaulted);
+        }
+        if name.ends_with(".tmp") {
+            continue;
         }
         let mut bytes = Vec::new();
         bytes

@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "ffi", "tools/runtime-bundler", "tools/xtask"]
+members = [
+    ".",
+    "ffi",
+    "tools/persistence-crash-fixture",
+    "tools/runtime-bundler",
+    "tools/xtask",
+]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +19,9 @@ license = "Apache-2.0"
 
 [lib]
 crate-type = ["rlib"]
+
+[features]
+persistence-crash-testing = []
 
 [dependencies]
 sha2 = { version = "0.10", default-features = false }
