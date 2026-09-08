@@ -43,3 +43,6 @@ pub use store::{StoreError, StoreOpenError, WorldFileSystemStore};
 pub use tree::{
     ComputerFileSystem, ExecutableRevision, FileSystemSnapshot, NodeKind, NodeMetadata,
 };
+#[cfg(feature = "persistence-crash-testing")]
+#[doc(hidden)]
+pub use worker::{PersistenceAtomicPhase, PersistenceAtomicTarget, PersistenceCrashPoint};
