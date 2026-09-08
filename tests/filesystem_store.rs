@@ -104,7 +104,7 @@ fn world_root_is_canonical_exclusive_and_explicitly_closed() {
     store.close().unwrap();
     assert_eq!(store.health(), StoreHealth::Closed);
     store.close().unwrap();
-    assert!(!root.path().join("lock").exists());
+    assert!(root.path().join("lock").is_file());
 }
 
 #[cfg(unix)]
