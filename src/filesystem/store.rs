@@ -17,7 +17,7 @@
  */
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -84,15 +84,7 @@ impl WorldFileSystemStore {
         if canonical != root {
             return Err(StoreOpenError::RootNotCanonical);
         }
-        let lock_path = root.join("lock");
-        let lock_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-            .map_err(|error| match error.kind() {
-                ErrorKind::AlreadyExists => StoreOpenError::Locked,
-                _ => StoreOpenError::Io,
-            })?;
+        let lock_file = acquire_store_lock(&root.join("lock"))?;
         std::fs::create_dir_all(root.join("objects")).map_err(|_| StoreOpenError::Io)?;
         std::fs::create_dir_all(root.join("computers")).map_err(|_| StoreOpenError::Io)?;
         let (persistence, worker) =
@@ -301,16 +293,41 @@ impl WorldFileSystemStore {
         {
             worker.join().map_err(|_| StoreError::StorageFaulted)?;
         }
-        let mut lock = self
-            .lock_file
+        self.lock_file
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        lock.take();
-        std::fs::remove_file(self.root.join("lock")).map_err(|_| StoreError::Io)?;
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
         *health = StoreHealth::Closed;
         self.persistence.mark_closed();
         Ok(())
     }
+}
+
+fn acquire_store_lock(path: &Path) -> Result<File, StoreOpenError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(StoreOpenError::Io);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(_) => return Err(StoreOpenError::Io),
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|_| StoreOpenError::Io)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| StoreOpenError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StoreOpenError::Io);
+    }
+    file.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => StoreOpenError::Locked,
+        TryLockError::Error(_) => StoreOpenError::Io,
+    })?;
+    Ok(file)
 }
 
 fn read_confirmed(path: &Path) -> Result<u64, StoreError> {
