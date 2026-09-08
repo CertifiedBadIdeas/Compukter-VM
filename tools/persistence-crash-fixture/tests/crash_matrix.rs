@@ -26,8 +26,8 @@ use compukter_vm::filesystem::{
     WorldFileSystemStore,
 };
 use persistence_crash_fixture::{
-    empty_rom, mutation_point_name, path, seed, BASELINE_BYTES, BASELINE_PATH, COMPUTER_ID,
-    CRASH_EXIT_CODE, NEXT_BYTES, NEXT_PATH,
+    atomic_point_name, empty_rom, path, seed, seed_tombstone, seed_unreachable_objects,
+    BASELINE_BYTES, BASELINE_PATH, COMPUTER_ID, CRASH_EXIT_CODE, NEXT_BYTES, NEXT_PATH,
 };
 use sha2::{Digest, Sha256};
 
@@ -87,17 +87,8 @@ fn mutation_crash_matrix_recovers_only_complete_atomic_publications() {
         for phase in PHASES {
             let root = TestRoot::new();
             seed(root.path());
-            let point = mutation_point_name(target, phase);
-            let status = Command::new(env!("CARGO_BIN_EXE_persistence-crash-fixture"))
-                .arg(root.path())
-                .arg(&point)
-                .status()
-                .expect("crash fixture starts");
-            assert_eq!(
-                Some(CRASH_EXIT_CODE),
-                status.code(),
-                "unexpected child status at {point}: {status}",
-            );
+            let point = atomic_point_name(target, phase);
+            run_crashing_child(root.path(), &point);
 
             let expects_next = target == PersistenceAtomicTarget::Confirmed
                 || (target == PersistenceAtomicTarget::Journal
@@ -107,6 +98,84 @@ fn mutation_crash_matrix_recovers_only_complete_atomic_publications() {
                     ));
             assert_recovered(root.path(), expects_next, &point);
         }
+    }
+}
+
+#[test]
+fn tombstone_crash_matrix_uses_only_the_canonical_tombstone() {
+    let _serial = SUBPROCESS_SCENARIOS.lock().expect("scenario lock");
+    for phase in PHASES {
+        let root = TestRoot::new();
+        seed(root.path());
+        let point = atomic_point_name(PersistenceAtomicTarget::Tombstone, phase);
+        run_crashing_child(root.path(), &point);
+
+        let limits = FileSystemLimits::testing();
+        let store = WorldFileSystemStore::open(root.path(), limits).expect("store reopens");
+        let tombstone_is_published = matches!(
+            phase,
+            PersistenceAtomicPhase::Renamed | PersistenceAtomicPhase::DirectorySynced
+        );
+        let opened = store.open_computer(COMPUTER_ID, empty_rom(&limits));
+        if tombstone_is_published {
+            assert!(matches!(opened, Err(StoreError::NotFound)), "point {point}");
+        } else {
+            let filesystem = opened.expect("temporary tombstone is not authoritative");
+            assert_eq!(1, filesystem.generation(), "point {point}");
+        }
+        store.close().expect("store closes");
+    }
+}
+
+#[test]
+fn tombstone_removal_crash_points_recover_the_visible_removal() {
+    let _serial = SUBPROCESS_SCENARIOS.lock().expect("scenario lock");
+    for point in ["tombstone-removed", "tombstone-removal-directory-synced"] {
+        let root = TestRoot::new();
+        seed_tombstone(root.path());
+        run_crashing_child(root.path(), point);
+
+        let limits = FileSystemLimits::testing();
+        let store = WorldFileSystemStore::open(root.path(), limits).expect("store reopens");
+        let filesystem = store
+            .open_computer(COMPUTER_ID, empty_rom(&limits))
+            .expect("removed tombstone no longer blocks the computer");
+        assert_eq!(1, filesystem.generation(), "point {point}");
+        store.close().expect("store closes");
+    }
+}
+
+#[test]
+fn collection_crash_points_preserve_reachable_data_and_converge() {
+    let _serial = SUBPROCESS_SCENARIOS.lock().expect("scenario lock");
+    for point in ["object-removed", "object-removal-directory-synced"] {
+        let root = TestRoot::new();
+        let unreachable = seed_unreachable_objects(root.path());
+        run_crashing_child(root.path(), point);
+        assert_eq!(
+            1,
+            unreachable.iter().filter(|path| path.exists()).count(),
+            "exactly one unreachable object remains at {point}",
+        );
+
+        let limits = FileSystemLimits::testing();
+        let store = WorldFileSystemStore::open(root.path(), limits).expect("store reopens");
+        let filesystem = store
+            .open_computer(COMPUTER_ID, empty_rom(&limits))
+            .expect("computer reopens");
+        assert_eq!(
+            BASELINE_BYTES,
+            filesystem
+                .read_file_for_test(&path(BASELINE_PATH))
+                .expect("reachable baseline remains readable"),
+            "point {point}",
+        );
+        assert_eq!(1, store.collect_unreachable_objects(1, 8).unwrap());
+        assert!(
+            unreachable.iter().all(|path| !path.exists()),
+            "point {point}"
+        );
+        store.close().expect("store closes");
     }
 }
 
@@ -210,4 +279,17 @@ fn assert_recovered(root: &Path, expects_next: bool, point: &str) {
         .collect_unreachable_objects(1, 16)
         .expect("post-crash collection succeeds");
     store.close().expect("recovered store closes");
+}
+
+fn run_crashing_child(root: &Path, point: &str) {
+    let status = Command::new(env!("CARGO_BIN_EXE_persistence-crash-fixture"))
+        .arg(root)
+        .arg(point)
+        .status()
+        .expect("crash fixture starts");
+    assert_eq!(
+        Some(CRASH_EXIT_CODE),
+        status.code(),
+        "unexpected child status at {point}: {status}",
+    );
 }
