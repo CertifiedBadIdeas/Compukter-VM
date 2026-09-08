@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use persistence_crash_fixture::{parse_mutation_point, run_mutation};
+use persistence_crash_fixture::{parse_point, run_scenario};
 
 fn main() {
     let mut arguments = std::env::args_os().skip(1);
@@ -27,7 +27,7 @@ fn main() {
     assert!(arguments.next().is_none(), "unexpected argument");
     let point = point
         .to_str()
-        .and_then(parse_mutation_point)
+        .and_then(parse_point)
         .expect("invalid crash point");
-    run_mutation(&root, point);
+    run_scenario(&root, point);
 }

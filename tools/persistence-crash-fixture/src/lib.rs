@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use compukter_vm::filesystem::{
@@ -47,7 +47,51 @@ pub fn seed(root: &Path) {
     store.close().expect("seed store closes");
 }
 
-pub fn run_mutation(root: &Path, point: PersistenceCrashPoint) {
+pub fn run_scenario(root: &Path, point: PersistenceCrashPoint) {
+    match point {
+        PersistenceCrashPoint::Atomic {
+            target: PersistenceAtomicTarget::Tombstone,
+            ..
+        } => run_tombstone_write(root, point),
+        PersistenceCrashPoint::TombstoneRemoved
+        | PersistenceCrashPoint::TombstoneRemovalDirectorySynced => {
+            run_tombstone_removal(root, point)
+        }
+        PersistenceCrashPoint::ObjectRemoved
+        | PersistenceCrashPoint::ObjectRemovalDirectorySynced => run_collection(root, point),
+        PersistenceCrashPoint::Atomic { .. } => run_mutation(root, point),
+    }
+}
+
+pub fn seed_tombstone(root: &Path) {
+    seed(root);
+    let limits = FileSystemLimits::testing();
+    let store = WorldFileSystemStore::open(root, limits).expect("tombstone seed store opens");
+    store.tombstone(COMPUTER_ID).expect("tombstone is durable");
+    store.close().expect("tombstone seed store closes");
+}
+
+pub fn seed_unreachable_objects(root: &Path) -> [PathBuf; 2] {
+    seed(root);
+    [
+        b"first unreachable".as_slice(),
+        b"second unreachable".as_slice(),
+    ]
+    .map(|bytes| {
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let encoded = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = root.join("objects").join(&encoded[..2]).join(encoded);
+        std::fs::create_dir_all(path.parent().expect("object shard"))
+            .expect("object shard is created");
+        std::fs::write(&path, bytes).expect("unreachable object is written");
+        path
+    })
+}
+
+fn run_mutation(root: &Path, point: PersistenceCrashPoint) {
     let limits = FileSystemLimits::testing();
     let store = WorldFileSystemStore::open_with_persistence_crash_point(root, limits, point)
         .expect("crash store opens");
@@ -63,12 +107,57 @@ pub fn run_mutation(root: &Path, point: PersistenceCrashPoint) {
     panic!("armed persistence crash point did not terminate the process");
 }
 
-pub fn parse_mutation_point(value: &str) -> Option<PersistenceCrashPoint> {
+fn run_tombstone_write(root: &Path, point: PersistenceCrashPoint) {
+    let limits = FileSystemLimits::testing();
+    let store = WorldFileSystemStore::open_with_persistence_crash_point(root, limits, point)
+        .expect("tombstone crash store opens");
+    store
+        .tombstone(COMPUTER_ID)
+        .expect("an armed crash point must terminate during tombstone write");
+    panic!("armed tombstone crash point did not terminate the process");
+}
+
+fn run_tombstone_removal(root: &Path, point: PersistenceCrashPoint) {
+    let limits = FileSystemLimits::testing();
+    let store = WorldFileSystemStore::open_with_persistence_crash_point(root, limits, point)
+        .expect("tombstone recovery crash store opens");
+    store
+        .recover_tombstone(COMPUTER_ID)
+        .expect("an armed crash point must terminate during tombstone removal");
+    panic!("armed tombstone removal crash point did not terminate the process");
+}
+
+fn run_collection(root: &Path, point: PersistenceCrashPoint) {
+    let limits = FileSystemLimits::testing();
+    let store = WorldFileSystemStore::open_with_persistence_crash_point(root, limits, point)
+        .expect("collection crash store opens");
+    store
+        .open_computer(COMPUTER_ID, empty_rom(&limits))
+        .expect("collection computer opens");
+    store
+        .collect_unreachable_objects(1, 8)
+        .expect("an armed crash point must terminate during object collection");
+    panic!("armed collection crash point did not terminate the process");
+}
+
+pub fn parse_point(value: &str) -> Option<PersistenceCrashPoint> {
+    match value {
+        "tombstone-removed" => return Some(PersistenceCrashPoint::TombstoneRemoved),
+        "tombstone-removal-directory-synced" => {
+            return Some(PersistenceCrashPoint::TombstoneRemovalDirectorySynced);
+        }
+        "object-removed" => return Some(PersistenceCrashPoint::ObjectRemoved),
+        "object-removal-directory-synced" => {
+            return Some(PersistenceCrashPoint::ObjectRemovalDirectorySynced);
+        }
+        _ => {}
+    }
     let (target, phase) = value.split_once('.')?;
     let target = match target {
         "object" => PersistenceAtomicTarget::Object,
         "journal" => PersistenceAtomicTarget::Journal,
         "confirmed" => PersistenceAtomicTarget::Confirmed,
+        "tombstone" => PersistenceAtomicTarget::Tombstone,
         _ => return None,
     };
     let phase = match phase {
@@ -82,10 +171,7 @@ pub fn parse_mutation_point(value: &str) -> Option<PersistenceCrashPoint> {
     Some(PersistenceCrashPoint::Atomic { target, phase })
 }
 
-pub fn mutation_point_name(
-    target: PersistenceAtomicTarget,
-    phase: PersistenceAtomicPhase,
-) -> String {
+pub fn atomic_point_name(target: PersistenceAtomicTarget, phase: PersistenceAtomicPhase) -> String {
     let target = match target {
         PersistenceAtomicTarget::Object => "object",
         PersistenceAtomicTarget::Journal => "journal",
