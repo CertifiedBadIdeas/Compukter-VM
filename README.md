@@ -77,14 +77,14 @@ Compukter Runtime releases and Rust workspace packages use one pre-1.0 SemVer
 - `y` is incremented for a compatible implementation replacement;
 - an ABI break changes `x` and resets `y` to zero.
 
-A Runtime `0.9.0` release uses tag `v0.9.0`. The first supported targets are Linux
+A Runtime `0.10.0` release uses tag `v0.10.0`. The first supported targets are Linux
 x86_64 (`x86_64-unknown-linux-gnu`) and Windows x86_64
 (`x86_64-pc-windows-msvc`). Each release contains these immutable assets:
 
 ```text
-compukter-runtime-0.9.0-linux-x86_64.tar.gz
-compukter-runtime-0.9.0-windows-x86_64.zip
-compukter-runtime-0.9.0-checksums.sha256
+compukter-runtime-0.10.0-linux-x86_64.tar.gz
+compukter-runtime-0.10.0-windows-x86_64.zip
+compukter-runtime-0.10.0-checksums.sha256
 ```
 
 Each platform archive has one fixed, self-describing layout:
@@ -100,8 +100,8 @@ The manifest binds the Runtime version and tag, full VM commit, FFI ABI,
 external format versions, pinned Rust compiler, target, native filename, byte
 size, SHA-256, and release profile. Consumers must pin both the exact Runtime
 release and the exact VM commit from that manifest. Published assets are
-immutable; a compatible replacement is a new revision such as `0.9.1`, never
-an overwrite of `0.9.0`.
+immutable; a compatible replacement is a new revision such as `0.10.1`, never
+an overwrite of `0.10.0`.
 
 The `Runtime release` workflow may be dispatched manually to build and test
 temporary Linux and Windows artifacts. It publishes a durable GitHub Release
