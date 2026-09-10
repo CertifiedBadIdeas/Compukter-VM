@@ -27,12 +27,13 @@ use compukter_ffi::{
     compukter_deployment_candidate_close, compukter_executable_revision,
     compukter_filesystem_generation, compukter_filesystem_list, compukter_filesystem_read,
     compukter_filesystem_stat, compukter_max_create_bytes, compukter_max_outcome_bytes,
-    compukter_redstone_confirm_output, compukter_redstone_submit_input, compukter_store_close,
-    compukter_store_durable_generation, compukter_store_flush, compukter_store_health,
-    compukter_store_open, compukter_store_recover, compukter_store_tombstone,
-    compukter_submit_canonical_line, compukter_terminal_changes_since, compukter_terminal_commit,
-    compukter_terminal_full_state, compukter_terminal_key, compukter_terminal_text,
-    compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus, COMPUKTER_FFI_ABI_VERSION,
+    compukter_redstone_confirm_output, compukter_redstone_submit_input,
+    compukter_resource_snapshot, compukter_store_close, compukter_store_durable_generation,
+    compukter_store_flush, compukter_store_health, compukter_store_open, compukter_store_recover,
+    compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
+    compukter_terminal_commit, compukter_terminal_full_state, compukter_terminal_key,
+    compukter_terminal_text, compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
+    COMPUKTER_FFI_ABI_VERSION,
 };
 use compukter_vm::ProcessFailureReason;
 use std::path::{Path, PathBuf};
@@ -40,8 +41,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(9, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(10, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
+}
+
+#[test]
+fn resource_snapshot_is_fixed_bounded_and_handle_checked() {
+    let handle = create_machine(&terminal_artifact());
+    let bytes = read_dynamic_output(|output, capacity, written| unsafe {
+        compukter_resource_snapshot(handle, output, capacity, written)
+    });
+
+    assert_eq!(98, bytes.len());
+    assert_eq!(1, bytes[0]);
+    assert_eq!(0, bytes[1]);
+    let heap_capacity = u64::from_le_bytes(bytes[42..50].try_into().unwrap());
+    let heap_used = u64::from_le_bytes(bytes[50..58].try_into().unwrap());
+    let filesystem_capacity = u64::from_le_bytes(bytes[82..90].try_into().unwrap());
+    assert!(heap_capacity > 0);
+    assert!(heap_used <= heap_capacity);
+    assert!(filesystem_capacity > 0);
+
+    assert_eq!(FfiStatus::Ok, compukter_close(handle));
+    let mut output = [0_u8; 98];
+    let mut written = 0_usize;
+    assert_eq!(FfiStatus::StaleHandle, unsafe {
+        compukter_resource_snapshot(handle, output.as_mut_ptr(), output.len(), &mut written)
+    });
 }
 
 #[test]
