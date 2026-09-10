@@ -82,6 +82,7 @@ impl Frame {
     }
 }
 
+#[inline(always)]
 pub(super) fn read_frame_value(
     arena: &FrameArena,
     frame: Frame,
@@ -127,6 +128,7 @@ pub(super) fn read_frame_value(
     }
 }
 
+#[inline(always)]
 pub(super) fn write_frame_value(
     arena: &mut FrameArena,
     frame: Frame,

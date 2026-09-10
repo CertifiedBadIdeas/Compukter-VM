@@ -46,7 +46,7 @@ same build. Times cover 1,000 slices of 4,096 budget units.
 
 | Workload | Traced elapsed ns | Computer elapsed ns | Traced instructions/s | Computer instructions/s | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| hot integer | 147,590,503 | 43,015,802 | 27,745,688 | 95,197,574 | 3.43x |
-| mixed branch/switch | 172,849,583 | 24,916,908 | 19,742,599 | 136,955,195 | 6.94x |
-| nested direct calls | 93,624,209 | 29,435,994 | 20,564,489 | 65,407,474 | 3.18x |
-| empty quota loop | 86,832,466 | 15,480,306 | 47,159,780 | 264,529,655 | 5.61x |
+| hot integer | 136,584,842 | 35,198,615 | 29,981,365 | 116,339,805 | 3.88x |
+| mixed branch/switch | 157,429,746 | 24,228,424 | 21,676,336 | 140,846,966 | 6.50x |
+| nested direct calls | 85,140,374 | 27,179,304 | 22,613,643 | 70,838,238 | 3.13x |
+| empty quota loop | 85,725,544 | 14,427,992 | 47,768,726 | 283,823,279 | 5.94x |
