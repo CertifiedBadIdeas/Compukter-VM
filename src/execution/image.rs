@@ -9,7 +9,7 @@ use crate::VerifiedArtifact;
 use super::{
     error::{AdmissionError, GuestTrap, ResidentStorageComponent},
     external_roots::ExternalRootTable,
-    frame::{FrameLayout, SafepointMap},
+    frame::{FrameLayout, FrameValueAccess, SafepointMap},
     heap::Heap,
     host::{HostValueType, ResolvedCapability},
     layout::{
@@ -56,6 +56,7 @@ pub(super) struct ResolvedFunction {
     pub register_count: usize,
     pub parameter_count: usize,
     pub registers: Box<[ResolvedValueType]>,
+    pub register_accesses: Box<[FrameValueAccess]>,
     pub frame_layout: FrameLayout,
     pub safepoints: Box<[ResolvedSafepoint]>,
     pub result: ResolvedValueType,
@@ -565,6 +566,10 @@ impl ExecutionImage {
                 }
                 let frame_layout = FrameLayout::derive(&function.values)
                     .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+                let mut register_accesses = reserved(registers.len())?;
+                for (register, value_type) in registers.iter().enumerate() {
+                    register_accesses.push(frame_layout.value_access(value_type.kind, register));
+                }
                 let local_roots = module
                     .safepoint_roots
                     .iter()
@@ -627,6 +632,7 @@ impl ExecutionImage {
                     register_count: function.register_count as usize,
                     parameter_count: function.parameter_count as usize,
                     registers: registers.into_boxed_slice(),
+                    register_accesses: register_accesses.into_boxed_slice(),
                     frame_layout,
                     safepoints: safepoints.into_boxed_slice(),
                     result: resolve_value_type(decoded, signature_key.module as usize, *result)?,

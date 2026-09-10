@@ -90,42 +90,11 @@ pub(super) fn read_frame_value(
     register: u16,
 ) -> Result<RuntimeValue, VmFault> {
     let register = register as usize;
-    let value_type = *function
-        .registers
+    let access = *function
+        .register_accesses
         .get(register)
         .ok_or(VmFault::InvalidStoragePlan)?;
-    match value_type.kind {
-        1 => arena
-            .read_i32(frame.base, &function.frame_layout, register, 0)
-            .map(RuntimeValue::I32),
-        2 => arena
-            .read_i64(frame.base, &function.frame_layout, register, 0)
-            .map(RuntimeValue::I64),
-        3 => arena
-            .read_f32(frame.base, &function.frame_layout, register, 0)
-            .map(RuntimeValue::F32),
-        4 => arena
-            .read_f64(frame.base, &function.frame_layout, register, 0)
-            .map(RuntimeValue::F64),
-        5 => arena
-            .read_i32(frame.base, &function.frame_layout, register, 0)
-            .and_then(|value| match value {
-                0 => Ok(RuntimeValue::Bool(false)),
-                1 => Ok(RuntimeValue::Bool(true)),
-                _ => Err(VmFault::InvalidValueType),
-            }),
-        6 => arena
-            .read_i32(frame.base, &function.frame_layout, register, 0)
-            .and_then(|value| {
-                u16::try_from(value)
-                    .map(RuntimeValue::Char)
-                    .map_err(|_| VmFault::InvalidValueType)
-            }),
-        7 => arena
-            .read_ref32(frame.base, &function.frame_layout, register, 0)
-            .map(|value| value.map_or(RuntimeValue::Null, RuntimeValue::Reference)),
-        _ => Err(VmFault::InvalidValueType),
-    }
+    arena.read_access(frame.base, access)
 }
 
 #[inline(always)]
@@ -137,45 +106,11 @@ pub(super) fn write_frame_value(
     value: RuntimeValue,
 ) -> Result<(), VmFault> {
     let register = register as usize;
-    let value_type = *function
-        .registers
+    let access = *function
+        .register_accesses
         .get(register)
         .ok_or(VmFault::InvalidStoragePlan)?;
-    match (value_type.kind, value) {
-        (1, RuntimeValue::I32(value)) => {
-            arena.write_i32(frame.base, &function.frame_layout, register, 0, value)
-        }
-        (2, RuntimeValue::I64(value)) => {
-            arena.write_i64(frame.base, &function.frame_layout, register, 0, value)
-        }
-        (3, RuntimeValue::F32(value)) => {
-            arena.write_f32(frame.base, &function.frame_layout, register, 0, value)
-        }
-        (4, RuntimeValue::F64(value)) => {
-            arena.write_f64(frame.base, &function.frame_layout, register, 0, value)
-        }
-        (5, RuntimeValue::Bool(value)) => arena.write_i32(
-            frame.base,
-            &function.frame_layout,
-            register,
-            0,
-            i32::from(value),
-        ),
-        (6, RuntimeValue::Char(value)) => arena.write_i32(
-            frame.base,
-            &function.frame_layout,
-            register,
-            0,
-            i32::from(value),
-        ),
-        (7, RuntimeValue::Null) => {
-            arena.write_ref32(frame.base, &function.frame_layout, register, 0, None)
-        }
-        (7, RuntimeValue::Reference(value)) => {
-            arena.write_ref32(frame.base, &function.frame_layout, register, 0, Some(value))
-        }
-        _ => Err(VmFault::InvalidValueType),
-    }
+    arena.write_access(frame.base, access, value)
 }
 
 pub(super) struct Machine {

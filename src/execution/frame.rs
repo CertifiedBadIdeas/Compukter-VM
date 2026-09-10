@@ -29,6 +29,12 @@ pub(super) struct ComponentLayout {
     pub atom: PhysicalAtom,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FrameValueAccess {
+    kind: u8,
+    component: Option<ComponentLayout>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ValueLayout {
     pub components: Box<[ComponentLayout]>,
@@ -213,6 +219,54 @@ impl FrameArena {
         )?)))
     }
 
+    #[inline(always)]
+    pub(super) fn read_access(
+        &self,
+        base: u32,
+        access: FrameValueAccess,
+    ) -> Result<RuntimeValue, VmFault> {
+        match access.kind {
+            1 => self
+                .read4_access(base, access.component, PhysicalAtom::I32)
+                .map(i32::from_le_bytes)
+                .map(RuntimeValue::I32),
+            2 => self
+                .read8_access(base, access.component, PhysicalAtom::I64)
+                .map(i64::from_le_bytes)
+                .map(RuntimeValue::I64),
+            3 => self
+                .read4_access(base, access.component, PhysicalAtom::F32)
+                .map(u32::from_le_bytes)
+                .map(RuntimeValue::F32),
+            4 => self
+                .read8_access(base, access.component, PhysicalAtom::F64)
+                .map(u64::from_le_bytes)
+                .map(RuntimeValue::F64),
+            5 => self
+                .read4_access(base, access.component, PhysicalAtom::I32)
+                .map(i32::from_le_bytes)
+                .and_then(|value| match value {
+                    0 => Ok(RuntimeValue::Bool(false)),
+                    1 => Ok(RuntimeValue::Bool(true)),
+                    _ => Err(VmFault::InvalidValueType),
+                }),
+            6 => self
+                .read4_access(base, access.component, PhysicalAtom::I32)
+                .map(i32::from_le_bytes)
+                .and_then(|value| {
+                    u16::try_from(value)
+                        .map(RuntimeValue::Char)
+                        .map_err(|_| VmFault::InvalidValueType)
+                }),
+            7 => self
+                .read4_access(base, access.component, PhysicalAtom::Ref32)
+                .map(u32::from_le_bytes)
+                .map(Ref32::from_bits)
+                .map(|value| value.map_or(RuntimeValue::Null, RuntimeValue::Reference)),
+            _ => Err(VmFault::InvalidValueType),
+        }
+    }
+
     pub(super) fn read_ref32_offset(
         &self,
         frame: FrameReservation,
@@ -290,6 +344,46 @@ impl FrameArena {
         stored: Option<Ref32>,
     ) -> Result<(), VmFault> {
         self.write_component(base, layout, value, component, PhysicalValue::Ref32(stored))
+    }
+
+    #[inline(always)]
+    pub(super) fn write_access(
+        &mut self,
+        base: u32,
+        access: FrameValueAccess,
+        value: RuntimeValue,
+    ) -> Result<(), VmFault> {
+        let stored = match (access.kind, value) {
+            (1, RuntimeValue::I32(value)) => PhysicalValue::I32(value),
+            (2, RuntimeValue::I64(value)) => PhysicalValue::I64(value),
+            (3, RuntimeValue::F32(value)) => PhysicalValue::F32(value),
+            (4, RuntimeValue::F64(value)) => PhysicalValue::F64(value),
+            (5, RuntimeValue::Bool(value)) => PhysicalValue::I32(i32::from(value)),
+            (6, RuntimeValue::Char(value)) => PhysicalValue::I32(i32::from(value)),
+            (7, RuntimeValue::Null) => PhysicalValue::Ref32(None),
+            (7, RuntimeValue::Reference(value)) => PhysicalValue::Ref32(Some(value)),
+            _ => return Err(VmFault::InvalidValueType),
+        };
+        let component = access
+            .component
+            .filter(|component| component.atom == stored.atom())
+            .ok_or(VmFault::InvalidValueType)?;
+        let range = self.component_range(base, &component)?;
+        match stored {
+            PhysicalValue::I32(value) => self.bytes[range].copy_from_slice(&value.to_le_bytes()),
+            PhysicalValue::I64(value) => self.bytes[range].copy_from_slice(&value.to_le_bytes()),
+            PhysicalValue::F32(value) => self.bytes[range].copy_from_slice(&value.to_le_bytes()),
+            PhysicalValue::F64(value) => self.bytes[range].copy_from_slice(&value.to_le_bytes()),
+            PhysicalValue::Ref32(value) => {
+                self.bytes[range].copy_from_slice(&value.map_or(0, Ref32::to_bits).to_le_bytes())
+            }
+        }
+        #[cfg(test)]
+        {
+            let initialized = self.component_range(base, &component)?;
+            self.initialized[initialized].fill(true);
+        }
+        Ok(())
     }
 
     pub(super) fn write_value(
@@ -391,6 +485,36 @@ impl FrameArena {
     ) -> Result<[u8; 8], VmFault> {
         let component = self.component(layout, value, component, atom)?;
         self.bytes[self.component_range(base, component)?]
+            .try_into()
+            .map_err(|_| VmFault::InvalidStoragePlan)
+    }
+
+    #[inline(always)]
+    fn read4_access(
+        &self,
+        base: u32,
+        component: Option<ComponentLayout>,
+        atom: PhysicalAtom,
+    ) -> Result<[u8; 4], VmFault> {
+        let component = component
+            .filter(|component| component.atom == atom)
+            .ok_or(VmFault::InvalidValueType)?;
+        self.bytes[self.component_range(base, &component)?]
+            .try_into()
+            .map_err(|_| VmFault::InvalidStoragePlan)
+    }
+
+    #[inline(always)]
+    fn read8_access(
+        &self,
+        base: u32,
+        component: Option<ComponentLayout>,
+        atom: PhysicalAtom,
+    ) -> Result<[u8; 8], VmFault> {
+        let component = component
+            .filter(|component| component.atom == atom)
+            .ok_or(VmFault::InvalidValueType)?;
+        self.bytes[self.component_range(base, &component)?]
             .try_into()
             .map_err(|_| VmFault::InvalidStoragePlan)
     }
@@ -642,6 +766,17 @@ impl FrameLayout {
             values: layouts.into_boxed_slice(),
         })
     }
+
+    pub(super) fn value_access(&self, kind: u8, value: usize) -> FrameValueAccess {
+        FrameValueAccess {
+            kind,
+            component: self
+                .values
+                .get(value)
+                .and_then(|value| value.components.first())
+                .copied(),
+        }
+    }
 }
 
 impl SafepointMap {
@@ -792,6 +927,14 @@ mod tests {
         assert_eq!(
             Err(VmFault::InvalidValueType),
             arena.read_i64(frame.base, &layout, 0, 0)
+        );
+        assert_eq!(
+            Err(VmFault::InvalidValueType),
+            arena.read_access(frame.base, layout.value_access(2, 0)),
+        );
+        assert_eq!(
+            Err(VmFault::InvalidValueType),
+            arena.write_access(frame.base, layout.value_access(1, 1), RuntimeValue::I32(1),),
         );
         assert_eq!(Err(VmFault::InvalidStoragePlan), arena.push(&layout));
     }
