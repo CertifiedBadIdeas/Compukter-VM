@@ -203,6 +203,7 @@ pub(super) struct Machine {
     executed_instructions: u64,
     maximum_observed_frame_depth: usize,
     trace: Sha256,
+    trace_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -273,6 +274,14 @@ impl Machine {
     }
 
     pub(super) fn new(image: ExecutionImage) -> Result<Self, AdmissionError> {
+        Self::new_with_trace(image, true)
+    }
+
+    pub(super) fn new_untraced(image: ExecutionImage) -> Result<Self, AdmissionError> {
+        Self::new_with_trace(image, false)
+    }
+
+    fn new_with_trace(image: ExecutionImage, trace_enabled: bool) -> Result<Self, AdmissionError> {
         let heap = Heap::new(&image.storage_plan())?;
         let external_roots = ExternalRootTable::new(image.external_root_capacity())?;
         let frame_count = image.maximum_call_depth();
@@ -330,6 +339,7 @@ impl Machine {
             executed_instructions: 0,
             maximum_observed_frame_depth: 0,
             trace: Sha256::new(),
+            trace_enabled,
         })
     }
 
@@ -2316,7 +2326,9 @@ impl Machine {
     }
 
     pub(super) fn trace_host_field(&mut self, bytes: &[u8]) {
-        trace_field(&mut self.trace, bytes);
+        if self.trace_enabled {
+            trace_field(&mut self.trace, bytes);
+        }
     }
 
     pub(super) fn entered_blocks(&self) -> u64 {
@@ -2333,6 +2345,9 @@ impl Machine {
         block_index: usize,
         remaining: u32,
     ) -> Result<(), RunError> {
+        if !self.trace_enabled {
+            return Ok(());
+        }
         let function = self
             .image
             .function(self.frames[frame_index].function)

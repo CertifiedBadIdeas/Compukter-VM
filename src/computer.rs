@@ -2138,7 +2138,7 @@ fn admit_session(
         REDSTONE_ABI_MINOR,
         &redstone_operations,
     ));
-    Session::admit(artifact, profile, &bindings)
+    Session::admit_untraced(artifact, profile, &bindings)
 }
 
 fn is_raw_terminal(request: HostRequestView<'_>) -> bool {

@@ -30,3 +30,23 @@ These values are a reproducible local reference, not an absolute
 hardware-specific CI throughput threshold. Semantic, cost-accounting,
 conformance-digest, and steady-state allocation regressions remain hard test
 failures.
+
+## Production computer path
+
+`ComputerMachine` does not expose the diagnostic session trace, so its internal
+sessions skip trace hashing while retaining execution and cost counters. This
+mode was measured on 2026-09-10 on the same host and toolchain with:
+
+```sh
+COMPUKTER_BENCH_CPU="$(uname -m) local" cargo test --release --locked --offline execution::tests::tier0_computer_machine_performance_baseline -- --ignored --nocapture --test-threads=1
+```
+
+The paired traced results below were recorded immediately afterward from the
+same build. Times cover 1,000 slices of 4,096 budget units.
+
+| Workload | Traced elapsed ns | Computer elapsed ns | Traced instructions/s | Computer instructions/s | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hot integer | 147,590,503 | 43,015,802 | 27,745,688 | 95,197,574 | 3.43x |
+| mixed branch/switch | 172,849,583 | 24,916,908 | 19,742,599 | 136,955,195 | 6.94x |
+| nested direct calls | 93,624,209 | 29,435,994 | 20,564,489 | 65,407,474 | 3.18x |
+| empty quota loop | 86,832,466 | 15,480,306 | 47,159,780 | 264,529,655 | 5.61x |

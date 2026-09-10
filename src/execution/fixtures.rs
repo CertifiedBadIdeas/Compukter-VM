@@ -41,6 +41,17 @@ pub(super) fn started_zero_arg(artifact: VerifiedArtifact) -> Machine {
     started(artifact, &[])
 }
 
+pub(super) fn started_zero_arg_untraced(artifact: VerifiedArtifact) -> Machine {
+    started_untraced(artifact, &[])
+}
+
+pub(super) fn started_untraced(artifact: VerifiedArtifact, args: &[EntryArgument]) -> Machine {
+    let image = ExecutionImage::admit(artifact, profile()).unwrap();
+    let mut machine = Machine::new_untraced(image).unwrap();
+    machine.start(args).unwrap();
+    machine
+}
+
 pub(super) fn nested_call_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let i32_type = primitive(1);

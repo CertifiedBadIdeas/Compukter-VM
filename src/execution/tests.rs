@@ -316,6 +316,37 @@ fn block_boundary_trace_digests_are_stable() {
 }
 
 #[test]
+fn disabling_trace_preserves_execution_and_cost_accounting() {
+    let case = fixtures::scalar_cases().remove(0);
+    let mut traced = fixtures::started(case.artifact.clone(), &case.args);
+    let mut untraced = fixtures::started_untraced(case.artifact, &case.args);
+
+    let traced_outcome = traced.run_slice(64, 0).unwrap();
+    let untraced_outcome = untraced.run_slice(64, 0).unwrap();
+
+    assert_eq!(traced_outcome, untraced_outcome);
+    assert_eq!(traced.entered_blocks(), untraced.entered_blocks());
+    assert_eq!(
+        traced.executed_instructions(),
+        untraced.executed_instructions()
+    );
+    assert_eq!(traced.consumed_fixed_cost(), untraced.consumed_fixed_cost());
+    assert_eq!(
+        traced.consumed_dynamic_cost(),
+        untraced.consumed_dynamic_cost()
+    );
+    assert_eq!(
+        traced.consumed_maintenance_cost(),
+        untraced.consumed_maintenance_cost()
+    );
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::new().finalize()),
+        untraced.trace_digest()
+    );
+    assert_ne!(traced.trace_digest(), untraced.trace_digest());
+}
+
+#[test]
 fn straight_line_trace_digest_matches_documented_field_encoding() {
     let case = fixtures::scalar_cases().remove(0);
     let content_hash = case.artifact.content_hash();
@@ -383,6 +414,72 @@ fn tier0_performance_baseline() {
     for workload in fixtures::performance_workloads() {
         let hash = workload.artifact.content_hash();
         let mut machine = fixtures::started_zero_arg(workload.artifact);
+        for _ in 0..WARMUP_SLICES {
+            assert_eq!(
+                Outcome::SliceExhausted,
+                machine.run_slice(BUDGET, 0).unwrap()
+            );
+        }
+        let blocks_before = machine.entered_blocks();
+        let instructions_before = machine.executed_instructions();
+        let started = Instant::now();
+        for _ in 0..MEASURED_SLICES {
+            assert_eq!(
+                Outcome::SliceExhausted,
+                machine.run_slice(BUDGET, 0).unwrap()
+            );
+        }
+        let elapsed = started.elapsed();
+        let blocks = machine.entered_blocks() - blocks_before;
+        let instructions = machine.executed_instructions() - instructions_before;
+        let elapsed_ns = elapsed.as_nanos();
+        assert!(elapsed_ns > 0 && blocks > 0 && instructions > 0);
+        let seconds = elapsed.as_secs_f64();
+        let mut hash_text = String::with_capacity(64);
+        for byte in hash {
+            write!(&mut hash_text, "{byte:02x}").unwrap();
+        }
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}\t{}\t{}\t{}",
+            hash_text,
+            workload.name,
+            blocks,
+            instructions,
+            elapsed_ns,
+            blocks as f64 / seconds,
+            instructions as f64 / seconds,
+            release,
+            host,
+            cpu
+        );
+    }
+}
+
+#[test]
+#[ignore = "records a hardware-specific production performance baseline"]
+fn tier0_computer_machine_performance_baseline() {
+    use std::{fmt::Write, process::Command, time::Instant};
+
+    const WARMUP_SLICES: usize = 100;
+    const MEASURED_SLICES: usize = 1_000;
+    const BUDGET: u32 = 4_096;
+
+    let rustc = Command::new("rustc").arg("-Vv").output().unwrap();
+    let rustc = String::from_utf8_lossy(&rustc.stdout);
+    let release = rustc
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .unwrap_or("unknown");
+    let host = rustc
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap_or("unknown");
+    let cpu = std::env::var("COMPUKTER_BENCH_CPU").unwrap_or_else(|_| "unspecified".into());
+    println!("artifact\tworkload\tblocks\tinstructions\telapsed_ns\tblocks_per_s\tinstructions_per_s\trustc\thost\tcpu");
+
+    for workload in fixtures::performance_workloads() {
+        let hash = workload.artifact.content_hash();
+        let mut machine = fixtures::started_zero_arg_untraced(workload.artifact);
         for _ in 0..WARMUP_SLICES {
             assert_eq!(
                 Outcome::SliceExhausted,
