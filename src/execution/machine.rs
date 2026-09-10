@@ -143,6 +143,14 @@ pub(super) struct Machine {
     trace_enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MachineResourceSnapshot {
+    pub heap_capacity_bytes: u64,
+    pub heap_used_bytes: u64,
+    pub live_objects: u64,
+    pub mutable_resident_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum AllocationShape {
     Object,
@@ -2410,6 +2418,17 @@ impl Machine {
 
     pub(super) fn consumed_maintenance_cost(&self) -> u64 {
         self.consumed_maintenance_cost
+    }
+
+    pub(super) fn resource_snapshot(&self) -> MachineResourceSnapshot {
+        let heap_capacity_bytes = self.image.storage_plan().heap_arena_bytes;
+        MachineResourceSnapshot {
+            heap_capacity_bytes,
+            heap_used_bytes: heap_capacity_bytes
+                .saturating_sub(u64::from(self.heap.total_free_bytes())),
+            live_objects: u64::from(self.heap.live_objects()),
+            mutable_resident_bytes: self.image.storage_plan().mutable_resident_bytes(),
+        }
     }
 
     #[cfg(test)]

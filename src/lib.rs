@@ -65,7 +65,7 @@ pub use computer::{
     ComputerDirectoryListing, ComputerError, ComputerFileChunk, ComputerFileKind,
     ComputerFileMetadata, ComputerFileReadError, ComputerFileStat, ComputerHostMerge,
     ComputerHostMergeEntry, ComputerHostRequest, ComputerHostRequestBatch, ComputerMachine,
-    ComputerStartError, ComputerTerminalEventKind, ComputerValue,
+    ComputerResourceSnapshot, ComputerStartError, ComputerTerminalEventKind, ComputerValue,
 };
 pub use deployment::{DeploymentCandidate, DeploymentFailure, HostDeployError, HostVerifyError};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
