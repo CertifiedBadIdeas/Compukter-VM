@@ -80,6 +80,13 @@ events use tag 3 followed by request ID, success/failure tag, and a typed value
 or bounded failure kind/code. Scalar payloads are little-endian. A string uses
 type tag 7, its `u32` code-unit count, then its `u16` units as framed fields.
 
+`ComputerMachine` uses an internal session admission mode that retains the
+same execution and cost counters but does not compute this digest. The computer
+and FFM APIs do not expose session accounting, and hashing every block plus all
+active registers would otherwise charge production execution for an
+unobservable diagnostic. Direct `Session::admit` callers continue to receive
+the complete trace described above.
+
 Legal request/resume operation performs no native allocation after admission.
 Managed string objects still consume the explicitly reserved guest heap and
 may cause budgeted GC maintenance.

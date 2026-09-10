@@ -85,6 +85,23 @@ impl Session {
         profile: ExecutionProfile,
         bindings: &[CapabilityBinding<'_>],
     ) -> Result<Self, AdmissionError> {
+        Self::admit_with_trace(artifact, profile, bindings, true)
+    }
+
+    pub(crate) fn admit_untraced(
+        artifact: VerifiedArtifact,
+        profile: ExecutionProfile,
+        bindings: &[CapabilityBinding<'_>],
+    ) -> Result<Self, AdmissionError> {
+        Self::admit_with_trace(artifact, profile, bindings, false)
+    }
+
+    fn admit_with_trace(
+        artifact: VerifiedArtifact,
+        profile: ExecutionProfile,
+        bindings: &[CapabilityBinding<'_>],
+        trace_enabled: bool,
+    ) -> Result<Self, AdmissionError> {
         let entry_contract = artifact.entry().arguments;
         let CapabilityResolution {
             capabilities,
@@ -113,7 +130,11 @@ impl Session {
             image_profile,
             capabilities.as_ref(),
         )?;
-        let machine = Machine::new(image)?;
+        let machine = if trace_enabled {
+            Machine::new(image)?
+        } else {
+            Machine::new_untraced(image)?
+        };
         let entry_arguments = initialized_entries(maximum_host_arguments)?;
         let argument_slots = empty_argument_slots(maximum_host_arguments)?;
         let outbound_utf16 = zeroed_u16(outbound_capacity)?;
