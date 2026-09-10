@@ -297,6 +297,10 @@ impl ComputerFileSystem {
         self.quota.logical_bytes()
     }
 
+    pub fn node_count(&self) -> u32 {
+        self.quota.nodes()
+    }
+
     pub fn object_count(&self) -> usize {
         self.objects.0.len()
     }

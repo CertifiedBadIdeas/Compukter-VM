@@ -434,6 +434,14 @@ impl Heap {
         }
     }
 
+    pub(super) const fn total_free_bytes(&self) -> u32 {
+        self.total_free
+    }
+
+    pub(super) const fn live_objects(&self) -> u32 {
+        self.live_objects
+    }
+
     pub(super) fn enqueue_gray(
         &mut self,
         reference: Ref32,

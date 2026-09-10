@@ -10,7 +10,7 @@ use super::{
         ResolvedOperation, ResumeError, TaskId,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
-    machine::Machine,
+    machine::{Machine, MachineResourceSnapshot},
     value::{EntryArgument, RuntimeValue},
 };
 
@@ -33,6 +33,12 @@ pub struct Session {
     accepted_responses: u64,
     entry_argument_limits: EntryArgumentLimits,
     entry_contract: EntryArguments,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionResourceSnapshot {
+    pub accounting: AccountingSnapshot,
+    pub machine: MachineResourceSnapshot,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -377,6 +383,13 @@ impl Session {
             published_requests: self.published_requests,
             accepted_responses: self.accepted_responses,
             trace_digest: self.machine.trace_digest(),
+        }
+    }
+
+    pub(crate) fn resource_snapshot(&self) -> SessionResourceSnapshot {
+        SessionResourceSnapshot {
+            accounting: self.accounting(),
+            machine: self.machine.resource_snapshot(),
         }
     }
 

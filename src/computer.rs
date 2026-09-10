@@ -26,11 +26,11 @@ use crate::stdio::{
     StandardStreams,
 };
 use crate::{
-    verify_artifact, AdmissionError, AdvanceOutcome, ArtifactLimits, CapabilityBinding,
-    ComputerFileSystem, DeploymentCandidate, DeploymentFailure, EntryValue, ExecutionProfile,
-    FileCapability, FileRights, FileSystemError, FileSystemLimits, GuestTrap, HostDeployError,
-    HostFailure, HostFailureKind, HostMergeEntrySource, HostMergeSchema, HostRequestView,
-    HostResponse, HostValueInput, HostValueType, HostValueView, HostVerifyError,
+    verify_artifact, AccountingSnapshot, AdmissionError, AdvanceOutcome, ArtifactLimits,
+    CapabilityBinding, ComputerFileSystem, DeploymentCandidate, DeploymentFailure, EntryValue,
+    ExecutionProfile, FileCapability, FileRights, FileSystemError, FileSystemLimits, GuestTrap,
+    HostDeployError, HostFailure, HostFailureKind, HostMergeEntrySource, HostMergeSchema,
+    HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView, HostVerifyError,
     ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, ProcessCompletion,
     ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId, ResumeError, RunError,
     Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction, TerminalPosition,
@@ -218,6 +218,74 @@ pub enum ComputerFileReadError {
     LimitExceeded,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ComputerResourceSnapshot {
+    pub fixed_guest_units: u64,
+    pub dynamic_guest_units: u64,
+    pub maintenance_units: u64,
+    pub entered_blocks: u64,
+    pub executed_instructions: u64,
+    pub heap_capacity_bytes: u64,
+    pub heap_used_bytes: u64,
+    pub live_objects: u64,
+    pub mutable_execution_resident_bytes: u64,
+    pub filesystem_logical_bytes: u64,
+    pub filesystem_logical_capacity_bytes: u64,
+    pub filesystem_nodes: u32,
+    pub filesystem_node_capacity: u32,
+    pub counters_saturated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RetiredExecutionAccounting {
+    fixed_guest_units: u64,
+    dynamic_guest_units: u64,
+    maintenance_units: u64,
+    entered_blocks: u64,
+    executed_instructions: u64,
+    saturated: bool,
+}
+
+impl RetiredExecutionAccounting {
+    fn add(&mut self, accounting: AccountingSnapshot) {
+        add_counter(
+            &mut self.fixed_guest_units,
+            accounting.fixed_guest_units,
+            &mut self.saturated,
+        );
+        add_counter(
+            &mut self.dynamic_guest_units,
+            accounting.dynamic_guest_units,
+            &mut self.saturated,
+        );
+        add_counter(
+            &mut self.maintenance_units,
+            accounting.maintenance_units,
+            &mut self.saturated,
+        );
+        add_counter(
+            &mut self.entered_blocks,
+            accounting.entered_blocks,
+            &mut self.saturated,
+        );
+        add_counter(
+            &mut self.executed_instructions,
+            accounting.executed_instructions,
+            &mut self.saturated,
+        );
+    }
+}
+
+fn add_counter(target: &mut u64, value: u64, saturated: &mut bool) {
+    let (sum, overflowed) = target.overflowing_add(value);
+    if overflowed {
+        *target = u64::MAX;
+        *saturated = true;
+    } else {
+        *target = sum;
+    }
+}
+
 impl From<FileSystemError> for ComputerFileReadError {
     fn from(error: FileSystemError) -> Self {
         Self::FileSystem(error)
@@ -240,6 +308,7 @@ pub struct ComputerMachine {
     addon_bindings: Box<[OwnedCapabilityBinding]>,
     process_limits: ProcessLimits,
     process_starts: u64,
+    retired_execution: RetiredExecutionAccounting,
     reserved_heap_bytes: u64,
     reserved_frame_storage_bytes: u64,
     maximum_text_code_units: usize,
@@ -414,6 +483,7 @@ impl ComputerMachine {
             addon_bindings: owned_addon_bindings,
             process_limits,
             process_starts: 1,
+            retired_execution: RetiredExecutionAccounting::default(),
             reserved_heap_bytes,
             reserved_frame_storage_bytes,
             maximum_text_code_units,
@@ -451,6 +521,71 @@ impl ComputerMachine {
 
     pub fn filesystem_generation(&self) -> u64 {
         self.filesystem.generation()
+    }
+
+    pub fn resource_snapshot(&self) -> ComputerResourceSnapshot {
+        let mut snapshot = ComputerResourceSnapshot {
+            fixed_guest_units: self.retired_execution.fixed_guest_units,
+            dynamic_guest_units: self.retired_execution.dynamic_guest_units,
+            maintenance_units: self.retired_execution.maintenance_units,
+            entered_blocks: self.retired_execution.entered_blocks,
+            executed_instructions: self.retired_execution.executed_instructions,
+            filesystem_logical_bytes: self.filesystem.logical_bytes(),
+            filesystem_logical_capacity_bytes: self.filesystem.limits().maximum_logical_bytes,
+            filesystem_nodes: self.filesystem.node_count(),
+            filesystem_node_capacity: self.filesystem.limits().maximum_nodes,
+            counters_saturated: self.retired_execution.saturated,
+            ..ComputerResourceSnapshot::default()
+        };
+        for frame in &self.sessions {
+            let resource = frame.session.resource_snapshot();
+            add_counter(
+                &mut snapshot.fixed_guest_units,
+                resource.accounting.fixed_guest_units,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.dynamic_guest_units,
+                resource.accounting.dynamic_guest_units,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.maintenance_units,
+                resource.accounting.maintenance_units,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.entered_blocks,
+                resource.accounting.entered_blocks,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.executed_instructions,
+                resource.accounting.executed_instructions,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.heap_capacity_bytes,
+                resource.machine.heap_capacity_bytes,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.heap_used_bytes,
+                resource.machine.heap_used_bytes,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.live_objects,
+                resource.machine.live_objects,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.mutable_execution_resident_bytes,
+                resource.machine.mutable_resident_bytes,
+                &mut snapshot.counters_saturated,
+            );
+        }
+        snapshot
     }
 
     pub fn filesystem_stat(&self, path: &VirtualPath) -> Result<ComputerFileStat, FileSystemError> {
@@ -1778,7 +1913,8 @@ impl ComputerMachine {
         completion: ProcessCompletion,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
         let child_depth = self.sessions.len();
-        self.sessions.pop();
+        let child = self.sessions.pop().expect("a child session is active");
+        self.retired_execution.add(child.session.accounting());
         self.reserved_heap_bytes -= u64::from(self.profile.heap_bytes);
         self.reserved_frame_storage_bytes -= self.profile.frame_storage_bytes;
         if self
@@ -2703,6 +2839,117 @@ mod tests {
         ProcessFailureReason, ProcessLimits, RomImage, TaskId, TerminalKey, TerminalKeyEvent,
         TerminalModifiers, VirtualPath, WorldFileSystemStore,
     };
+
+    #[test]
+    fn resource_snapshot_reports_owned_capacity_and_cumulative_execution() {
+        let execution_profile = profile();
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            execution_profile.clone(),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let initial = computer.resource_snapshot();
+        assert_eq!(
+            u64::from(execution_profile.heap_bytes),
+            initial.heap_capacity_bytes
+        );
+        assert!(initial.heap_used_bytes <= initial.heap_capacity_bytes);
+        assert!(initial.mutable_execution_resident_bytes >= initial.heap_capacity_bytes);
+        assert_eq!(0, initial.filesystem_logical_bytes);
+        assert_eq!(
+            FileSystemLimits::default().maximum_logical_bytes,
+            initial.filesystem_logical_capacity_bytes
+        );
+        assert_eq!(2, initial.filesystem_nodes);
+        assert_eq!(
+            FileSystemLimits::default().maximum_nodes,
+            initial.filesystem_node_capacity
+        );
+        assert!(!initial.counters_saturated);
+
+        assert_eq!(None, halt(&mut computer));
+        let completed = computer.resource_snapshot();
+        assert!(completed.fixed_guest_units > initial.fixed_guest_units);
+        assert!(completed.entered_blocks > initial.entered_blocks);
+        assert!(completed.executed_instructions > initial.executed_instructions);
+        assert_eq!(initial.heap_capacity_bytes, completed.heap_capacity_bytes);
+    }
+
+    #[test]
+    fn resource_snapshot_counter_saturation_is_explicit() {
+        let mut value = u64::MAX - 1;
+        let mut saturated = false;
+
+        add_counter(&mut value, 2, &mut saturated);
+
+        assert_eq!(u64::MAX, value);
+        assert!(saturated);
+    }
+
+    #[test]
+    fn resource_snapshot_folds_retired_child_work_and_releases_its_memory() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        let child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let child_bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        filesystem
+            .write_file(&owner, &path("/home/child", &limits), &child_bytes, true)
+            .unwrap();
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let execution_profile = profile();
+        let mut computer = ComputerMachine::start_in_filesystem(
+            parent,
+            execution_profile.clone(),
+            &[],
+            &[],
+            filesystem,
+            owner,
+        )
+        .unwrap();
+        while computer.sessions.len() == 1 {
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                computer.advance(64, 64, u32::MAX).unwrap(),
+            );
+        }
+        let with_child = computer.resource_snapshot();
+        assert_eq!(
+            2 * u64::from(execution_profile.heap_bytes),
+            with_child.heap_capacity_bytes
+        );
+        assert_eq!(
+            child_bytes.len() as u64,
+            with_child.filesystem_logical_bytes
+        );
+        assert_eq!(3, with_child.filesystem_nodes);
+
+        while computer.sessions.len() == 2 {
+            let before = computer.resource_snapshot();
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                computer.advance(64, 64, u32::MAX).unwrap(),
+            );
+            let after = computer.resource_snapshot();
+            assert!(after.executed_instructions >= before.executed_instructions);
+        }
+        let without_child = computer.resource_snapshot();
+        assert_eq!(
+            u64::from(execution_profile.heap_bytes),
+            without_child.heap_capacity_bytes
+        );
+        assert!(without_child.executed_instructions >= with_child.executed_instructions);
+        assert!(
+            without_child.mutable_execution_resident_bytes
+                < with_child.mutable_execution_resident_bytes
+        );
+    }
 
     #[test]
     fn redstone_input_and_confirmed_output_are_rust_local_scalar_reads() {
