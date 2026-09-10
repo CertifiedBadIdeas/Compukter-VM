@@ -1,9 +1,36 @@
 use compukter_vm::{
     AdmissionError, CompilationRequest, ComputerDirectoryListing, ComputerFileChunk,
-    ComputerFileKind, ComputerFileMetadata, ComputerFileStat, EntryArgumentLimit,
-    ExecutableRevision, FileSystemLimits, HostFailureKind, QuotaKind, RunError, StoreHealth,
-    StoreOpenError, TerminalCell, TerminalChange, TerminalDevice, TerminalSnapshot, TerminalUpdate,
+    ComputerFileKind, ComputerFileMetadata, ComputerFileStat, ComputerResourceSnapshot,
+    EntryArgumentLimit, ExecutableRevision, FileSystemLimits, HostFailureKind, QuotaKind, RunError,
+    StoreHealth, StoreOpenError, TerminalCell, TerminalChange, TerminalDevice, TerminalSnapshot,
+    TerminalUpdate,
 };
+
+pub(crate) fn encode_resource_snapshot(snapshot: ComputerResourceSnapshot) -> Vec<u8> {
+    let values = [
+        snapshot.fixed_guest_units,
+        snapshot.dynamic_guest_units,
+        snapshot.maintenance_units,
+        snapshot.entered_blocks,
+        snapshot.executed_instructions,
+        snapshot.heap_capacity_bytes,
+        snapshot.heap_used_bytes,
+        snapshot.live_objects,
+        snapshot.mutable_execution_resident_bytes,
+        snapshot.filesystem_logical_bytes,
+        snapshot.filesystem_logical_capacity_bytes,
+    ];
+    let jvm_maximum = i64::MAX as u64;
+    let saturated = snapshot.counters_saturated || values.iter().any(|value| *value > jvm_maximum);
+    let mut encoder = Encoder::new(1);
+    encoder.u8(u8::from(saturated));
+    for value in values {
+        encoder.u64(value.min(jvm_maximum));
+    }
+    encoder.u32(snapshot.filesystem_nodes);
+    encoder.u32(snapshot.filesystem_node_capacity);
+    encoder.finish()
+}
 
 pub(crate) fn encode_executable_revision(revision: ExecutableRevision) -> Vec<u8> {
     let mut encoder = Encoder::new(1);

@@ -78,6 +78,7 @@ const MAXIMUM_INBOUND_UTF16_CODE_UNITS: usize = 4_096;
 const MAXIMUM_STORE_OPEN_BYTES: usize = 10;
 const MAXIMUM_STORE_HEALTH_BYTES: usize = 2;
 const MAXIMUM_STORE_GENERATION_BYTES: usize = 9;
+const RESOURCE_SNAPSHOT_BYTES: usize = 98;
 const MAXIMUM_STORE_ROOT_BYTES: usize = 32 * 1_024;
 const MAXIMUM_ROM_BYTES: usize = 16 * 1_024 * 1_024;
 const MAXIMUM_FILESYSTEM_LIMITS_BYTES: usize = 1 + 17 * 8;
@@ -754,6 +755,42 @@ pub unsafe extern "C" fn compukter_filesystem_generation(
         };
         let encoded = crate::wire::encode_store_generation(generation);
         // SAFETY: The fixed maximum was checked before the fixed encoding.
+        unsafe { core::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
+        // SAFETY: The validated ABI contract provides writable length output.
+        unsafe { written_out.write(encoded.len()) };
+        FfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Writes one fixed, versioned resource snapshot for a live VM session.
+///
+/// # Safety
+///
+/// Non-empty output must name a writable region and `written_out` must name
+/// one writable `usize`.
+pub unsafe extern "C" fn compukter_resource_snapshot(
+    handle: u64,
+    output: *mut u8,
+    output_capacity: usize,
+    written_out: *mut usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if written_out.is_null() || (output_capacity != 0 && output.is_null()) {
+            return FfiStatus::InvalidArgument;
+        }
+        if output_capacity < RESOURCE_SNAPSHOT_BYTES {
+            // SAFETY: The validated ABI contract provides writable length output.
+            unsafe { written_out.write(RESOURCE_SNAPSHOT_BYTES) };
+            return FfiStatus::BufferTooSmall;
+        }
+        let snapshot = match bridge::resource_snapshot(handle) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return bridge_status(Err(error)),
+        };
+        let encoded = crate::wire::encode_resource_snapshot(snapshot);
+        debug_assert_eq!(RESOURCE_SNAPSHOT_BYTES, encoded.len());
+        // SAFETY: The fixed capacity was checked before the fixed encoding.
         unsafe { core::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
         // SAFETY: The validated ABI contract provides writable length output.
         unsafe { written_out.write(encoded.len()) };

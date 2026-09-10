@@ -354,6 +354,14 @@ pub(crate) fn filesystem_generation(handle: u64) -> Result<u64, BridgeError> {
         .map_err(BridgeError::Handle)
 }
 
+pub(crate) fn resource_snapshot(
+    handle: u64,
+) -> Result<compukter_vm::ComputerResourceSnapshot, BridgeError> {
+    sessions()
+        .with(handle, |session| session.computer.resource_snapshot())
+        .map_err(BridgeError::Handle)
+}
+
 pub(crate) fn filesystem_stat(
     handle: u64,
     path: &str,
