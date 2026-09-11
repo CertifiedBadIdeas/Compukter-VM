@@ -524,6 +524,79 @@ pub(crate) fn redstone_unit_artifact(operation: u32, arguments: &[i32]) -> Verif
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
 
+pub(crate) fn sound_bool_artifact(arguments: &[i32]) -> VerifiedArtifact {
+    let mut decoded = crate::decode::records::decode_artifact(
+        Arc::from(crate::test_support::minimal_vector_with_string_records(&[
+            b"compukter",
+            b"sound",
+        ])),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let bool_type = primitive(5);
+    let i32_type = primitive(1);
+    decoded.header.semantic_features = 0b110;
+    decoded.capabilities.push(crate::artifact::Capability {
+        namespace: 0,
+        name: 1,
+        abi_major: 1,
+        minimum_abi_minor: 0,
+        flags: 1,
+        operation_count: 1,
+    });
+    decoded.manifest.required_capabilities = 1;
+    decoded.manifest.maximum_host_requests = 1;
+    decoded.manifest.required_stack_bytes = 128;
+    decoded.modules[0].types[0] = NominalType::Function {
+        name: 1,
+        flags: 1,
+        result: bool_type,
+        parameters: Vec::new(),
+    };
+    let mut constants = arguments.to_vec();
+    constants.sort_unstable_by_key(|value| *value as u32);
+    constants.dedup();
+    decoded.modules[0].constants = constants.iter().copied().map(Constant::I32).collect();
+    let function = &mut decoded.modules[0].functions[0];
+    function.name = 1;
+    function.flags = 1;
+    function.register_count = (arguments.len() + 1) as u16;
+    function.parameter_count = 0;
+    function.values = crate::artifact::scalar_values(
+        vec![i32_type; arguments.len()]
+            .into_iter()
+            .chain(std::iter::once(bool_type))
+            .collect(),
+    );
+    let mut first = arguments
+        .iter()
+        .enumerate()
+        .map(|(index, value)| Instruction::Const {
+            dst: index as u16,
+            constant: constants
+                .iter()
+                .position(|candidate| candidate == value)
+                .unwrap() as u32,
+        })
+        .collect::<Vec<_>>();
+    let destination = arguments.len() as u16;
+    first.push(Instruction::CapabilityCallAsync {
+        dst: destination,
+        capability: 0,
+        operation: 0,
+        args: (0..arguments.len() as u16)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        resume_block: 1,
+    });
+    install_entry_blocks(
+        &mut decoded,
+        vec![first, vec![Instruction::Return { value: destination }]],
+    );
+    let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
 pub(super) fn scalar_capability_artifact(
     value_type: ValueType,
     constant: Constant,

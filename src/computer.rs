@@ -54,6 +54,13 @@ const REDSTONE_NAME: &str = "redstone";
 const REDSTONE_ABI_MAJOR: u16 = 1;
 const REDSTONE_ABI_MINOR: u16 = 0;
 const REDSTONE_MERGE_GROUP: u32 = 0x7265_6473;
+const SOUND_NAME: &str = "sound";
+const SOUND_ABI_MAJOR: u16 = 1;
+const SOUND_ABI_MINOR: u16 = 0;
+const SOUND_MINIMUM_NOTE: i32 = 0;
+const SOUND_MAXIMUM_NOTE: i32 = 24;
+const SOUND_MINIMUM_VOLUME: i32 = 1;
+const SOUND_MAXIMUM_VOLUME: i32 = 100;
 const COMPILATION_WIRE_VERSION: u16 = 1;
 const MAXIMUM_COMPILER_SOURCE_BYTES: usize = 256 * 1024;
 const COMPILATION_STATUS_SUCCESS: i32 = 0;
@@ -80,6 +87,7 @@ pub enum ComputerError {
     InvalidProcessRequest,
     InvalidCompilerRequest,
     InvalidRedstoneRequest,
+    InvalidSoundRequest,
     ActiveCompilation,
     NoActiveCompilation,
     InvalidCompilationToken,
@@ -2129,6 +2137,7 @@ fn admit_session(
     let redstone_wait_arguments = [HostValueType::I32, HostValueType::I32];
     let redstone_output_arguments = [HostValueType::I32, HostValueType::I32];
     let redstone_outputs_argument = [HostValueType::I32];
+    let sound_beep_arguments = [HostValueType::I32, HostValueType::I32];
     let terminal_position_arguments = [HostValueType::I32, HostValueType::I32];
     let terminal_visibility_arguments = [HostValueType::Bool];
     let terminal_write_at_arguments = [
@@ -2207,6 +2216,10 @@ fn admit_session(
             },
         ),
     ];
+    let sound_operations = [OperationSchema::asynchronous(
+        &sound_beep_arguments,
+        HostValueType::Bool,
+    )];
     let addon_operations = addon_bindings
         .iter()
         .map(|binding| {
@@ -2222,7 +2235,7 @@ fn admit_session(
                 .collect::<Box<[_]>>()
         })
         .collect::<Box<[_]>>();
-    let mut bindings = Vec::with_capacity(addon_bindings.len() + 6);
+    let mut bindings = Vec::with_capacity(addon_bindings.len() + 7);
     for (index, binding) in addon_bindings.iter().enumerate() {
         bindings.push(CapabilityBinding::new(
             binding.namespace(),
@@ -2274,6 +2287,13 @@ fn admit_session(
         REDSTONE_ABI_MINOR,
         &redstone_operations,
     ));
+    bindings.push(CapabilityBinding::new(
+        TERMINAL_NAMESPACE,
+        SOUND_NAME,
+        SOUND_ABI_MAJOR,
+        SOUND_ABI_MINOR,
+        &sound_operations,
+    ));
     Session::admit_untraced(artifact, profile, &bindings)
 }
 
@@ -2311,6 +2331,12 @@ fn is_redstone(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == REDSTONE_NAME
         && request.abi_major() == REDSTONE_ABI_MAJOR
+}
+
+fn is_sound(request: HostRequestView<'_>) -> bool {
+    request.namespace() == TERMINAL_NAMESPACE
+        && request.name() == SOUND_NAME
+        && request.abi_major() == SOUND_ABI_MAJOR
 }
 
 fn is_redstone_local(request: HostRequestView<'_>) -> bool {
@@ -2730,6 +2756,22 @@ fn copy_external_request(
             _ => return Err(ComputerError::InvalidRedstoneRequest),
         }
     }
+    if is_sound(request) {
+        let integer = |index| match request.arguments().get(index) {
+            Some(HostValueView::I32(value)) => Ok(value),
+            _ => Err(ComputerError::InvalidSoundRequest),
+        };
+        match (
+            request.operation(),
+            request.asynchronous(),
+            request.arguments().len(),
+        ) {
+            (0, true, 2)
+                if (SOUND_MINIMUM_NOTE..=SOUND_MAXIMUM_NOTE).contains(&integer(0)?)
+                    && (SOUND_MINIMUM_VOLUME..=SOUND_MAXIMUM_VOLUME).contains(&integer(1)?) => {}
+            _ => return Err(ComputerError::InvalidSoundRequest),
+        }
+    }
     Ok(copy_host_request(request))
 }
 
@@ -3094,6 +3136,56 @@ mod tests {
             .unwrap();
             assert_eq!(
                 ComputerError::InvalidRedstoneRequest,
+                computer.advance(64, 64, u32::MAX).unwrap_err(),
+            );
+        }
+    }
+
+    #[test]
+    fn sound_beep_is_bounded_and_resumes_with_host_admission() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::sound_bool_artifact(&[12, 75]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let request = match computer.advance(64, 64, u32::MAX).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
+            other => panic!("unexpected sound outcome: {other:?}"),
+        };
+        assert_eq!("compukter", request.namespace.as_ref());
+        assert_eq!("sound", request.name.as_ref());
+        assert_eq!(1, request.abi_major);
+        assert_eq!(0, request.abi_minor);
+        assert_eq!(0, request.operation);
+        assert_eq!(
+            vec![ComputerValue::I32(12), ComputerValue::I32(75)].into_boxed_slice(),
+            request.arguments,
+        );
+        assert_eq!(ComputerHostMerge::Ordinary, request.merge);
+
+        computer
+            .resume_host_request(
+                request.id,
+                HostResponse::Success(HostValueInput::Bool(true)),
+            )
+            .unwrap();
+        assert_eq!(Some(ComputerValue::Bool(true)), halt(&mut computer));
+    }
+
+    #[test]
+    fn malformed_sound_beep_is_rejected_before_host_publication() {
+        for arguments in [vec![-1, 100], vec![25, 100], vec![12, 0], vec![12, 101]] {
+            let mut computer = ComputerMachine::start(
+                crate::execution::fixtures::sound_bool_artifact(&arguments),
+                profile(),
+                &[],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                ComputerError::InvalidSoundRequest,
                 computer.advance(64, 64, u32::MAX).unwrap_err(),
             );
         }
