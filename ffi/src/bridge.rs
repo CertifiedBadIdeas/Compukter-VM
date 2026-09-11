@@ -139,6 +139,7 @@ pub(crate) enum FileInspectionBridgeError {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedResponse {
     SuccessUnit,
+    SuccessBool(bool),
     SuccessString(Vec<u16>),
     Failure(HostFailure),
 }
@@ -327,6 +328,9 @@ pub(crate) fn resume(
         .with(handle, |session| {
             let borrowed = match response {
                 OwnedResponse::SuccessUnit => HostResponse::Success(HostValueInput::Unit),
+                OwnedResponse::SuccessBool(value) => {
+                    HostResponse::Success(HostValueInput::Bool(*value))
+                }
                 OwnedResponse::SuccessString(units) => {
                     HostResponse::Success(HostValueInput::String(units))
                 }
@@ -777,6 +781,7 @@ fn copy_error(error: ComputerError) -> BridgeError {
         | ComputerError::InvalidProcessRequest
         | ComputerError::InvalidCompilerRequest
         | ComputerError::InvalidRedstoneRequest
+        | ComputerError::InvalidSoundRequest
         | ComputerError::ActiveCompilation
         | ComputerError::NoActiveCompilation
         | ComputerError::InvalidCompilationToken
