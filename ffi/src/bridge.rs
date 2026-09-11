@@ -793,7 +793,7 @@ fn copy_input_error(_error: TerminalInputError) -> BridgeError {
 
 fn profile() -> ExecutionProfile {
     ExecutionProfile {
-        heap_bytes: 1024 * 1024,
+        heap_bytes: 256 * 1024,
         frame_storage_bytes: 1024 * 1024,
         maximum_call_depth: 64,
         maximum_coroutines: 64,
@@ -822,6 +822,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn production_profile_provides_256_kib_guest_heap() {
+        assert_eq!(256 * 1024, profile().heap_bytes);
+    }
 
     #[test]
     fn stdio_and_input_ownership_errors_are_invalid_bridge_operations() {
