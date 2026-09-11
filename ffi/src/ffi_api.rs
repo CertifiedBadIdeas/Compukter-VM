@@ -1121,6 +1121,26 @@ pub extern "C" fn compukter_resume_unit(handle: u64, task_id: u32, request_id: u
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn compukter_resume_bool(
+    handle: u64,
+    task_id: u32,
+    request_id: u64,
+    value: u32,
+) -> FfiStatus {
+    ffi_status(|| {
+        if task_id == 0 || value > 1 {
+            return FfiStatus::InvalidArgument;
+        }
+        bridge_status(bridge::resume(
+            handle,
+            task_id,
+            request_id,
+            &OwnedResponse::SuccessBool(value != 0),
+        ))
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Resumes a host request with exact UTF-16 code units.
 ///
 /// # Safety
