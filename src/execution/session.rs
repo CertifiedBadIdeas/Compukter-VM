@@ -4,13 +4,16 @@ use super::{
     error::{AdmissionError, RunError},
     host::{
         AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
-        ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostRequestBatchView,
-        HostRequestView, HostResponse, HostValueInput, HostValueSlot, HostValueView,
-        ManagedAllocationFailure, QuotaExhaustion, QuotaKind, RequestId, ResolvedCapability,
-        ResolvedOperation, ResumeError, TaskId,
+        ExecutionProfile, HostFailure, HostFailureKind, HostRequestBatchView, HostResponse,
+        HostValueInput, HostValueSlot, HostValueView, ManagedAllocationFailure, QuotaExhaustion,
+        QuotaKind, RequestId, ResolvedCapability, ResolvedOperation, ResumeError, TaskId,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::{Machine, MachineResourceSnapshot},
+    requests::{
+        HostRequestIdentity, PendingHostRequest, PendingRequestTable, RequestTableError,
+        RequestTableLimits,
+    },
     value::{EntryArgument, RuntimeValue},
 };
 
@@ -22,7 +25,7 @@ pub struct Session {
     inbound_utf16: Box<[u16]>,
     argument_slots: Box<[HostValueSlot]>,
     argument_count: usize,
-    pending_request: Option<PendingRequest>,
+    pending_requests: PendingRequestTable,
     terminal: Option<SessionTerminal>,
     next_request_id: u64,
     preparing_request: Option<PreparingRequest>,
@@ -39,14 +42,6 @@ pub struct Session {
 pub(crate) struct SessionResourceSnapshot {
     pub accounting: AccountingSnapshot,
     pub machine: MachineResourceSnapshot,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PendingRequest {
-    id: RequestId,
-    task: TaskId,
-    capability: u32,
-    operation: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,7 +74,7 @@ impl core::fmt::Debug for Session {
             .field("entry_capacity", &self.entry_arguments.len())
             .field("outbound_utf16_capacity", &self.outbound_utf16.len())
             .field("inbound_utf16_capacity", &self.inbound_utf16.len())
-            .field("pending_request", &self.pending_request)
+            .field("pending_requests", &self.pending_requests)
             .field("terminal", &self.terminal)
             .finish_non_exhaustive()
     }
@@ -145,6 +140,22 @@ impl Session {
         let argument_slots = empty_argument_slots(maximum_host_arguments)?;
         let outbound_utf16 = zeroed_u16(outbound_capacity)?;
         let inbound_utf16 = zeroed_u16(inbound_capacity)?;
+        let maximum_host_requests = checked_usize(profile.maximum_host_requests)?;
+        let maximum_total_arguments = maximum_host_requests
+            .checked_mul(maximum_host_arguments)
+            .ok_or(AdmissionError::StoragePlanOverflow)?;
+        let maximum_total_utf16 = maximum_host_requests
+            .checked_mul(outbound_capacity)
+            .ok_or(AdmissionError::StoragePlanOverflow)?;
+        let pending_requests = PendingRequestTable::new(RequestTableLimits {
+            maximum_requests: maximum_host_requests,
+            maximum_arguments_per_request: maximum_host_arguments,
+            maximum_total_arguments,
+            maximum_utf16_per_request: outbound_capacity,
+            maximum_total_utf16,
+            maximum_merge_entries_per_request: 0,
+            maximum_total_merge_entries: 0,
+        });
         Ok(Self {
             machine,
             capabilities,
@@ -153,7 +164,7 @@ impl Session {
             inbound_utf16,
             argument_slots,
             argument_count: 0,
-            pending_request: None,
+            pending_requests,
             terminal: None,
             next_request_id: 1,
             preparing_request: None,
@@ -219,33 +230,118 @@ impl Session {
                 }
             });
         }
-        if self.pending_request.is_some() {
+        if !self.machine.has_active_task()
+            && !self.pending_requests.is_empty()
+            && !self.resuming_host_string
+            && self.preparing_request.is_none()
+        {
             return self.request_outcome().map_err(|_| RunError::NotRunnable);
         }
         if self.preparing_request.is_some() {
             return self.advance_request_preparation(guest_budget, maintenance_budget);
         }
         if self.resuming_host_string {
+            let before_guest = self.guest_units();
+            let before_maintenance = self.machine.consumed_maintenance_cost();
             let outcome = self.machine.run_capability_string_slice(
                 &self.inbound_utf16[..self.inbound_length],
                 guest_budget,
                 maintenance_budget,
             )?;
             self.resuming_host_string = self.machine.capability_string_response_pending();
-            return self.map_machine_outcome(outcome);
+            if !self.resuming_host_string && self.machine.has_task_string_response() {
+                if let Err(fault) = self.machine.finish_task_string_response() {
+                    return self.establish_fault(fault);
+                }
+            }
+            return self.map_machine_outcome(
+                outcome,
+                guest_budget.saturating_sub(self.guest_units().saturating_sub(before_guest) as u32),
+                maintenance_budget.saturating_sub(
+                    self.machine
+                        .consumed_maintenance_cost()
+                        .saturating_sub(before_maintenance) as u32,
+                ),
+            );
         }
+        self.run_and_map(guest_budget, maintenance_budget)
+    }
+
+    fn run_and_map(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+    ) -> Result<AdvanceOutcome<'_>, RunError> {
+        let before_guest = self.guest_units();
+        let before_maintenance = self.machine.consumed_maintenance_cost();
         let outcome = self.machine.run_slice(guest_budget, maintenance_budget)?;
-        self.map_machine_outcome(outcome)
+        let used_guest = self.guest_units().saturating_sub(before_guest);
+        let used_maintenance = self
+            .machine
+            .consumed_maintenance_cost()
+            .saturating_sub(before_maintenance);
+        self.map_machine_outcome(
+            outcome,
+            guest_budget.saturating_sub(u32::try_from(used_guest).unwrap_or(u32::MAX)),
+            maintenance_budget.saturating_sub(u32::try_from(used_maintenance).unwrap_or(u32::MAX)),
+        )
+    }
+
+    fn guest_units(&self) -> u64 {
+        self.machine
+            .consumed_fixed_cost()
+            .saturating_add(self.machine.consumed_dynamic_cost())
     }
 
     fn map_machine_outcome(
         &mut self,
         outcome: super::error::Outcome,
+        guest_budget: u32,
+        maintenance_budget: u32,
     ) -> Result<AdvanceOutcome<'_>, RunError> {
         match outcome {
-            super::error::Outcome::SliceExhausted => Ok(AdvanceOutcome::SliceExhausted),
-            super::error::Outcome::TasksWaiting => Ok(AdvanceOutcome::SliceExhausted),
-            super::error::Outcome::HostRequest => self.begin_request(),
+            super::error::Outcome::SliceExhausted => {
+                if self.pending_requests.is_empty() {
+                    Ok(AdvanceOutcome::SliceExhausted)
+                } else {
+                    self.request_outcome().map_err(|_| RunError::NotRunnable)
+                }
+            }
+            super::error::Outcome::TasksWaiting => {
+                if self.pending_requests.is_empty() {
+                    Ok(AdvanceOutcome::SliceExhausted)
+                } else {
+                    self.request_outcome().map_err(|_| RunError::NotRunnable)
+                }
+            }
+            super::error::Outcome::HostRequest => {
+                let before_guest = self.guest_units();
+                if !self.begin_request()? {
+                    if let Some(terminal) = self.terminal {
+                        return Ok(match terminal {
+                            SessionTerminal::HostFailed(failure) => {
+                                AdvanceOutcome::HostFailed(failure)
+                            }
+                            SessionTerminal::Faulted(fault) => AdvanceOutcome::Faulted(fault),
+                            SessionTerminal::QuotaExhausted(exhaustion) => {
+                                AdvanceOutcome::QuotaExhausted(exhaustion)
+                            }
+                        });
+                    }
+                    return Ok(AdvanceOutcome::SliceExhausted);
+                }
+                let guest_budget = guest_budget.saturating_sub(
+                    u32::try_from(self.guest_units().saturating_sub(before_guest))
+                        .unwrap_or(u32::MAX),
+                );
+                if self.machine.has_active_task()
+                    && guest_budget >= self.machine.minimum_run_budget()
+                {
+                    self.run_and_map(guest_budget, maintenance_budget)
+                } else {
+                    self.request_outcome().map_err(|_| RunError::NotRunnable)
+                }
+            }
             super::error::Outcome::AllocationExhausted(exhaustion) => Ok(
                 AdvanceOutcome::AllocationExhausted(ManagedAllocationFailure {
                     diagnostic: exhaustion.diagnostic,
@@ -281,18 +377,31 @@ impl Session {
         if self.terminal.is_some() {
             return Err(ResumeError::NoPendingRequest);
         }
-        let pending = self.pending_request.ok_or(ResumeError::NoPendingRequest)?;
-        if task != pending.task {
-            return Err(ResumeError::WrongTask);
-        }
-        if request_id != pending.id {
-            return Err(ResumeError::WrongRequestId);
-        }
+        let identity = HostRequestIdentity::new(task, request_id);
+        let pending = self.pending_requests.get(identity).ok_or_else(|| {
+            if self
+                .pending_requests
+                .requests()
+                .iter()
+                .any(|request| request.identity().request() == request_id)
+            {
+                ResumeError::WrongTask
+            } else if self
+                .pending_requests
+                .requests()
+                .iter()
+                .any(|request| request.identity().task() == task)
+            {
+                ResumeError::WrongRequestId
+            } else {
+                ResumeError::NoPendingRequest
+            }
+        })?;
         let expected = self
             .capabilities
-            .get(pending.capability as usize)
+            .get(pending.capability() as usize)
             .and_then(Option::as_ref)
-            .and_then(|capability| capability.operations.get(pending.operation as usize))
+            .and_then(|capability| capability.operations.get(pending.operation() as usize))
             .map(|operation| operation.result)
             .ok_or(ResumeError::NoPendingRequest)?;
         if let HostResponse::Success(input) = response {
@@ -307,7 +416,7 @@ impl Session {
         }
         if let HostResponse::Failure(failure) = response {
             self.accept_response(request_id, response);
-            self.pending_request = None;
+            let _ = self.pending_requests.take(identity);
             self.terminal = Some(SessionTerminal::HostFailed(failure));
             return Ok(());
         }
@@ -324,27 +433,31 @@ impl Session {
             HostValueInput::Char(value) => Some(RuntimeValue::Char(value)),
             HostValueInput::String(units) => {
                 self.inbound_utf16[..units.len()].copy_from_slice(units);
-                if let Err(fault) = self
-                    .machine
-                    .begin_capability_string_response(units.is_empty())
-                {
-                    self.accept_response(request_id, response);
-                    self.pending_request = None;
-                    self.terminal = Some(SessionTerminal::Faulted(fault));
-                    return Ok(());
-                }
+                let pending = match self.machine.begin_task_string_response(
+                    task,
+                    request_id,
+                    units.is_empty(),
+                ) {
+                    Ok(pending) => pending,
+                    Err(fault) => {
+                        self.accept_response(request_id, response);
+                        let _ = self.pending_requests.take(identity);
+                        self.terminal = Some(SessionTerminal::Faulted(fault));
+                        return Ok(());
+                    }
+                };
                 self.inbound_length = units.len();
-                self.resuming_host_string = self.machine.capability_string_response_pending();
+                self.resuming_host_string = pending;
                 self.accept_response(request_id, response);
-                self.pending_request = None;
+                let _ = self.pending_requests.take(identity);
                 return Ok(());
             }
         };
         self.machine
-            .complete_capability(value)
+            .complete_task_capability(task, request_id, value)
             .map_err(|_| ResumeError::WrongResponseType)?;
         self.accept_response(request_id, response);
-        self.pending_request = None;
+        let _ = self.pending_requests.take(identity);
         Ok(())
     }
 
@@ -394,11 +507,21 @@ impl Session {
         }
     }
 
-    fn begin_request(&mut self) -> Result<AdvanceOutcome<'_>, RunError> {
+    fn begin_request(&mut self) -> Result<bool, RunError> {
         let Some(next_request_id) = self.next_request_id.checked_add(1) else {
-            return self.establish_fault(super::error::VmFault::AccountingOverflow);
+            self.terminal = Some(SessionTerminal::Faulted(
+                super::error::VmFault::AccountingOverflow,
+            ));
+            return Ok(false);
         };
         let id = RequestId::new(self.next_request_id).ok_or(RunError::NotRunnable)?;
+        let task = match self.machine.current_task() {
+            Ok(task) => task,
+            Err(fault) => {
+                self.terminal = Some(SessionTerminal::Faulted(fault));
+                return Ok(false);
+            }
+        };
         let prepared = (|| {
             let suspension = self.machine.capability_suspension()?;
             if suspension.arguments.len() > self.argument_slots.len() {
@@ -441,29 +564,34 @@ impl Session {
         let (capability, operation, argument_count, outbound_used, contains_string) = match prepared
         {
             Ok(prepared) => prepared,
-            Err(fault) => return self.establish_fault(fault),
+            Err(fault) => {
+                self.terminal = Some(SessionTerminal::Faulted(fault));
+                return Ok(false);
+            }
         };
         self.argument_count = argument_count;
         let outbound_limit = u64::try_from(self.outbound_utf16.len()).unwrap_or(u64::MAX);
         if u64::from(outbound_used) > outbound_limit {
-            return self.establish_quota(QuotaExhaustion {
+            self.terminal = Some(SessionTerminal::QuotaExhausted(QuotaExhaustion {
                 kind: QuotaKind::HostRequestCodeUnits,
                 limit: outbound_limit,
                 consumed: u64::from(outbound_used),
-            });
+            }));
+            return Ok(false);
         }
         if contains_string && outbound_used != 0 {
             self.preparing_request = Some(PreparingRequest {
                 id,
-                task: TaskId::ROOT,
+                task,
                 capability,
                 operation,
                 argument: 0,
                 string_offset: 0,
             });
-            return Ok(AdvanceOutcome::SliceExhausted);
+            return Ok(false);
         }
-        self.publish_prepared_request(id, TaskId::ROOT, next_request_id, capability, operation)
+        self.publish_prepared_request(id, task, next_request_id, capability, operation)?;
+        Ok(true)
     }
 
     fn publish_prepared_request(
@@ -473,15 +601,20 @@ impl Session {
         next_request_id: u64,
         capability: u32,
         operation: u32,
-    ) -> Result<AdvanceOutcome<'_>, RunError> {
+    ) -> Result<(), RunError> {
         self.next_request_id = next_request_id;
-        self.pending_request = Some(PendingRequest {
-            id,
-            task,
-            capability,
-            operation,
-        });
-        self.published_requests += 1;
+        let slots = self.argument_slots[..self.argument_count]
+            .to_vec()
+            .into_boxed_slice();
+        let utf16_length = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                HostValueSlot::String { start, length } => start.checked_add(*length),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let utf16_length = usize::try_from(utf16_length).map_err(|_| RunError::NotRunnable)?;
         trace_request(
             &mut self.machine,
             id,
@@ -490,7 +623,35 @@ impl Session {
             &self.argument_slots[..self.argument_count],
             &self.outbound_utf16,
         );
-        self.request_outcome().map_err(|_| RunError::NotRunnable)
+        let request = PendingHostRequest::ordinary(
+            HostRequestIdentity::new(task, id),
+            capability,
+            operation,
+            slots,
+            self.outbound_utf16[..utf16_length]
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        if let Err(error) = self.pending_requests.insert(request) {
+            self.terminal = Some(match error {
+                RequestTableError::RequestLimit => {
+                    SessionTerminal::QuotaExhausted(QuotaExhaustion {
+                        kind: QuotaKind::HostRequests,
+                        limit: u64::try_from(self.pending_requests.requests().len())
+                            .unwrap_or(u64::MAX),
+                        consumed: u64::try_from(self.pending_requests.requests().len() + 1)
+                            .unwrap_or(u64::MAX),
+                    })
+                }
+                _ => SessionTerminal::Faulted(super::error::VmFault::InvalidStoragePlan),
+            });
+            return Ok(());
+        }
+        self.published_requests += 1;
+        if let Err(fault) = self.machine.suspend_capability_task(id) {
+            self.terminal = Some(SessionTerminal::Faulted(fault));
+        }
+        Ok(())
     }
 
     fn accept_response(&mut self, request_id: RequestId, response: HostResponse<'_>) {
@@ -571,29 +732,26 @@ impl Session {
             next_request_id,
             state.capability,
             state.operation,
-        )
+        )?;
+        if let Some(terminal) = self.terminal {
+            return Ok(match terminal {
+                SessionTerminal::HostFailed(failure) => AdvanceOutcome::HostFailed(failure),
+                SessionTerminal::Faulted(fault) => AdvanceOutcome::Faulted(fault),
+                SessionTerminal::QuotaExhausted(exhaustion) => {
+                    AdvanceOutcome::QuotaExhausted(exhaustion)
+                }
+            });
+        }
+        self.request_outcome().map_err(|_| RunError::NotRunnable)
     }
 
     fn request_outcome(&self) -> Result<AdvanceOutcome<'_>, super::error::VmFault> {
-        let pending = self
-            .pending_request
-            .ok_or(super::error::VmFault::CorruptLifecycle)?;
-        let capability = self
-            .capabilities
-            .get(pending.capability as usize)
-            .and_then(Option::as_ref)
-            .ok_or(super::error::VmFault::InvalidResolvedId)?;
-        Ok(AdvanceOutcome::HostRequestBatch(HostRequestBatchView::one(
-            HostRequestView {
-                id: pending.id,
-                task: pending.task,
-                capability,
-                operation: pending.operation,
-                arguments: HostArguments {
-                    slots: &self.argument_slots[..self.argument_count],
-                    utf16: &self.outbound_utf16,
-                },
-            },
+        if self.pending_requests.is_empty() {
+            return Err(super::error::VmFault::CorruptLifecycle);
+        }
+        Ok(AdvanceOutcome::HostRequestBatch(HostRequestBatchView::new(
+            self.pending_requests.requests(),
+            &self.capabilities,
         )))
     }
 

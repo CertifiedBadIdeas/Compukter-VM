@@ -131,6 +131,22 @@ impl PendingHostRequest {
         self.identity
     }
 
+    pub(crate) const fn capability(&self) -> u32 {
+        self.capability
+    }
+
+    pub(crate) const fn operation(&self) -> u32 {
+        self.operation
+    }
+
+    pub(crate) fn arguments(&self) -> &[HostValueSlot] {
+        &self.arguments
+    }
+
+    pub(crate) fn utf16(&self) -> &[u16] {
+        &self.utf16
+    }
+
     pub(crate) fn with_merge_group(mut self, group: HostMergeGroup) -> Self {
         if let HostRequestMerge::LastWriteWins { group: current, .. } = &mut self.merge {
             *current = group;
@@ -195,6 +211,16 @@ impl PendingRequestTable {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.requests.is_empty()
+    }
+
+    pub(crate) fn requests(&self) -> &[PendingHostRequest] {
+        &self.requests
+    }
+
+    pub(crate) fn get(&self, identity: HostRequestIdentity) -> Option<&PendingHostRequest> {
+        self.requests
+            .iter()
+            .find(|request| request.identity == identity)
     }
 
     pub(crate) fn insert(&mut self, request: PendingHostRequest) -> Result<(), RequestTableError> {

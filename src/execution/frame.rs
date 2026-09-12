@@ -222,7 +222,10 @@ impl FrameArena {
     fn read_free(&self, base: u32) -> Result<(Option<u32>, u32), VmFault> {
         let start = usize::try_from(base).map_err(|_| VmFault::CorruptLifecycle)?;
         let end = start.checked_add(8).ok_or(VmFault::CorruptLifecycle)?;
-        let bytes = self.bytes.get(start..end).ok_or(VmFault::CorruptLifecycle)?;
+        let bytes = self
+            .bytes
+            .get(start..end)
+            .ok_or(VmFault::CorruptLifecycle)?;
         let next = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let length = u32::from_le_bytes(bytes[4..].try_into().unwrap());
         if length < 8 || length % 8 != 0 {
@@ -231,12 +234,7 @@ impl FrameArena {
         Ok(((next != u32::MAX).then_some(next), length))
     }
 
-    fn write_free(
-        &mut self,
-        base: u32,
-        next: Option<u32>,
-        length: u32,
-    ) -> Result<(), VmFault> {
+    fn write_free(&mut self, base: u32, next: Option<u32>, length: u32) -> Result<(), VmFault> {
         let start = usize::try_from(base).map_err(|_| VmFault::CorruptLifecycle)?;
         let end = start.checked_add(8).ok_or(VmFault::CorruptLifecycle)?;
         let bytes = self

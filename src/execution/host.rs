@@ -397,30 +397,55 @@ impl PartialEq for HostRequestView<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct HostRequestBatchView<'a> {
-    request: HostRequestView<'a>,
+    requests: &'a [super::requests::PendingHostRequest],
+    capabilities: &'a [Option<ResolvedCapability>],
+}
+
+impl PartialEq for HostRequestBatchView<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && (0..self.len()).all(|index| self.get(index) == other.get(index))
+    }
 }
 
 impl<'a> HostRequestBatchView<'a> {
-    pub(super) const fn one(request: HostRequestView<'a>) -> Self {
-        Self { request }
+    pub(super) const fn new(
+        requests: &'a [super::requests::PendingHostRequest],
+        capabilities: &'a [Option<ResolvedCapability>],
+    ) -> Self {
+        Self {
+            requests,
+            capabilities,
+        }
     }
 
     pub const fn len(self) -> usize {
-        1
+        self.requests.len()
     }
 
     pub const fn is_empty(self) -> bool {
-        false
+        self.requests.is_empty()
     }
 
-    pub const fn get(self, index: usize) -> Option<HostRequestView<'a>> {
-        if index == 0 {
-            Some(self.request)
-        } else {
-            None
-        }
+    pub fn get(self, index: usize) -> Option<HostRequestView<'a>> {
+        let request = self.requests.get(index)?;
+        let identity = request.identity();
+        let capability = self
+            .capabilities
+            .get(request.capability() as usize)?
+            .as_ref()?;
+        Some(HostRequestView {
+            id: identity.request(),
+            task: identity.task(),
+            capability,
+            operation: request.operation(),
+            arguments: HostArguments {
+                slots: request.arguments(),
+                utf16: request.utf16(),
+            },
+        })
     }
 }
 

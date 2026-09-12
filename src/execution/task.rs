@@ -71,7 +71,8 @@ pub(super) struct TaskScheduler {
 
 impl TaskScheduler {
     pub(super) const fn resident_bytes(capacity: u64) -> Option<u64> {
-        let per_task = (core::mem::size_of::<TaskRecord>() + core::mem::size_of::<usize>() * 2) as u64;
+        let per_task =
+            (core::mem::size_of::<TaskRecord>() + core::mem::size_of::<usize>() * 2) as u64;
         per_task.checked_mul(capacity)
     }
 
@@ -303,6 +304,9 @@ mod tests {
             Err(TaskError::WrongWait),
             scheduler.complete_host(child, request(8)),
         );
-        assert_eq!(Some(TaskState::Waiting(TaskWait::Host(request(7)))), scheduler.state(child));
+        assert_eq!(
+            Some(TaskState::Waiting(TaskWait::Host(request(7)))),
+            scheduler.state(child)
+        );
     }
 }

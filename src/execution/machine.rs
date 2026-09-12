@@ -9,11 +9,12 @@ use super::{
     gc::{Collector, RootSet},
     heap::{AllocationRequest, Heap},
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
-    host::{EntryArgumentLimits, TaskId},
+    host::{EntryArgumentLimits, RequestId, TaskId},
     image::{ExecutionImage, ResolvedFunction, ResolvedInstruction, ResolvedValueType},
     layout::{array_layout, RuntimeTypeLayout, ValueWidth},
-    numeric, text,
+    numeric,
     task::{TaskError, TaskScheduler},
+    text,
     value::{EntryArgument, Ref32, ReferenceDomain, RuntimeValue},
     TypeKey,
 };
@@ -135,6 +136,7 @@ pub(super) struct Machine {
     pending_host_string: Option<text::PendingHostString>,
     pending_host_string_source: Option<AllocationSource>,
     string_collection_pending: Option<StringCollectionTarget>,
+    task_string_response: Option<(TaskId, RequestId, Option<TaskId>)>,
     emergency_oom: Option<super::value::Ref32>,
     frame_depth: usize,
     consumed_fixed_cost: u64,
@@ -230,6 +232,7 @@ impl Machine {
             + core::mem::size_of::<Option<AllocationSource>>() * 2
             + core::mem::size_of::<Option<text::PendingHostString>>()
             + core::mem::size_of::<Option<StringCollectionTarget>>()) as u64
+            + core::mem::size_of::<Option<(TaskId, RequestId, Option<TaskId>)>>() as u64
     }
 
     pub(super) const fn fixed_state_bytes() -> u64 {
@@ -311,6 +314,7 @@ impl Machine {
             pending_host_string: None,
             pending_host_string_source: None,
             string_collection_pending: None,
+            task_string_response: None,
             emergency_oom: Some(super::value::Ref32::reserved(0).unwrap()),
             frame_depth: 0,
             consumed_fixed_cost: 0,
@@ -398,7 +402,9 @@ impl Machine {
         let slot = self.tasks.slot_of(task).ok_or(VmFault::CorruptLifecycle)?;
         let width = self.image.maximum_call_depth();
         let start = slot.checked_mul(width).ok_or(VmFault::InvalidStoragePlan)?;
-        let end = start.checked_add(width).ok_or(VmFault::InvalidStoragePlan)?;
+        let end = start
+            .checked_add(width)
+            .ok_or(VmFault::InvalidStoragePlan)?;
         let saved = self
             .task_frames
             .get_mut(start..end)
@@ -419,7 +425,9 @@ impl Machine {
             .ok_or(VmFault::InvalidStoragePlan)?;
         let width = self.image.maximum_call_depth();
         let start = slot.checked_mul(width).ok_or(VmFault::InvalidStoragePlan)?;
-        let end = start.checked_add(width).ok_or(VmFault::InvalidStoragePlan)?;
+        let end = start
+            .checked_add(width)
+            .ok_or(VmFault::InvalidStoragePlan)?;
         let saved = self
             .task_frames
             .get_mut(start..end)
@@ -437,6 +445,122 @@ impl Machine {
         };
         self.restore_task(task)?;
         Ok(true)
+    }
+
+    pub(super) fn current_task(&self) -> Result<TaskId, VmFault> {
+        self.tasks.current().map_err(task_fault)
+    }
+
+    pub(super) fn has_active_task(&self) -> bool {
+        self.tasks.current().is_ok()
+    }
+
+    pub(super) fn minimum_run_budget(&self) -> u32 {
+        if self.pending_allocation.is_some() {
+            1
+        } else {
+            self.image.minimum_slice_cost()
+        }
+    }
+
+    pub(super) fn suspend_capability_task(
+        &mut self,
+        request: super::host::RequestId,
+    ) -> Result<bool, VmFault> {
+        let task = self.current_task()?;
+        self.tasks.suspend_host(request).map_err(task_fault)?;
+        self.save_task(task)?;
+        self.activate_next_task()
+    }
+
+    pub(super) fn complete_task_capability(
+        &mut self,
+        task: TaskId,
+        request: super::host::RequestId,
+        value: Option<RuntimeValue>,
+    ) -> Result<(), VmFault> {
+        let active = self.tasks.current().ok();
+        if let Some(active) = active {
+            self.save_task(active)?;
+        }
+        self.restore_task(task)?;
+        let completion = self.complete_capability(value);
+        let save = self.save_task(task);
+        if let Some(active) = active {
+            self.restore_task(active)?;
+        }
+        completion?;
+        save?;
+        self.tasks
+            .complete_host(task, request)
+            .map_err(task_fault)?;
+        if active.is_none() {
+            self.activate_next_task()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn begin_task_string_response(
+        &mut self,
+        task: TaskId,
+        request: RequestId,
+        empty: bool,
+    ) -> Result<bool, VmFault> {
+        if self.task_string_response.is_some() {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        let active = self.tasks.current().ok();
+        if let Some(active) = active {
+            self.save_task(active)?;
+        }
+        self.restore_task(task)?;
+        if let Err(fault) = self.begin_capability_string_response(empty) {
+            self.save_task(task)?;
+            if let Some(active) = active {
+                self.restore_task(active)?;
+            }
+            return Err(fault);
+        }
+        if empty {
+            self.save_task(task)?;
+            if let Some(active) = active {
+                self.restore_task(active)?;
+            }
+            self.tasks
+                .complete_host(task, request)
+                .map_err(task_fault)?;
+            if active.is_none() {
+                self.activate_next_task()?;
+            }
+            return Ok(false);
+        }
+        self.task_string_response = Some((task, request, active));
+        Ok(true)
+    }
+
+    pub(super) fn finish_task_string_response(&mut self) -> Result<(), VmFault> {
+        if self.capability_string_response_pending() {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        let (task, request, active) = self
+            .task_string_response
+            .take()
+            .ok_or(VmFault::CorruptLifecycle)?;
+        self.save_task(task)?;
+        if let Some(active) = active {
+            self.restore_task(active)?;
+        }
+        self.tasks
+            .complete_host(task, request)
+            .map_err(task_fault)?;
+        if active.is_none() {
+            self.activate_next_task()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_task_string_response(&self) -> bool {
+        self.task_string_response.is_some()
     }
 
     pub(super) fn materialize_entry_string_array(
@@ -1525,7 +1649,8 @@ impl Machine {
                         let Some(target_function) = self.image.function(*target) else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));
                         };
-                        let reservation = match self.frame_arena.push(&target_function.frame_layout) {
+                        let reservation = match self.frame_arena.push(&target_function.frame_layout)
+                        {
                             Ok(reservation) => reservation,
                             Err(fault) => return Ok(self.fault(fault)),
                         };

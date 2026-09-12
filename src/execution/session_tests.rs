@@ -45,6 +45,50 @@ fn only_request(outcome: AdvanceOutcome<'_>) -> super::host::HostRequestView<'_>
 }
 
 #[test]
+fn independent_tasks_publish_together_and_resume_out_of_order() {
+    let operations = [
+        OperationSchema::asynchronous(&[], HostValueType::I32),
+        OperationSchema::asynchronous(&[], HostValueType::Unit),
+    ];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session =
+        Session::admit(fixtures::two_task_host_artifact(), profile(), &[binding]).unwrap();
+    session.start(&[]).unwrap();
+
+    let AdvanceOutcome::HostRequestBatch(batch) = session.advance(64, 0).unwrap() else {
+        panic!("tasks did not publish a host request batch")
+    };
+    assert_eq!(2, batch.len());
+    let reader = batch.get(0).unwrap();
+    let writer = batch.get(1).unwrap();
+    assert_eq!(0, reader.operation());
+    assert_eq!(1, writer.operation());
+    assert_ne!(reader.task_id(), writer.task_id());
+    let reader_identity = (reader.task_id(), reader.id());
+    let writer_identity = (writer.task_id(), writer.id());
+
+    session
+        .resume_for(
+            writer_identity.0,
+            writer_identity.1,
+            HostResponse::Success(HostValueInput::Unit),
+        )
+        .unwrap();
+    session
+        .resume_for(
+            reader_identity.0,
+            reader_identity.1,
+            HostResponse::Success(HostValueInput::I32(13)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        AdvanceOutcome::Halted(None),
+        session.advance(64, 0).unwrap()
+    );
+}
+
+#[test]
 fn entry_string_array_is_materialized_as_one_owned_guest_argument() {
     let mut session = Session::admit(
         fixtures::entry_string_array_length_artifact(),
