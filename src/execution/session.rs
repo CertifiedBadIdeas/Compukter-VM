@@ -118,6 +118,8 @@ impl Session {
             frame_storage_bytes: profile.frame_storage_bytes,
             maximum_call_depth: profile.maximum_call_depth,
             maximum_coroutines: profile.maximum_coroutines,
+            maximum_channels: profile.maximum_channels,
+            maximum_channel_values: profile.maximum_channel_values,
             maximum_host_requests: profile.maximum_host_requests,
             maximum_events: profile.maximum_events,
             maximum_slice_budget: profile.maximum_slice_budget,

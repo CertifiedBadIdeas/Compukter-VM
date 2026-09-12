@@ -268,6 +268,109 @@ pub(super) fn task_spawn_join_artifact() -> VerifiedArtifact {
     })
 }
 
+pub(super) fn channel_handoff_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let unit_type = primitive(0);
+        let i32_type = primitive(1);
+        artifact.header.runtime_major = 1;
+        artifact.header.runtime_minor = 2;
+        artifact.header.semantic_features = 0b1_0010;
+        artifact.manifest.maximum_coroutines = 2;
+        artifact.manifest.maximum_channels = 1;
+        artifact.manifest.maximum_channel_values = 1;
+        artifact.modules[0].types = vec![
+            NominalType::Function {
+                name: 1,
+                flags: 1,
+                result: i32_type,
+                parameters: Vec::new(),
+            },
+            NominalType::Function {
+                name: 1,
+                flags: 1,
+                result: unit_type,
+                parameters: vec![i32_type],
+            },
+        ];
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].constants = vec![Constant::I32(1), Constant::I32(42)];
+        let mut entry = function(0, 0, vec![i32_type, i32_type, i32_type, i32_type], 0);
+        entry.flags = 1;
+        entry.block_count = 2;
+        let mut sender = function(1, 1, vec![i32_type, i32_type], 2);
+        sender.flags = 1;
+        sender.block_count = 2;
+        artifact.modules[0].functions = vec![entry, sender];
+        artifact.modules[0].declared_functions = 2;
+        let programs = vec![
+            (
+                FunctionId(0),
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::ChannelCreate {
+                        dst: 1,
+                        capacity: 0,
+                    },
+                    Instruction::CoroutineSpawn {
+                        dst: 2,
+                        function_ref: 1,
+                        args: Box::new([1]),
+                    },
+                    Instruction::ChannelReceive {
+                        dst: 3,
+                        channel: 1,
+                        resume_block: 1,
+                    },
+                ],
+            ),
+            (FunctionId(0), vec![Instruction::Return { value: 3 }]),
+            (
+                FunctionId(1),
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 1,
+                    },
+                    Instruction::ChannelSend {
+                        channel: 0,
+                        value: 1,
+                        resume_block: 3,
+                    },
+                ],
+            ),
+            (FunctionId(1), vec![Instruction::Return { value: u16::MAX }]),
+        ];
+        let mut maximum_block_cost = 0;
+        artifact.modules[0].blocks.clear();
+        artifact.modules[0].code.clear();
+        for (block_id, (owner, instructions)) in programs.into_iter().enumerate() {
+            let fixed_cost = instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum();
+            maximum_block_cost = maximum_block_cost.max(fixed_cost);
+            artifact.modules[0].blocks.push(Block {
+                owner_function: owner,
+                code_record: BlockId(block_id as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: fixed_cost,
+                flags: 0,
+            });
+            artifact.modules[0].code.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: instructions.into_boxed_slice(),
+                fixed_cost,
+            });
+        }
+        artifact.manifest.maximum_block_cost = maximum_block_cost;
+        artifact.manifest.minimum_slice_cost = maximum_block_cost;
+        configure_stack(artifact, 2, 2);
+    })
+}
+
 pub(super) fn two_task_host_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let unit_type = primitive(0);
@@ -5224,6 +5327,8 @@ pub(super) fn profile() -> ExecutionProfile {
         frame_storage_bytes: 1024 * 1024,
         maximum_call_depth: 64,
         maximum_coroutines: 64,
+        maximum_channels: 64,
+        maximum_channel_values: 4096,
         maximum_host_requests: 64,
         maximum_events: 64,
         maximum_slice_budget: u32::MAX,

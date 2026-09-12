@@ -401,6 +401,7 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
         TaskScheduler::resident_bytes(image.maximum_coroutines() as u64).unwrap(),
         plan.task_scheduler_bytes,
     );
+    assert_eq!(0, plan.channel_bytes);
     assert_eq!(8, plan.static_bytes);
     assert_eq!(
         core::mem::size_of::<TypeInitializationState>() as u64 * 4,
@@ -418,6 +419,7 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
             + plan.frame_arena_bytes
             + plan.frame_record_bytes
             + plan.task_scheduler_bytes
+            + plan.channel_bytes
             + plan.static_bytes
             + plan.type_initialization_bytes
             + plan.external_root_bytes

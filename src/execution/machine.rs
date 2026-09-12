@@ -1,4 +1,5 @@
 use super::{
+    channel::{ChannelArena, ChannelError, ReceiveResult, SendResult},
     error::{
         AdmissionError, AllocationDiagnostic, AllocationExhaustion, AllocationRequestKind,
         AllocationSource, EntryArgumentLimit, GuestTrap, Outcome, ResidentStorageComponent,
@@ -122,6 +123,7 @@ pub(super) struct Machine {
     task_frames: Box<[Frame]>,
     task_frame_depths: Box<[usize]>,
     tasks: TaskScheduler,
+    channels: ChannelArena,
     frame_arena: FrameArena,
     statics: StaticArena,
     type_initialization: Box<[TypeInitializationState]>,
@@ -206,6 +208,15 @@ fn task_fault(error: TaskError) -> VmFault {
     }
 }
 
+fn channel_failure(error: ChannelError) -> InstructionFailure {
+    match error {
+        ChannelError::InvalidCapacity | ChannelError::InvalidHandle | ChannelError::NoCapacity => {
+            InstructionFailure::Trap(GuestTrap::InvalidArgument)
+        }
+        ChannelError::CorruptQueue => InstructionFailure::Fault(VmFault::CorruptLifecycle),
+    }
+}
+
 impl AllocationRetry {
     fn reserve(self, heap: &mut Heap) -> Result<Option<PendingAllocation>, VmFault> {
         let reservation = heap.reserve(self.request)?;
@@ -284,6 +295,12 @@ impl Machine {
             .map_err(|_| AdmissionError::AllocationFailed)?;
         task_frame_depths.resize(task_count, 0);
         let tasks = TaskScheduler::new(task_count).map_err(|_| AdmissionError::AllocationFailed)?;
+        let channels = ChannelArena::new(
+            image.maximum_channels(),
+            image.maximum_channel_values(),
+            task_count,
+        )
+        .map_err(|_| AdmissionError::AllocationFailed)?;
         let statics = StaticArena::new(image.static_layout().clone())
             .map_err(|_| AdmissionError::AllocationFailed)?;
         let mut type_initialization = Vec::new();
@@ -305,6 +322,7 @@ impl Machine {
             task_frames: task_frames.into_boxed_slice(),
             task_frame_depths: task_frame_depths.into_boxed_slice(),
             tasks,
+            channels,
             frame_arena,
             statics,
             type_initialization: type_initialization.into_boxed_slice(),
@@ -442,6 +460,50 @@ impl Machine {
         self.task_frame_depths[slot] = 0;
         self.frame_depth = depth;
         Ok(())
+    }
+
+    fn resume_saved_channel_task(
+        &mut self,
+        task: TaskId,
+        channel: u32,
+        resume_block: usize,
+        result: Option<(u16, i32)>,
+    ) -> Result<(), VmFault> {
+        let slot = self.tasks.slot_of(task).ok_or(VmFault::CorruptLifecycle)?;
+        let depth = *self
+            .task_frame_depths
+            .get(slot)
+            .filter(|depth| **depth != 0)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let start = slot
+            .checked_mul(self.image.maximum_call_depth())
+            .ok_or(VmFault::InvalidStoragePlan)?;
+        let frame_index = start
+            .checked_add(depth - 1)
+            .ok_or(VmFault::InvalidStoragePlan)?;
+        let frame = *self
+            .task_frames
+            .get(frame_index)
+            .filter(|frame| frame.function != usize::MAX)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let function = self
+            .image
+            .function(frame.function)
+            .ok_or(VmFault::InvalidResolvedId)?;
+        if let Some((destination, value)) = result {
+            write_frame_value(
+                &mut self.frame_arena,
+                frame,
+                function,
+                destination,
+                RuntimeValue::I32(value),
+            )?;
+        }
+        self.task_frames[frame_index].block = resume_block;
+        self.task_frames[frame_index].instruction = 0;
+        self.tasks
+            .complete_channel(task, channel)
+            .map_err(task_fault)
     }
 
     fn activate_next_task(&mut self) -> Result<bool, VmFault> {
@@ -1747,6 +1809,179 @@ impl Machine {
                             Err(error) => return Ok(self.fault(task_fault(error))),
                         }
                     }
+                    ResolvedInstruction::ChannelCreate { dst, capacity } => {
+                        let destination = *dst;
+                        let capacity_register = *capacity;
+                        let capacity = match self.read_register(frame_index, capacity_register) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let handle = match self.channels.create(capacity).map_err(channel_failure) {
+                            Ok(handle) => handle,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => {
+                                return Ok(self.fault(fault));
+                            }
+                        };
+                        if let Err(fault) =
+                            self.write_register(frame_index, destination, RuntimeValue::I32(handle))
+                        {
+                            return Ok(self.fault(fault));
+                        }
+                        self.frames[frame_index].instruction += 1;
+                    }
+                    ResolvedInstruction::ChannelSend {
+                        channel,
+                        value,
+                        resume_block,
+                    } => {
+                        let channel_register = *channel;
+                        let value_register = *value;
+                        let continuation = *resume_block;
+                        let handle = match self.read_register(frame_index, channel_register) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let value = match self.read_register(frame_index, value_register) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let current = match self.tasks.current() {
+                            Ok(current) => current,
+                            Err(error) => return Ok(self.fault(task_fault(error))),
+                        };
+                        let Some(slot) = self.tasks.slot_of(current) else {
+                            return Ok(self.fault(VmFault::CorruptLifecycle));
+                        };
+                        let result = match self
+                            .channels
+                            .send(handle, slot, current, value, continuation)
+                            .map_err(channel_failure)
+                        {
+                            Ok(result) => result,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => {
+                                return Ok(self.fault(fault));
+                            }
+                        };
+                        match result {
+                            SendResult::Complete => {}
+                            SendResult::WakeReceiver {
+                                task,
+                                destination,
+                                resume_block,
+                            } => {
+                                if let Err(fault) = self.resume_saved_channel_task(
+                                    task,
+                                    handle as u32,
+                                    resume_block,
+                                    Some((destination, value)),
+                                ) {
+                                    return Ok(self.fault(fault));
+                                }
+                            }
+                            SendResult::Suspend => {
+                                if let Err(error) = self.tasks.suspend_channel(handle as u32) {
+                                    return Ok(self.fault(task_fault(error)));
+                                }
+                                if let Err(fault) = self.save_task(current) {
+                                    return Ok(self.fault(fault));
+                                }
+                                match self.activate_next_task() {
+                                    Ok(true) => continue 'run,
+                                    Ok(false) => return Ok(Outcome::TasksWaiting),
+                                    Err(fault) => return Ok(self.fault(fault)),
+                                }
+                            }
+                        }
+                        self.frames[frame_index].block = continuation;
+                        self.frames[frame_index].instruction = 0;
+                        break;
+                    }
+                    ResolvedInstruction::ChannelReceive {
+                        dst,
+                        channel,
+                        resume_block,
+                    } => {
+                        let destination = *dst;
+                        let channel_register = *channel;
+                        let continuation = *resume_block;
+                        let handle = match self.read_register(frame_index, channel_register) {
+                            Ok(RuntimeValue::I32(value)) => value,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let current = match self.tasks.current() {
+                            Ok(current) => current,
+                            Err(error) => return Ok(self.fault(task_fault(error))),
+                        };
+                        let Some(slot) = self.tasks.slot_of(current) else {
+                            return Ok(self.fault(VmFault::CorruptLifecycle));
+                        };
+                        let result = match self
+                            .channels
+                            .receive(handle, slot, current, destination, continuation)
+                            .map_err(channel_failure)
+                        {
+                            Ok(result) => result,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => {
+                                return Ok(self.fault(fault));
+                            }
+                        };
+                        match result {
+                            ReceiveResult::Value { value, wake_sender } => {
+                                if let Some((task, sender_resume_block)) = wake_sender {
+                                    if let Err(fault) = self.resume_saved_channel_task(
+                                        task,
+                                        handle as u32,
+                                        sender_resume_block,
+                                        None,
+                                    ) {
+                                        return Ok(self.fault(fault));
+                                    }
+                                }
+                                if let Err(fault) = self.write_register(
+                                    frame_index,
+                                    destination,
+                                    RuntimeValue::I32(value),
+                                ) {
+                                    return Ok(self.fault(fault));
+                                }
+                            }
+                            ReceiveResult::Suspend => {
+                                if let Err(error) = self.tasks.suspend_channel(handle as u32) {
+                                    return Ok(self.fault(task_fault(error)));
+                                }
+                                if let Err(fault) = self.save_task(current) {
+                                    return Ok(self.fault(fault));
+                                }
+                                match self.activate_next_task() {
+                                    Ok(true) => continue 'run,
+                                    Ok(false) => return Ok(Outcome::TasksWaiting),
+                                    Err(fault) => return Ok(self.fault(fault)),
+                                }
+                            }
+                        }
+                        self.frames[frame_index].block = continuation;
+                        self.frames[frame_index].instruction = 0;
+                        break;
+                    }
                     ResolvedInstruction::CapabilityCallSync { .. }
                     | ResolvedInstruction::CapabilityCallAsync { .. } => {
                         return Ok(Outcome::HostRequest);
@@ -2835,6 +3070,7 @@ impl Machine {
             + self.task_frames.len() * core::mem::size_of::<Frame>()
             + self.task_frame_depths.len() * core::mem::size_of::<usize>()
             + self.tasks.reserved_bytes()
+            + self.channels.reserved_bytes()
             + self.frame_arena.reserved_bytes()
             + self.statics.reserved_bytes()
             + self.type_initialization.len() * core::mem::size_of::<TypeInitializationState>()

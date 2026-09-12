@@ -753,6 +753,8 @@ fn admission_code(error: AdmissionError) -> u16 {
         AdmissionError::FrameStorageLimit { .. } => 5,
         AdmissionError::CallDepthLimit { .. } => 6,
         AdmissionError::CoroutineLimit { .. } => 7,
+        AdmissionError::ChannelLimit { .. } => 19,
+        AdmissionError::ChannelValueLimit { .. } => 20,
         AdmissionError::HostRequestLimit { .. } => 8,
         AdmissionError::EventLimit { .. } => 9,
         AdmissionError::SliceLimit { .. } => 10,
@@ -853,6 +855,26 @@ mod tests {
             encode_create(Err(CreateError::Admission(
                 AdmissionError::ResidentStorageOverflow {
                     component: ResidentStorageComponent::FrameArena,
+                },
+            ))),
+        );
+    }
+
+    #[test]
+    fn channel_admission_limits_have_append_only_wire_codes() {
+        assert_eq!(
+            vec![2, 19, 0],
+            encode_create(Err(CreateError::Admission(AdmissionError::ChannelLimit {
+                required: 2,
+                available: 1,
+            }))),
+        );
+        assert_eq!(
+            vec![2, 20, 0],
+            encode_create(Err(CreateError::Admission(
+                AdmissionError::ChannelValueLimit {
+                    required: 2,
+                    available: 1,
                 },
             ))),
         );

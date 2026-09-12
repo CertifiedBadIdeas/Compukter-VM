@@ -122,6 +122,8 @@ pub struct ExecutionProfile {
     pub frame_storage_bytes: u64,
     pub maximum_call_depth: u32,
     pub maximum_coroutines: u32,
+    pub maximum_channels: u32,
+    pub maximum_channel_values: u32,
     pub maximum_host_requests: u32,
     pub maximum_events: u32,
     pub maximum_slice_budget: u32,

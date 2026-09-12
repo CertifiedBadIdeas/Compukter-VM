@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod channel;
 mod error;
 mod external_roots;
 mod frame;

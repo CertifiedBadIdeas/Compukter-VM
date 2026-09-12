@@ -7,6 +7,7 @@ use crate::artifact::{
 use crate::VerifiedArtifact;
 
 use super::{
+    channel::ChannelArena,
     error::{AdmissionError, GuestTrap, ResidentStorageComponent},
     external_roots::ExternalRootTable,
     frame::{FrameLayout, FrameValueAccess, SafepointMap},
@@ -35,6 +36,8 @@ pub(super) struct ExecutionProfile {
     pub frame_storage_bytes: u64,
     pub maximum_call_depth: u32,
     pub maximum_coroutines: u32,
+    pub maximum_channels: u32,
+    pub maximum_channel_values: u32,
     pub maximum_host_requests: u32,
     pub maximum_events: u32,
     pub maximum_slice_budget: u32,
@@ -330,6 +333,20 @@ pub(super) enum ResolvedInstruction {
         task: u16,
         resume_block: usize,
     },
+    ChannelCreate {
+        dst: u16,
+        capacity: u16,
+    },
+    ChannelSend {
+        channel: u16,
+        value: u16,
+        resume_block: usize,
+    },
+    ChannelReceive {
+        dst: u16,
+        channel: u16,
+        resume_block: usize,
+    },
     CapabilityCallSync {
         dst: u16,
         capability: u32,
@@ -425,6 +442,8 @@ struct ExecutionImageInner {
     registers_per_frame: usize,
     maximum_call_depth: usize,
     maximum_coroutines: usize,
+    maximum_channels: usize,
+    maximum_channel_values: usize,
     external_root_capacity: u32,
     minimum_slice_cost: u32,
     maximum_slice_budget: u32,
@@ -679,6 +698,14 @@ impl ExecutionImage {
                 component: ResidentStorageComponent::TaskScheduler,
             },
         )?;
+        let channel_bytes = ChannelArena::resident_bytes(
+            u64::from(decoded.manifest.maximum_channels),
+            u64::from(decoded.manifest.maximum_channel_values),
+            maximum_coroutines,
+        )
+        .ok_or(AdmissionError::ResidentStorageOverflow {
+            component: ResidentStorageComponent::Channels,
+        })?;
         let static_bytes = align_u64(u64::from(static_layout.byte_len), 8)?;
         let type_initialization_bytes = (core::mem::size_of::<TypeInitializationState>() as u64)
             .checked_mul(checked_u32(type_layouts.len())?.into())
@@ -693,6 +720,7 @@ impl ExecutionImage {
             frame_arena_bytes,
             frame_record_bytes,
             task_scheduler_bytes,
+            channel_bytes,
             static_bytes,
             type_initialization_bytes,
             external_root_bytes,
@@ -788,6 +816,8 @@ impl ExecutionImage {
             registers_per_frame,
             maximum_call_depth: decoded.manifest.maximum_call_depth as usize,
             maximum_coroutines: decoded.manifest.maximum_coroutines as usize,
+            maximum_channels: decoded.manifest.maximum_channels as usize,
+            maximum_channel_values: decoded.manifest.maximum_channel_values as usize,
             external_root_capacity: decoded.manifest.maximum_host_requests,
             minimum_slice_cost: decoded.manifest.minimum_slice_cost,
             maximum_slice_budget: profile.maximum_slice_budget,
@@ -874,6 +904,14 @@ impl ExecutionImage {
 
     pub(super) fn maximum_coroutines(&self) -> usize {
         self.0.maximum_coroutines
+    }
+
+    pub(super) fn maximum_channels(&self) -> usize {
+        self.0.maximum_channels
+    }
+
+    pub(super) fn maximum_channel_values(&self) -> usize {
+        self.0.maximum_channel_values
     }
 
     pub(super) fn external_root_capacity(&self) -> u32 {
@@ -1367,6 +1405,22 @@ fn check_profile(
         manifest.maximum_coroutines,
         profile.maximum_coroutines,
         |required, available| AdmissionError::CoroutineLimit {
+            required,
+            available,
+        },
+    )?;
+    check_limit(
+        manifest.maximum_channels,
+        profile.maximum_channels,
+        |required, available| AdmissionError::ChannelLimit {
+            required,
+            available,
+        },
+    )?;
+    check_limit(
+        manifest.maximum_channel_values,
+        profile.maximum_channel_values,
+        |required, available| AdmissionError::ChannelValueLimit {
             required,
             available,
         },
@@ -2075,6 +2129,28 @@ fn resolve_instruction(
                 resume_block: block(*resume_block)?,
             }
         }
+        Instruction::ChannelCreate { dst, capacity } => ResolvedInstruction::ChannelCreate {
+            dst: *dst,
+            capacity: *capacity,
+        },
+        Instruction::ChannelSend {
+            channel,
+            value,
+            resume_block,
+        } => ResolvedInstruction::ChannelSend {
+            channel: *channel,
+            value: *value,
+            resume_block: block(*resume_block)?,
+        },
+        Instruction::ChannelReceive {
+            dst,
+            channel,
+            resume_block,
+        } => ResolvedInstruction::ChannelReceive {
+            dst: *dst,
+            channel: *channel,
+            resume_block: block(*resume_block)?,
+        },
         Instruction::CapabilityCallSync {
             dst,
             capability,
