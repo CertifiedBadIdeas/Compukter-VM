@@ -70,6 +70,11 @@ pub(super) struct TaskScheduler {
 }
 
 impl TaskScheduler {
+    pub(super) const fn resident_bytes(capacity: u64) -> Option<u64> {
+        let per_task = (core::mem::size_of::<TaskRecord>() + core::mem::size_of::<usize>() * 2) as u64;
+        per_task.checked_mul(capacity)
+    }
+
     pub(super) fn new(capacity: usize) -> Result<Self, TaskError> {
         if capacity == 0 {
             return Err(TaskError::NoCapacity);
@@ -113,6 +118,9 @@ impl TaskScheduler {
             .iter()
             .position(|task| task.state == TaskState::Vacant)
             .ok_or(TaskError::NoCapacity)?;
+        if self.next_id > i32::MAX as u32 {
+            return Err(TaskError::IdExhausted);
+        }
         let id = TaskId::new(self.next_id).ok_or(TaskError::IdExhausted)?;
         self.next_id = self.next_id.checked_add(1).ok_or(TaskError::IdExhausted)?;
         self.tasks[slot] = TaskRecord {
@@ -204,6 +212,19 @@ impl TaskScheduler {
 
     pub(super) fn state(&self, task: TaskId) -> Option<TaskState> {
         self.slot(task).map(|slot| self.tasks[slot].state)
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub(super) fn reserved_bytes(&self) -> usize {
+        self.tasks.len() * core::mem::size_of::<TaskRecord>()
+            + self.ready.len() * core::mem::size_of::<usize>()
+    }
+
+    pub(super) fn slot_of(&self, id: TaskId) -> Option<usize> {
+        self.slot(id)
     }
 
     fn suspend(&mut self, wait: TaskWait) -> Result<TaskId, TaskError> {

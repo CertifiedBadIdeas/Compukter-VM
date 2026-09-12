@@ -1020,7 +1020,7 @@ fn verify_instruction(
                 args,
                 limits,
             )?;
-            require_kind(function, *dst, 7, module_id, function_id, limits)?;
+            require_kind(function, *dst, 1, module_id, function_id, limits)?;
             write(state, *dst, function, module_id, function_id, limits)?;
         }
         Instruction::CapabilityCallSync {
@@ -1113,9 +1113,14 @@ fn verify_instruction(
         }
         Instruction::CoroutineJoin { dst, coroutine, .. } => {
             read(function, state, *coroutine, module_id, function_id, limits)?;
-            require_kind(function, *coroutine, 7, module_id, function_id, limits)?;
+            require_kind(function, *coroutine, 1, module_id, function_id, limits)?;
             if *dst != u16::MAX {
-                write(state, *dst, function, module_id, function_id, limits)?;
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "task join destination must be Unit",
+                ));
             }
         }
         Instruction::CapabilityCallAsync {

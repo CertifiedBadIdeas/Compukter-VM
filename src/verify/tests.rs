@@ -1365,6 +1365,28 @@ fn vm_blocking_capability_does_not_claim_coroutine_semantics() {
     super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default()).unwrap();
 }
 
+#[test]
+fn task_instructions_require_runtime_abi_1_1() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.header.runtime_major = 1;
+    artifact.header.runtime_minor = 0;
+    artifact.header.semantic_features = 1 << 1;
+    artifact.modules[0].code[0].instructions =
+        vec![crate::artifact::Instruction::CoroutineJoin {
+            dst: u16::MAX,
+            coroutine: 0,
+            resume_block: 0,
+        }]
+        .into_boxed_slice();
+
+    let error = super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default())
+        .unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadModule);
+
+    artifact.header.runtime_minor = 1;
+    super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default()).unwrap();
+}
+
 fn exception_handler_artifact(reads_uninitialized_local: bool) -> crate::artifact::DecodedArtifact {
     let mut artifact = decoded(support::minimal_vector());
     artifact.header.semantic_features = 1;

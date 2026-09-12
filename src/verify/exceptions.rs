@@ -217,6 +217,7 @@ pub(crate) fn verify_semantic_features(
     limits: &ArtifactLimits,
 ) -> Result<(), DiagnosticSet> {
     let mut expected = 0_u32;
+    let mut uses_tasks = false;
     for module in &artifact.modules {
         if !module.exceptions.is_empty()
             || module
@@ -248,6 +249,16 @@ pub(crate) fn verify_semantic_features(
         {
             expected |= 1 << 1;
         }
+        uses_tasks |= module
+            .code
+            .iter()
+            .flat_map(|code| code.instructions.iter())
+            .any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::CoroutineSpawn { .. } | Instruction::CoroutineJoin { .. }
+                )
+            });
         if !artifact.capabilities.is_empty()
             || module
                 .code
@@ -266,6 +277,18 @@ pub(crate) fn verify_semantic_features(
         if !module.imports.is_empty() {
             expected |= 1 << 3;
         }
+    }
+    if uses_tasks && (artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 1) {
+        let mut diagnostic = Diagnostic::at_offset(
+            Family::Module,
+            Code::BadModule,
+            6,
+            "task instructions require minimum runtime ABI 1.1",
+        );
+        diagnostic.location.section = None;
+        let mut errors = DiagnosticSet::new(limits.diagnostics);
+        errors.push(diagnostic);
+        return Err(errors);
     }
     if artifact.header.semantic_features != expected {
         let mut diagnostic = Diagnostic::at_offset(

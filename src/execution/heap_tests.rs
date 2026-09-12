@@ -13,6 +13,7 @@ use super::{
         RuntimeTypeLayout, StoragePlan, StringEncoding, ValueWidth,
     },
     machine::{Frame, Machine, TypeInitializationState},
+    task::TaskScheduler,
     value::{EntryArgument, RuntimeValue},
     TypeKey,
 };
@@ -391,8 +392,14 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
     assert_eq!(Heap::allocator_resident_bytes(), plan.heap_allocator_bytes);
     assert_eq!(0, plan.frame_arena_bytes);
     assert_eq!(
-        core::mem::size_of::<Frame>() as u64 * image.maximum_call_depth() as u64,
+        core::mem::size_of::<Frame>() as u64
+            * image.maximum_call_depth() as u64
+            * (image.maximum_coroutines() as u64 + 1),
         plan.frame_record_bytes,
+    );
+    assert_eq!(
+        TaskScheduler::resident_bytes(image.maximum_coroutines() as u64).unwrap(),
+        plan.task_scheduler_bytes,
     );
     assert_eq!(8, plan.static_bytes);
     assert_eq!(
@@ -410,6 +417,7 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
             + plan.heap_allocator_bytes
             + plan.frame_arena_bytes
             + plan.frame_record_bytes
+            + plan.task_scheduler_bytes
             + plan.static_bytes
             + plan.type_initialization_bytes
             + plan.external_root_bytes

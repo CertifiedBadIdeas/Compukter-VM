@@ -4,7 +4,7 @@ pub(crate) const DIGEST_SIZE: usize = 32;
 
 pub(crate) const FORMAT_MAJOR: u16 = 3;
 pub(crate) const RUNTIME_ABI_MAJOR: u16 = 1;
-pub(crate) const RUNTIME_ABI_MINOR: u16 = 0;
+pub(crate) const RUNTIME_ABI_MINOR: u16 = 1;
 
 pub(crate) const CRITICAL: u16 = 1 << 0;
 pub(crate) const SEMANTIC: u16 = 1 << 1;
