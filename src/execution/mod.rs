@@ -13,6 +13,7 @@ mod machine;
 mod numeric;
 mod requests;
 mod session;
+mod task;
 mod text;
 mod value;
 
