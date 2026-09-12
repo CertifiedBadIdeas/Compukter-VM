@@ -7,6 +7,7 @@ pub enum ResidentStorageComponent {
     FrameArena,
     FrameRecords,
     TaskScheduler,
+    Channels,
     Statics,
     TypeInitialization,
     ExternalRoots,
@@ -37,6 +38,14 @@ pub enum AdmissionError {
         available: u32,
     },
     CoroutineLimit {
+        required: u32,
+        available: u32,
+    },
+    ChannelLimit {
+        required: u32,
+        available: u32,
+    },
+    ChannelValueLimit {
         required: u32,
         available: u32,
     },

@@ -158,6 +158,8 @@ fn profile() -> ExecutionProfile {
         frame_storage_bytes: 1024 * 1024,
         maximum_call_depth: 64,
         maximum_coroutines: 64,
+        maximum_channels: 64,
+        maximum_channel_values: 4096,
         maximum_host_requests: 64,
         maximum_events: 64,
         maximum_slice_budget: u32::MAX,

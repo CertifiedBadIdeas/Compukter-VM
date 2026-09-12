@@ -28,6 +28,41 @@ fn spawned_task_runs_when_root_joins_and_wakes_root_on_completion() {
 }
 
 #[test]
+fn channel_handoff_suspends_and_resumes_entirely_inside_the_vm() {
+    let mut machine = fixtures::started_zero_arg(fixtures::channel_handoff_artifact());
+
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::I32(42))),
+        machine.run_slice(64, 0).unwrap(),
+    );
+    assert_eq!(0, machine.resource_snapshot().suspended_tasks);
+}
+
+#[test]
+fn channel_storage_is_rejected_before_machine_allocation_when_profile_is_too_small() {
+    let artifact = fixtures::channel_handoff_artifact();
+    let mut channel_profile = fixtures::profile();
+    channel_profile.maximum_channels = 0;
+    assert!(matches!(
+        ExecutionImage::admit(artifact.clone(), channel_profile),
+        Err(super::error::AdmissionError::ChannelLimit {
+            required: 1,
+            available: 0,
+        })
+    ));
+
+    let mut value_profile = fixtures::profile();
+    value_profile.maximum_channel_values = 0;
+    assert!(matches!(
+        ExecutionImage::admit(artifact, value_profile),
+        Err(super::error::AdmissionError::ChannelValueLimit {
+            required: 1,
+            available: 0,
+        })
+    ));
+}
+
+#[test]
 fn unused_class_does_not_run_its_initializer() {
     let mut machine =
         fixtures::started_zero_arg(fixtures::unused_failing_type_initializer_artifact());

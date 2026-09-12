@@ -22,6 +22,7 @@ use super::host::{RequestId, TaskId};
 pub(super) enum TaskWait {
     Host(RequestId),
     Join(TaskId),
+    Channel(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +151,10 @@ impl TaskScheduler {
         self.suspend(TaskWait::Host(request))
     }
 
+    pub(super) fn suspend_channel(&mut self, channel: u32) -> Result<TaskId, TaskError> {
+        self.suspend(TaskWait::Channel(channel))
+    }
+
     pub(super) fn join(&mut self, target: TaskId) -> Result<bool, TaskError> {
         let current = self.current()?;
         if current == target {
@@ -194,6 +199,15 @@ impl TaskScheduler {
     ) -> Result<(), TaskError> {
         let slot = self.slot(task).ok_or(TaskError::UnknownTask)?;
         if self.tasks[slot].state != TaskState::Waiting(TaskWait::Host(request)) {
+            return Err(TaskError::WrongWait);
+        }
+        self.tasks[slot].state = TaskState::Ready;
+        self.enqueue(slot)
+    }
+
+    pub(super) fn complete_channel(&mut self, task: TaskId, channel: u32) -> Result<(), TaskError> {
+        let slot = self.slot(task).ok_or(TaskError::UnknownTask)?;
+        if self.tasks[slot].state != TaskState::Waiting(TaskWait::Channel(channel)) {
             return Err(TaskError::WrongWait);
         }
         self.tasks[slot].state = TaskState::Ready;
