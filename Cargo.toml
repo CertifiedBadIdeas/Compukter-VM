@@ -2,6 +2,7 @@
 members = [
     ".",
     "ffi",
+    "jni",
     "tools/persistence-crash-fixture",
     "tools/runtime-bundler",
     "tools/xtask",
