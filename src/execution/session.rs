@@ -349,9 +349,15 @@ impl Session {
                 }),
             ),
             super::error::Outcome::Halted(value) => match value {
-                None => Ok(AdvanceOutcome::Halted(None)),
+                None => {
+                    self.pending_requests.clear();
+                    Ok(AdvanceOutcome::Halted(None))
+                }
                 Some(value) => match runtime_view(value) {
-                    Some(value) => Ok(AdvanceOutcome::Halted(Some(value))),
+                    Some(value) => {
+                        self.pending_requests.clear();
+                        Ok(AdvanceOutcome::Halted(Some(value)))
+                    }
                     None => self.establish_fault(super::error::VmFault::InvalidValueType),
                 },
             },
@@ -637,7 +643,7 @@ impl Session {
                 RequestTableError::RequestLimit => {
                     SessionTerminal::QuotaExhausted(QuotaExhaustion {
                         kind: QuotaKind::HostRequests,
-                        limit: u64::try_from(self.pending_requests.requests().len())
+                        limit: u64::try_from(self.pending_requests.maximum_requests())
                             .unwrap_or(u64::MAX),
                         consumed: u64::try_from(self.pending_requests.requests().len() + 1)
                             .unwrap_or(u64::MAX),

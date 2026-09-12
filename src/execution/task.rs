@@ -47,6 +47,15 @@ pub(super) enum TaskError {
     CorruptQueue,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct TaskSnapshot {
+    pub capacity: u64,
+    pub live: u64,
+    pub runnable: u64,
+    pub suspended: u64,
+    pub completed: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TaskRecord {
     id: Option<TaskId>,
@@ -217,6 +226,36 @@ impl TaskScheduler {
 
     pub(super) fn capacity(&self) -> usize {
         self.tasks.len()
+    }
+
+    pub(super) fn snapshot(&self) -> TaskSnapshot {
+        let mut snapshot = TaskSnapshot {
+            capacity: self.tasks.len() as u64,
+            ..TaskSnapshot::default()
+        };
+        for task in &self.tasks {
+            match task.state {
+                TaskState::Vacant => {}
+                TaskState::Ready | TaskState::Running => {
+                    snapshot.live += 1;
+                    snapshot.runnable += 1;
+                }
+                TaskState::Waiting(_) => {
+                    snapshot.live += 1;
+                    snapshot.suspended += 1;
+                }
+                TaskState::Completed => snapshot.completed += 1,
+            }
+        }
+        snapshot
+    }
+
+    pub(super) fn cancel_all(&mut self) {
+        self.tasks.fill(TaskRecord::EMPTY);
+        self.ready.fill(usize::MAX);
+        self.ready_head = 0;
+        self.ready_len = 0;
+        self.active = None;
     }
 
     pub(super) fn reserved_bytes(&self) -> usize {

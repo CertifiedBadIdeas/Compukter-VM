@@ -237,6 +237,11 @@ pub struct ComputerResourceSnapshot {
     pub heap_used_bytes: u64,
     pub live_objects: u64,
     pub mutable_execution_resident_bytes: u64,
+    pub task_capacity: u64,
+    pub live_tasks: u64,
+    pub runnable_tasks: u64,
+    pub suspended_tasks: u64,
+    pub completed_tasks: u64,
     pub filesystem_logical_bytes: u64,
     pub filesystem_logical_capacity_bytes: u64,
     pub filesystem_nodes: u32,
@@ -590,6 +595,31 @@ impl ComputerMachine {
             add_counter(
                 &mut snapshot.mutable_execution_resident_bytes,
                 resource.machine.mutable_resident_bytes,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.task_capacity,
+                resource.machine.task_capacity,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.live_tasks,
+                resource.machine.live_tasks,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.runnable_tasks,
+                resource.machine.runnable_tasks,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.suspended_tasks,
+                resource.machine.suspended_tasks,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.completed_tasks,
+                resource.machine.completed_tasks,
                 &mut snapshot.counters_saturated,
             );
         }
