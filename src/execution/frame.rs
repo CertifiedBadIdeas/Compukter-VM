@@ -164,9 +164,7 @@ impl FrameArena {
             .checked_add(frame.byte_len)
             .filter(|end| *end <= self.bytes.len() as u32)
             .ok_or(VmFault::CorruptLifecycle)?;
-        if !frame.base.is_multiple_of(8)
-            || frame.byte_len < 8
-            || !frame.byte_len.is_multiple_of(8)
+        if !frame.base.is_multiple_of(8) || frame.byte_len < 8 || !frame.byte_len.is_multiple_of(8)
         {
             return Err(VmFault::CorruptLifecycle);
         }
