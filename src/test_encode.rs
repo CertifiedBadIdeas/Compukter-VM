@@ -250,7 +250,8 @@ fn encode_manifest(value: &Manifest) -> Vec<u8> {
     }
     bytes.extend(value.compiler_abi);
     bytes.extend(value.platform_abi);
-    u64le(&mut bytes, 0);
+    u32le(&mut bytes, value.maximum_channels);
+    u32le(&mut bytes, value.maximum_channel_values);
     bytes
 }
 
@@ -942,6 +943,28 @@ fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeEr
             regs(&mut operands, &[*dst, *coroutine]);
             id(&mut operands, *resume_block);
             (0xe8, 0)
+        }
+        Instruction::ChannelCreate { dst, capacity } => {
+            regs(&mut operands, &[*dst, *capacity]);
+            (0x52, 0)
+        }
+        Instruction::ChannelSend {
+            channel,
+            value,
+            resume_block,
+        } => {
+            regs(&mut operands, &[*channel, *value]);
+            id(&mut operands, *resume_block);
+            (0xea, 0)
+        }
+        Instruction::ChannelReceive {
+            dst,
+            channel,
+            resume_block,
+        } => {
+            regs(&mut operands, &[*dst, *channel]);
+            id(&mut operands, *resume_block);
+            (0xeb, 0)
         }
         Instruction::CapabilityCallAsync {
             dst,

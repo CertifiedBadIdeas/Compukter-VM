@@ -1386,6 +1386,40 @@ fn task_instructions_require_runtime_abi_1_1() {
     super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default()).unwrap();
 }
 
+#[test]
+fn channel_instructions_require_runtime_abi_1_2_feature_and_manifest_limits() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.header.runtime_major = 1;
+    artifact.header.runtime_minor = 1;
+    artifact.header.semantic_features = (1 << 1) | (1 << 4);
+    artifact.manifest.maximum_channels = 1;
+    artifact.manifest.maximum_channel_values = 1;
+    artifact.modules[0].functions[0].flags |= 1;
+    if let crate::artifact::NominalType::Function { flags, .. } = &mut artifact.modules[0].types[0]
+    {
+        *flags |= 1;
+    }
+    artifact.modules[0].code[0].instructions = vec![crate::artifact::Instruction::ChannelSend {
+        channel: 0,
+        value: 0,
+        resume_block: 0,
+    }]
+    .into_boxed_slice();
+
+    let old = super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default())
+        .unwrap_err();
+    assert_eq!(old.first().unwrap().code, Code::BadModule);
+
+    artifact.header.runtime_minor = 2;
+    super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default()).unwrap();
+
+    artifact.manifest.maximum_channels = 0;
+    let missing_limits =
+        super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default())
+            .unwrap_err();
+    assert_eq!(missing_limits.first().unwrap().code, Code::BadModule);
+}
+
 fn exception_handler_artifact(reads_uninitialized_local: bool) -> crate::artifact::DecodedArtifact {
     let mut artifact = decoded(support::minimal_vector());
     artifact.header.semantic_features = 1;

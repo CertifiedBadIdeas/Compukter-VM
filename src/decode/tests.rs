@@ -93,7 +93,7 @@ fn container_rejects_non_zero_alignment_gap() {
 #[test]
 fn container_rejects_unknown_feature_bit() {
     let mut bytes = support::minimal_vector();
-    support::write_u32(&mut bytes, 20, 1 << 4);
+    support::write_u32(&mut bytes, 20, 1 << 5);
     support::rehash(&mut bytes);
     assert_eq!(error_code(bytes), Code::UnsupportedVersion);
 }
@@ -759,6 +759,7 @@ fn for_each_v1_opcode_case(mut check: impl FnMut(u8, u8, &[u8], bool)) {
         (0x42, 0, &[0xff, 0xff, 0, 0], false),
         (0x50, 0, &[0, 0, 0, 0], false),
         (0x51, 0, &[0xff, 0xff, 0, 0, 0], false),
+        (0x52, 0, r2, false),
         (0x60, 0, r2, false),
         (0x61, 0, r3, false),
         (0x62, 0, r3, false),
@@ -779,12 +780,28 @@ fn for_each_v1_opcode_case(mut check: impl FnMut(u8, u8, &[u8], bool)) {
         (0xe7, 0, &[0, 0, 0], true),
         (0xe8, 0, &[0xff, 0xff, 0, 0, 0], true),
         (0xe9, 0, &[0xff, 0xff, 0, 0, 0, 0], true),
+        (0xea, 0, &[0, 0, 1, 0, 0], true),
+        (0xeb, 0, &[0, 0, 1, 0, 0], true),
         (0xff, 0, &[], true),
     ];
 
     for &(opcode, form, operands, terminator) in cases {
         check(opcode, form, operands, terminator);
     }
+}
+
+#[test]
+fn manifest_decodes_channel_storage_limits_from_the_former_reserved_bytes() {
+    let mut bytes = support::minimal_vector();
+    let manifest = support::section_offset(&bytes, crate::artifact::format::MANIFEST, 0);
+    bytes[manifest + 104..manifest + 108].copy_from_slice(&3_u32.to_le_bytes());
+    bytes[manifest + 108..manifest + 112].copy_from_slice(&17_u32.to_le_bytes());
+    support::rehash(&mut bytes);
+
+    let decoded =
+        super::records::decode_artifact(Arc::from(bytes), &ArtifactLimits::default()).unwrap();
+    assert_eq!(decoded.manifest.maximum_channels, 3);
+    assert_eq!(decoded.manifest.maximum_channel_values, 17);
 }
 
 #[test]

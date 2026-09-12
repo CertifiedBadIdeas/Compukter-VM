@@ -239,6 +239,10 @@ fn decode_instruction(
                 args,
             }
         }
+        0x52 => Instruction::ChannelCreate {
+            dst: reg(&mut cursor, offset)?,
+            capacity: reg(&mut cursor, offset)?,
+        },
         0x60 => Instruction::StringLength {
             dst: reg(&mut cursor, offset)?,
             string: reg(&mut cursor, offset)?,
@@ -367,6 +371,16 @@ fn decode_instruction(
                 resume_block,
             }
         }
+        0xea => Instruction::ChannelSend {
+            channel: reg(&mut cursor, offset)?,
+            value: reg(&mut cursor, offset)?,
+            resume_block: id(&mut cursor, offset)?,
+        },
+        0xeb => Instruction::ChannelReceive {
+            dst: reg(&mut cursor, offset)?,
+            channel: reg(&mut cursor, offset)?,
+            resume_block: id(&mut cursor, offset)?,
+        },
         0xff => Instruction::Unreachable,
         _ => return Err(error(Code::BadInstruction, offset, "unknown opcode")),
     };
@@ -670,6 +684,8 @@ impl Instruction {
                 | Self::Yield { .. }
                 | Self::Sleep { .. }
                 | Self::CoroutineJoin { .. }
+                | Self::ChannelSend { .. }
+                | Self::ChannelReceive { .. }
                 | Self::CapabilityCallAsync { .. }
                 | Self::Unreachable
         )
@@ -695,6 +711,8 @@ impl Instruction {
             | Self::NewObject { .. }
             | Self::NewArray { .. }
             | Self::CoroutineJoin { .. } => 4,
+            Self::ChannelCreate { .. } => 3,
+            Self::ChannelSend { .. } | Self::ChannelReceive { .. } => 4,
             Self::Sleep { .. } => 3,
             Self::CallDirect { args, .. } => variable_cost(4, args.len())?,
             Self::CallVirtual { args, .. } | Self::CallSuspend { args, .. } => {

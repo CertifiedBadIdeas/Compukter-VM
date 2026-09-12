@@ -125,6 +125,8 @@ pub(crate) struct Manifest {
     pub optional_capabilities: u32,
     pub compiler_abi: [u8; 32],
     pub platform_abi: [u8; 32],
+    pub maximum_channels: u32,
+    pub maximum_channel_values: u32,
 }
 
 #[derive(Debug)]
@@ -643,6 +645,20 @@ pub(crate) enum Instruction {
     CoroutineJoin {
         dst: u16,
         coroutine: u16,
+        resume_block: u32,
+    },
+    ChannelCreate {
+        dst: u16,
+        capacity: u16,
+    },
+    ChannelSend {
+        channel: u16,
+        value: u16,
+        resume_block: u32,
+    },
+    ChannelReceive {
+        dst: u16,
+        channel: u16,
         resume_block: u32,
     },
     CapabilityCallAsync {

@@ -154,6 +154,8 @@ fn terminator_targets(instruction: &Instruction) -> Vec<u32> {
         | Instruction::Yield { resume_block }
         | Instruction::Sleep { resume_block, .. }
         | Instruction::CoroutineJoin { resume_block, .. }
+        | Instruction::ChannelSend { resume_block, .. }
+        | Instruction::ChannelReceive { resume_block, .. }
         | Instruction::CapabilityCallAsync { resume_block, .. } => vec![*resume_block],
         Instruction::Return { .. } | Instruction::Throw { .. } | Instruction::Unreachable => {
             Vec::new()

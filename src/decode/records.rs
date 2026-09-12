@@ -1446,22 +1446,12 @@ fn decode_manifest(
         .map_err(|error| single(limits, relocate(error, start)))?
         .try_into()
         .unwrap();
-    if cursor
-        .take(8)
-        .map_err(|error| single(limits, relocate(error, start)))?
-        .iter()
-        .any(|byte| *byte != 0)
-    {
-        return Err(single(
-            limits,
-            at(
-                Code::BadRecord,
-                format::MANIFEST,
-                start + 104,
-                "manifest reserved bytes are non-zero",
-            ),
-        ));
-    }
+    let maximum_channels = cursor
+        .read_u32()
+        .map_err(|error| single(limits, relocate(error, start)))?;
+    let maximum_channel_values = cursor
+        .read_u32()
+        .map_err(|error| single(limits, relocate(error, start)))?;
     Ok(Manifest {
         required_heap_bytes: values[0],
         required_stack_bytes: values[1],
@@ -1475,6 +1465,8 @@ fn decode_manifest(
         optional_capabilities: values[9],
         compiler_abi,
         platform_abi,
+        maximum_channels,
+        maximum_channel_values,
     })
 }
 
