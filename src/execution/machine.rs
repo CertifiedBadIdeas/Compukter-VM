@@ -155,6 +155,11 @@ pub(crate) struct MachineResourceSnapshot {
     pub heap_used_bytes: u64,
     pub live_objects: u64,
     pub mutable_resident_bytes: u64,
+    pub task_capacity: u64,
+    pub live_tasks: u64,
+    pub runnable_tasks: u64,
+    pub suspended_tasks: u64,
+    pub completed_tasks: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -844,6 +849,7 @@ impl Machine {
                             if current == TaskId::ROOT {
                                 let outcome = Outcome::Halted(returned);
                                 self.lifecycle = Lifecycle::Terminal(outcome);
+                                self.tasks.cancel_all();
                                 self.frame_depth = 0;
                                 return Ok(outcome);
                             }
@@ -2756,12 +2762,18 @@ impl Machine {
 
     pub(super) fn resource_snapshot(&self) -> MachineResourceSnapshot {
         let heap_capacity_bytes = self.image.storage_plan().heap_arena_bytes;
+        let tasks = self.tasks.snapshot();
         MachineResourceSnapshot {
             heap_capacity_bytes,
             heap_used_bytes: heap_capacity_bytes
                 .saturating_sub(u64::from(self.heap.total_free_bytes())),
             live_objects: u64::from(self.heap.live_objects()),
             mutable_resident_bytes: self.image.storage_plan().mutable_resident_bytes(),
+            task_capacity: tasks.capacity,
+            live_tasks: tasks.live,
+            runnable_tasks: tasks.runnable,
+            suspended_tasks: tasks.suspended,
+            completed_tasks: tasks.completed,
         }
     }
 

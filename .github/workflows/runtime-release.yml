@@ -91,6 +91,7 @@ jobs:
             --format filesystem-generation=1 \
             --format executable-revision=1 \
             --format compilation-request=1 \
+            --format resource-snapshot=2 \
             --output target/runtime-release
       - name: Upload temporary platform bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

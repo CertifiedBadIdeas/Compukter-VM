@@ -213,8 +213,19 @@ impl PendingRequestTable {
         self.requests.is_empty()
     }
 
+    pub(crate) const fn maximum_requests(&self) -> usize {
+        self.limits.maximum_requests
+    }
+
     pub(crate) fn requests(&self) -> &[PendingHostRequest] {
         &self.requests
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.requests.clear();
+        self.total_arguments = 0;
+        self.total_utf16 = 0;
+        self.total_merge_entries = 0;
     }
 
     pub(crate) fn get(&self, identity: HostRequestIdentity) -> Option<&PendingHostRequest> {

@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(11, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(12, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
@@ -65,18 +65,22 @@ fn resource_snapshot_is_fixed_bounded_and_handle_checked() {
         compukter_resource_snapshot(handle, output, capacity, written)
     });
 
-    assert_eq!(98, bytes.len());
-    assert_eq!(1, bytes[0]);
+    assert_eq!(138, bytes.len());
+    assert_eq!(2, bytes[0]);
     assert_eq!(0, bytes[1]);
     let heap_capacity = u64::from_le_bytes(bytes[42..50].try_into().unwrap());
     let heap_used = u64::from_le_bytes(bytes[50..58].try_into().unwrap());
-    let filesystem_capacity = u64::from_le_bytes(bytes[82..90].try_into().unwrap());
+    let task_capacity = u64::from_le_bytes(bytes[74..82].try_into().unwrap());
+    let live_tasks = u64::from_le_bytes(bytes[82..90].try_into().unwrap());
+    let filesystem_capacity = u64::from_le_bytes(bytes[122..130].try_into().unwrap());
     assert!(heap_capacity > 0);
     assert!(heap_used <= heap_capacity);
+    assert!(task_capacity > 0);
+    assert!(live_tasks <= task_capacity);
     assert!(filesystem_capacity > 0);
 
     assert_eq!(FfiStatus::Ok, compukter_close(handle));
-    let mut output = [0_u8; 98];
+    let mut output = [0_u8; 138];
     let mut written = 0_usize;
     assert_eq!(FfiStatus::StaleHandle, unsafe {
         compukter_resource_snapshot(handle, output.as_mut_ptr(), output.len(), &mut written)

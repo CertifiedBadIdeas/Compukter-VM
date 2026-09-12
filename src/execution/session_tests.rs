@@ -54,6 +54,11 @@ fn independent_tasks_publish_together_and_resume_out_of_order() {
     let mut session =
         Session::admit(fixtures::two_task_host_artifact(), profile(), &[binding]).unwrap();
     session.start(&[]).unwrap();
+    let started = session.resource_snapshot().machine;
+    assert_eq!(3, started.task_capacity);
+    assert_eq!(1, started.live_tasks);
+    assert_eq!(1, started.runnable_tasks);
+    assert_eq!(0, started.suspended_tasks);
 
     let AdvanceOutcome::HostRequestBatch(batch) = session.advance(64, 0).unwrap() else {
         panic!("tasks did not publish a host request batch")
@@ -66,6 +71,10 @@ fn independent_tasks_publish_together_and_resume_out_of_order() {
     assert_ne!(reader.task_id(), writer.task_id());
     let reader_identity = (reader.task_id(), reader.id());
     let writer_identity = (writer.task_id(), writer.id());
+    let waiting = session.resource_snapshot().machine;
+    assert_eq!(3, waiting.live_tasks);
+    assert_eq!(0, waiting.runnable_tasks);
+    assert_eq!(3, waiting.suspended_tasks);
 
     session
         .resume_for(
@@ -86,6 +95,11 @@ fn independent_tasks_publish_together_and_resume_out_of_order() {
         AdvanceOutcome::Halted(None),
         session.advance(64, 0).unwrap()
     );
+    let halted = session.resource_snapshot().machine;
+    assert_eq!(0, halted.live_tasks);
+    assert_eq!(0, halted.runnable_tasks);
+    assert_eq!(0, halted.suspended_tasks);
+    assert_eq!(0, halted.completed_tasks);
 }
 
 #[test]

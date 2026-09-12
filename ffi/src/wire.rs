@@ -17,12 +17,17 @@ pub(crate) fn encode_resource_snapshot(snapshot: ComputerResourceSnapshot) -> Ve
         snapshot.heap_used_bytes,
         snapshot.live_objects,
         snapshot.mutable_execution_resident_bytes,
+        snapshot.task_capacity,
+        snapshot.live_tasks,
+        snapshot.runnable_tasks,
+        snapshot.suspended_tasks,
+        snapshot.completed_tasks,
         snapshot.filesystem_logical_bytes,
         snapshot.filesystem_logical_capacity_bytes,
     ];
     let jvm_maximum = i64::MAX as u64;
     let saturated = snapshot.counters_saturated || values.iter().any(|value| *value > jvm_maximum);
-    let mut encoder = Encoder::new(1);
+    let mut encoder = Encoder::new(2);
     encoder.u8(u8::from(saturated));
     for value in values {
         encoder.u64(value.min(jvm_maximum));
