@@ -16,7 +16,10 @@
  * limitations under the License.
  */
 
-use crate::manifest::{expected_filename, RuntimeManifest, LINUX_TARGET, WINDOWS_TARGET};
+use crate::manifest::{
+    expected_filename, NativeLibrary, RuntimeManifest, FFI_TRANSPORT, JNI_TRANSPORT, LINUX_TARGET,
+    WINDOWS_TARGET,
+};
 use crate::version::RuntimeVersion;
 use flate2::{Compression, GzBuilder};
 use sha2::{Digest, Sha256};
@@ -42,7 +45,8 @@ pub struct BundleInputs<'a> {
     pub vm_commit: &'a str,
     pub rustc: &'a str,
     pub target: &'a str,
-    pub native_library: &'a Path,
+    pub ffi_library: &'a Path,
+    pub jni_library: &'a Path,
     pub license: &'a Path,
     pub notice: &'a Path,
     pub formats: BTreeMap<String, u32>,
@@ -66,25 +70,17 @@ impl From<io::Error> for BundleError {
 }
 
 pub fn create_bundle(inputs: &BundleInputs<'_>, output_dir: &Path) -> Result<PathBuf, BundleError> {
-    let expected_native = expected_filename(inputs.target)
-        .ok_or_else(|| BundleError(format!("unsupported runtime target: {}", inputs.target)))?;
-    require(
-        inputs
-            .native_library
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some(expected_native),
-        "native library filename does not match its target",
-    )?;
-
-    let native = read_regular_bounded(inputs.native_library, MAXIMUM_NATIVE_BYTES, "native")?;
+    let expected_ffi = require_library_filename(inputs.target, FFI_TRANSPORT, inputs.ffi_library)?;
+    let expected_jni = require_library_filename(inputs.target, JNI_TRANSPORT, inputs.jni_library)?;
+    let ffi = read_regular_bounded(inputs.ffi_library, MAXIMUM_NATIVE_BYTES, "FFI native")?;
+    let jni = read_regular_bounded(inputs.jni_library, MAXIMUM_NATIVE_BYTES, "JNI native")?;
     let license = read_regular_bounded(inputs.license, MAXIMUM_METADATA_BYTES, "license")?;
     let notice = read_regular_bounded(inputs.notice, MAXIMUM_METADATA_BYTES, "notice")?;
     require(!license.is_empty(), "runtime license must not be empty")?;
     require(!notice.is_empty(), "runtime notice must not be empty")?;
 
     let manifest = RuntimeManifest {
-        schema: 1,
+        schema: 2,
         runtime_version: inputs.runtime_version.to_string(),
         release_tag: inputs.release_tag.to_owned(),
         vm_commit: inputs.vm_commit.to_owned(),
@@ -92,9 +88,24 @@ pub fn create_bundle(inputs: &BundleInputs<'_>, output_dir: &Path) -> Result<Pat
         formats: inputs.formats.clone(),
         rustc: inputs.rustc.to_owned(),
         target: inputs.target.to_owned(),
-        filename: expected_native.to_owned(),
-        size: native.len() as u64,
-        sha256: sha256(&native),
+        libraries: BTreeMap::from([
+            (
+                FFI_TRANSPORT.to_owned(),
+                NativeLibrary {
+                    filename: expected_ffi.to_owned(),
+                    size: ffi.len() as u64,
+                    sha256: sha256(&ffi),
+                },
+            ),
+            (
+                JNI_TRANSPORT.to_owned(),
+                NativeLibrary {
+                    filename: expected_jni.to_owned(),
+                    size: jni.len() as u64,
+                    sha256: sha256(&jni),
+                },
+            ),
+        ]),
         profile: "release".to_owned(),
     };
     manifest
@@ -111,7 +122,8 @@ pub fn create_bundle(inputs: &BundleInputs<'_>, output_dir: &Path) -> Result<Pat
     require(!output.exists(), "runtime bundle output already exists")?;
     let mut temporary = NamedTempFile::new_in(output_dir)?;
     let entries = [
-        (format!("native/{expected_native}"), native.as_slice()),
+        (format!("native/{expected_ffi}"), ffi.as_slice()),
+        (format!("native/{expected_jni}"), jni.as_slice()),
         (MANIFEST_NAME.to_owned(), manifest_json.as_slice()),
         (LICENSE_NAME.to_owned(), license.as_slice()),
         (NOTICE_NAME.to_owned(), notice.as_slice()),
@@ -160,13 +172,17 @@ pub fn inspect_bundle(path: &Path) -> Result<RuntimeManifest, BundleError> {
         .validate_for(version, &version.tag(), manifest.ffi_abi)
         .map_err(BundleError)?;
 
-    let native_name = format!("native/{}", manifest.filename);
-    let expected = BTreeSet::from([
-        native_name.clone(),
+    let mut expected = BTreeSet::from([
         MANIFEST_NAME.to_owned(),
         LICENSE_NAME.to_owned(),
         NOTICE_NAME.to_owned(),
     ]);
+    expected.extend(
+        manifest
+            .libraries
+            .values()
+            .map(|library| format!("native/{}", library.filename)),
+    );
     require(
         contents.keys().cloned().collect::<BTreeSet<_>>() == expected,
         "runtime bundle entries do not match the fixed layout",
@@ -179,23 +195,44 @@ pub fn inspect_bundle(path: &Path) -> Result<RuntimeManifest, BundleError> {
         !contents.get(NOTICE_NAME).is_some_and(Vec::is_empty),
         "runtime notice must not be empty",
     )?;
-    let native = contents
-        .get(&native_name)
-        .ok_or_else(|| BundleError("runtime native payload is missing".to_owned()))?;
-    require(
-        native.len() as u64 == manifest.size,
-        "runtime native size does not match the manifest",
-    )?;
-    require(
-        sha256(native) == manifest.sha256,
-        "runtime native SHA-256 does not match the manifest",
-    )?;
+    for library in manifest.libraries.values() {
+        let native_name = format!("native/{}", library.filename);
+        let native = contents
+            .get(&native_name)
+            .ok_or_else(|| BundleError("runtime native payload is missing".to_owned()))?;
+        require(
+            native.len() as u64 == library.size,
+            "runtime native size does not match the manifest",
+        )?;
+        require(
+            sha256(native) == library.sha256,
+            "runtime native SHA-256 does not match the manifest",
+        )?;
+    }
     require(
         path.file_name().and_then(|name| name.to_str())
             == Some(bundle_filename(version, &manifest.target)?.as_str()),
         "runtime bundle filename does not match the manifest",
     )?;
     Ok(manifest)
+}
+
+fn require_library_filename<'a>(
+    target: &str,
+    transport: &str,
+    path: &'a Path,
+) -> Result<&'a str, BundleError> {
+    let expected = expected_filename(target, transport).ok_or_else(|| {
+        BundleError(format!(
+            "unsupported runtime target or transport: {target}/{transport}"
+        ))
+    })?;
+    let actual = path.file_name().and_then(|name| name.to_str());
+    require(
+        actual == Some(expected),
+        "native library filename does not match its target and transport",
+    )?;
+    Ok(actual.expect("validated native library filename"))
 }
 
 fn bundle_filename(version: RuntimeVersion, target: &str) -> Result<String, BundleError> {
@@ -297,7 +334,7 @@ fn read_tar_gz(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, BundleError> {
             contents.insert(name, bytes).is_none(),
             "runtime TAR contains duplicate entries",
         )?;
-        require(contents.len() <= 4, "runtime TAR contains too many entries")?;
+        require(contents.len() <= 5, "runtime TAR contains too many entries")?;
     }
     Ok(contents)
 }
@@ -305,7 +342,7 @@ fn read_tar_gz(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, BundleError> {
 fn read_zip(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, BundleError> {
     let mut archive = ZipArchive::new(File::open(path)?)
         .map_err(|error| BundleError(format!("failed to open ZIP bundle: {error}")))?;
-    require(archive.len() <= 4, "runtime ZIP contains too many entries")?;
+    require(archive.len() <= 5, "runtime ZIP contains too many entries")?;
     let mut contents = BTreeMap::new();
     for index in 0..archive.len() {
         let mut entry = archive
@@ -409,23 +446,27 @@ mod tests {
 
     struct Fixture {
         root: TempDir,
-        native: PathBuf,
+        ffi: PathBuf,
+        jni: PathBuf,
         license: PathBuf,
         notice: PathBuf,
     }
 
     impl Fixture {
-        fn new(filename: &str) -> Self {
+        fn new(ffi_filename: &str, jni_filename: &str) -> Self {
             let root = tempfile::tempdir().unwrap();
-            let native = root.path().join(filename);
+            let ffi = root.path().join(ffi_filename);
+            let jni = root.path().join(jni_filename);
             let license = root.path().join("LICENSE.txt");
             let notice = root.path().join("NOTICE.txt");
-            fs::write(&native, NATIVE_BYTES).unwrap();
+            fs::write(&ffi, NATIVE_BYTES).unwrap();
+            fs::write(&jni, b"JNI native archive fixture").unwrap();
             fs::write(&license, "license\n").unwrap();
             fs::write(&notice, "notice\n").unwrap();
             Self {
                 root,
-                native,
+                ffi,
+                jni,
                 license,
                 notice,
             }
@@ -438,7 +479,8 @@ mod tests {
                 vm_commit: COMMIT,
                 rustc: "rustc 1.98.0 (88d9e12ae 2026-08-18)",
                 target,
-                native_library: &self.native,
+                ffi_library: &self.ffi,
+                jni_library: &self.jni,
                 license: &self.license,
                 notice: &self.notice,
                 formats: BTreeMap::from([
@@ -453,7 +495,7 @@ mod tests {
 
     #[test]
     fn creates_and_reinspects_the_exact_linux_layout() {
-        let fixture = Fixture::new("libcompukter_ffi.so");
+        let fixture = Fixture::new("libcompukter_ffi.so", "libcompukter_jni.so");
         let bundle = create_bundle(&fixture.inputs(LINUX_TARGET), fixture.root.path()).unwrap();
 
         assert_eq!(
@@ -463,6 +505,7 @@ mod tests {
         assert_eq!(
             vec![
                 "native/libcompukter_ffi.so",
+                "native/libcompukter_jni.so",
                 "manifest.json",
                 "LICENSE.txt",
                 "NOTICE.txt",
@@ -470,13 +513,13 @@ mod tests {
             tar_entry_names(&bundle)
         );
         let manifest = inspect_bundle(&bundle).unwrap();
-        assert_eq!(NATIVE_BYTES.len() as u64, manifest.size);
+        assert_eq!(NATIVE_BYTES.len() as u64, manifest.libraries["ffi"].size);
         assert_eq!(LINUX_TARGET, manifest.target);
     }
 
     #[test]
     fn creates_and_reinspects_the_exact_windows_layout() {
-        let fixture = Fixture::new("compukter_ffi.dll");
+        let fixture = Fixture::new("compukter_ffi.dll", "compukter_jni.dll");
         let bundle = create_bundle(&fixture.inputs(WINDOWS_TARGET), fixture.root.path()).unwrap();
 
         assert_eq!(
@@ -486,6 +529,7 @@ mod tests {
         assert_eq!(
             vec![
                 "native/compukter_ffi.dll",
+                "native/compukter_jni.dll",
                 "manifest.json",
                 "LICENSE.txt",
                 "NOTICE.txt",
@@ -493,13 +537,13 @@ mod tests {
             zip_entry_names(&bundle)
         );
         let manifest = inspect_bundle(&bundle).unwrap();
-        assert_eq!(NATIVE_BYTES.len() as u64, manifest.size);
+        assert_eq!(NATIVE_BYTES.len() as u64, manifest.libraries["ffi"].size);
         assert_eq!(WINDOWS_TARGET, manifest.target);
     }
 
     #[test]
     fn rejects_a_target_filename_mismatch_before_writing_output() {
-        let fixture = Fixture::new("compukter_ffi.dll");
+        let fixture = Fixture::new("compukter_ffi.dll", "libcompukter_jni.so");
 
         assert!(create_bundle(&fixture.inputs(LINUX_TARGET), fixture.root.path()).is_err());
         assert!(!fixture
@@ -511,11 +555,11 @@ mod tests {
 
     #[test]
     fn emits_reproducible_linux_and_windows_archives() {
-        for (target, filename) in [
-            (LINUX_TARGET, "libcompukter_ffi.so"),
-            (WINDOWS_TARGET, "compukter_ffi.dll"),
+        for (target, ffi_filename, jni_filename) in [
+            (LINUX_TARGET, "libcompukter_ffi.so", "libcompukter_jni.so"),
+            (WINDOWS_TARGET, "compukter_ffi.dll", "compukter_jni.dll"),
         ] {
-            let fixture = Fixture::new(filename);
+            let fixture = Fixture::new(ffi_filename, jni_filename);
             let first_dir = fixture.root.path().join("first");
             let second_dir = fixture.root.path().join("second");
             let first = create_bundle(&fixture.inputs(target), &first_dir).unwrap();
@@ -527,7 +571,7 @@ mod tests {
 
     #[test]
     fn inspection_rejects_an_extra_archive_entry() {
-        let fixture = Fixture::new("compukter_ffi.dll");
+        let fixture = Fixture::new("compukter_ffi.dll", "compukter_jni.dll");
         let bundle = create_bundle(&fixture.inputs(WINDOWS_TARGET), fixture.root.path()).unwrap();
         let file = OpenOptions::new()
             .read(true)

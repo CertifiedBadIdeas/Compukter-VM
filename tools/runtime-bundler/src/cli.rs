@@ -37,7 +37,8 @@ pub struct PackageCommand {
     pub tag: String,
     pub commit: String,
     pub target: String,
-    pub library: PathBuf,
+    pub ffi_library: PathBuf,
+    pub jni_library: PathBuf,
     pub license: PathBuf,
     pub notice: PathBuf,
     pub rustc: String,
@@ -73,7 +74,8 @@ pub fn execute(command: Command) -> Result<String, String> {
     match command {
         Command::Package(package) => {
             let version = read_runtime_version(&package.version_file)?;
-            require_ffi_abi(&package.library, version.abi).map_err(|error| error.to_string())?;
+            require_ffi_abi(&package.ffi_library, version.abi)
+                .map_err(|error| error.to_string())?;
             let bundle = create_bundle(
                 &BundleInputs {
                     runtime_version: version,
@@ -81,7 +83,8 @@ pub fn execute(command: Command) -> Result<String, String> {
                     vm_commit: &package.commit,
                     rustc: &package.rustc,
                     target: &package.target,
-                    native_library: &package.library,
+                    ffi_library: &package.ffi_library,
+                    jni_library: &package.jni_library,
                     license: &package.license,
                     notice: &package.notice,
                     formats: package.formats,
@@ -107,7 +110,8 @@ fn parse_package(arguments: Vec<String>) -> Result<Command, String> {
     let mut tag = None;
     let mut commit = None;
     let mut target = None;
-    let mut library = None;
+    let mut ffi_library = None;
+    let mut jni_library = None;
     let mut license = None;
     let mut notice = None;
     let mut rustc = None;
@@ -125,7 +129,8 @@ fn parse_package(arguments: Vec<String>) -> Result<Command, String> {
             "--tag" => set_once(&mut tag, value, flag)?,
             "--commit" => set_once(&mut commit, value, flag)?,
             "--target" => set_once(&mut target, value, flag)?,
-            "--library" => set_once(&mut library, PathBuf::from(value), flag)?,
+            "--ffi-library" => set_once(&mut ffi_library, PathBuf::from(value), flag)?,
+            "--jni-library" => set_once(&mut jni_library, PathBuf::from(value), flag)?,
             "--license" => set_once(&mut license, PathBuf::from(value), flag)?,
             "--notice" => set_once(&mut notice, PathBuf::from(value), flag)?,
             "--rustc" => set_once(&mut rustc, value, flag)?,
@@ -145,7 +150,8 @@ fn parse_package(arguments: Vec<String>) -> Result<Command, String> {
         tag: required(tag, "--tag")?,
         commit: required(commit, "--commit")?,
         target: required(target, "--target")?,
-        library: required(library, "--library")?,
+        ffi_library: required(ffi_library, "--ffi-library")?,
+        jni_library: required(jni_library, "--jni-library")?,
         license: required(license, "--license")?,
         notice: required(notice, "--notice")?,
         rustc: required(rustc, "--rustc")?,
@@ -232,8 +238,10 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567",
             "--target",
             "x86_64-unknown-linux-gnu",
-            "--library",
+            "--ffi-library",
             "target/release/libcompukter_ffi.so",
+            "--jni-library",
+            "target/release/libcompukter_jni.so",
             "--license",
             "LICENSE",
             "--notice",
@@ -251,6 +259,14 @@ mod tests {
 
         let package = command.package().unwrap();
         assert_eq!("v0.5.1", package.tag);
+        assert_eq!(
+            std::path::Path::new("target/release/libcompukter_ffi.so"),
+            package.ffi_library
+        );
+        assert_eq!(
+            std::path::Path::new("target/release/libcompukter_jni.so"),
+            package.jni_library
+        );
         assert_eq!(Some(&2), package.formats.get("artifact"));
         assert_eq!(Some(&1), package.formats.get("filesystem-generation"));
     }

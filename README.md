@@ -87,19 +87,22 @@ compukter-runtime-0.10.0-windows-x86_64.zip
 compukter-runtime-0.10.0-checksums.sha256
 ```
 
-Each platform archive has one fixed, self-describing layout:
+Each platform archive has one fixed, self-describing layout containing both
+supported JVM transports:
 
 ```text
-native/<platform library>
+native/<platform FFI library>
+native/<platform JNI library>
 manifest.json
 LICENSE.txt
 NOTICE.txt
 ```
 
 The manifest binds the Runtime version and tag, full VM commit, FFI ABI,
-external format versions, pinned Rust compiler, target, native filename, byte
-size, SHA-256, and release profile. Consumers must pin both the exact Runtime
-release and the exact VM commit from that manifest. Published assets are
+external format versions, pinned Rust compiler, target, release profile, and
+the canonical filename, byte size, and SHA-256 of each transport library.
+Consumers must pin both the exact Runtime release and the exact VM commit from
+that manifest. Published assets are
 immutable; a compatible replacement is a new revision such as `0.10.1`, never
 an overwrite of `0.10.0`.
 
