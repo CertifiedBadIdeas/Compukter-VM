@@ -22,6 +22,7 @@ pub(super) enum CollectorPhase {
 pub(super) struct RootSet<'a> {
     pub statics: &'a StaticArena,
     pub frames: &'a [Frame],
+    pub saved_frames: &'a [Frame],
     pub frame_arena: &'a FrameArena,
     pub frame_depth: usize,
     pub runtime_roots: &'a [Option<Ref32>],
@@ -59,6 +60,7 @@ pub(super) struct Collector {
     external_root: usize,
     static_field: usize,
     frame: usize,
+    saved_frame: usize,
     register: usize,
     gray_head: Option<u32>,
     gray_tail: Option<u32>,
@@ -77,6 +79,7 @@ impl Collector {
             external_root: 0,
             static_field: 0,
             frame: 0,
+            saved_frame: 0,
             register: 0,
             gray_head: None,
             gray_tail: None,
@@ -95,6 +98,7 @@ impl Collector {
         self.external_root = 0;
         self.static_field = 0;
         self.frame = 0;
+        self.saved_frame = 0;
         self.register = 0;
         self.gray_head = None;
         self.gray_tail = None;
@@ -222,6 +226,37 @@ impl Collector {
                 ));
             }
             self.frame += 1;
+            self.register = 0;
+        }
+        while self.saved_frame < roots.saved_frames.len() {
+            let frame = roots
+                .saved_frames
+                .get(self.saved_frame)
+                .ok_or(VmFault::CorruptLifecycle)?;
+            if frame.function == usize::MAX {
+                self.saved_frame += 1;
+                self.register = 0;
+                continue;
+            }
+            let boundary = u32::try_from(frame.instruction).map_err(|_| VmFault::InvalidRootMap)?;
+            let map = image
+                .safepoint_map(frame.function, frame.block, boundary)
+                .ok_or(VmFault::InvalidRootMap)?;
+            if self.register < map.reference_offsets.len() {
+                let offset = map.reference_offsets[self.register];
+                self.register += 1;
+                let reference = roots.frame_arena.read_ref32_offset(
+                    super::frame::FrameReservation {
+                        base: frame.base,
+                        byte_len: frame.byte_len,
+                    },
+                    offset,
+                )?;
+                return Ok(Some(
+                    reference.map_or(RuntimeValue::Null, RuntimeValue::Reference),
+                ));
+            }
+            self.saved_frame += 1;
             self.register = 0;
         }
         Ok(None)

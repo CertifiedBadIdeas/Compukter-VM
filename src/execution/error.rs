@@ -6,6 +6,7 @@ pub enum ResidentStorageComponent {
     HeapAllocator,
     FrameArena,
     FrameRecords,
+    TaskScheduler,
     Statics,
     TypeInitialization,
     ExternalRoots,
@@ -169,6 +170,7 @@ pub enum VmFault {
 pub(super) enum Outcome {
     SliceExhausted,
     HostRequest,
+    TasksWaiting,
     AllocationExhausted(AllocationExhaustion),
     Halted(Option<RuntimeValue>),
     Crashed(GuestTrap),
@@ -177,7 +179,10 @@ pub(super) enum Outcome {
 
 impl Outcome {
     pub(super) fn is_terminal(self) -> bool {
-        !matches!(self, Self::SliceExhausted | Self::HostRequest)
+        !matches!(
+            self,
+            Self::SliceExhausted | Self::HostRequest | Self::TasksWaiting
+        )
     }
 }
 

@@ -78,6 +78,8 @@ pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, Enc
     }
     assemble(
         sections,
+        artifact.header.runtime_major,
+        artifact.header.runtime_minor,
         artifact.header.semantic_features,
         artifact.header.entry_module,
         artifact.header.entry_function,
@@ -1082,6 +1084,8 @@ fn semantic_hash(sections: &[ModuleSection]) -> [u8; 32] {
 
 fn assemble(
     sections: Vec<Section>,
+    runtime_major: u16,
+    runtime_minor: u16,
     semantic_features: u32,
     entry_module: u32,
     entry_function: u32,
@@ -1116,7 +1120,14 @@ fn assemble(
 
     let mut bytes = Vec::new();
     bytes.extend(b"CPKT");
-    for value in [format::FORMAT_MAJOR, 0, 1, 0, 64, 32] {
+    for value in [
+        format::FORMAT_MAJOR,
+        0,
+        runtime_major,
+        runtime_minor,
+        64,
+        32,
+    ] {
         u16le(&mut bytes, value);
     }
     u32le(

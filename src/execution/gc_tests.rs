@@ -109,6 +109,7 @@ fn collect_with_external_roots(
                     RootSet {
                         statics: &statics,
                         frames: &frames,
+                        saved_frames: &[],
                         frame_arena: &frame_arena,
                         frame_depth: frames.len(),
                         runtime_roots: &[],
@@ -192,6 +193,7 @@ fn collector_keeps_explicit_pending_runtime_roots() {
                 RootSet {
                     statics: &statics,
                     frames: &[],
+                    saved_frames: &[],
                     frame_arena: &frame_arena,
                     frame_depth: 0,
                     runtime_roots: &runtime_roots,
@@ -265,6 +267,7 @@ fn collector_faults_on_missing_or_out_of_frame_root_maps() {
                 RootSet {
                     statics: &statics,
                     frames: &frames,
+                    saved_frames: &[],
                     frame_arena: &frame_arena,
                     frame_depth: 1,
                     runtime_roots: &[],
@@ -316,6 +319,7 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                 RootSet {
                     statics: &statics,
                     frames: &frames,
+                    saved_frames: &[],
                     frame_arena: &frame_arena,
                     frame_depth: 1,
                     runtime_roots: &[],
@@ -337,6 +341,7 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                     RootSet {
                         statics: &statics,
                         frames: &frames,
+                        saved_frames: &[],
                         frame_arena: &frame_arena,
                         frame_depth: 1,
                         runtime_roots: &[],
@@ -359,6 +364,7 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                 RootSet {
                     statics: &statics,
                     frames: &frames,
+                    saved_frames: &[],
                     frame_arena: &frame_arena,
                     frame_depth: 1,
                     runtime_roots: &[],
@@ -855,6 +861,7 @@ fn collector_steady_state_allocates_nothing() {
                 RootSet {
                     statics: &statics,
                     frames: &frames,
+                    saved_frames: &[],
                     frame_arena: &frame_arena,
                     frame_depth: 1,
                     runtime_roots: &[],
@@ -924,6 +931,7 @@ fn managed_heap_performance_gc_units() {
                         RootSet {
                             statics: &statics,
                             frames: &frames,
+                            saved_frames: &[],
                             frame_arena: &frame_arena,
                             frame_depth: 1,
                             runtime_roots: &[],
@@ -985,6 +993,7 @@ fn managed_heap_performance_gc_units() {
                     RootSet {
                         statics: &leaf_statics,
                         frames: &leaf_frames,
+                        saved_frames: &[],
                         frame_arena: &leaf_frame_arena,
                         frame_depth: 1,
                         runtime_roots: &[],

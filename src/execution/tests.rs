@@ -17,6 +17,17 @@ fn active_static_get_runs_its_class_initializer_exactly_once() {
 }
 
 #[test]
+fn spawned_task_runs_when_root_joins_and_wakes_root_on_completion() {
+    let mut machine = fixtures::started_zero_arg(fixtures::task_spawn_join_artifact());
+
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(10, 0).unwrap());
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::I32(42))),
+        machine.run_slice(10, 0).unwrap(),
+    );
+}
+
+#[test]
 fn unused_class_does_not_run_its_initializer() {
     let mut machine =
         fixtures::started_zero_arg(fixtures::unused_failing_type_initializer_artifact());

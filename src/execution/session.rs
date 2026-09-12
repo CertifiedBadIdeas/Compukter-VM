@@ -244,6 +244,7 @@ impl Session {
     ) -> Result<AdvanceOutcome<'_>, RunError> {
         match outcome {
             super::error::Outcome::SliceExhausted => Ok(AdvanceOutcome::SliceExhausted),
+            super::error::Outcome::TasksWaiting => Ok(AdvanceOutcome::SliceExhausted),
             super::error::Outcome::HostRequest => self.begin_request(),
             super::error::Outcome::AllocationExhausted(exhaustion) => Ok(
                 AdvanceOutcome::AllocationExhausted(ManagedAllocationFailure {

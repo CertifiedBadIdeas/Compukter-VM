@@ -16,6 +16,7 @@ use super::{
         object_layout, FieldSpec, RuntimeTypeLayout, StorageCharges, StoragePlan, ValueWidth,
     },
     machine::{Frame, Machine, TypeInitializationState},
+    task::TaskScheduler,
     value::{Ref32, RuntimeValue},
     FunctionKey, TypeKey,
 };
@@ -320,6 +321,15 @@ pub(super) enum ResolvedInstruction {
         args: Box<[u16]>,
         resume_block: usize,
     },
+    TaskSpawn {
+        dst: u16,
+        target: usize,
+        args: Box<[u16]>,
+    },
+    TaskJoin {
+        task: u16,
+        resume_block: usize,
+    },
     CapabilityCallSync {
         dst: u16,
         capability: u32,
@@ -414,6 +424,7 @@ struct ExecutionImageInner {
     storage_plan: StoragePlan,
     registers_per_frame: usize,
     maximum_call_depth: usize,
+    maximum_coroutines: usize,
     external_root_capacity: u32,
     minimum_slice_cost: u32,
     maximum_slice_budget: u32,
@@ -666,11 +677,18 @@ impl ExecutionImage {
                 component: ResidentStorageComponent::FrameArena,
             },
         )?;
+        let maximum_coroutines = u64::from(decoded.manifest.maximum_coroutines);
         let frame_record_bytes = (core::mem::size_of::<Frame>() as u64)
             .checked_mul(maximum_call_depth)
+            .and_then(|bytes| bytes.checked_mul(maximum_coroutines.checked_add(1)?))
             .ok_or(AdmissionError::ResidentStorageOverflow {
                 component: ResidentStorageComponent::FrameRecords,
             })?;
+        let task_scheduler_bytes = TaskScheduler::resident_bytes(maximum_coroutines).ok_or(
+            AdmissionError::ResidentStorageOverflow {
+                component: ResidentStorageComponent::TaskScheduler,
+            },
+        )?;
         let static_bytes = align_u64(u64::from(static_layout.byte_len), 8)?;
         let type_initialization_bytes = (core::mem::size_of::<TypeInitializationState>() as u64)
             .checked_mul(checked_u32(type_layouts.len())?.into())
@@ -684,6 +702,7 @@ impl ExecutionImage {
             heap_allocator_bytes: Heap::allocator_resident_bytes(),
             frame_arena_bytes,
             frame_record_bytes,
+            task_scheduler_bytes,
             static_bytes,
             type_initialization_bytes,
             external_root_bytes,
@@ -778,6 +797,7 @@ impl ExecutionImage {
             storage_plan,
             registers_per_frame,
             maximum_call_depth: decoded.manifest.maximum_call_depth as usize,
+            maximum_coroutines: decoded.manifest.maximum_coroutines as usize,
             external_root_capacity: decoded.manifest.maximum_host_requests,
             minimum_slice_cost: decoded.manifest.minimum_slice_cost,
             maximum_slice_budget: profile.maximum_slice_budget,
@@ -860,6 +880,10 @@ impl ExecutionImage {
 
     pub(super) fn maximum_call_depth(&self) -> usize {
         self.0.maximum_call_depth
+    }
+
+    pub(super) fn maximum_coroutines(&self) -> usize {
+        self.0.maximum_coroutines
     }
 
     pub(super) fn external_root_capacity(&self) -> u32 {
@@ -2029,6 +2053,35 @@ fn resolve_instruction(
                 dst: *dst,
                 target,
                 args: args.clone(),
+                resume_block: block(*resume_block)?,
+            }
+        }
+        Instruction::CoroutineSpawn {
+            dst,
+            function_ref,
+            args,
+        } => {
+            let key = resolve_function(artifact, module, *function_ref)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let target = resolution.function_offsets[key.module as usize]
+                .checked_add(key.function as usize)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            ResolvedInstruction::TaskSpawn {
+                dst: *dst,
+                target,
+                args: args.clone(),
+            }
+        }
+        Instruction::CoroutineJoin {
+            dst,
+            coroutine,
+            resume_block,
+        } => {
+            if *dst != u16::MAX {
+                return Err(AdmissionError::InvalidEntry);
+            }
+            ResolvedInstruction::TaskJoin {
+                task: *coroutine,
                 resume_block: block(*resume_block)?,
             }
         }

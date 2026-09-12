@@ -9,6 +9,8 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Header {
+    pub runtime_major: u16,
+    pub runtime_minor: u16,
     pub section_count: u32,
     pub semantic_features: u32,
     pub payload_end: u64,
@@ -200,6 +202,8 @@ fn decode_header(bytes: &[u8], limits: &ArtifactLimits) -> Result<Header, Diagno
     }
 
     Ok(Header {
+        runtime_major,
+        runtime_minor,
         section_count,
         semantic_features,
         payload_end,
