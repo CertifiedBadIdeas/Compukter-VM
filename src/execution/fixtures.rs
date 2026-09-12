@@ -371,7 +371,7 @@ pub(super) fn channel_handoff_artifact() -> VerifiedArtifact {
     })
 }
 
-pub(super) fn two_task_host_artifact() -> VerifiedArtifact {
+pub(crate) fn two_task_host_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let unit_type = primitive(0);
         let i32_type = primitive(1);
@@ -489,6 +489,197 @@ pub(super) fn two_task_host_artifact() -> VerifiedArtifact {
         artifact.manifest.maximum_call_depth = 1;
         artifact.manifest.required_stack_bytes = 16;
     })
+}
+
+pub(crate) fn redstone_wait_and_external_request_artifact() -> VerifiedArtifact {
+    internal_wait_and_external_request_artifact(b"redstone", 1, 8, 1, Some(0), true)
+}
+
+pub(crate) fn external_request_then_redstone_wait_artifact() -> VerifiedArtifact {
+    internal_wait_and_external_request_artifact(b"redstone", 1, 8, 1, Some(0), false)
+}
+
+pub(crate) fn raw_terminal_wait_and_external_request_artifact() -> VerifiedArtifact {
+    internal_wait_and_external_request_artifact(b"terminal", 2, 14, 3, None, true)
+}
+
+fn internal_wait_and_external_request_artifact(
+    internal_name: &[u8],
+    internal_abi_major: u16,
+    internal_operation_count: u32,
+    internal_operation: u32,
+    argument: Option<i32>,
+    waiter_first: bool,
+) -> VerifiedArtifact {
+    let mut decoded = crate::decode::records::decode_artifact(
+        Arc::from(crate::test_support::minimal_vector()),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let mut bytes = decoded.bytes.to_vec();
+    decoded.modules[0].strings = [b"app".as_slice(), b"compukter", b"entry", internal_name]
+        .into_iter()
+        .map(|value| {
+            let start = bytes.len();
+            bytes.extend_from_slice(value);
+            ByteRange {
+                start,
+                end: bytes.len(),
+            }
+        })
+        .collect();
+    decoded.bytes = Arc::from(bytes);
+    let unit_type = primitive(0);
+    let i32_type = primitive(1);
+    decoded.header.runtime_major = 1;
+    decoded.header.runtime_minor = 1;
+    decoded.header.semantic_features = 0b110;
+    decoded.manifest.maximum_coroutines = 3;
+    decoded.manifest.maximum_host_requests = 2;
+    decoded.manifest.required_capabilities = 2;
+    decoded.capabilities = vec![
+        Capability {
+            namespace: 0,
+            name: 2,
+            abi_major: 1,
+            minimum_abi_minor: 0,
+            flags: 1,
+            operation_count: 1,
+        },
+        Capability {
+            namespace: 1,
+            name: 3,
+            abi_major: internal_abi_major,
+            minimum_abi_minor: 0,
+            flags: 1,
+            operation_count: internal_operation_count,
+        },
+    ];
+    decoded.modules[0].types = (0..3)
+        .map(|_| NominalType::Function {
+            name: 1,
+            flags: 1,
+            result: unit_type,
+            parameters: Vec::new(),
+        })
+        .collect();
+    decoded.modules[0].declared_types = 3;
+    decoded.modules[0].constants = argument.into_iter().map(Constant::I32).collect();
+    let mut root = function(0, 0, vec![i32_type, i32_type], 0);
+    root.flags = 1;
+    root.block_count = 3;
+    let waiter_registers = if argument.is_some() {
+        vec![i32_type, i32_type]
+    } else {
+        vec![i32_type]
+    };
+    let mut waiter = function(1, 0, waiter_registers, 3);
+    waiter.flags = 1;
+    waiter.block_count = 2;
+    let mut caller = function(2, 0, Vec::new(), 5);
+    caller.flags = 1;
+    caller.block_count = 2;
+    decoded.modules[0].functions = vec![root, waiter, caller];
+    decoded.modules[0].declared_functions = 3;
+    let waiter_spawn = Instruction::CoroutineSpawn {
+        dst: 0,
+        function_ref: 1,
+        args: Box::new([]),
+    };
+    let caller_spawn = Instruction::CoroutineSpawn {
+        dst: 1,
+        function_ref: 2,
+        args: Box::new([]),
+    };
+    let spawns = if waiter_first {
+        [waiter_spawn, caller_spawn]
+    } else {
+        [caller_spawn, waiter_spawn]
+    };
+    let [first_spawn, second_spawn] = spawns;
+    let programs = vec![
+        (
+            FunctionId(0),
+            vec![
+                first_spawn,
+                second_spawn,
+                Instruction::CoroutineJoin {
+                    dst: u16::MAX,
+                    coroutine: 0,
+                    resume_block: 1,
+                },
+            ],
+        ),
+        (
+            FunctionId(0),
+            vec![Instruction::CoroutineJoin {
+                dst: u16::MAX,
+                coroutine: 1,
+                resume_block: 2,
+            }],
+        ),
+        (FunctionId(0), vec![Instruction::Return { value: u16::MAX }]),
+        (FunctionId(1), {
+            let mut instructions = Vec::new();
+            let (destination, arguments) = if argument.is_some() {
+                instructions.push(Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                });
+                (1, vec![0].into_boxed_slice())
+            } else {
+                (0, Vec::<u16>::new().into_boxed_slice())
+            };
+            instructions.push(Instruction::CapabilityCallAsync {
+                dst: destination,
+                capability: 1,
+                operation: internal_operation,
+                args: arguments,
+                resume_block: 4,
+            });
+            instructions
+        }),
+        (FunctionId(1), vec![Instruction::Return { value: u16::MAX }]),
+        (
+            FunctionId(2),
+            vec![Instruction::CapabilityCallAsync {
+                dst: u16::MAX,
+                capability: 0,
+                operation: 0,
+                args: Box::new([]),
+                resume_block: 6,
+            }],
+        ),
+        (FunctionId(2), vec![Instruction::Return { value: u16::MAX }]),
+    ];
+    let mut maximum_block_cost = 0;
+    decoded.modules[0].blocks.clear();
+    decoded.modules[0].code.clear();
+    for (block_id, (owner, instructions)) in programs.into_iter().enumerate() {
+        let fixed_cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        maximum_block_cost = maximum_block_cost.max(fixed_cost);
+        decoded.modules[0].blocks.push(Block {
+            owner_function: owner,
+            code_record: BlockId(block_id as u32),
+            instruction_count: instructions.len() as u32,
+            declared_fixed_cost: fixed_cost,
+            flags: 0,
+        });
+        decoded.modules[0].code.push(DecodedCode {
+            bytes: ByteRange { start: 0, end: 0 },
+            instructions: instructions.into_boxed_slice(),
+            fixed_cost,
+        });
+    }
+    decoded.manifest.maximum_block_cost = maximum_block_cost;
+    decoded.manifest.minimum_slice_cost = maximum_block_cost;
+    decoded.manifest.maximum_call_depth = 1;
+    decoded.manifest.required_stack_bytes = 16;
+    let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
 
 pub(super) fn recursive_suspend_artifact(maximum_call_depth: u32) -> VerifiedArtifact {

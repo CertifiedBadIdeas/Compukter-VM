@@ -342,6 +342,7 @@ struct ProcessFrame {
 #[derive(Debug)]
 struct CompilationTransaction {
     token: u64,
+    task: TaskId,
     request: RequestId,
     owner_depth: usize,
     source: VirtualPath,
@@ -928,29 +929,34 @@ impl ComputerMachine {
         maintenance_budget: u32,
         host_request_budget: u32,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
-        if self.pending_compilation.is_some() {
+        if self.active_frame().pending_stdio_read.is_some()
+            && self.advance_pending_stdio()? != ComputerAdvanceOutcome::WaitingForTerminalEvent
+        {
             return Ok(ComputerAdvanceOutcome::SliceExhausted);
-        }
-        if self.active_frame().pending_stdio_read.is_some() {
-            return self.advance_pending_stdio();
         }
         if let Some((task, request)) = self.active_frame().pending_terminal_event {
-            let Some(kind) = self.terminal_await_event_for(task)? else {
-                return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
-            };
-            self.active_session_mut()
-                .resume_internal_for(
-                    task,
-                    request,
-                    HostResponse::Success(HostValueInput::I32(kind as i32)),
-                )
-                .map_err(ComputerError::Resume)?;
-            self.active_frame_mut().pending_terminal_event = None;
-            return Ok(ComputerAdvanceOutcome::SliceExhausted);
+            if let Some(kind) = self.terminal_await_event_for(task)? {
+                self.active_session_mut()
+                    .resume_internal_for(
+                        task,
+                        request,
+                        HostResponse::Success(HostValueInput::I32(kind as i32)),
+                    )
+                    .map_err(ComputerError::Resume)?;
+                self.active_frame_mut().pending_terminal_event = None;
+                return Ok(ComputerAdvanceOutcome::SliceExhausted);
+            }
         }
-        let internal = {
+        let pending_stdio_read = self.active_frame().pending_stdio_read;
+        let pending_terminal_event = self.active_frame().pending_terminal_event;
+        let compilation_pending = self.pending_compilation.is_some();
+        let redstone = &self.redstone;
+        let (internal, external) = {
             let outcome = self
-                .active_session_mut()
+                .sessions
+                .last_mut()
+                .expect("a computer always has a root process")
+                .session
                 .advance(guest_budget, maintenance_budget)
                 .map_err(ComputerError::Run)?;
             match outcome {
@@ -958,51 +964,66 @@ impl ComputerMachine {
                     if batch.is_empty() {
                         return Err(ComputerError::Run(RunError::NotRunnable));
                     }
+                    let allowed = usize::try_from(host_request_budget).unwrap_or(usize::MAX);
+                    let mut external = Vec::new();
                     let mut internal = None;
+                    let is_parked = |request: HostRequestView<'_>| {
+                        let identity = (request.task_id(), request.id());
+                        (is_raw_terminal(request) && pending_terminal_event == Some(identity))
+                            || (is_stdio(request) && pending_stdio_read == Some(identity))
+                            || (is_compiler(request) && compilation_pending)
+                            || (is_redstone_local(request)
+                                && redstone.contains_waiter(identity.0, identity.1))
+                    };
                     for index in 0..batch.len() {
                         let request = batch
                             .get(index)
                             .ok_or(ComputerError::Run(RunError::NotRunnable))?;
-                        internal = if is_raw_terminal(request) {
-                            Some(copy_raw_terminal_request(request)?)
-                        } else if is_stdio(request) {
-                            Some(copy_stdio_request(request)?)
-                        } else if is_filesystem(request) {
-                            Some(copy_filesystem_request(request)?)
-                        } else if is_process(request) {
-                            Some(copy_process_request(request)?)
-                        } else if is_compiler(request) {
-                            Some(copy_compiler_request(request)?)
-                        } else if is_redstone_local(request) {
-                            Some(copy_redstone_request(request)?)
-                        } else {
-                            None
-                        };
-                        if internal.is_some() {
-                            break;
+                        if is_parked(request)
+                            || !is_redstone_local(request)
+                            || request.operation() != 1
+                        {
+                            continue;
                         }
+                        internal = Some(copy_redstone_request(request)?);
+                        break;
                     }
-                    if internal.is_some() {
-                        internal
-                    } else {
-                        let allowed = usize::try_from(host_request_budget).unwrap_or(usize::MAX);
-                        if allowed == 0 {
-                            return Ok(ComputerAdvanceOutcome::WaitingForHostQuota);
-                        }
-                        let count = batch.len().min(allowed);
-                        let mut requests = Vec::with_capacity(count);
-                        for index in 0..count {
+                    if internal.is_none() {
+                        for index in 0..batch.len() {
                             let request = batch
                                 .get(index)
                                 .ok_or(ComputerError::Run(RunError::NotRunnable))?;
-                            requests.push(copy_external_request(request)?);
+                            if is_parked(request) {
+                                continue;
+                            }
+                            internal = if is_raw_terminal(request) {
+                                Some(copy_raw_terminal_request(request)?)
+                            } else if is_stdio(request) {
+                                Some(copy_stdio_request(request)?)
+                            } else if is_filesystem(request) {
+                                Some(copy_filesystem_request(request)?)
+                            } else if is_process(request) {
+                                Some(copy_process_request(request)?)
+                            } else if is_compiler(request) {
+                                Some(copy_compiler_request(request)?)
+                            } else if is_redstone_local(request) {
+                                Some(copy_redstone_request(request)?)
+                            } else {
+                                None
+                            };
+                            if internal.is_some() {
+                                break;
+                            }
+                            if allowed == 0 {
+                                return Ok(ComputerAdvanceOutcome::WaitingForHostQuota);
+                            }
+                            external.push(copy_external_request(request)?);
+                            if external.len() == allowed {
+                                break;
+                            }
                         }
-                        return Ok(ComputerAdvanceOutcome::HostRequestBatch(
-                            ComputerHostRequestBatch {
-                                requests: requests.into_boxed_slice(),
-                            },
-                        ));
                     }
+                    (internal, external)
                 }
                 AdvanceOutcome::SliceExhausted => {
                     return Ok(ComputerAdvanceOutcome::SliceExhausted)
@@ -1061,7 +1082,25 @@ impl ComputerMachine {
                 }
             }
         };
-        match internal.expect("internal request branch always publishes an action") {
+        if !external.is_empty() {
+            return Ok(ComputerAdvanceOutcome::HostRequestBatch(
+                ComputerHostRequestBatch {
+                    requests: external.into_boxed_slice(),
+                },
+            ));
+        }
+        let Some(internal) = internal else {
+            return Ok(
+                if self.active_frame().pending_stdio_read.is_some()
+                    || self.active_frame().pending_terminal_event.is_some()
+                {
+                    ComputerAdvanceOutcome::WaitingForTerminalEvent
+                } else {
+                    ComputerAdvanceOutcome::SliceExhausted
+                },
+            );
+        };
+        match internal {
             TerminalRequest::Raw {
                 task,
                 id,
@@ -1072,17 +1111,21 @@ impl ComputerMachine {
                 id,
                 operation,
             } => self.handle_stdio_request(task, id, operation),
-            TerminalRequest::FileSystem { id, operation } => {
-                self.handle_filesystem_request(id, operation)
-            }
+            TerminalRequest::FileSystem {
+                task,
+                id,
+                operation,
+            } => self.handle_filesystem_request(task, id, operation),
             TerminalRequest::Process {
                 task,
                 id,
                 operation,
             } => self.handle_process_request(task, id, operation),
-            TerminalRequest::Compiler { id, operation } => {
-                self.handle_compiler_request(id, operation)
-            }
+            TerminalRequest::Compiler {
+                task,
+                id,
+                operation,
+            } => self.handle_compiler_request(task, id, operation),
             TerminalRequest::Redstone {
                 task,
                 id,
@@ -1282,7 +1325,11 @@ impl ComputerMachine {
                     .encode_utf16()
                     .collect::<Vec<_>>();
                 self.active_session_mut()
-                    .resume_internal(id, HostResponse::Success(HostValueInput::String(&units)))
+                    .resume_internal_for(
+                        task,
+                        id,
+                        HostResponse::Success(HostValueInput::String(&units)),
+                    )
                     .map_err(ComputerError::Resume)?;
                 return Ok(ComputerAdvanceOutcome::SliceExhausted);
             }
@@ -1348,6 +1395,7 @@ impl ComputerMachine {
 
     fn handle_filesystem_request(
         &mut self,
+        task: TaskId,
         id: RequestId,
         operation: FileSystemOperation,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
@@ -1361,7 +1409,11 @@ impl ComputerMachine {
                         NodeKind::Directory => 2,
                     })
                     .unwrap_or_else(filesystem_error_code);
-                self.resume_filesystem(id, HostResponse::Success(HostValueInput::I32(result)))?;
+                self.resume_filesystem(
+                    task,
+                    id,
+                    HostResponse::Success(HostValueInput::I32(result)),
+                )?;
             }
             FileSystemOperation::List(path) => {
                 let result = self
@@ -1381,17 +1433,19 @@ impl ComputerMachine {
                             .collect::<Vec<_>>();
                         if units.len() > self.maximum_text_code_units {
                             self.resume_filesystem(
+                                task,
                                 id,
                                 filesystem_failure(FileSystemError::QuotaExceeded),
                             )?;
                         } else {
                             self.resume_filesystem(
+                                task,
                                 id,
                                 HostResponse::Success(HostValueInput::String(&units)),
                             )?;
                         }
                     }
-                    Err(error) => self.resume_filesystem(id, filesystem_failure(error))?,
+                    Err(error) => self.resume_filesystem(task, id, filesystem_failure(error))?,
                 }
             }
             FileSystemOperation::ReadText(path) => {
@@ -1404,17 +1458,20 @@ impl ComputerMachine {
                             let units = text.encode_utf16().collect::<Vec<_>>();
                             if units.len() > self.maximum_text_code_units {
                                 self.resume_filesystem(
+                                    task,
                                     id,
                                     filesystem_failure(FileSystemError::QuotaExceeded),
                                 )?;
                             } else {
                                 self.resume_filesystem(
+                                    task,
                                     id,
                                     HostResponse::Success(HostValueInput::String(&units)),
                                 )?;
                             }
                         }
                         Err(_) => self.resume_filesystem(
+                            task,
                             id,
                             HostResponse::Failure(HostFailure::new(
                                 HostFailureKind::InputOutput,
@@ -1422,7 +1479,7 @@ impl ComputerMachine {
                             )),
                         )?,
                     },
-                    Err(error) => self.resume_filesystem(id, filesystem_failure(error))?,
+                    Err(error) => self.resume_filesystem(task, id, filesystem_failure(error))?,
                 }
             }
             FileSystemOperation::WriteText(path, value) => {
@@ -1439,6 +1496,7 @@ impl ComputerMachine {
                         })
                 });
                 self.resume_filesystem(
+                    task,
                     id,
                     HostResponse::Success(HostValueInput::I32(status_code(result))),
                 )?;
@@ -1449,6 +1507,7 @@ impl ComputerMachine {
                         .create_directory(&self.initial_file_capability, &path)
                 });
                 self.resume_filesystem(
+                    task,
                     id,
                     HostResponse::Success(HostValueInput::I32(status_code(result))),
                 )?;
@@ -1458,6 +1517,7 @@ impl ComputerMachine {
                     .parse_path(&path)
                     .and_then(|path| self.filesystem.remove(&self.initial_file_capability, &path));
                 self.resume_filesystem(
+                    task,
                     id,
                     HostResponse::Success(HostValueInput::I32(status_code(result))),
                 )?;
@@ -1474,6 +1534,7 @@ impl ComputerMachine {
                     })
                 });
                 self.resume_filesystem(
+                    task,
                     id,
                     HostResponse::Success(HostValueInput::I32(status_code(result))),
                 )?;
@@ -1489,6 +1550,7 @@ impl ComputerMachine {
                     })
                 });
                 self.resume_filesystem(
+                    task,
                     id,
                     HostResponse::Success(HostValueInput::I32(status_code(result))),
                 )?;
@@ -1549,11 +1611,12 @@ impl ComputerMachine {
 
     fn resume_filesystem(
         &mut self,
+        task: TaskId,
         id: RequestId,
         response: HostResponse<'_>,
     ) -> Result<(), ComputerError> {
         self.active_session_mut()
-            .resume_internal(id, response)
+            .resume_internal_for(task, id, response)
             .map_err(ComputerError::Resume)
     }
 
@@ -1766,6 +1829,7 @@ impl ComputerMachine {
 
     fn handle_compiler_request(
         &mut self,
+        task: TaskId,
         id: RequestId,
         operation: CompilerOperation,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
@@ -1773,7 +1837,8 @@ impl ComputerMachine {
             let frame = self.active_frame_mut();
             frame
                 .session
-                .resume_internal(
+                .resume_internal_for(
+                    task,
                     id,
                     HostResponse::Success(HostValueInput::String(&frame.compiler_diagnostics)),
                 )
@@ -1786,32 +1851,38 @@ impl ComputerMachine {
         self.active_frame_mut().compiler_diagnostics = Box::new([]);
         let source = match self.parse_path(&source) {
             Ok(path) if path.file_name().is_some_and(|name| name.ends_with(".kt")) => path,
-            _ => return self.reject_compilation(id, "source must be a canonical .kt file"),
+            _ => return self.reject_compilation(task, id, "source must be a canonical .kt file"),
         };
         let output = match self.parse_path(&output) {
             Ok(path) if path != source => path,
-            _ => return self.reject_compilation(id, "output must be a different canonical path"),
+            _ => {
+                return self.reject_compilation(
+                    task,
+                    id,
+                    "output must be a different canonical path",
+                )
+            }
         };
         let source_metadata = match self.filesystem.stat(&self.initial_file_capability, &source) {
             Ok(metadata) if metadata.kind == NodeKind::File => metadata,
-            Ok(_) => return self.reject_compilation(id, "source is not a regular file"),
-            Err(_) => return self.reject_compilation(id, "source is not readable"),
+            Ok(_) => return self.reject_compilation(task, id, "source is not a regular file"),
+            Err(_) => return self.reject_compilation(task, id, "source is not readable"),
         };
         let source_bytes = match self.read_file_bounded(&source, MAXIMUM_COMPILER_SOURCE_BYTES) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return self.reject_compilation(id, "source exceeds limits or cannot be read")
+                return self.reject_compilation(task, id, "source exceeds limits or cannot be read")
             }
         };
         if std::str::from_utf8(&source_bytes).is_err() {
-            return self.reject_compilation(id, "source is not strict UTF-8");
+            return self.reject_compilation(task, id, "source is not strict UTF-8");
         }
         let output_revision = match self
             .filesystem
             .executable_install_revision(&self.initial_file_capability, &output)
         {
             Ok(revision) => revision,
-            Err(_) => return self.reject_compilation(id, "output is not writable"),
+            Err(_) => return self.reject_compilation(task, id, "output is not writable"),
         };
         let token = self.next_compilation_token;
         self.next_compilation_token = self
@@ -1820,6 +1891,7 @@ impl ComputerMachine {
             .ok_or(ComputerError::ActiveCompilation)?;
         self.pending_compilation = Some(CompilationTransaction {
             token,
+            task,
             request: id,
             owner_depth: self.sessions.len(),
             source: source.clone(),
@@ -1842,10 +1914,11 @@ impl ComputerMachine {
 
     fn reject_compilation(
         &mut self,
+        task: TaskId,
         id: RequestId,
         diagnostic: &str,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
-        self.finish_compilation_request(id, COMPILATION_STATUS_REJECTED, diagnostic)?;
+        self.finish_compilation_request(task, id, COMPILATION_STATUS_REJECTED, diagnostic)?;
         Ok(ComputerAdvanceOutcome::SliceExhausted)
     }
 
@@ -1860,6 +1933,7 @@ impl ComputerMachine {
             || verify_artifact(Arc::from(artifact), artifact_limits).is_err()
         {
             return self.finish_compilation_request(
+                transaction.task,
                 transaction.request,
                 COMPILATION_STATUS_INVALID_ARTIFACT,
                 "compiler returned an invalid artifact",
@@ -1874,6 +1948,7 @@ impl ComputerMachine {
             });
         if !source_is_current {
             return self.finish_compilation_request(
+                transaction.task,
                 transaction.request,
                 COMPILATION_STATUS_STALE,
                 "source changed while compilation was running",
@@ -1885,15 +1960,20 @@ impl ComputerMachine {
             artifact,
             transaction.output_revision,
         ) {
-            Ok(()) => {
-                self.finish_compilation_request(transaction.request, COMPILATION_STATUS_SUCCESS, "")
-            }
+            Ok(()) => self.finish_compilation_request(
+                transaction.task,
+                transaction.request,
+                COMPILATION_STATUS_SUCCESS,
+                "",
+            ),
             Err(FileSystemError::Busy) => self.finish_compilation_request(
+                transaction.task,
                 transaction.request,
                 COMPILATION_STATUS_STALE,
                 "output changed while compilation was running",
             ),
             Err(_) => self.finish_compilation_request(
+                transaction.task,
                 transaction.request,
                 COMPILATION_STATUS_IO_FAILED,
                 "compiled artifact could not be installed",
@@ -1908,6 +1988,7 @@ impl ComputerMachine {
     ) -> Result<(), ComputerError> {
         let transaction = self.take_compilation(token)?;
         self.finish_compilation_request(
+            transaction.task,
             transaction.request,
             COMPILATION_STATUS_REJECTED,
             diagnostics,
@@ -1933,6 +2014,7 @@ impl ComputerMachine {
 
     fn finish_compilation_request(
         &mut self,
+        task: TaskId,
         request: RequestId,
         status: i32,
         diagnostic: &str,
@@ -1942,7 +2024,11 @@ impl ComputerMachine {
         frame.compiler_diagnostics = diagnostics;
         frame
             .session
-            .resume_internal(request, HostResponse::Success(HostValueInput::I32(status)))
+            .resume_internal_for(
+                task,
+                request,
+                HostResponse::Success(HostValueInput::I32(status)),
+            )
             .map_err(ComputerError::Resume)
     }
 
@@ -2060,6 +2146,7 @@ enum TerminalRequest {
         operation: StdioOperation,
     },
     FileSystem {
+        task: TaskId,
         id: RequestId,
         operation: FileSystemOperation,
     },
@@ -2069,6 +2156,7 @@ enum TerminalRequest {
         operation: ProcessOperation,
     },
     Compiler {
+        task: TaskId,
         id: RequestId,
         operation: CompilerOperation,
     },
@@ -2465,6 +2553,7 @@ fn copy_compiler_request(request: HostRequestView<'_>) -> Result<TerminalRequest
         _ => return Err(ComputerError::InvalidCompilerRequest),
     };
     Ok(TerminalRequest::Compiler {
+        task: request.task_id(),
         id: request.id(),
         operation,
     })
@@ -2590,6 +2679,7 @@ fn copy_filesystem_request(request: HostRequestView<'_>) -> Result<TerminalReque
         _ => return Err(ComputerError::InvalidFileSystemRequest),
     };
     Ok(TerminalRequest::FileSystem {
+        task: request.task_id(),
         id: request.id(),
         operation,
     })
@@ -3085,6 +3175,191 @@ mod tests {
             .unwrap();
 
         assert_eq!(Some(ComputerValue::I32(9)), halt(&mut computer));
+    }
+
+    #[test]
+    fn parked_redstone_wait_does_not_hide_an_external_request_from_another_task() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::redstone_wait_and_external_request_artifact(),
+            profile(),
+            &[addon],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64, u32::MAX).unwrap(),
+        );
+        let request = match computer.advance(64, 64, u32::MAX).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
+            other => panic!("parked redstone wait hid external work: {other:?}"),
+        };
+        assert_eq!(("app", "entry"), (&*request.namespace, &*request.name));
+        assert_ne!(TaskId::ROOT.get(), request.task_id);
+
+        computer
+            .resume_host_request_for(
+                request.task_id,
+                request.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        computer.submit_redstone_input(1 | (13 << 6)).unwrap();
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn later_redstone_wait_is_armed_before_an_earlier_external_request() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::external_request_then_redstone_wait_artifact(),
+            profile(),
+            &[addon],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64, u32::MAX).unwrap(),
+        );
+        computer.submit_redstone_input(1 | (13 << 6)).unwrap();
+        let request = match computer.advance(64, 64, u32::MAX).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
+            other => panic!("external request was not retained after arming the wait: {other:?}"),
+        };
+        computer
+            .resume_host_request_for(
+                request.task_id,
+                request.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn parked_terminal_wait_does_not_hide_an_external_request_from_another_task() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::raw_terminal_wait_and_external_request_artifact(),
+            profile(),
+            &[addon],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ComputerAdvanceOutcome::WaitingForTerminalEvent,
+            computer.advance(64, 64, u32::MAX).unwrap(),
+        );
+        let request = match computer.advance(64, 64, u32::MAX).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
+            other => panic!("parked terminal wait hid external work: {other:?}"),
+        };
+        computer
+            .resume_host_request_for(
+                request.task_id,
+                request.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        computer.terminal_mut().push_text("x").unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64, u32::MAX).unwrap(),
+        );
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn filesystem_request_resumes_its_child_task() {
+        let operations = [
+            OperationSchema::asynchronous(&[], HostValueType::I32),
+            OperationSchema::asynchronous(&[], HostValueType::Unit),
+        ];
+        let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::two_task_host_artifact(),
+            profile(),
+            &[addon],
+            &[],
+        )
+        .unwrap();
+        let batch = match computer.advance(64, 64, u32::MAX).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let reader = batch.requests[0].clone();
+        let writer = batch.requests[1].clone();
+
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer
+                .handle_filesystem_request(
+                    TaskId::new(reader.task_id).unwrap(),
+                    RequestId::new(reader.id).unwrap(),
+                    FileSystemOperation::Stat("/missing".encode_utf16().collect()),
+                )
+                .unwrap(),
+        );
+        computer
+            .resume_host_request_for(
+                writer.task_id,
+                writer.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn rejected_compilation_resumes_its_child_task() {
+        let operations = [
+            OperationSchema::asynchronous(&[], HostValueType::I32),
+            OperationSchema::asynchronous(&[], HostValueType::Unit),
+        ];
+        let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::two_task_host_artifact(),
+            profile(),
+            &[addon],
+            &[],
+        )
+        .unwrap();
+        let batch = match computer.advance(64, 64, u32::MAX).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let reader = batch.requests[0].clone();
+        let writer = batch.requests[1].clone();
+
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer
+                .handle_compiler_request(
+                    TaskId::new(reader.task_id).unwrap(),
+                    RequestId::new(reader.id).unwrap(),
+                    CompilerOperation::Compile(
+                        "relative.kt".encode_utf16().collect(),
+                        "/home/out".encode_utf16().collect(),
+                    ),
+                )
+                .unwrap(),
+        );
+        computer
+            .resume_host_request_for(
+                writer.task_id,
+                writer.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        assert_eq!(None, halt(&mut computer));
     }
 
     #[test]
