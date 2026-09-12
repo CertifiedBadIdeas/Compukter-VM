@@ -81,7 +81,7 @@ impl PhysicalValue {
 
 pub(super) struct FrameArena {
     bytes: Box<[u8]>,
-    used: u32,
+    free_head: Option<u32>,
     #[cfg(test)]
     initialized: Box<[bool]>,
 }
@@ -100,42 +100,151 @@ impl FrameArena {
             .try_reserve_exact(length)
             .map_err(|_| VmFault::InvalidStoragePlan)?;
         bytes.resize(length, 0);
-        Ok(Self {
+        let mut arena = Self {
             bytes: bytes.into_boxed_slice(),
-            used: 0,
+            free_head: (capacity >= 8).then_some(0),
             #[cfg(test)]
             initialized: vec![false; length].into_boxed_slice(),
-        })
+        };
+        if capacity >= 8 {
+            arena.write_free(0, None, capacity)?;
+        }
+        Ok(arena)
     }
 
     pub(super) fn push(&mut self, layout: &FrameLayout) -> Result<FrameReservation, VmFault> {
         let byte_len = align(layout.byte_len, 8).map_err(|_| VmFault::InvalidStoragePlan)?;
-        let end = self
-            .used
+        if byte_len == 0 {
+            return Ok(FrameReservation { base: 0, byte_len });
+        }
+        let mut previous = None;
+        let mut current = self.free_head;
+        let base = loop {
+            let region = current.ok_or(VmFault::InvalidStoragePlan)?;
+            let (next, available) = self.read_free(region)?;
+            if available >= byte_len {
+                let remaining = available - byte_len;
+                let replacement = if remaining == 0 {
+                    next
+                } else {
+                    let remainder = region
+                        .checked_add(byte_len)
+                        .ok_or(VmFault::InvalidStoragePlan)?;
+                    self.write_free(remainder, next, remaining)?;
+                    Some(remainder)
+                };
+                if let Some(previous) = previous {
+                    let (_, previous_len) = self.read_free(previous)?;
+                    self.write_free(previous, replacement, previous_len)?;
+                } else {
+                    self.free_head = replacement;
+                }
+                break region;
+            }
+            previous = current;
+            current = next;
+        };
+        let end = base
             .checked_add(byte_len)
             .filter(|end| *end <= self.bytes.len() as u32)
             .ok_or(VmFault::InvalidStoragePlan)?;
-        let reservation = FrameReservation {
-            base: self.used,
-            byte_len,
-        };
+        let reservation = FrameReservation { base, byte_len };
         self.bytes[reservation.base as usize..end as usize].fill(0);
         #[cfg(test)]
         self.initialized[reservation.base as usize..end as usize].fill(false);
-        self.used = end;
         Ok(reservation)
     }
 
     pub(super) fn pop(&mut self, frame: FrameReservation) -> Result<(), VmFault> {
-        if frame
+        if frame.byte_len == 0 {
+            return Ok(());
+        }
+        let end = frame
             .base
             .checked_add(frame.byte_len)
-            .filter(|end| *end == self.used)
-            .is_none()
+            .filter(|end| *end <= self.bytes.len() as u32)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        if !frame.base.is_multiple_of(8)
+            || frame.byte_len < 8
+            || !frame.byte_len.is_multiple_of(8)
         {
             return Err(VmFault::CorruptLifecycle);
         }
-        self.used = frame.base;
+        let mut previous = None;
+        let mut next = self.free_head;
+        while let Some(region) = next {
+            let (following, region_len) = self.read_free(region)?;
+            let region_end = region
+                .checked_add(region_len)
+                .ok_or(VmFault::CorruptLifecycle)?;
+            if end <= region {
+                break;
+            }
+            if frame.base < region_end {
+                return Err(VmFault::CorruptLifecycle);
+            }
+            previous = Some(region);
+            next = following;
+        }
+
+        let mut free_base = frame.base;
+        let mut free_len = frame.byte_len;
+        if let Some(region) = next {
+            if end == region {
+                let (following, region_len) = self.read_free(region)?;
+                free_len = free_len
+                    .checked_add(region_len)
+                    .ok_or(VmFault::CorruptLifecycle)?;
+                next = following;
+            }
+        }
+        if let Some(region) = previous {
+            let (_, region_len) = self.read_free(region)?;
+            let region_end = region
+                .checked_add(region_len)
+                .ok_or(VmFault::CorruptLifecycle)?;
+            if region_end == frame.base {
+                free_base = region;
+                free_len = region_len
+                    .checked_add(free_len)
+                    .ok_or(VmFault::CorruptLifecycle)?;
+                self.write_free(free_base, next, free_len)?;
+                return Ok(());
+            }
+            self.write_free(region, Some(free_base), region_len)?;
+        } else {
+            self.free_head = Some(free_base);
+        }
+        self.write_free(free_base, next, free_len)?;
+        Ok(())
+    }
+
+    fn read_free(&self, base: u32) -> Result<(Option<u32>, u32), VmFault> {
+        let start = usize::try_from(base).map_err(|_| VmFault::CorruptLifecycle)?;
+        let end = start.checked_add(8).ok_or(VmFault::CorruptLifecycle)?;
+        let bytes = self.bytes.get(start..end).ok_or(VmFault::CorruptLifecycle)?;
+        let next = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let length = u32::from_le_bytes(bytes[4..].try_into().unwrap());
+        if length < 8 || length % 8 != 0 {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        Ok(((next != u32::MAX).then_some(next), length))
+    }
+
+    fn write_free(
+        &mut self,
+        base: u32,
+        next: Option<u32>,
+        length: u32,
+    ) -> Result<(), VmFault> {
+        let start = usize::try_from(base).map_err(|_| VmFault::CorruptLifecycle)?;
+        let end = start.checked_add(8).ok_or(VmFault::CorruptLifecycle)?;
+        let bytes = self
+            .bytes
+            .get_mut(start..end)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        bytes[..4].copy_from_slice(&next.unwrap_or(u32::MAX).to_le_bytes());
+        bytes[4..].copy_from_slice(&length.to_le_bytes());
         Ok(())
     }
 
@@ -937,6 +1046,27 @@ mod tests {
             arena.write_access(frame.base, layout.value_access(1, 1), RuntimeValue::I32(1),),
         );
         assert_eq!(Err(VmFault::InvalidStoragePlan), arena.push(&layout));
+    }
+
+    #[test]
+    fn arena_reclaims_non_lifo_task_frames_and_coalesces_space() {
+        let layout = FrameLayout::derive(&[value(vec![PhysicalAtom::I64])]).unwrap();
+        let double = FrameLayout::derive(&[
+            value(vec![PhysicalAtom::I64]),
+            value(vec![PhysicalAtom::I64]),
+        ])
+        .unwrap();
+        let mut arena = FrameArena::new(24).unwrap();
+        let first = arena.push(&layout).unwrap();
+        let middle = arena.push(&layout).unwrap();
+        let last = arena.push(&layout).unwrap();
+
+        arena.pop(middle).unwrap();
+        assert_eq!(middle, arena.push(&layout).unwrap());
+        arena.pop(first).unwrap();
+        arena.pop(middle).unwrap();
+        assert_eq!(first.base, arena.push(&double).unwrap().base);
+        arena.pop(last).unwrap();
     }
 
     #[test]
