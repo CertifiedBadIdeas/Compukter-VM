@@ -411,6 +411,9 @@ fn may_throw(instruction: &Instruction) -> bool {
             | Instruction::StringValueOf { .. }
             | Instruction::Sleep { .. }
             | Instruction::CoroutineJoin { .. }
+            | Instruction::ChannelCreate { .. }
+            | Instruction::ChannelSend { .. }
+            | Instruction::ChannelReceive { .. }
             | Instruction::CapabilityCallAsync { .. }
     )
 }
@@ -433,6 +436,8 @@ fn verify_instruction(
                 | Instruction::Yield { .. }
                 | Instruction::Sleep { .. }
                 | Instruction::CoroutineJoin { .. }
+                | Instruction::ChannelSend { .. }
+                | Instruction::ChannelReceive { .. }
         )
     {
         return Err(failure(
@@ -1122,6 +1127,24 @@ fn verify_instruction(
                     "task join destination must be Unit",
                 ));
             }
+        }
+        Instruction::ChannelCreate { dst, capacity } => {
+            read(function, state, *capacity, module_id, function_id, limits)?;
+            require_kind(function, *capacity, 1, module_id, function_id, limits)?;
+            require_kind(function, *dst, 1, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::ChannelSend { channel, value, .. } => {
+            read(function, state, *channel, module_id, function_id, limits)?;
+            read(function, state, *value, module_id, function_id, limits)?;
+            require_kind(function, *channel, 1, module_id, function_id, limits)?;
+            require_kind(function, *value, 1, module_id, function_id, limits)?;
+        }
+        Instruction::ChannelReceive { dst, channel, .. } => {
+            read(function, state, *channel, module_id, function_id, limits)?;
+            require_kind(function, *channel, 1, module_id, function_id, limits)?;
+            require_kind(function, *dst, 1, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
         }
         Instruction::CapabilityCallAsync {
             dst,

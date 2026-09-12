@@ -218,6 +218,7 @@ pub(crate) fn verify_semantic_features(
 ) -> Result<(), DiagnosticSet> {
     let mut expected = 0_u32;
     let mut uses_tasks = false;
+    let mut uses_channels = false;
     for module in &artifact.modules {
         if !module.exceptions.is_empty()
             || module
@@ -244,6 +245,8 @@ pub(crate) fn verify_semantic_features(
                             | Instruction::Yield { .. }
                             | Instruction::Sleep { .. }
                             | Instruction::CoroutineJoin { .. }
+                            | Instruction::ChannelSend { .. }
+                            | Instruction::ChannelReceive { .. }
                     )
                 })
         {
@@ -257,6 +260,18 @@ pub(crate) fn verify_semantic_features(
                 matches!(
                     instruction,
                     Instruction::CoroutineSpawn { .. } | Instruction::CoroutineJoin { .. }
+                )
+            });
+        uses_channels |= module
+            .code
+            .iter()
+            .flat_map(|code| code.instructions.iter())
+            .any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::ChannelCreate { .. }
+                        | Instruction::ChannelSend { .. }
+                        | Instruction::ChannelReceive { .. }
                 )
             });
         if !artifact.capabilities.is_empty()
@@ -277,6 +292,9 @@ pub(crate) fn verify_semantic_features(
         if !module.imports.is_empty() {
             expected |= 1 << 3;
         }
+        if uses_channels {
+            expected |= 1 << 4;
+        }
     }
     if uses_tasks && (artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 1) {
         let mut diagnostic = Diagnostic::at_offset(
@@ -289,6 +307,36 @@ pub(crate) fn verify_semantic_features(
         let mut errors = DiagnosticSet::new(limits.diagnostics);
         errors.push(diagnostic);
         return Err(errors);
+    }
+    if uses_channels && (artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 2) {
+        let mut diagnostic = Diagnostic::at_offset(
+            Family::Module,
+            Code::BadModule,
+            6,
+            "channel instructions require minimum runtime ABI 1.2",
+        );
+        diagnostic.location.section = None;
+        let mut errors = DiagnosticSet::new(limits.diagnostics);
+        errors.push(diagnostic);
+        return Err(errors);
+    }
+    if uses_channels
+        && (artifact.manifest.maximum_channels == 0
+            || artifact.manifest.maximum_channel_values == 0)
+    {
+        return Err(module_failure(
+            limits,
+            "channel instructions require non-zero channel manifest limits",
+        ));
+    }
+    if !uses_channels
+        && (artifact.manifest.maximum_channels != 0
+            || artifact.manifest.maximum_channel_values != 0)
+    {
+        return Err(module_failure(
+            limits,
+            "channel manifest limits require channel instructions",
+        ));
     }
     if artifact.header.semantic_features != expected {
         let mut diagnostic = Diagnostic::at_offset(
@@ -304,6 +352,14 @@ pub(crate) fn verify_semantic_features(
     } else {
         Ok(())
     }
+}
+
+fn module_failure(limits: &ArtifactLimits, detail: &'static str) -> DiagnosticSet {
+    let mut diagnostic = Diagnostic::at_offset(Family::Module, Code::BadModule, 0, detail);
+    diagnostic.location.section = None;
+    let mut errors = DiagnosticSet::new(limits.diagnostics);
+    errors.push(diagnostic);
+    errors
 }
 
 fn failure(

@@ -4,12 +4,12 @@ pub(crate) const DIGEST_SIZE: usize = 32;
 
 pub(crate) const FORMAT_MAJOR: u16 = 3;
 pub(crate) const RUNTIME_ABI_MAJOR: u16 = 1;
-pub(crate) const RUNTIME_ABI_MINOR: u16 = 1;
+pub(crate) const RUNTIME_ABI_MINOR: u16 = 2;
 
 pub(crate) const CRITICAL: u16 = 1 << 0;
 pub(crate) const SEMANTIC: u16 = 1 << 1;
 pub(crate) const KNOWN_FLAGS: u16 = CRITICAL | SEMANTIC;
-pub(crate) const KNOWN_FEATURES: u32 = 0b1111;
+pub(crate) const KNOWN_FEATURES: u32 = 0b1_1111;
 
 pub(crate) const MANIFEST: u16 = 0x0001;
 pub(crate) const MODULES: u16 = 0x0002;
