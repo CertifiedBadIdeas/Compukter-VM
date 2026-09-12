@@ -665,18 +665,8 @@ impl ExecutionImage {
             }
         }
 
-        let maximum_frame_bytes = functions
-            .iter()
-            .map(|function| align_u64(u64::from(function.frame_layout.byte_len), 8))
-            .try_fold(0_u64, |largest, bytes| {
-                bytes.map(|bytes| largest.max(bytes))
-            })?;
         let maximum_call_depth = u64::from(decoded.manifest.maximum_call_depth);
-        let frame_arena_bytes = maximum_frame_bytes.checked_mul(maximum_call_depth).ok_or(
-            AdmissionError::ResidentStorageOverflow {
-                component: ResidentStorageComponent::FrameArena,
-            },
-        )?;
+        let frame_arena_bytes = u64::from(decoded.manifest.required_stack_bytes);
         let maximum_coroutines = u64::from(decoded.manifest.maximum_coroutines);
         let frame_record_bytes = (core::mem::size_of::<Frame>() as u64)
             .checked_mul(maximum_call_depth)

@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use crate::{
     artifact::{
-        Block, BlockId, ByteRange, Constant, DecodedCode, Export, Field, Function, FunctionId,
-        Import, Instruction, ModuleId, NominalType, SwitchCase, TypeId, Utf16LiteralId, ValueType,
+        Block, BlockId, ByteRange, Capability, Constant, DecodedCode, Export, Field, Function,
+        FunctionId, Import, Instruction, ModuleId, NominalType, SwitchCase, TypeId, Utf16LiteralId,
+        ValueType,
     },
     verify_artifact, ArtifactLimits, VerifiedArtifact,
 };
@@ -216,29 +217,28 @@ pub(super) fn task_spawn_join_artifact() -> VerifiedArtifact {
         child.flags = 1;
         artifact.modules[0].functions = vec![entry, child];
         artifact.modules[0].declared_functions = 2;
-        let programs =
+        let programs = vec![
             vec![
-                vec![
-                    Instruction::CoroutineSpawn {
-                        dst: 0,
-                        function_ref: 1,
-                        args: Box::new([]),
-                    },
-                    Instruction::CoroutineJoin {
-                        dst: u16::MAX,
-                        coroutine: 0,
-                        resume_block: 1,
-                    },
-                ],
-                vec![
-                    Instruction::Const {
-                        dst: 1,
-                        constant: 0,
-                    },
-                    Instruction::Return { value: 1 },
-                ],
-                vec![Instruction::Return { value: u16::MAX }],
-            ];
+                Instruction::CoroutineSpawn {
+                    dst: 0,
+                    function_ref: 1,
+                    args: Box::new([]),
+                },
+                Instruction::CoroutineJoin {
+                    dst: u16::MAX,
+                    coroutine: 0,
+                    resume_block: 1,
+                },
+            ],
+            vec![
+                Instruction::Const {
+                    dst: 1,
+                    constant: 0,
+                },
+                Instruction::Return { value: 1 },
+            ],
+            vec![Instruction::Return { value: u16::MAX }],
+        ];
         let owners = [FunctionId(0), FunctionId(0), FunctionId(1)];
         let mut maximum_block_cost = 0;
         artifact.modules[0].blocks.clear();
@@ -265,6 +265,126 @@ pub(super) fn task_spawn_join_artifact() -> VerifiedArtifact {
         artifact.manifest.maximum_block_cost = maximum_block_cost;
         artifact.manifest.minimum_slice_cost = maximum_block_cost;
         configure_stack(artifact, 2, 2);
+    })
+}
+
+pub(super) fn two_task_host_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let unit_type = primitive(0);
+        let i32_type = primitive(1);
+        artifact.header.runtime_major = 1;
+        artifact.header.runtime_minor = 1;
+        artifact.header.semantic_features = 0b110;
+        artifact.manifest.maximum_coroutines = 3;
+        artifact.manifest.maximum_host_requests = 2;
+        artifact.manifest.required_capabilities = 1;
+        artifact.capabilities.push(Capability {
+            namespace: 0,
+            name: 1,
+            abi_major: 1,
+            minimum_abi_minor: 0,
+            flags: 1,
+            operation_count: 2,
+        });
+        artifact.modules[0].types = (0..3)
+            .map(|_| NominalType::Function {
+                name: 1,
+                flags: 1,
+                result: unit_type,
+                parameters: Vec::new(),
+            })
+            .collect();
+        artifact.modules[0].declared_types = 3;
+        let mut root = function(0, 0, vec![i32_type, i32_type], 0);
+        root.flags = 1;
+        root.block_count = 3;
+        let mut reader = function(1, 0, vec![i32_type], 3);
+        reader.flags = 1;
+        reader.block_count = 2;
+        let mut writer = function(2, 0, Vec::new(), 5);
+        writer.flags = 1;
+        writer.block_count = 2;
+        artifact.modules[0].functions = vec![root, reader, writer];
+        artifact.modules[0].declared_functions = 3;
+        let programs = vec![
+            (
+                FunctionId(0),
+                vec![
+                    Instruction::CoroutineSpawn {
+                        dst: 0,
+                        function_ref: 1,
+                        args: Box::new([]),
+                    },
+                    Instruction::CoroutineSpawn {
+                        dst: 1,
+                        function_ref: 2,
+                        args: Box::new([]),
+                    },
+                    Instruction::CoroutineJoin {
+                        dst: u16::MAX,
+                        coroutine: 0,
+                        resume_block: 1,
+                    },
+                ],
+            ),
+            (
+                FunctionId(0),
+                vec![Instruction::CoroutineJoin {
+                    dst: u16::MAX,
+                    coroutine: 1,
+                    resume_block: 2,
+                }],
+            ),
+            (FunctionId(0), vec![Instruction::Return { value: u16::MAX }]),
+            (
+                FunctionId(1),
+                vec![Instruction::CapabilityCallAsync {
+                    dst: 0,
+                    capability: 0,
+                    operation: 0,
+                    args: Box::new([]),
+                    resume_block: 4,
+                }],
+            ),
+            (FunctionId(1), vec![Instruction::Return { value: u16::MAX }]),
+            (
+                FunctionId(2),
+                vec![Instruction::CapabilityCallAsync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 1,
+                    args: Box::new([]),
+                    resume_block: 6,
+                }],
+            ),
+            (FunctionId(2), vec![Instruction::Return { value: u16::MAX }]),
+        ];
+        let mut maximum_block_cost = 0;
+        artifact.modules[0].blocks.clear();
+        artifact.modules[0].code.clear();
+        for (block_id, (owner, instructions)) in programs.into_iter().enumerate() {
+            let fixed_cost = instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum();
+            maximum_block_cost = maximum_block_cost.max(fixed_cost);
+            artifact.modules[0].blocks.push(Block {
+                owner_function: owner,
+                code_record: BlockId(block_id as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: fixed_cost,
+                flags: 0,
+            });
+            artifact.modules[0].code.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: instructions.into_boxed_slice(),
+                fixed_cost,
+            });
+        }
+        artifact.manifest.maximum_block_cost = maximum_block_cost;
+        artifact.manifest.minimum_slice_cost = maximum_block_cost;
+        artifact.manifest.maximum_call_depth = 1;
+        artifact.manifest.required_stack_bytes = 16;
     })
 }
 

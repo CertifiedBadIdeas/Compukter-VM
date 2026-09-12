@@ -1371,13 +1371,12 @@ fn task_instructions_require_runtime_abi_1_1() {
     artifact.header.runtime_major = 1;
     artifact.header.runtime_minor = 0;
     artifact.header.semantic_features = 1 << 1;
-    artifact.modules[0].code[0].instructions =
-        vec![crate::artifact::Instruction::CoroutineJoin {
-            dst: u16::MAX,
-            coroutine: 0,
-            resume_block: 0,
-        }]
-        .into_boxed_slice();
+    artifact.modules[0].code[0].instructions = vec![crate::artifact::Instruction::CoroutineJoin {
+        dst: u16::MAX,
+        coroutine: 0,
+        resume_block: 0,
+    }]
+    .into_boxed_slice();
 
     let error = super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default())
         .unwrap_err();
