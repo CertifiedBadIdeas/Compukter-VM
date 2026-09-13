@@ -40,9 +40,11 @@ use compukter_vm::ProcessFailureReason;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
+
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(13, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(14, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
@@ -398,6 +400,8 @@ fn c_abi_creates_a_machine_inside_an_open_world_store() {
             rom.len(),
             artifact.as_ptr(),
             artifact.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
             output.as_mut_ptr(),
             1,
             &mut written,
@@ -412,6 +416,8 @@ fn c_abi_creates_a_machine_inside_an_open_world_store() {
             rom.len(),
             artifact.as_ptr(),
             artifact.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
             output.as_mut_ptr(),
             output.len(),
             &mut written,
@@ -452,6 +458,8 @@ fn c_abi_boots_a_machine_from_the_executable_rom_entry() {
             id.as_ptr(),
             rom.as_ptr(),
             rom.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
             output.as_mut_ptr(),
             output.len(),
             &mut written,
@@ -617,6 +625,8 @@ fn create_preserves_the_typed_wire_result_and_rejects_short_output_first() {
         compukter_create(
             invalid_artifact.as_ptr(),
             invalid_artifact.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
             short.as_mut_ptr(),
             short.len(),
             &mut written,
@@ -629,6 +639,8 @@ fn create_preserves_the_typed_wire_result_and_rejects_short_output_first() {
         compukter_create(
             invalid_artifact.as_ptr(),
             invalid_artifact.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
             output.as_mut_ptr(),
             output.len(),
             &mut written,
@@ -721,6 +733,8 @@ fn create_machine(artifact: &[u8]) -> u64 {
         compukter_create(
             artifact.as_ptr(),
             artifact.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
             output.as_mut_ptr(),
             output.len(),
             &mut written,
@@ -919,6 +933,8 @@ fn boot_create_wire(store: u64, id: [u8; 16], rom: &[u8]) -> Vec<u8> {
             id.as_ptr(),
             rom.as_ptr(),
             rom.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
             output.as_mut_ptr(),
             output.len(),
             &mut written,

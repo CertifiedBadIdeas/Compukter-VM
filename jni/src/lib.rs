@@ -297,13 +297,23 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_crea
     mut env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     artifact: JByteArray<'caller>,
+    capability_schemas: JByteArray<'caller>,
     output: JByteArray<'caller>,
     written: JLongArray<'caller>,
 ) -> jint {
     status(&mut env, |env| {
         let artifact = bytes(env, &artifact)?;
+        let capability_schemas = bytes(env, &capability_schemas)?;
         output_call(env, &output, &written, |out, capacity, count| unsafe {
-            compukter_create(artifact.as_ptr(), artifact.len(), out, capacity, count)
+            compukter_create(
+                artifact.as_ptr(),
+                artifact.len(),
+                capability_schemas.as_ptr(),
+                capability_schemas.len(),
+                out,
+                capacity,
+                count,
+            )
         })
     })
 }
@@ -318,6 +328,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_crea
     id: JByteArray<'caller>,
     rom: JByteArray<'caller>,
     artifact: JByteArray<'caller>,
+    capability_schemas: JByteArray<'caller>,
     output: JByteArray<'caller>,
     written: JLongArray<'caller>,
 ) -> jint {
@@ -325,6 +336,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_crea
         let id = bytes(env, &id)?;
         let rom = bytes(env, &rom)?;
         let artifact = bytes(env, &artifact)?;
+        let capability_schemas = bytes(env, &capability_schemas)?;
         if id.len() != 16 {
             return Ok(INVALID_ARGUMENT);
         }
@@ -336,6 +348,8 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_crea
                 rom.len(),
                 artifact.as_ptr(),
                 artifact.len(),
+                capability_schemas.as_ptr(),
+                capability_schemas.len(),
                 out,
                 capacity,
                 count,
@@ -353,12 +367,14 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_crea
     store_handle: jlong,
     id: JByteArray<'caller>,
     rom: JByteArray<'caller>,
+    capability_schemas: JByteArray<'caller>,
     output: JByteArray<'caller>,
     written: JLongArray<'caller>,
 ) -> jint {
     status(&mut env, |env| {
         let id = bytes(env, &id)?;
         let rom = bytes(env, &rom)?;
+        let capability_schemas = bytes(env, &capability_schemas)?;
         if id.len() != 16 {
             return Ok(INVALID_ARGUMENT);
         }
@@ -368,6 +384,8 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_crea
                 id.as_ptr(),
                 rom.as_ptr(),
                 rom.len(),
+                capability_schemas.as_ptr(),
+                capability_schemas.len(),
                 out,
                 capacity,
                 count,

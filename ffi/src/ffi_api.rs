@@ -84,6 +84,7 @@ const MAXIMUM_ROM_BYTES: usize = 16 * 1_024 * 1_024;
 const MAXIMUM_FILESYSTEM_LIMITS_BYTES: usize = 1 + 17 * 8;
 const MAXIMUM_COMPILATION_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const MAXIMUM_COMPILATION_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const MAXIMUM_CAPABILITY_SCHEMA_BYTES: usize = 64 * 1024;
 const MAXIMUM_EXECUTABLE_REVISION_BYTES: usize = 10;
 const MAXIMUM_DEPLOYMENT_PATH_BYTES: usize = 4 * 1024;
 const MAXIMUM_FILESYSTEM_LIST_ENTRIES: u32 = 256;
@@ -337,13 +338,15 @@ pub extern "C" fn compukter_store_close(store_handle: u64) -> FfiStatus {
 ///
 /// # Safety
 ///
-/// When `artifact_len` is non-zero, `artifact` must point to a readable region
-/// of at least that many bytes. When `output_capacity` is non-zero, `output`
+/// Non-empty artifact and capability-schema inputs must name readable regions
+/// of their declared lengths. When `output_capacity` is non-zero, `output`
 /// must point to a writable region of at least that many bytes. `written_out`
 /// must always point to a writable `usize`.
 pub unsafe extern "C" fn compukter_create(
     artifact: *const u8,
     artifact_len: usize,
+    capability_schemas: *const u8,
+    capability_schemas_len: usize,
     output: *mut u8,
     output_capacity: usize,
     written_out: *mut usize,
@@ -351,7 +354,9 @@ pub unsafe extern "C" fn compukter_create(
     ffi_status(|| {
         if written_out.is_null()
             || artifact_len > compukter_vm::ArtifactLimits::default().artifact_bytes
+            || capability_schemas_len > MAXIMUM_CAPABILITY_SCHEMA_BYTES
             || (artifact_len != 0 && artifact.is_null())
+            || (capability_schemas_len != 0 && capability_schemas.is_null())
             || (output_capacity != 0 && output.is_null())
         {
             return FfiStatus::InvalidArgument;
@@ -367,7 +372,17 @@ pub unsafe extern "C" fn compukter_create(
             // SAFETY: The C ABI requires a readable region of `artifact_len` bytes.
             unsafe { core::slice::from_raw_parts(artifact, artifact_len) }.to_vec()
         };
-        let encoded = crate::wire::encode_create(bridge::create(bytes));
+        let capability_schemas = if capability_schemas_len == 0 {
+            &[]
+        } else {
+            // SAFETY: The C ABI requires a readable region of `capability_schemas_len` bytes.
+            unsafe { core::slice::from_raw_parts(capability_schemas, capability_schemas_len) }
+        };
+        let Some(capability_schemas) = crate::wire::decode_capability_schemas(capability_schemas)
+        else {
+            return FfiStatus::InvalidArgument;
+        };
+        let encoded = crate::wire::encode_create(bridge::create(bytes, &capability_schemas));
         if encoded.len() > output_capacity {
             return FfiStatus::Internal;
         }
@@ -385,9 +400,9 @@ pub unsafe extern "C" fn compukter_create(
 ///
 /// # Safety
 ///
-/// `id` must name 16 readable bytes. Non-empty ROM, artifact, and output
-/// inputs must name readable or writable regions of their declared lengths.
-/// `written_out` must always name one writable `usize`.
+/// `id` must name 16 readable bytes. Non-empty ROM, artifact, capability-schema,
+/// and output inputs must name readable or writable regions of their declared
+/// lengths. `written_out` must always name one writable `usize`.
 pub unsafe extern "C" fn compukter_create_in_store(
     store_handle: u64,
     id: *const u8,
@@ -395,6 +410,8 @@ pub unsafe extern "C" fn compukter_create_in_store(
     rom_len: usize,
     artifact: *const u8,
     artifact_len: usize,
+    capability_schemas: *const u8,
+    capability_schemas_len: usize,
     output: *mut u8,
     output_capacity: usize,
     written_out: *mut usize,
@@ -404,8 +421,10 @@ pub unsafe extern "C" fn compukter_create_in_store(
             || id.is_null()
             || rom_len > MAXIMUM_ROM_BYTES
             || artifact_len > compukter_vm::ArtifactLimits::default().artifact_bytes
+            || capability_schemas_len > MAXIMUM_CAPABILITY_SCHEMA_BYTES
             || (rom_len != 0 && rom.is_null())
             || (artifact_len != 0 && artifact.is_null())
+            || (capability_schemas_len != 0 && capability_schemas.is_null())
             || (output_capacity != 0 && output.is_null())
         {
             return FfiStatus::InvalidArgument;
@@ -429,12 +448,23 @@ pub unsafe extern "C" fn compukter_create_in_store(
             // SAFETY: The validated ABI contract provides readable artifact bytes.
             unsafe { core::slice::from_raw_parts(artifact, artifact_len) }.to_vec()
         };
-        let encoded = match bridge::create_in_store(store_handle, id, rom, artifact) {
-            Ok(handle) => crate::wire::encode_create(Ok(handle)),
-            Err(CreateInStoreError::Create(error)) => crate::wire::encode_create(Err(error)),
-            Err(CreateInStoreError::Rom) => return FfiStatus::Admission,
-            Err(CreateInStoreError::Store(error)) => return store_status(error),
+        let capability_schemas = if capability_schemas_len == 0 {
+            &[]
+        } else {
+            // SAFETY: The validated ABI contract provides readable capability schema bytes.
+            unsafe { core::slice::from_raw_parts(capability_schemas, capability_schemas_len) }
         };
+        let Some(capability_schemas) = crate::wire::decode_capability_schemas(capability_schemas)
+        else {
+            return FfiStatus::InvalidArgument;
+        };
+        let encoded =
+            match bridge::create_in_store(store_handle, id, rom, artifact, &capability_schemas) {
+                Ok(handle) => crate::wire::encode_create(Ok(handle)),
+                Err(CreateInStoreError::Create(error)) => crate::wire::encode_create(Err(error)),
+                Err(CreateInStoreError::Rom) => return FfiStatus::Admission,
+                Err(CreateInStoreError::Store(error)) => return store_status(error),
+            };
         // SAFETY: The fixed maximum was checked before the bounded encoding.
         unsafe { core::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
         // SAFETY: The validated ABI contract provides writable length output.
@@ -448,14 +478,16 @@ pub unsafe extern "C" fn compukter_create_in_store(
 ///
 /// # Safety
 ///
-/// `id` must name 16 readable bytes. Non-empty ROM and output inputs must name
-/// readable or writable regions of their declared lengths. `written_out` must
-/// always name one writable `usize`.
+/// `id` must name 16 readable bytes. Non-empty ROM, capability-schema, and output
+/// inputs must name readable or writable regions of their declared lengths.
+/// `written_out` must always name one writable `usize`.
 pub unsafe extern "C" fn compukter_create_boot_in_store(
     store_handle: u64,
     id: *const u8,
     rom: *const u8,
     rom_len: usize,
+    capability_schemas: *const u8,
+    capability_schemas_len: usize,
     output: *mut u8,
     output_capacity: usize,
     written_out: *mut usize,
@@ -464,7 +496,9 @@ pub unsafe extern "C" fn compukter_create_boot_in_store(
         if written_out.is_null()
             || id.is_null()
             || rom_len > MAXIMUM_ROM_BYTES
+            || capability_schemas_len > MAXIMUM_CAPABILITY_SCHEMA_BYTES
             || (rom_len != 0 && rom.is_null())
+            || (capability_schemas_len != 0 && capability_schemas.is_null())
             || (output_capacity != 0 && output.is_null())
         {
             return FfiStatus::InvalidArgument;
@@ -482,7 +516,18 @@ pub unsafe extern "C" fn compukter_create_boot_in_store(
             // SAFETY: The validated ABI contract provides readable ROM bytes.
             unsafe { core::slice::from_raw_parts(rom, rom_len) }.to_vec()
         };
-        let encoded = match bridge::create_boot_in_store(store_handle, id, rom) {
+        let capability_schemas = if capability_schemas_len == 0 {
+            &[]
+        } else {
+            // SAFETY: The validated ABI contract provides readable capability schema bytes.
+            unsafe { core::slice::from_raw_parts(capability_schemas, capability_schemas_len) }
+        };
+        let Some(capability_schemas) = crate::wire::decode_capability_schemas(capability_schemas)
+        else {
+            return FfiStatus::InvalidArgument;
+        };
+        let encoded = match bridge::create_boot_in_store(store_handle, id, rom, &capability_schemas)
+        {
             Ok(handle) => crate::wire::encode_create(Ok(handle)),
             Err(CreateInStoreError::Create(error)) => crate::wire::encode_create(Err(error)),
             Err(CreateInStoreError::Rom) => return FfiStatus::Admission,
