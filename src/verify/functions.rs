@@ -429,17 +429,7 @@ fn verify_instruction(
     state: &mut [u64],
     limits: &ArtifactLimits,
 ) -> Result<(), DiagnosticSet> {
-    if function.flags & 1 == 0
-        && matches!(
-            instruction,
-            Instruction::CallSuspend { .. }
-                | Instruction::Yield { .. }
-                | Instruction::Sleep { .. }
-                | Instruction::CoroutineJoin { .. }
-                | Instruction::ChannelSend { .. }
-                | Instruction::ChannelReceive { .. }
-        )
-    {
+    if function.flags & 1 == 0 && matches!(instruction, Instruction::CallSuspend { .. }) {
         return Err(failure(
             limits,
             Family::Cfg,
@@ -1006,14 +996,6 @@ fn verify_instruction(
         } => {
             let (target_module, target) =
                 resolve_function(artifact, module_id, *function_ref, function_id, limits)?;
-            if target.flags & 1 == 0 {
-                return Err(type_failure(
-                    limits,
-                    module_id,
-                    function_id,
-                    "coroutine_spawn target is not suspending",
-                ));
-            }
             verify_call_arguments(
                 artifact,
                 module_id,

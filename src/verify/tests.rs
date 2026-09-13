@@ -1215,7 +1215,7 @@ fn exception_rejects_crossing_ranges() {
 }
 
 #[test]
-fn exception_rejects_suspend_in_non_suspending_function() {
+fn task_yield_is_valid_in_a_non_suspending_function() {
     let mut artifact = decoded(support::minimal_vector());
     artifact.modules[0].blocks[0].flags = 1;
     artifact.modules[0].blocks[0].declared_fixed_cost = 2;
@@ -1224,8 +1224,27 @@ fn exception_rejects_suspend_in_non_suspending_function() {
     artifact.manifest.minimum_slice_cost = 2;
     artifact.modules[0].code[0].instructions =
         vec![crate::artifact::Instruction::Yield { resume_block: 0 }].into_boxed_slice();
-    let error = verify_cfg(&artifact).unwrap_err();
-    assert_eq!(error.first().unwrap().code, Code::BadControlFlow);
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
+fn task_spawn_accepts_a_non_suspending_target() {
+    let mut artifact = decoded(support::minimal_vector());
+    configure_entry(
+        &mut artifact,
+        vec![primitive(1)],
+        0,
+        vec![
+            crate::artifact::Instruction::CoroutineSpawn {
+                dst: 0,
+                function_ref: 0,
+                args: Vec::new().into_boxed_slice(),
+            },
+            crate::artifact::Instruction::Return { value: u16::MAX },
+        ],
+    );
+
+    verify_cfg(&artifact).unwrap();
 }
 
 #[test]
