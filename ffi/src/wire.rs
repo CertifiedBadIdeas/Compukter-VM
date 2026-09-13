@@ -1,10 +1,149 @@
 use compukter_vm::{
     AdmissionError, CompilationRequest, ComputerDirectoryListing, ComputerFileChunk,
     ComputerFileKind, ComputerFileMetadata, ComputerFileStat, ComputerResourceSnapshot,
-    EntryArgumentLimit, ExecutableRevision, FileSystemLimits, HostFailureKind, QuotaKind, RunError,
-    StoreHealth, StoreOpenError, TerminalCell, TerminalChange, TerminalDevice, TerminalSnapshot,
-    TerminalUpdate,
+    EntryArgumentLimit, ExecutableRevision, FileSystemLimits, HostFailureKind, HostValueType,
+    QuotaKind, RunError, StoreHealth, StoreOpenError, TerminalCell, TerminalChange, TerminalDevice,
+    TerminalSnapshot, TerminalUpdate,
 };
+
+const MAXIMUM_ADDON_CAPABILITIES: usize = 28;
+const MAXIMUM_CAPABILITY_OPERATIONS: usize = 256;
+const MAXIMUM_OPERATION_ARGUMENTS: usize = 32;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedCapabilitySchema {
+    pub namespace: String,
+    pub name: String,
+    pub abi_major: u16,
+    pub abi_minor: u16,
+    pub operations: Vec<DecodedOperationSchema>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedOperationSchema {
+    pub arguments: Vec<HostValueType>,
+    pub result: HostValueType,
+    pub asynchronous: bool,
+}
+
+pub(crate) fn decode_capability_schemas(bytes: &[u8]) -> Option<Vec<DecodedCapabilitySchema>> {
+    let mut decoder = CapabilitySchemaDecoder::new(bytes);
+    if decoder.u8()? != 1 {
+        return None;
+    }
+    let count = usize::from(decoder.u8()?);
+    if count > MAXIMUM_ADDON_CAPABILITIES {
+        return None;
+    }
+    let mut schemas = Vec::with_capacity(count);
+    for _ in 0..count {
+        let namespace = decoder.component()?;
+        let name = decoder.component()?;
+        let abi_major = decoder.u16()?;
+        let abi_minor = decoder.u16()?;
+        let operation_count = usize::from(decoder.u16()?);
+        if abi_major == 0 || operation_count == 0 || operation_count > MAXIMUM_CAPABILITY_OPERATIONS
+        {
+            return None;
+        }
+        if schemas.iter().any(|schema: &DecodedCapabilitySchema| {
+            schema.namespace == namespace && schema.name == name && schema.abi_major == abi_major
+        }) {
+            return None;
+        }
+        let mut operations = Vec::with_capacity(operation_count);
+        for _ in 0..operation_count {
+            let asynchronous = match decoder.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let result = decoder.value_type()?;
+            let argument_count = usize::from(decoder.u8()?);
+            if argument_count > MAXIMUM_OPERATION_ARGUMENTS {
+                return None;
+            }
+            let mut arguments = Vec::with_capacity(argument_count);
+            for _ in 0..argument_count {
+                arguments.push(decoder.value_type()?);
+            }
+            operations.push(DecodedOperationSchema {
+                arguments,
+                result,
+                asynchronous,
+            });
+        }
+        schemas.push(DecodedCapabilitySchema {
+            namespace,
+            name,
+            abi_major,
+            abi_minor,
+            operations,
+        });
+    }
+    decoder.end().then_some(schemas)
+}
+
+struct CapabilitySchemaDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CapabilitySchemaDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        let value = *self.bytes.get(self.offset)?;
+        self.offset += 1;
+        Some(value)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let end = self.offset.checked_add(2)?;
+        let value = u16::from_le_bytes(self.bytes.get(self.offset..end)?.try_into().ok()?);
+        self.offset = end;
+        Some(value)
+    }
+
+    fn component(&mut self) -> Option<String> {
+        let length = usize::from(self.u8()?);
+        if length == 0 || length > 64 {
+            return None;
+        }
+        let end = self.offset.checked_add(length)?;
+        let bytes = self.bytes.get(self.offset..end)?;
+        let first = *bytes.first()?;
+        if !first.is_ascii_lowercase()
+            || !bytes
+                .iter()
+                .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'-')
+        {
+            return None;
+        }
+        self.offset = end;
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+
+    fn value_type(&mut self) -> Option<HostValueType> {
+        Some(match self.u8()? {
+            0 => HostValueType::Unit,
+            1 => HostValueType::I32,
+            2 => HostValueType::I64,
+            3 => HostValueType::F32,
+            4 => HostValueType::F64,
+            5 => HostValueType::Bool,
+            6 => HostValueType::Char,
+            7 => HostValueType::String,
+            _ => return None,
+        })
+    }
+
+    fn end(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
 
 pub(crate) fn encode_resource_snapshot(snapshot: ComputerResourceSnapshot) -> Vec<u8> {
     let values = [
@@ -813,6 +952,68 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn capability_schema_wire_decodes_exact_types_and_flags() {
+        let bytes = [
+            1, 1, 6, b'c', b'r', b'e', b'a', b't', b'e', 8, b'k', b'i', b'n', b'e', b't', b'i',
+            b'c', b's', 1, 0, 0, 0, 1, 0, 1, 3, 2, 1, 3,
+        ];
+
+        assert_eq!(
+            Some(vec![DecodedCapabilitySchema {
+                namespace: "create".to_owned(),
+                name: "kinetics".to_owned(),
+                abi_major: 1,
+                abi_minor: 0,
+                operations: vec![DecodedOperationSchema {
+                    arguments: vec![HostValueType::I32, HostValueType::F32],
+                    result: HostValueType::F32,
+                    asynchronous: true,
+                }],
+            }]),
+            decode_capability_schemas(&bytes),
+        );
+        assert_eq!(Some(Vec::new()), decode_capability_schemas(&[1, 0]));
+    }
+
+    #[test]
+    fn capability_schema_wire_rejects_noncanonical_or_unbounded_inputs() {
+        let valid = [1, 1, 1, b'a', 1, b'b', 1, 0, 0, 0, 1, 0, 0, 0, 0];
+        for malformed in [
+            Vec::new(),
+            vec![2, 0],
+            vec![1, 0, 0],
+            vec![1, 29],
+            {
+                let mut value = valid.to_vec();
+                value[3] = b'A';
+                value
+            },
+            {
+                let mut value = valid.to_vec();
+                value[6] = 0;
+                value
+            },
+            {
+                let mut value = valid.to_vec();
+                value[12] = 2;
+                value
+            },
+            {
+                let mut value = valid.to_vec();
+                value[13] = 8;
+                value
+            },
+        ] {
+            assert_eq!(None, decode_capability_schemas(&malformed));
+        }
+
+        let mut duplicate = vec![1, 2];
+        duplicate.extend_from_slice(&valid[2..]);
+        duplicate.extend_from_slice(&valid[2..]);
+        assert_eq!(None, decode_capability_schemas(&duplicate));
+    }
 
     #[test]
     fn create_handle_has_a_fixed_little_endian_wire_form() {

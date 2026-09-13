@@ -3,18 +3,20 @@ use std::sync::{Arc, OnceLock};
 
 use compukter_vm::{
     verify_artifact, AdmissionError, ArtifactLimits, CanonicalLineSubmissionError,
-    CompilationRequest, ComputerAdvanceOutcome, ComputerDirectoryListing, ComputerError,
-    ComputerFileChunk, ComputerFileReadError, ComputerFileStat, ComputerHostMerge, ComputerId,
-    ComputerMachine, ComputerStartError, ComputerValue, DeploymentCandidate, EntryArgumentLimits,
-    ExecutableRevision, ExecutionProfile, FileCapability, FileRights, FileSystemError,
-    FileSystemLimits, GuestTrap, HostDeployError, HostFailure, HostResponse, HostValueInput,
-    HostVerifyError, ManagedAllocationFailure, ProcessFailureReason, ProcessLimits,
-    QuotaExhaustion, ResumeError, RomImage, RunError, StoreError, StoreHealth, StoreOpenError,
-    TerminalDevice, TerminalInputError, TerminalKey, TerminalKeyAction, TerminalKeyEvent,
-    TerminalModifiers, TerminalUpdate, VirtualPath, VmFault, WorldFileSystemStore,
+    CapabilityBinding, CompilationRequest, ComputerAdvanceOutcome, ComputerDirectoryListing,
+    ComputerError, ComputerFileChunk, ComputerFileReadError, ComputerFileStat, ComputerHostMerge,
+    ComputerId, ComputerMachine, ComputerStartError, ComputerValue, DeploymentCandidate,
+    EntryArgumentLimits, ExecutableRevision, ExecutionProfile, FileCapability, FileRights,
+    FileSystemError, FileSystemLimits, GuestTrap, HostDeployError, HostFailure, HostMergeSchema,
+    HostResponse, HostValueInput, HostVerifyError, ManagedAllocationFailure, OperationSchema,
+    ProcessFailureReason, ProcessLimits, QuotaExhaustion, ResumeError, RomImage, RunError,
+    StoreError, StoreHealth, StoreOpenError, TerminalDevice, TerminalInputError, TerminalKey,
+    TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, TerminalUpdate, VirtualPath, VmFault,
+    WorldFileSystemStore,
 };
 
 use crate::handle_table::{HandleError, HandleTable};
+use crate::wire::DecodedCapabilitySchema;
 
 static SESSIONS: OnceLock<HandleTable<BridgeSession>> = OnceLock::new();
 static STORES: OnceLock<HandleTable<Arc<WorldFileSystemStore>>> = OnceLock::new();
@@ -167,15 +169,20 @@ pub(crate) enum StoreCreateError {
     Handle(HandleError),
 }
 
-pub(crate) fn create(artifact_bytes: Vec<u8>) -> Result<u64, CreateError> {
+pub(crate) fn create(
+    artifact_bytes: Vec<u8>,
+    capability_schemas: &[DecodedCapabilitySchema],
+) -> Result<u64, CreateError> {
     let artifact = verify_artifact(Arc::from(artifact_bytes), ArtifactLimits::default())
         .map_err(|_| CreateError::Verification)?;
-    let computer =
-        ComputerMachine::start(artifact, profile(), &[], &[]).map_err(|error| match error {
-            ComputerStartError::Admission(error) => CreateError::Admission(error),
-            ComputerStartError::Start(error) => CreateError::Run(error),
-            ComputerStartError::Process(error) => CreateError::Process(error),
-        })?;
+    let computer = with_capability_bindings(capability_schemas, |bindings| {
+        ComputerMachine::start(artifact, profile(), bindings, &[])
+    })
+    .map_err(|error| match error {
+        ComputerStartError::Admission(error) => CreateError::Admission(error),
+        ComputerStartError::Start(error) => CreateError::Run(error),
+        ComputerStartError::Process(error) => CreateError::Process(error),
+    })?;
     sessions()
         .insert(BridgeSession::new(computer, FileSystemLimits::default()))
         .map_err(CreateError::Handle)
@@ -190,6 +197,7 @@ pub(crate) fn create_in_store(
     id: ComputerId,
     rom_bytes: Vec<u8>,
     artifact_bytes: Vec<u8>,
+    capability_schemas: &[DecodedCapabilitySchema],
 ) -> Result<u64, CreateInStoreError> {
     let artifact = verify_artifact(Arc::from(artifact_bytes), ArtifactLimits::default())
         .map_err(|_| CreateInStoreError::Create(CreateError::Verification))?;
@@ -207,14 +215,16 @@ pub(crate) fn create_in_store(
                     .expect("fixed initial filesystem capability path"),
                 FileRights::OWNER,
             );
-            ComputerMachine::start_in_filesystem(
-                artifact,
-                profile(),
-                &[],
-                &[],
-                filesystem,
-                initial_capability,
-            )
+            with_capability_bindings(capability_schemas, |bindings| {
+                ComputerMachine::start_in_filesystem(
+                    artifact,
+                    profile(),
+                    bindings,
+                    &[],
+                    filesystem,
+                    initial_capability,
+                )
+            })
             .map_err(|error| {
                 CreateInStoreError::Create(match error {
                     ComputerStartError::Admission(error) => CreateError::Admission(error),
@@ -236,6 +246,7 @@ pub(crate) fn create_boot_in_store(
     store_handle: u64,
     id: ComputerId,
     rom_bytes: Vec<u8>,
+    capability_schemas: &[DecodedCapabilitySchema],
 ) -> Result<u64, CreateInStoreError> {
     let computer = stores()
         .with(store_handle, |store| {
@@ -251,13 +262,15 @@ pub(crate) fn create_boot_in_store(
                     .expect("fixed boot filesystem capability path"),
                 FileRights::OWNER,
             );
-            ComputerMachine::boot_in_filesystem(
-                profile(),
-                ProcessLimits::default(),
-                &[],
-                filesystem,
-                initial_capability,
-            )
+            with_capability_bindings(capability_schemas, |bindings| {
+                ComputerMachine::boot_in_filesystem(
+                    profile(),
+                    ProcessLimits::default(),
+                    bindings,
+                    filesystem,
+                    initial_capability,
+                )
+            })
             .map_err(|error| {
                 CreateInStoreError::Create(match error {
                     ComputerStartError::Admission(error) => CreateError::Admission(error),
@@ -273,6 +286,41 @@ pub(crate) fn create_boot_in_store(
     sessions()
         .insert(BridgeSession::new(computer, limits))
         .map_err(|error| CreateInStoreError::Create(CreateError::Handle(error)))
+}
+
+fn with_capability_bindings<T>(
+    schemas: &[DecodedCapabilitySchema],
+    action: impl FnOnce(&[CapabilityBinding<'_>]) -> T,
+) -> T {
+    let operations: Vec<Vec<OperationSchema<'_>>> = schemas
+        .iter()
+        .map(|schema| {
+            schema
+                .operations
+                .iter()
+                .map(|operation| OperationSchema {
+                    arguments: &operation.arguments,
+                    result: operation.result,
+                    asynchronous: operation.asynchronous,
+                    merge: HostMergeSchema::Ordinary,
+                })
+                .collect()
+        })
+        .collect();
+    let bindings: Vec<CapabilityBinding<'_>> = schemas
+        .iter()
+        .zip(&operations)
+        .map(|(schema, operations)| {
+            CapabilityBinding::new(
+                &schema.namespace,
+                &schema.name,
+                schema.abi_major,
+                schema.abi_minor,
+                operations,
+            )
+        })
+        .collect();
+    action(&bindings)
 }
 
 pub(crate) fn advance(
