@@ -220,6 +220,7 @@ pub(crate) fn verify_semantic_features(
     let mut uses_tasks = false;
     let mut uses_channels = false;
     let mut uses_i64_string_conversion = false;
+    let mut uses_f32_string_conversion = false;
     for module in &artifact.modules {
         if !module.exceptions.is_empty()
             || module
@@ -280,6 +281,11 @@ pub(crate) fn verify_semantic_features(
             .iter()
             .flat_map(|code| code.instructions.iter())
             .any(|instruction| matches!(instruction, Instruction::StringValueOf { form: 2, .. }));
+        uses_f32_string_conversion |= module
+            .code
+            .iter()
+            .flat_map(|code| code.instructions.iter())
+            .any(|instruction| matches!(instruction, Instruction::StringValueOf { form: 3, .. }));
         if !artifact.capabilities.is_empty()
             || module
                 .code
@@ -334,6 +340,20 @@ pub(crate) fn verify_semantic_features(
             Code::BadModule,
             6,
             "I64 string conversion requires minimum runtime ABI 1.3",
+        );
+        diagnostic.location.section = None;
+        let mut errors = DiagnosticSet::new(limits.diagnostics);
+        errors.push(diagnostic);
+        return Err(errors);
+    }
+    if uses_f32_string_conversion
+        && (artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 4)
+    {
+        let mut diagnostic = Diagnostic::at_offset(
+            Family::Module,
+            Code::BadModule,
+            6,
+            "F32 string conversion requires minimum runtime ABI 1.4",
         );
         diagnostic.location.section = None;
         let mut errors = DiagnosticSet::new(limits.diagnostics);

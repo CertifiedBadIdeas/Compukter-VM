@@ -24,13 +24,13 @@ use compukter_ffi::{
     compukter_filesystem_generation, compukter_filesystem_list, compukter_filesystem_read,
     compukter_filesystem_stat, compukter_max_create_bytes, compukter_max_outcome_bytes,
     compukter_redstone_confirm_output, compukter_redstone_submit_input,
-    compukter_resource_snapshot, compukter_resume_bool, compukter_resume_failure,
-    compukter_resume_string, compukter_resume_unit, compukter_store_close,
-    compukter_store_durable_generation, compukter_store_flush, compukter_store_health,
-    compukter_store_open, compukter_store_recover, compukter_store_tombstone,
-    compukter_submit_canonical_line, compukter_terminal_changes_since, compukter_terminal_commit,
-    compukter_terminal_full_state, compukter_terminal_key, compukter_terminal_text,
-    compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
+    compukter_resource_snapshot, compukter_resume_bool, compukter_resume_f32_bits,
+    compukter_resume_failure, compukter_resume_i32, compukter_resume_string, compukter_resume_unit,
+    compukter_store_close, compukter_store_durable_generation, compukter_store_flush,
+    compukter_store_health, compukter_store_open, compukter_store_recover,
+    compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
+    compukter_terminal_commit, compukter_terminal_full_state, compukter_terminal_key,
+    compukter_terminal_text, compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
 };
 use jni::{
     errors::{Result, ThrowRuntimeExAndDefault},
@@ -285,6 +285,8 @@ simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_deploymentCa
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_submitRedstoneInput(handle: jlong, packet: jint) => compukter_redstone_submit_input(handle as u64, packet as u32));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_confirmRedstoneOutput(handle: jlong, packet: jint) => compukter_redstone_confirm_output(handle as u64, packet as u32));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeUnit(handle: jlong, task_id: jint, request_id: jlong) => compukter_resume_unit(handle as u64, task_id as u32, request_id as u64));
+simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeInt(handle: jlong, task_id: jint, request_id: jlong, value: jint) => compukter_resume_i32(handle as u64, task_id as u32, request_id as u64, value));
+simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeFloatBits(handle: jlong, task_id: jint, request_id: jlong, bits: jint) => compukter_resume_f32_bits(handle as u64, task_id as u32, request_id as u64, bits as u32));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeBool(handle: jlong, task_id: jint, request_id: jlong, value: jboolean) => compukter_resume_bool(handle as u64, task_id as u32, request_id as u64, u32::from(value)));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeFailure(handle: jlong, task_id: jint, request_id: jlong, kind: jint, code: jint) => compukter_resume_failure(handle as u64, task_id as u32, request_id as u64, kind as u32, code as u32));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_terminalCommit(handle: jlong) => compukter_terminal_commit(handle as u64));

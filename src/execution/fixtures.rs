@@ -2263,10 +2263,10 @@ pub(super) fn scalar_string_value_artifact(form: u8, value: Constant) -> Verifie
                 Instruction::Return { value: 1 },
             ],
         ],
-        |artifact| {
-            if form == 2 {
-                artifact.header.runtime_minor = 3;
-            }
+        |artifact| match form {
+            2 => artifact.header.runtime_minor = 3,
+            3 => artifact.header.runtime_minor = 4,
+            _ => {}
         },
     )
 }
