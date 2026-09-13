@@ -2241,7 +2241,7 @@ pub(super) fn scalar_string_value_artifact(form: u8, value: Constant) -> Verifie
         flags: 0,
         nominal_type: TypeId(0x8000_0000),
     };
-    literal_string_program_blocks(
+    literal_string_program_blocks_configured(
         string,
         vec![primitive(form), string],
         vec![value],
@@ -2263,6 +2263,11 @@ pub(super) fn scalar_string_value_artifact(form: u8, value: Constant) -> Verifie
                 Instruction::Return { value: 1 },
             ],
         ],
+        |artifact| {
+            if form == 2 {
+                artifact.header.runtime_minor = 3;
+            }
+        },
     )
 }
 

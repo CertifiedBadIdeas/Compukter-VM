@@ -159,6 +159,16 @@ fn scalar_string_conversion_matches_kotlin_representations() {
             "-2147483648".encode_utf16().collect::<Vec<_>>(),
         ),
         (
+            2,
+            Constant::I64(i64::MAX),
+            "9223372036854775807".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            2,
+            Constant::I64(i64::MIN),
+            "-9223372036854775808".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
             5,
             Constant::Bool(false),
             "false".encode_utf16().collect::<Vec<_>>(),

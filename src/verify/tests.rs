@@ -599,6 +599,15 @@ fn cfg_accepts_every_typed_string_instruction() {
             },
         ),
         (
+            vec![primitive(2), string],
+            1,
+            crate::artifact::Instruction::StringValueOf {
+                form: 2,
+                dst: 1,
+                source: 0,
+            },
+        ),
+        (
             vec![primitive(5), string],
             1,
             crate::artifact::Instruction::StringValueOf {
@@ -1418,6 +1427,29 @@ fn channel_instructions_require_runtime_abi_1_2_feature_and_manifest_limits() {
         super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default())
             .unwrap_err();
     assert_eq!(missing_limits.first().unwrap().code, Code::BadModule);
+}
+
+#[test]
+fn i64_string_conversion_requires_runtime_abi_1_3() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.header.runtime_major = 1;
+    artifact.header.runtime_minor = 2;
+    artifact.modules[0].code[0].instructions = vec![
+        crate::artifact::Instruction::StringValueOf {
+            form: 2,
+            dst: 0,
+            source: 0,
+        },
+        crate::artifact::Instruction::Return { value: u16::MAX },
+    ]
+    .into_boxed_slice();
+
+    let error = super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default())
+        .unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadModule);
+
+    artifact.header.runtime_minor = 3;
+    super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default()).unwrap();
 }
 
 fn exception_handler_artifact(reads_uninitialized_local: bool) -> crate::artifact::DecodedArtifact {

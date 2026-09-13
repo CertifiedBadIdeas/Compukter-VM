@@ -6,10 +6,12 @@ use super::{
     value::{Ref32, RuntimeValue},
 };
 
+const INLINE_SCALAR_UNITS: usize = 20;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum StringBacking {
     Inline {
-        units: [u16; 11],
+        units: [u16; INLINE_SCALAR_UNITS],
         start: u8,
         length: u8,
     },
@@ -251,7 +253,7 @@ impl PendingConcat {
             lhs_start: 0,
             lhs_length: u32::from(length),
             rhs: StringBacking::Inline {
-                units: [0; 11],
+                units: [0; INLINE_SCALAR_UNITS],
                 start: 0,
                 length: 0,
             },
@@ -1103,10 +1105,31 @@ fn code_unit(
     }
 }
 
-fn scalar_units(value: RuntimeValue, form: u8) -> Result<([u16; 11], u8, u8), TextError> {
-    let mut units = [0_u16; 11];
+fn scalar_units(
+    value: RuntimeValue,
+    form: u8,
+) -> Result<([u16; INLINE_SCALAR_UNITS], u8, u8), TextError> {
+    let mut units = [0_u16; INLINE_SCALAR_UNITS];
     match (form, value) {
         (1, RuntimeValue::I32(value)) => {
+            let negative = value < 0;
+            let mut magnitude = value.unsigned_abs();
+            let mut start = units.len();
+            loop {
+                start -= 1;
+                units[start] = u16::from(b'0') + (magnitude % 10) as u16;
+                magnitude /= 10;
+                if magnitude == 0 {
+                    break;
+                }
+            }
+            if negative {
+                start -= 1;
+                units[start] = u16::from(b'-');
+            }
+            Ok((units, start as u8, (units.len() - start) as u8))
+        }
+        (2, RuntimeValue::I64(value)) => {
             let negative = value < 0;
             let mut magnitude = value.unsigned_abs();
             let mut start = units.len();

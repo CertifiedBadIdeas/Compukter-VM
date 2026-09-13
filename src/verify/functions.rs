@@ -1213,7 +1213,7 @@ fn verify_instruction(
             write(state, *dst, function, module_id, function_id, limits)?;
         }
         Instruction::StringValueOf { form, dst, source } => {
-            if !matches!(form, 1 | 5 | 6) {
+            if !matches!(form, 1 | 2 | 5 | 6) {
                 return Err(type_failure(
                     limits,
                     module_id,
