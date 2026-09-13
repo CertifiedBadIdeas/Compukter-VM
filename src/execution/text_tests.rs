@@ -169,6 +169,71 @@ fn scalar_string_conversion_matches_kotlin_representations() {
             "-9223372036854775808".encode_utf16().collect::<Vec<_>>(),
         ),
         (
+            3,
+            Constant::F32(0.0_f32.to_bits()),
+            "0.0".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32((-0.0_f32).to_bits()),
+            "-0.0".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(1.5_f32.to_bits()),
+            "1.5".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(10_000_000.0_f32.to_bits()),
+            "1.0E7".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(0.001_f32.to_bits()),
+            "0.001".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(0.0001_f32.to_bits()),
+            "1.0E-4".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(f32::INFINITY.to_bits()),
+            "Infinity".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(f32::NEG_INFINITY.to_bits()),
+            "-Infinity".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(f32::NAN.to_bits()),
+            "NaN".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(f32::MAX.to_bits()),
+            "3.4028235E38".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(f32::MIN_POSITIVE.to_bits()),
+            "1.1754944E-38".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32(f32::from_bits(1).to_bits()),
+            "1.4E-45".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            3,
+            Constant::F32((-f32::from_bits(1)).to_bits()),
+            "-1.4E-45".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
             5,
             Constant::Bool(false),
             "false".encode_utf16().collect::<Vec<_>>(),

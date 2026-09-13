@@ -1121,6 +1121,46 @@ pub extern "C" fn compukter_resume_unit(handle: u64, task_id: u32, request_id: u
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn compukter_resume_i32(
+    handle: u64,
+    task_id: u32,
+    request_id: u64,
+    value: i32,
+) -> FfiStatus {
+    ffi_status(|| {
+        if task_id == 0 {
+            return FfiStatus::InvalidArgument;
+        }
+        bridge_status(bridge::resume(
+            handle,
+            task_id,
+            request_id,
+            &OwnedResponse::SuccessI32(value),
+        ))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn compukter_resume_f32_bits(
+    handle: u64,
+    task_id: u32,
+    request_id: u64,
+    bits: u32,
+) -> FfiStatus {
+    ffi_status(|| {
+        if task_id == 0 {
+            return FfiStatus::InvalidArgument;
+        }
+        bridge_status(bridge::resume(
+            handle,
+            task_id,
+            request_id,
+            &OwnedResponse::SuccessF32(bits),
+        ))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn compukter_resume_bool(
     handle: u64,
     task_id: u32,

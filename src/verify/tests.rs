@@ -608,6 +608,15 @@ fn cfg_accepts_every_typed_string_instruction() {
             },
         ),
         (
+            vec![primitive(3), string],
+            1,
+            crate::artifact::Instruction::StringValueOf {
+                form: 3,
+                dst: 1,
+                source: 0,
+            },
+        ),
+        (
             vec![primitive(5), string],
             1,
             crate::artifact::Instruction::StringValueOf {
@@ -1449,6 +1458,29 @@ fn i64_string_conversion_requires_runtime_abi_1_3() {
     assert_eq!(error.first().unwrap().code, Code::BadModule);
 
     artifact.header.runtime_minor = 3;
+    super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default()).unwrap();
+}
+
+#[test]
+fn f32_string_conversion_requires_runtime_abi_1_4() {
+    let mut artifact = decoded(support::minimal_vector());
+    artifact.header.runtime_major = 1;
+    artifact.header.runtime_minor = 3;
+    artifact.modules[0].code[0].instructions = vec![
+        crate::artifact::Instruction::StringValueOf {
+            form: 3,
+            dst: 0,
+            source: 0,
+        },
+        crate::artifact::Instruction::Return { value: u16::MAX },
+    ]
+    .into_boxed_slice();
+
+    let error = super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default())
+        .unwrap_err();
+    assert_eq!(error.first().unwrap().code, Code::BadModule);
+
+    artifact.header.runtime_minor = 4;
     super::exceptions::verify_semantic_features(&artifact, &ArtifactLimits::default()).unwrap();
 }
 

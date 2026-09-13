@@ -25,6 +25,7 @@ crate-type = ["rlib"]
 persistence-crash-testing = []
 
 [dependencies]
+ryu = { version = "1.0", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 
 [profile.release]

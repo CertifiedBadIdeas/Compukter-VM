@@ -139,6 +139,8 @@ pub(crate) enum FileInspectionBridgeError {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedResponse {
     SuccessUnit,
+    SuccessI32(i32),
+    SuccessF32(u32),
     SuccessBool(bool),
     SuccessString(Vec<u16>),
     Failure(HostFailure),
@@ -328,6 +330,12 @@ pub(crate) fn resume(
         .with(handle, |session| {
             let borrowed = match response {
                 OwnedResponse::SuccessUnit => HostResponse::Success(HostValueInput::Unit),
+                OwnedResponse::SuccessI32(value) => {
+                    HostResponse::Success(HostValueInput::I32(*value))
+                }
+                OwnedResponse::SuccessF32(bits) => {
+                    HostResponse::Success(HostValueInput::F32(*bits))
+                }
                 OwnedResponse::SuccessBool(value) => {
                     HostResponse::Success(HostValueInput::Bool(*value))
                 }

@@ -1147,6 +1147,10 @@ fn scalar_units(
             }
             Ok((units, start as u8, (units.len() - start) as u8))
         }
+        (3, RuntimeValue::F32(bits)) => {
+            let length = write_kotlin_f32(bits, &mut units)?;
+            Ok((units, 0, length))
+        }
         (5, RuntimeValue::Bool(value)) => {
             let text: &[u8] = if value { b"true" } else { b"false" };
             for (destination, source) in units.iter_mut().zip(text.iter().copied()) {
@@ -1160,4 +1164,165 @@ fn scalar_units(
         }
         _ => Err(TextError::Fault(VmFault::InvalidValueType)),
     }
+}
+
+fn write_kotlin_f32(bits: u32, units: &mut [u16; INLINE_SCALAR_UNITS]) -> Result<u8, TextError> {
+    let value = f32::from_bits(bits);
+    if value.is_nan() {
+        return write_ascii(units, b"NaN");
+    }
+    if value == f32::INFINITY {
+        return write_ascii(units, b"Infinity");
+    }
+    if value == f32::NEG_INFINITY {
+        return write_ascii(units, b"-Infinity");
+    }
+    if bits & 0x7fff_ffff == 0 {
+        return write_ascii(units, if bits >> 31 == 0 { b"0.0" } else { b"-0.0" });
+    }
+    let magnitude_bits = bits & 0x7fff_ffff;
+    if magnitude_bits < 8 {
+        let scaled = (magnitude_bits as u8) * 14;
+        let mut tiny = [0_u8; 8];
+        let mut length = 0_usize;
+        if bits >> 31 != 0 {
+            push_ascii(&mut tiny, &mut length, b'-')?;
+        }
+        push_ascii(&mut tiny, &mut length, b'0' + scaled / 10)?;
+        push_ascii(&mut tiny, &mut length, b'.')?;
+        push_ascii(&mut tiny, &mut length, b'0' + scaled % 10)?;
+        push_ascii(&mut tiny, &mut length, b'E')?;
+        push_ascii(&mut tiny, &mut length, b'-')?;
+        push_ascii(&mut tiny, &mut length, b'4')?;
+        push_ascii(&mut tiny, &mut length, b'5')?;
+        return write_ascii(units, &tiny[..length]);
+    }
+
+    let mut buffer = ryu::Buffer::new();
+    let shortest = buffer.format_finite(value).as_bytes();
+    let mut output = [0_u8; INLINE_SCALAR_UNITS];
+    let mut output_length = 0_usize;
+    let mut offset = 0_usize;
+    if shortest.first() == Some(&b'-') {
+        push_ascii(&mut output, &mut output_length, b'-')?;
+        offset = 1;
+    }
+    let exponent_offset = shortest[offset..]
+        .iter()
+        .position(|byte| *byte == b'e' || *byte == b'E')
+        .map(|index| offset + index);
+    let mantissa_end = exponent_offset.unwrap_or(shortest.len());
+    let explicit_exponent = exponent_offset
+        .map(|index| {
+            core::str::from_utf8(&shortest[index + 1..])
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .ok_or(TextError::Fault(VmFault::InvalidValueType))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let decimal_index = shortest[offset..mantissa_end]
+        .iter()
+        .position(|byte| *byte == b'.')
+        .unwrap_or(mantissa_end - offset);
+    let mut digits = [0_u8; 24];
+    let mut digit_count = 0_usize;
+    for byte in &shortest[offset..mantissa_end] {
+        if *byte != b'.' {
+            digits[digit_count] = *byte;
+            digit_count += 1;
+        }
+    }
+    let first = digits[..digit_count]
+        .iter()
+        .position(|byte| *byte != b'0')
+        .ok_or(TextError::Fault(VmFault::InvalidValueType))?;
+    let last = digits[..digit_count]
+        .iter()
+        .rposition(|byte| *byte != b'0')
+        .ok_or(TextError::Fault(VmFault::InvalidValueType))?;
+    let significant = &digits[first..=last];
+    let scientific_exponent = decimal_index as i32 + explicit_exponent - first as i32 - 1;
+
+    if (-3..=6).contains(&scientific_exponent) {
+        let point = scientific_exponent + 1;
+        if point <= 0 {
+            push_ascii(&mut output, &mut output_length, b'0')?;
+            push_ascii(&mut output, &mut output_length, b'.')?;
+            for _ in 0..-point {
+                push_ascii(&mut output, &mut output_length, b'0')?;
+            }
+            for byte in significant {
+                push_ascii(&mut output, &mut output_length, *byte)?;
+            }
+        } else {
+            let point = point as usize;
+            for index in 0..point {
+                push_ascii(
+                    &mut output,
+                    &mut output_length,
+                    significant.get(index).copied().unwrap_or(b'0'),
+                )?;
+            }
+            push_ascii(&mut output, &mut output_length, b'.')?;
+            if point < significant.len() {
+                for byte in &significant[point..] {
+                    push_ascii(&mut output, &mut output_length, *byte)?;
+                }
+            } else {
+                push_ascii(&mut output, &mut output_length, b'0')?;
+            }
+        }
+    } else {
+        push_ascii(&mut output, &mut output_length, significant[0])?;
+        push_ascii(&mut output, &mut output_length, b'.')?;
+        if significant.len() == 1 {
+            push_ascii(&mut output, &mut output_length, b'0')?;
+        } else {
+            for byte in &significant[1..] {
+                push_ascii(&mut output, &mut output_length, *byte)?;
+            }
+        }
+        push_ascii(&mut output, &mut output_length, b'E')?;
+        if scientific_exponent < 0 {
+            push_ascii(&mut output, &mut output_length, b'-')?;
+        }
+        let magnitude = scientific_exponent.unsigned_abs();
+        if magnitude >= 10 {
+            push_ascii(
+                &mut output,
+                &mut output_length,
+                b'0' + (magnitude / 10) as u8,
+            )?;
+        }
+        push_ascii(
+            &mut output,
+            &mut output_length,
+            b'0' + (magnitude % 10) as u8,
+        )?;
+    }
+    write_ascii(units, &output[..output_length])
+}
+
+fn push_ascii<const N: usize>(
+    output: &mut [u8; N],
+    length: &mut usize,
+    byte: u8,
+) -> Result<(), TextError> {
+    let slot = output
+        .get_mut(*length)
+        .ok_or(TextError::Fault(VmFault::AccountingOverflow))?;
+    *slot = byte;
+    *length += 1;
+    Ok(())
+}
+
+fn write_ascii(units: &mut [u16; INLINE_SCALAR_UNITS], ascii: &[u8]) -> Result<u8, TextError> {
+    if ascii.len() > units.len() {
+        return Err(TextError::Fault(VmFault::AccountingOverflow));
+    }
+    for (unit, byte) in units.iter_mut().zip(ascii) {
+        *unit = u16::from(*byte);
+    }
+    Ok(ascii.len() as u8)
 }
