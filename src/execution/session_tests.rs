@@ -643,7 +643,7 @@ fn explicit_host_failure_is_a_stable_terminal_outcome() {
     let request = only_request(session.advance(64, 0).unwrap());
     assert_eq!(TaskId::ROOT, request.task_id());
     let id = request.id();
-    let failure = HostFailure::new(HostFailureKind::Unavailable, 17);
+    let failure = HostFailure::new(HostFailureKind::Unavailable, "Peripheral is unavailable");
     session
         .resume_for(TaskId::ROOT, id, HostResponse::Failure(failure))
         .unwrap();
@@ -661,6 +661,45 @@ fn explicit_host_failure_is_a_stable_terminal_outcome() {
             .resume_for(TaskId::ROOT, id, HostResponse::Failure(failure))
             .unwrap_err(),
     );
+}
+
+#[test]
+fn invalid_or_oversized_host_failure_detail_keeps_the_request_pending() {
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+    let mut session = Session::admit(
+        fixtures::capability_artifact(true, true, 1, 0),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = only_request(session.advance(64, 0).unwrap()).id();
+
+    assert_eq!(
+        ResumeError::InvalidFailureDetail,
+        session
+            .resume(
+                id,
+                HostResponse::Failure(HostFailure::new(HostFailureKind::Other, ""))
+            )
+            .unwrap_err()
+    );
+    let oversized = "x".repeat(super::host::MAXIMUM_HOST_FAILURE_DETAIL_BYTES + 1);
+    assert_eq!(
+        ResumeError::ResponseTooLarge,
+        session
+            .resume(
+                id,
+                HostResponse::Failure(HostFailure::new(HostFailureKind::Other, &oversized)),
+            )
+            .unwrap_err()
+    );
+    assert!(matches!(
+        session.advance(1, 1).unwrap(),
+        AdvanceOutcome::HostRequestBatch(batch)
+            if batch.get(0).is_some_and(|request| request.id() == id)
+    ));
 }
 
 fn string_session(

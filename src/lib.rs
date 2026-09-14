@@ -74,8 +74,9 @@ pub use execution::{
     EntryArgumentLimits, EntryValue, ExecutionProfile, GuestTrap, HostArguments, HostFailure,
     HostFailureKind, HostMergeEntry, HostMergeEntrySource, HostMergeGroup, HostMergeSchema,
     HostRequestBatchView, HostRequestView, HostResponse, HostValueInput, HostValueType,
-    HostValueView, ManagedAllocationFailure, OperationSchema, QuotaExhaustion, QuotaKind,
-    RequestId, ResidentStorageComponent, ResumeError, RunError, Session, TaskId, VmFault,
+    HostValueView, ManagedAllocationFailure, OperationSchema, OwnedHostFailure, QuotaExhaustion,
+    QuotaKind, RequestId, ResidentStorageComponent, ResumeError, RunError, Session, TaskId,
+    VmFault, MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
 };
 pub use filesystem::{
     recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, ExecutableRevision,

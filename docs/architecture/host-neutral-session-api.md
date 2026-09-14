@@ -38,11 +38,15 @@ outside the VM and later calls `resume(id, response)`. Thus the Rust API calls
 are synchronous state transitions even when the capability operation itself is
 asynchronous.
 
-`resume` validates the pending ID, success type, and string bound before any
-response is accepted. Wrong or stale IDs, wrong types, and oversized strings
-are correctable `ResumeError` values: the original request and accounting stay
-unchanged. A valid response is accepted exactly once. Explicit host failures
-become stable `HostFailed` outcomes rather than guest traps or VM faults.
+`resume` validates the pending ID, success type, string bound, and host-failure
+detail before any response is accepted. Wrong or stale IDs, wrong types,
+oversized strings, and empty or oversized failure details are correctable
+`ResumeError` values: the original request and accounting stay unchanged. A
+valid response is accepted exactly once. Explicit host failures carry one of
+the shared failure kinds plus a non-empty human-readable UTF-8 detail of at
+most 256 bytes and become stable `HostFailed` outcomes rather than guest traps
+or VM faults. The detail uses a fixed session-resident buffer reserved during
+admission, so accepting a failure allocates nothing.
 
 ## Strings and ownership
 
@@ -77,8 +81,9 @@ Every trace field is framed by a little-endian `u32` byte length. Host request
 events use tag 2 followed by request ID (`u64`), capability index (`u32`),
 operation (`u32`), argument count (`u32`), and typed values. Host response
 events use tag 3 followed by request ID, success/failure tag, and a typed value
-or bounded failure kind/code. Scalar payloads are little-endian. A string uses
-type tag 7, its `u32` code-unit count, then its `u16` units as framed fields.
+or bounded failure kind and UTF-8 detail. Scalar payloads are little-endian. A
+string uses type tag 7, its `u32` code-unit count, then its `u16` units as framed
+fields.
 
 `ComputerMachine` uses an internal session admission mode that retains the
 same execution and cost counters but does not compute this digest. The computer
@@ -95,10 +100,10 @@ may cause budgeted GC maintenance.
 
 A terminal, JNI, Minecraft, test, or future addon adapter owns capability
 implementations, asynchronous dispatch, cancellation policy, UTF conversion,
-and mapping host errors to bounded `HostFailure` values. It must not retain a
-borrowed request view across a mutable session call. It should copy or consume
-the request immediately, perform external work without holding the session
-borrow, and resume later with the exact request ID.
+and mapping host errors to bounded human-readable `HostFailure` values. It must
+not retain a borrowed request view across a mutable session call. It should copy
+or consume the request immediately, perform external work without holding the
+session borrow, and resume later with the exact request ID.
 
 The VM intentionally does not spawn threads, perform I/O, interpret wall-clock
 time, or decide how multiple computers run in parallel. A host scheduler can

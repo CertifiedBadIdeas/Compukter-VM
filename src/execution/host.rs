@@ -254,30 +254,55 @@ pub enum HostFailureKind {
     Other,
 }
 
+pub const MAXIMUM_HOST_FAILURE_DETAIL_BYTES: usize = 256;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostFailure {
+pub struct HostFailure<'a> {
     kind: HostFailureKind,
-    code: u32,
+    detail: &'a str,
 }
 
-impl HostFailure {
-    pub const fn new(kind: HostFailureKind, code: u32) -> Self {
-        Self { kind, code }
+impl<'a> HostFailure<'a> {
+    pub const fn new(kind: HostFailureKind, detail: &'a str) -> Self {
+        Self { kind, detail }
     }
 
     pub const fn kind(self) -> HostFailureKind {
         self.kind
     }
 
-    pub const fn code(self) -> u32 {
-        self.code
+    pub const fn detail(self) -> &'a str {
+        self.detail
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedHostFailure {
+    kind: HostFailureKind,
+    detail: Box<str>,
+}
+
+impl OwnedHostFailure {
+    pub fn copy_from(failure: HostFailure<'_>) -> Self {
+        Self {
+            kind: failure.kind(),
+            detail: failure.detail().into(),
+        }
+    }
+
+    pub const fn kind(&self) -> HostFailureKind {
+        self.kind
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HostResponse<'a> {
     Success(HostValueInput<'a>),
-    Failure(HostFailure),
+    Failure(HostFailure<'a>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,6 +311,7 @@ pub enum ResumeError {
     WrongTask,
     WrongRequestId,
     WrongResponseType,
+    InvalidFailureDetail,
     ResponseTooLarge,
 }
 
@@ -492,5 +518,5 @@ pub enum AdvanceOutcome<'a> {
     Halted(Option<HostValueView<'a>>),
     Crashed(super::error::GuestTrap),
     Faulted(super::error::VmFault),
-    HostFailed(HostFailure),
+    HostFailed(HostFailure<'a>),
 }

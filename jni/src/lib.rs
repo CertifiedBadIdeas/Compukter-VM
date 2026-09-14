@@ -288,7 +288,6 @@ simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeUnit(h
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeInt(handle: jlong, task_id: jint, request_id: jlong, value: jint) => compukter_resume_i32(handle as u64, task_id as u32, request_id as u64, value));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeFloatBits(handle: jlong, task_id: jint, request_id: jlong, bits: jint) => compukter_resume_f32_bits(handle as u64, task_id as u32, request_id as u64, bits as u32));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeBool(handle: jlong, task_id: jint, request_id: jlong, value: jboolean) => compukter_resume_bool(handle as u64, task_id as u32, request_id as u64, u32::from(value)));
-simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeFailure(handle: jlong, task_id: jint, request_id: jlong, kind: jint, code: jint) => compukter_resume_failure(handle as u64, task_id as u32, request_id as u64, kind as u32, code as u32));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_terminalCommit(handle: jlong) => compukter_terminal_commit(handle as u64));
 simple_status!(Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_terminalKey(handle: jlong, key: jint, action: jint, modifiers: jint) => compukter_terminal_key(handle as u64, key as u16, action as u32, modifiers as u32));
 
@@ -684,6 +683,33 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resu
                 request_id as u64,
                 value.as_ptr(),
                 value.len(),
+            )
+        } as jint)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeFailure<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    task_id: jint,
+    request_id: jlong,
+    kind: jint,
+    detail: JByteArray<'caller>,
+) -> jint {
+    status(&mut env, |env| {
+        let detail = bytes(env, &detail)?;
+        Ok(unsafe {
+            compukter_resume_failure(
+                handle as u64,
+                task_id as u32,
+                request_id as u64,
+                kind as u32,
+                detail.as_ptr(),
+                detail.len(),
             )
         } as jint)
     })

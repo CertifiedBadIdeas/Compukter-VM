@@ -31,10 +31,10 @@ use crate::{
     ExecutionProfile, FileCapability, FileRights, FileSystemError, FileSystemLimits, GuestTrap,
     HostDeployError, HostFailure, HostFailureKind, HostMergeEntrySource, HostMergeSchema,
     HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView, HostVerifyError,
-    ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, ProcessCompletion,
-    ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId, ResumeError, RunError,
-    Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction, TerminalPosition,
-    TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
+    ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, OwnedHostFailure,
+    ProcessCompletion, ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId,
+    ResumeError, RunError, Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction,
+    TerminalPosition, TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
@@ -160,7 +160,7 @@ pub enum ComputerAdvanceOutcome {
     Halted(Option<ComputerValue>),
     Crashed(GuestTrap),
     Faulted(VmFault),
-    HostFailed(HostFailure),
+    HostFailed(OwnedHostFailure),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1072,10 +1072,11 @@ impl ComputerMachine {
                     return Ok(ComputerAdvanceOutcome::Faulted(value));
                 }
                 AdvanceOutcome::HostFailed(value) => {
+                    let value = OwnedHostFailure::copy_from(value);
                     if self.sessions.len() > 1 {
                         return self.finish_child(self.process_failure(
                             ProcessFailureReason::HostFailure,
-                            &format!("host operation failed: {value:?}"),
+                            &format!("host operation failed: {}", value.detail()),
                         ));
                     }
                     return Ok(ComputerAdvanceOutcome::HostFailed(value));
@@ -1475,7 +1476,7 @@ impl ComputerMachine {
                             id,
                             HostResponse::Failure(HostFailure::new(
                                 HostFailureKind::InputOutput,
-                                INVALID_UTF8_ERROR_CODE,
+                                "File is not valid UTF-8 text",
                             )),
                         )?,
                     },
@@ -2711,11 +2712,24 @@ fn filesystem_error_code(error: FileSystemError) -> i32 {
 fn filesystem_failure(error: FileSystemError) -> HostResponse<'static> {
     HostResponse::Failure(HostFailure::new(
         HostFailureKind::InputOutput,
-        filesystem_error_code(error).unsigned_abs(),
+        match error {
+            FileSystemError::InvalidPath => "Invalid filesystem path",
+            FileSystemError::NotFound => "Filesystem entry was not found",
+            FileSystemError::AlreadyExists => "Filesystem entry already exists",
+            FileSystemError::NotDirectory => "Filesystem entry is not a directory",
+            FileSystemError::IsDirectory => "Filesystem entry is a directory",
+            FileSystemError::NotEmpty => "Directory is not empty",
+            FileSystemError::ReadOnly => "Filesystem entry is read-only",
+            FileSystemError::PermissionDenied => "Filesystem permission was denied",
+            FileSystemError::StaleHandle => "Filesystem handle is stale",
+            FileSystemError::QuotaExceeded => "Filesystem quota was exceeded",
+            FileSystemError::Busy => "Filesystem is busy",
+            FileSystemError::StorageFaulted => "Filesystem storage faulted",
+            FileSystemError::Closed => "Filesystem is closed",
+            FileSystemError::NotExecutable => "Filesystem entry is not executable",
+        },
     ))
 }
-
-const INVALID_UTF8_ERROR_CODE: u32 = 14;
 
 fn copy_raw_terminal_request(
     request: HostRequestView<'_>,
@@ -2822,20 +2836,17 @@ fn copy_stdio_request(request: HostRequestView<'_>) -> Result<TerminalRequest, C
     })
 }
 
-const STDIO_BUSY_ERROR_CODE: u32 = 1;
-const STDIO_STREAM_ERROR_CODE: u32 = 2;
-
 fn stdio_ownership_failure(_: InputOwnershipError) -> HostResponse<'static> {
     HostResponse::Failure(HostFailure::new(
         HostFailureKind::Unavailable,
-        STDIO_BUSY_ERROR_CODE,
+        "Terminal input is already owned by another process",
     ))
 }
 
 fn stdio_stream_failure(_: StandardStreamError) -> HostResponse<'static> {
     HostResponse::Failure(HostFailure::new(
         HostFailureKind::InputOutput,
-        STDIO_STREAM_ERROR_CODE,
+        "Terminal stream operation failed",
     ))
 }
 
@@ -3754,7 +3765,10 @@ mod tests {
             }
         };
         assert_eq!(HostFailureKind::Unavailable, failure.kind());
-        assert_eq!(STDIO_BUSY_ERROR_CODE, failure.code());
+        assert_eq!(
+            "Terminal input is already owned by another process",
+            failure.detail()
+        );
         assert_eq!(
             Some(ComputerTerminalEventKind::Text),
             computer.terminal_await_event().unwrap()
@@ -4311,7 +4325,10 @@ mod tests {
             process_v2_result_with_addons(
                 &child_bytes,
                 &[addon],
-                Some(HostFailure::new(HostFailureKind::Unavailable, 17)),
+                Some(HostFailure::new(
+                    HostFailureKind::Unavailable,
+                    "Addon is unavailable",
+                )),
             ),
         );
     }
@@ -4739,7 +4756,7 @@ mod tests {
                 ComputerAdvanceOutcome::SliceExhausted => {}
                 ComputerAdvanceOutcome::HostFailed(failure) => {
                     assert_eq!(HostFailureKind::InputOutput, failure.kind());
-                    assert_eq!(10, failure.code());
+                    assert_eq!("Filesystem quota was exceeded", failure.detail());
                     break;
                 }
                 other => panic!("unexpected bounded filesystem outcome: {other:?}"),

@@ -29,12 +29,12 @@ use compukter_ffi::{
     compukter_filesystem_stat, compukter_max_create_bytes, compukter_max_outcome_bytes,
     compukter_redstone_confirm_output, compukter_redstone_submit_input,
     compukter_resource_snapshot, compukter_resume_bool, compukter_resume_f32_bits,
-    compukter_resume_i32, compukter_store_close, compukter_store_durable_generation,
-    compukter_store_flush, compukter_store_health, compukter_store_open, compukter_store_recover,
-    compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
-    compukter_terminal_commit, compukter_terminal_full_state, compukter_terminal_key,
-    compukter_terminal_text, compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
-    COMPUKTER_FFI_ABI_VERSION,
+    compukter_resume_failure, compukter_resume_i32, compukter_store_close,
+    compukter_store_durable_generation, compukter_store_flush, compukter_store_health,
+    compukter_store_open, compukter_store_recover, compukter_store_tombstone,
+    compukter_submit_canonical_line, compukter_terminal_changes_since, compukter_terminal_commit,
+    compukter_terminal_full_state, compukter_terminal_key, compukter_terminal_text,
+    compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus, COMPUKTER_FFI_ABI_VERSION,
 };
 use compukter_vm::ProcessFailureReason;
 use std::path::{Path, PathBuf};
@@ -44,7 +44,7 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(14, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(15, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
@@ -66,6 +66,27 @@ fn numeric_responses_validate_task_identity_and_handles() {
         FfiStatus::InvalidHandle,
         compukter_resume_f32_bits(0, 1, 1, (-0.0_f32).to_bits())
     );
+}
+
+#[test]
+fn failure_responses_reject_empty_invalid_and_oversized_utf8_before_handle_lookup() {
+    let detail = b"Peripheral is unavailable";
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_resume_failure(0, 1, 1, 1, core::ptr::null(), 0)
+    });
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_resume_failure(0, 1, 1, 1, [0xff].as_ptr(), 1)
+    });
+    let oversized = [b'x'; compukter_vm::MAXIMUM_HOST_FAILURE_DETAIL_BYTES + 1];
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_resume_failure(0, 1, 1, 1, oversized.as_ptr(), oversized.len())
+    });
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_resume_failure(0, 1, 1, 5, detail.as_ptr(), detail.len())
+    });
+    assert_eq!(FfiStatus::InvalidHandle, unsafe {
+        compukter_resume_failure(0, 1, 1, 1, detail.as_ptr(), detail.len())
+    });
 }
 
 #[test]
