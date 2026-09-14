@@ -7,6 +7,7 @@ use super::{
         ExecutionProfile, HostFailure, HostFailureKind, HostRequestBatchView, HostResponse,
         HostValueInput, HostValueSlot, HostValueView, ManagedAllocationFailure, QuotaExhaustion,
         QuotaKind, RequestId, ResolvedCapability, ResolvedOperation, ResumeError, TaskId,
+        MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::{Machine, MachineResourceSnapshot},
@@ -23,6 +24,8 @@ pub struct Session {
     entry_arguments: Box<[EntryArgument]>,
     outbound_utf16: Box<[u16]>,
     inbound_utf16: Box<[u16]>,
+    failure_detail: [u8; MAXIMUM_HOST_FAILURE_DETAIL_BYTES],
+    failure_detail_length: usize,
     argument_slots: Box<[HostValueSlot]>,
     argument_count: usize,
     pending_requests: PendingRequestTable,
@@ -56,7 +59,7 @@ struct PreparingRequest {
 
 #[derive(Clone, Copy, Debug)]
 enum SessionTerminal {
-    HostFailed(HostFailure),
+    HostFailed(HostFailureKind),
     Faulted(super::error::VmFault),
     QuotaExhausted(QuotaExhaustion),
 }
@@ -164,6 +167,8 @@ impl Session {
             entry_arguments,
             outbound_utf16,
             inbound_utf16,
+            failure_detail: [0; MAXIMUM_HOST_FAILURE_DETAIL_BYTES],
+            failure_detail_length: 0,
             argument_slots,
             argument_count: 0,
             pending_requests,
@@ -225,7 +230,11 @@ impl Session {
     ) -> Result<AdvanceOutcome<'_>, RunError> {
         if let Some(terminal) = self.terminal {
             return Ok(match terminal {
-                SessionTerminal::HostFailed(failure) => AdvanceOutcome::HostFailed(failure),
+                SessionTerminal::HostFailed(kind) => AdvanceOutcome::HostFailed(HostFailure::new(
+                    kind,
+                    core::str::from_utf8(&self.failure_detail[..self.failure_detail_length])
+                        .expect("accepted host failure detail must remain valid UTF-8"),
+                )),
                 SessionTerminal::Faulted(fault) => AdvanceOutcome::Faulted(fault),
                 SessionTerminal::QuotaExhausted(exhaustion) => {
                     AdvanceOutcome::QuotaExhausted(exhaustion)
@@ -321,8 +330,14 @@ impl Session {
                 if !self.begin_request()? {
                     if let Some(terminal) = self.terminal {
                         return Ok(match terminal {
-                            SessionTerminal::HostFailed(failure) => {
-                                AdvanceOutcome::HostFailed(failure)
+                            SessionTerminal::HostFailed(kind) => {
+                                AdvanceOutcome::HostFailed(HostFailure::new(
+                                    kind,
+                                    core::str::from_utf8(
+                                        &self.failure_detail[..self.failure_detail_length],
+                                    )
+                                    .expect("accepted host failure detail must remain valid UTF-8"),
+                                ))
                             }
                             SessionTerminal::Faulted(fault) => AdvanceOutcome::Faulted(fault),
                             SessionTerminal::QuotaExhausted(exhaustion) => {
@@ -423,9 +438,18 @@ impl Session {
             }
         }
         if let HostResponse::Failure(failure) = response {
+            if failure.detail().is_empty() {
+                return Err(ResumeError::InvalidFailureDetail);
+            }
+            if failure.detail().len() > self.failure_detail.len() {
+                return Err(ResumeError::ResponseTooLarge);
+            }
+            self.failure_detail[..failure.detail().len()]
+                .copy_from_slice(failure.detail().as_bytes());
+            self.failure_detail_length = failure.detail().len();
             self.accept_response(request_id, response);
             let _ = self.pending_requests.take(identity);
-            self.terminal = Some(SessionTerminal::HostFailed(failure));
+            self.terminal = Some(SessionTerminal::HostFailed(failure.kind()));
             return Ok(());
         }
         let HostResponse::Success(input) = response else {
@@ -743,7 +767,11 @@ impl Session {
         )?;
         if let Some(terminal) = self.terminal {
             return Ok(match terminal {
-                SessionTerminal::HostFailed(failure) => AdvanceOutcome::HostFailed(failure),
+                SessionTerminal::HostFailed(kind) => AdvanceOutcome::HostFailed(HostFailure::new(
+                    kind,
+                    core::str::from_utf8(&self.failure_detail[..self.failure_detail_length])
+                        .expect("accepted host failure detail must remain valid UTF-8"),
+                )),
                 SessionTerminal::Faulted(fault) => AdvanceOutcome::Faulted(fault),
                 SessionTerminal::QuotaExhausted(exhaustion) => {
                     AdvanceOutcome::QuotaExhausted(exhaustion)
@@ -790,6 +818,7 @@ impl Session {
             + self.entry_arguments.len() * core::mem::size_of::<EntryArgument>()
             + self.outbound_utf16.len() * core::mem::size_of::<u16>()
             + self.inbound_utf16.len() * core::mem::size_of::<u16>()
+            + self.failure_detail.len()
             + self.argument_slots.len() * core::mem::size_of::<HostValueSlot>()
     }
 }
@@ -835,7 +864,7 @@ fn trace_response(machine: &mut Machine, id: RequestId, response: HostResponse<'
                 HostFailureKind::Other => 4,
             };
             trace_field(machine, &[kind]);
-            trace_field(machine, &failure.code().to_le_bytes());
+            trace_field(machine, failure.detail().as_bytes());
         }
     }
 }

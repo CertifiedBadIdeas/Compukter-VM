@@ -421,7 +421,7 @@ pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
         OwnedOutcome::HostFailed(value) => {
             let mut encoder = Encoder::new(7);
             encoder.u8(host_failure_code(value.kind()));
-            encoder.u32(value.code());
+            encoder.bytes(value.detail().as_bytes());
             encoder
         }
         OwnedOutcome::WaitingForTerminalEvent => Encoder::new(9),
@@ -948,7 +948,8 @@ pub(crate) fn host_failure_code(kind: HostFailureKind) -> u8 {
 #[cfg(test)]
 mod tests {
     use compukter_vm::{
-        CompilationRequest, CompilationSource, GuestTrap, QuotaExhaustion, TerminalDevice, VmFault,
+        CompilationRequest, CompilationSource, GuestTrap, HostFailure, HostFailureKind,
+        OwnedHostFailure, QuotaExhaustion, TerminalDevice, VmFault,
     };
 
     use super::*;
@@ -1186,6 +1187,14 @@ mod tests {
         assert_eq!(
             vec![6, 7],
             encode_outcome(OwnedOutcome::Faulted(VmFault::HandleExhausted))
+        );
+        assert_eq!(
+            vec![
+                7, 1, 11, 0, 0, 0, b'U', b'n', b'a', b'v', b'a', b'i', b'l', b'a', b'b', b'l', b'e'
+            ],
+            encode_outcome(OwnedOutcome::HostFailed(OwnedHostFailure::copy_from(
+                HostFailure::new(HostFailureKind::Unavailable, "Unavailable"),
+            )))
         );
         assert_eq!(
             vec![3, 1, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0],

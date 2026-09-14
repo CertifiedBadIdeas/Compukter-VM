@@ -26,7 +26,8 @@ pub use host::{
     ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostMergeEntry,
     HostMergeEntrySource, HostMergeGroup, HostMergeSchema, HostRequestBatchView, HostRequestView,
     HostResponse, HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure,
-    OperationSchema, QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
+    OperationSchema, OwnedHostFailure, QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
+    MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
 };
 pub use session::Session;
 

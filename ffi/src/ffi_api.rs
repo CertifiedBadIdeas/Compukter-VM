@@ -75,6 +75,7 @@ pub enum FfiStatus {
 const MAXIMUM_OUTCOME_BYTES: usize = 64 * 1024;
 const MAXIMUM_CREATE_BYTES: usize = 9;
 const MAXIMUM_INBOUND_UTF16_CODE_UNITS: usize = 4_096;
+const MAXIMUM_HOST_FAILURE_DETAIL_BYTES: usize = compukter_vm::MAXIMUM_HOST_FAILURE_DETAIL_BYTES;
 const MAXIMUM_STORE_OPEN_BYTES: usize = 10;
 const MAXIMUM_STORE_HEALTH_BYTES: usize = 2;
 const MAXIMUM_STORE_GENERATION_BYTES: usize = 9;
@@ -1262,15 +1263,25 @@ pub unsafe extern "C" fn compukter_resume_string(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn compukter_resume_failure(
+/// Resumes a pending host request with a human-readable failure.
+///
+/// # Safety
+///
+/// `detail` must name `detail_len` readable bytes containing valid UTF-8.
+pub unsafe extern "C" fn compukter_resume_failure(
     handle: u64,
     task_id: u32,
     request_id: u64,
     kind: u32,
-    code: u32,
+    detail: *const u8,
+    detail_len: usize,
 ) -> FfiStatus {
     ffi_status(|| {
-        if task_id == 0 {
+        if task_id == 0
+            || detail_len == 0
+            || detail_len > MAXIMUM_HOST_FAILURE_DETAIL_BYTES
+            || detail.is_null()
+        {
             return FfiStatus::InvalidArgument;
         }
         let kind = match kind {
@@ -1281,11 +1292,17 @@ pub extern "C" fn compukter_resume_failure(
             4 => compukter_vm::HostFailureKind::Other,
             _ => return FfiStatus::InvalidArgument,
         };
+        // SAFETY: Guaranteed by the caller after the null and length checks above.
+        let detail = unsafe { core::slice::from_raw_parts(detail, detail_len) };
+        let detail = match core::str::from_utf8(detail) {
+            Ok(detail) => detail.to_owned(),
+            Err(_) => return FfiStatus::InvalidArgument,
+        };
         bridge_status(bridge::resume(
             handle,
             task_id,
             request_id,
-            &OwnedResponse::Failure(compukter_vm::HostFailure::new(kind, code)),
+            &OwnedResponse::Failure { kind, detail },
         ))
     })
 }

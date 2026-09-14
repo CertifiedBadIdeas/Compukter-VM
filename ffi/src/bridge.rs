@@ -7,12 +7,12 @@ use compukter_vm::{
     ComputerError, ComputerFileChunk, ComputerFileReadError, ComputerFileStat, ComputerHostMerge,
     ComputerId, ComputerMachine, ComputerStartError, ComputerValue, DeploymentCandidate,
     EntryArgumentLimits, ExecutableRevision, ExecutionProfile, FileCapability, FileRights,
-    FileSystemError, FileSystemLimits, GuestTrap, HostDeployError, HostFailure, HostMergeSchema,
-    HostResponse, HostValueInput, HostVerifyError, ManagedAllocationFailure, OperationSchema,
-    ProcessFailureReason, ProcessLimits, QuotaExhaustion, ResumeError, RomImage, RunError,
-    StoreError, StoreHealth, StoreOpenError, TerminalDevice, TerminalInputError, TerminalKey,
-    TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, TerminalUpdate, VirtualPath, VmFault,
-    WorldFileSystemStore,
+    FileSystemError, FileSystemLimits, GuestTrap, HostDeployError, HostFailure, HostFailureKind,
+    HostMergeSchema, HostResponse, HostValueInput, HostVerifyError, ManagedAllocationFailure,
+    OperationSchema, OwnedHostFailure, ProcessFailureReason, ProcessLimits, QuotaExhaustion,
+    ResumeError, RomImage, RunError, StoreError, StoreHealth, StoreOpenError, TerminalDevice,
+    TerminalInputError, TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers,
+    TerminalUpdate, VirtualPath, VmFault, WorldFileSystemStore,
 };
 
 use crate::handle_table::{HandleError, HandleTable};
@@ -87,7 +87,7 @@ pub(crate) enum OwnedOutcome {
     Halted(Option<OwnedValue>),
     Crashed(GuestTrap),
     Faulted(VmFault),
-    HostFailed(HostFailure),
+    HostFailed(OwnedHostFailure),
     WaitingForTerminalEvent,
     CompilationRequested { token: u64 },
 }
@@ -145,7 +145,10 @@ pub(crate) enum OwnedResponse {
     SuccessF32(u32),
     SuccessBool(bool),
     SuccessString(Vec<u16>),
-    Failure(HostFailure),
+    Failure {
+        kind: HostFailureKind,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -390,7 +393,9 @@ pub(crate) fn resume(
                 OwnedResponse::SuccessString(units) => {
                     HostResponse::Success(HostValueInput::String(units))
                 }
-                OwnedResponse::Failure(failure) => HostResponse::Failure(*failure),
+                OwnedResponse::Failure { kind, detail } => {
+                    HostResponse::Failure(HostFailure::new(*kind, detail))
+                }
             };
             session
                 .computer
