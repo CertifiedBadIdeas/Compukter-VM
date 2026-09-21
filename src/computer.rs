@@ -57,6 +57,9 @@ const REDSTONE_MERGE_GROUP: u32 = 0x7265_6473;
 const SOUND_NAME: &str = "sound";
 const SOUND_ABI_MAJOR: u16 = 1;
 const SOUND_ABI_MINOR: u16 = 0;
+const TIMER_NAME: &str = "timer";
+const TIMER_ABI_MAJOR: u16 = 1;
+const TIMER_ABI_MINOR: u16 = 0;
 const SOUND_MINIMUM_NOTE: i32 = 0;
 const SOUND_MAXIMUM_NOTE: i32 = 24;
 const SOUND_MINIMUM_VOLUME: i32 = 1;
@@ -88,6 +91,7 @@ pub enum ComputerError {
     InvalidCompilerRequest,
     InvalidRedstoneRequest,
     InvalidSoundRequest,
+    InvalidTimerRequest,
     ActiveCompilation,
     NoActiveCompilation,
     InvalidCompilationToken,
@@ -2257,6 +2261,7 @@ fn admit_session(
     let redstone_output_arguments = [HostValueType::I32, HostValueType::I32];
     let redstone_outputs_argument = [HostValueType::I32];
     let sound_beep_arguments = [HostValueType::I32, HostValueType::I32];
+    let timer_sleep_arguments = [HostValueType::I32];
     let terminal_position_arguments = [HostValueType::I32, HostValueType::I32];
     let terminal_visibility_arguments = [HostValueType::Bool];
     let terminal_write_at_arguments = [
@@ -2339,6 +2344,10 @@ fn admit_session(
         &sound_beep_arguments,
         HostValueType::Bool,
     )];
+    let timer_operations = [OperationSchema::asynchronous(
+        &timer_sleep_arguments,
+        HostValueType::Unit,
+    )];
     let addon_operations = addon_bindings
         .iter()
         .map(|binding| {
@@ -2354,7 +2363,7 @@ fn admit_session(
                 .collect::<Box<[_]>>()
         })
         .collect::<Box<[_]>>();
-    let mut bindings = Vec::with_capacity(addon_bindings.len() + 7);
+    let mut bindings = Vec::with_capacity(addon_bindings.len() + 8);
     for (index, binding) in addon_bindings.iter().enumerate() {
         bindings.push(CapabilityBinding::new(
             binding.namespace(),
@@ -2413,6 +2422,13 @@ fn admit_session(
         SOUND_ABI_MINOR,
         &sound_operations,
     ));
+    bindings.push(CapabilityBinding::new(
+        TERMINAL_NAMESPACE,
+        TIMER_NAME,
+        TIMER_ABI_MAJOR,
+        TIMER_ABI_MINOR,
+        &timer_operations,
+    ));
     Session::admit_untraced(artifact, profile, &bindings)
 }
 
@@ -2456,6 +2472,12 @@ fn is_sound(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == SOUND_NAME
         && request.abi_major() == SOUND_ABI_MAJOR
+}
+
+fn is_timer(request: HostRequestView<'_>) -> bool {
+    request.namespace() == TERMINAL_NAMESPACE
+        && request.name() == TIMER_NAME
+        && request.abi_major() == TIMER_ABI_MAJOR
 }
 
 fn is_redstone_local(request: HostRequestView<'_>) -> bool {
@@ -2901,6 +2923,20 @@ fn copy_external_request(
                 if (SOUND_MINIMUM_NOTE..=SOUND_MAXIMUM_NOTE).contains(&integer(0)?)
                     && (SOUND_MINIMUM_VOLUME..=SOUND_MAXIMUM_VOLUME).contains(&integer(1)?) => {}
             _ => return Err(ComputerError::InvalidSoundRequest),
+        }
+    }
+    if is_timer(request) {
+        let duration = match request.arguments().get(0) {
+            Some(HostValueView::I32(value)) => value,
+            _ => return Err(ComputerError::InvalidTimerRequest),
+        };
+        match (
+            request.operation(),
+            request.asynchronous(),
+            request.arguments().len(),
+        ) {
+            (0, true, 1) if duration >= 0 => {}
+            _ => return Err(ComputerError::InvalidTimerRequest),
         }
     }
     Ok(copy_host_request(request))
@@ -3505,6 +3541,51 @@ mod tests {
                 computer.advance(64, 64, u32::MAX).unwrap_err(),
             );
         }
+    }
+
+    #[test]
+    fn timer_sleep_is_published_and_resumes_with_unit() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::timer_unit_artifact(12),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let request = match computer.advance(64, 64, u32::MAX).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
+            other => panic!("unexpected timer outcome: {other:?}"),
+        };
+        assert_eq!("compukter", request.namespace.as_ref());
+        assert_eq!("timer", request.name.as_ref());
+        assert_eq!(1, request.abi_major);
+        assert_eq!(0, request.abi_minor);
+        assert_eq!(0, request.operation);
+        assert_eq!(
+            vec![ComputerValue::I32(12)].into_boxed_slice(),
+            request.arguments,
+        );
+        assert_eq!(ComputerHostMerge::Ordinary, request.merge);
+
+        computer
+            .resume_host_request(request.id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn negative_timer_sleep_is_rejected_before_host_publication() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::timer_unit_artifact(-1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            ComputerError::InvalidTimerRequest,
+            computer.advance(64, 64, u32::MAX).unwrap_err(),
+        );
     }
 
     #[test]
