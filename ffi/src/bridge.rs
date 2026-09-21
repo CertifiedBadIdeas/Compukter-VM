@@ -843,6 +843,7 @@ fn copy_error(error: ComputerError) -> BridgeError {
         | ComputerError::InvalidCompilerRequest
         | ComputerError::InvalidRedstoneRequest
         | ComputerError::InvalidSoundRequest
+        | ComputerError::InvalidTimerRequest
         | ComputerError::ActiveCompilation
         | ComputerError::NoActiveCompilation
         | ComputerError::InvalidCompilationToken
