@@ -82,6 +82,13 @@ pub(super) struct ResolvedSwitchCase {
     pub target: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DispatchEntry {
+    actual_type: usize,
+    declaration: usize,
+    implementation: usize,
+}
+
 #[derive(Debug)]
 pub(super) enum ResolvedInstruction {
     Nop,
@@ -318,6 +325,16 @@ pub(super) enum ResolvedInstruction {
         target: usize,
         args: Box<[u16]>,
     },
+    CallVirtual {
+        dst: u16,
+        declaration: usize,
+        args: Box<[u16]>,
+    },
+    CallInterface {
+        dst: u16,
+        declaration: usize,
+        args: Box<[u16]>,
+    },
     CallSuspend {
         dst: u16,
         target: usize,
@@ -423,6 +440,7 @@ struct ExecutionImageInner {
     artifact_bytes: Arc<[u8]>,
     entry: usize,
     functions: Box<[ResolvedFunction]>,
+    dispatch_entries: Box<[DispatchEntry]>,
     blocks: Box<[ResolvedBlock]>,
     constants: Box<[RuntimeValue]>,
     host_references: Box<[ResolvedHostReference]>,
@@ -579,9 +597,6 @@ impl ExecutionImage {
         let mut registers_per_frame = 0_usize;
         for (module_id, module) in decoded.modules.iter().enumerate() {
             for (function_id, function) in module.functions.iter().enumerate() {
-                if function.flags & (1 << 3) != 0 {
-                    return Err(AdmissionError::InvalidEntry);
-                }
                 let signature_key = resolve_type(decoded, module_id, function.signature)
                     .ok_or(AdmissionError::InvalidEntry)?;
                 let NominalType::Function { result, .. } = &decoded.modules
@@ -683,6 +698,14 @@ impl ExecutionImage {
                 });
             }
         }
+
+        let dispatch_entries = resolve_dispatch_entries(
+            decoded,
+            &function_offsets,
+            &type_offsets,
+            &assignable_type_sets,
+            &functions,
+        )?;
 
         let maximum_call_depth = u64::from(decoded.manifest.maximum_call_depth);
         let frame_arena_bytes = u64::from(decoded.manifest.required_stack_bytes);
@@ -797,6 +820,7 @@ impl ExecutionImage {
             artifact_bytes: decoded.bytes.clone(),
             entry,
             functions: functions.into_boxed_slice(),
+            dispatch_entries,
             blocks: blocks.into_boxed_slice(),
             constants: constants.into_boxed_slice(),
             host_references: host_references.into_boxed_slice(),
@@ -842,6 +866,17 @@ impl ExecutionImage {
 
     pub(super) fn function(&self, index: usize) -> Option<&ResolvedFunction> {
         self.0.functions.get(index)
+    }
+
+    pub(super) fn dispatch_target(&self, actual: TypeKey, declaration: usize) -> Option<usize> {
+        let actual_type = self.type_index(actual)?;
+        self.0
+            .dispatch_entries
+            .binary_search_by_key(&(actual_type, declaration), |entry| {
+                (entry.actual_type, entry.declaration)
+            })
+            .ok()
+            .map(|index| self.0.dispatch_entries[index].implementation)
     }
 
     pub(super) fn block(&self, index: usize) -> Option<&ResolvedBlock> {
@@ -2082,6 +2117,38 @@ fn resolve_instruction(
                 args: args.clone(),
             }
         }
+        Instruction::CallVirtual {
+            dst,
+            function_ref,
+            args,
+        } => {
+            let key = resolve_function(artifact, module, *function_ref)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let declaration = resolution.function_offsets[key.module as usize]
+                .checked_add(key.function as usize)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            ResolvedInstruction::CallVirtual {
+                dst: *dst,
+                declaration,
+                args: args.clone(),
+            }
+        }
+        Instruction::CallInterface {
+            dst,
+            function_ref,
+            args,
+        } => {
+            let key = resolve_function(artifact, module, *function_ref)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let declaration = resolution.function_offsets[key.module as usize]
+                .checked_add(key.function as usize)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            ResolvedInstruction::CallInterface {
+                dst: *dst,
+                declaration,
+                args: args.clone(),
+            }
+        }
         Instruction::CallSuspend {
             dst,
             function_ref,
@@ -2339,6 +2406,143 @@ fn host_type_matches(
             actual.kind == 7 && !actual.nullable && actual.nominal == string_type
         }
     }
+}
+
+fn resolve_dispatch_entries(
+    artifact: &DecodedArtifact,
+    function_offsets: &[usize],
+    type_offsets: &[usize],
+    assignable_types: &[Box<[TypeKey]>],
+    functions: &[ResolvedFunction],
+) -> Result<Box<[DispatchEntry]>, AdmissionError> {
+    let mut declarations = reserved(functions.len())?;
+    for (declaration, resolved) in functions.iter().enumerate() {
+        let module = &artifact.modules[resolved.key.module as usize];
+        let function = &module.functions[resolved.key.function as usize];
+        let owner = resolve_type(artifact, resolved.key.module as usize, function.owner);
+        let interface_owner = owner.is_some_and(|owner| {
+            matches!(
+                artifact.modules[owner.module as usize].types[owner.ty as usize],
+                NominalType::Interface { .. }
+            )
+        });
+        if function.flags & (1 << 2) != 0 || interface_owner {
+            declarations.push((declaration, owner.ok_or(AdmissionError::InvalidEntry)?));
+        }
+    }
+
+    let capacity = type_offsets
+        .last()
+        .copied()
+        .ok_or(AdmissionError::InvalidEntry)?
+        .checked_mul(declarations.len())
+        .ok_or(AdmissionError::StoragePlanOverflow)?;
+    let mut entries = reserved(capacity)?;
+    for (module_id, module) in artifact.modules.iter().enumerate() {
+        for (local_type, nominal) in module.types.iter().enumerate() {
+            let NominalType::Class { flags, .. } = nominal else {
+                continue;
+            };
+            let actual = TypeKey {
+                module: checked_u32(module_id)?,
+                ty: checked_u32(local_type)?,
+            };
+            let actual_type = global_index(type_offsets, actual)?;
+            for &(declaration, owner) in &declarations {
+                if !assignable_types[actual_type].contains(&owner) {
+                    continue;
+                }
+                if let Some(implementation) = find_method_implementation(
+                    artifact,
+                    function_offsets,
+                    functions,
+                    actual,
+                    declaration,
+                )? {
+                    entries.push(DispatchEntry {
+                        actual_type,
+                        declaration,
+                        implementation,
+                    });
+                } else if flags & 1 == 0 {
+                    return Err(AdmissionError::InvalidEntry);
+                }
+            }
+        }
+    }
+    Ok(entries.into_boxed_slice())
+}
+
+fn find_method_implementation(
+    artifact: &DecodedArtifact,
+    function_offsets: &[usize],
+    functions: &[ResolvedFunction],
+    actual: TypeKey,
+    declaration: usize,
+) -> Result<Option<usize>, AdmissionError> {
+    let mut current = Some(actual);
+    while let Some(owner) = current {
+        let module = &artifact.modules[owner.module as usize];
+        let NominalType::Class {
+            super_type,
+            method_start,
+            method_count,
+            ..
+        } = &module.types[owner.ty as usize]
+        else {
+            return Err(AdmissionError::InvalidEntry);
+        };
+        let end = method_start
+            .checked_add(*method_count)
+            .ok_or(AdmissionError::StoragePlanOverflow)?;
+        for local_method in *method_start..end {
+            let candidate = function_offsets[owner.module as usize]
+                .checked_add(local_method as usize)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            let decoded = module
+                .functions
+                .get(local_method as usize)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            if decoded.flags & (1 << 3) == 0
+                && same_method_shape(artifact, functions, declaration, candidate)?
+            {
+                return Ok(Some(candidate));
+            }
+        }
+        current = resolve_type(artifact, owner.module as usize, *super_type);
+    }
+    Ok(None)
+}
+
+fn same_method_shape(
+    artifact: &DecodedArtifact,
+    functions: &[ResolvedFunction],
+    declaration: usize,
+    candidate: usize,
+) -> Result<bool, AdmissionError> {
+    let declaration = functions
+        .get(declaration)
+        .ok_or(AdmissionError::InvalidEntry)?;
+    let candidate = functions
+        .get(candidate)
+        .ok_or(AdmissionError::InvalidEntry)?;
+    let declaration_module = &artifact.modules[declaration.key.module as usize];
+    let candidate_module = &artifact.modules[candidate.key.module as usize];
+    let declaration_record = &declaration_module.functions[declaration.key.function as usize];
+    let candidate_record = &candidate_module.functions[candidate.key.function as usize];
+    let declaration_name =
+        declaration_module.strings[declaration_record.name as usize].slice(&artifact.bytes);
+    let candidate_name =
+        candidate_module.strings[candidate_record.name as usize].slice(&artifact.bytes);
+    if declaration_name != candidate_name
+        || declaration.result != candidate.result
+        || declaration.parameter_count == 0
+        || candidate.parameter_count != declaration.parameter_count
+    {
+        return Ok(false);
+    }
+    Ok(declaration.registers[1..declaration.parameter_count]
+        == candidate.registers[1..candidate.parameter_count])
 }
 
 fn type_exists(artifact: &DecodedArtifact, key: TypeKey) -> bool {
