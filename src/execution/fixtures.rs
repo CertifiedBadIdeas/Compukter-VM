@@ -109,6 +109,207 @@ pub(super) fn nested_call_artifact() -> VerifiedArtifact {
     })
 }
 
+pub(super) fn dynamic_dispatch_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let i32_type = primitive(1);
+        let reference = |ty| ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(ty),
+        };
+        artifact.modules[0].types = vec![
+            function_type(i32_type, Vec::new()),
+            function_type(i32_type, vec![reference(5)]),
+            function_type(i32_type, vec![reference(6)]),
+            function_type(i32_type, vec![reference(7)]),
+            function_type(i32_type, vec![reference(8)]),
+            NominalType::Class {
+                flags: 0,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: Vec::new(),
+                field_start: 0,
+                field_count: 0,
+                method_start: 1,
+                method_count: 1,
+                initializer: None,
+            },
+            NominalType::Class {
+                flags: 2,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(5),
+                interfaces: Vec::new(),
+                field_start: 0,
+                field_count: 0,
+                method_start: 2,
+                method_count: 1,
+                initializer: None,
+            },
+            NominalType::Interface {
+                flags: 0,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: Vec::new(),
+                method_start: 3,
+                method_count: 1,
+            },
+            NominalType::Class {
+                flags: 2,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: vec![TypeId(7)],
+                field_start: 0,
+                field_count: 0,
+                method_start: 4,
+                method_count: 1,
+                initializer: None,
+            },
+        ];
+        artifact.modules[0].declared_types = 9;
+        artifact.modules[0].constants =
+            vec![Constant::I32(10), Constant::I32(20), Constant::I32(22)];
+        artifact.modules[0].functions = vec![
+            Function {
+                block_count: 3,
+                ..function(
+                    0,
+                    0,
+                    vec![reference(6), reference(8), i32_type, i32_type, i32_type],
+                    0,
+                )
+            },
+            Function {
+                owner: TypeId(5),
+                flags: 1 << 2,
+                ..function(1, 1, vec![reference(5), i32_type], 3)
+            },
+            Function {
+                owner: TypeId(6),
+                flags: 1 << 2,
+                ..function(2, 1, vec![reference(6), i32_type], 4)
+            },
+            Function {
+                owner: TypeId(7),
+                flags: 1 << 3,
+                block_count: 0,
+                first_block: BlockId(0),
+                ..function(3, 1, vec![reference(7)], 0)
+            },
+            Function {
+                owner: TypeId(8),
+                flags: 1 << 2,
+                ..function(4, 1, vec![reference(8), i32_type], 5)
+            },
+        ];
+        artifact.modules[0].declared_functions = 5;
+        let programs = vec![
+            (
+                0,
+                vec![
+                    Instruction::NewObject {
+                        dst: 0,
+                        type_ref: 6,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+            ),
+            (
+                0,
+                vec![
+                    Instruction::NewObject {
+                        dst: 1,
+                        type_ref: 8,
+                    },
+                    Instruction::Jump { target: 2 },
+                ],
+            ),
+            (
+                0,
+                vec![
+                    Instruction::CallVirtual {
+                        dst: 2,
+                        function_ref: 1,
+                        args: Box::new([0]),
+                    },
+                    Instruction::CallInterface {
+                        dst: 3,
+                        function_ref: 3,
+                        args: Box::new([1]),
+                    },
+                    Instruction::Add {
+                        form: 1,
+                        dst: 4,
+                        lhs: 2,
+                        rhs: 3,
+                    },
+                    Instruction::Return { value: 4 },
+                ],
+            ),
+            (
+                1,
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Return { value: 1 },
+                ],
+            ),
+            (
+                2,
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 1,
+                    },
+                    Instruction::Return { value: 1 },
+                ],
+            ),
+            (
+                4,
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 2,
+                    },
+                    Instruction::Return { value: 1 },
+                ],
+            ),
+        ];
+        let mut blocks = Vec::new();
+        let mut code = Vec::new();
+        let mut maximum_block_cost = 0;
+        for (block_id, (owner, instructions)) in programs.into_iter().enumerate() {
+            let fixed_cost = instructions
+                .iter()
+                .map(|instruction| instruction.fixed_cost().unwrap())
+                .sum();
+            maximum_block_cost = maximum_block_cost.max(fixed_cost);
+            blocks.push(Block {
+                owner_function: FunctionId(owner),
+                code_record: BlockId(block_id as u32),
+                instruction_count: instructions.len() as u32,
+                declared_fixed_cost: fixed_cost,
+                flags: 0,
+            });
+            code.push(DecodedCode {
+                bytes: ByteRange { start: 0, end: 0 },
+                instructions: instructions.into_boxed_slice(),
+                fixed_cost,
+            });
+        }
+        artifact.modules[0].blocks = blocks;
+        artifact.modules[0].code = code;
+        artifact.manifest.maximum_block_cost = maximum_block_cost;
+        artifact.manifest.minimum_slice_cost = maximum_block_cost;
+        configure_stack(artifact, 5, 2);
+    })
+}
+
 pub(super) fn suspend_value_call_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let i32_type = primitive(1);

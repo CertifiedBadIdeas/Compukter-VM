@@ -972,6 +972,8 @@ impl Machine {
                         break;
                     }
                     ResolvedInstruction::CallDirect { .. }
+                    | ResolvedInstruction::CallVirtual { .. }
+                    | ResolvedInstruction::CallInterface { .. }
                     | ResolvedInstruction::CallSuspend { .. } => {
                         let (dst, target, args, caller_block, caller_instruction) =
                             match instruction {
@@ -988,6 +990,51 @@ impl Machine {
                                     args,
                                     resume_block,
                                 } => (*dst, *target, args.as_ref(), *resume_block, 0),
+                                ResolvedInstruction::CallVirtual {
+                                    dst,
+                                    declaration,
+                                    args,
+                                }
+                                | ResolvedInstruction::CallInterface {
+                                    dst,
+                                    declaration,
+                                    args,
+                                } => {
+                                    let receiver = match args.first().copied() {
+                                        Some(receiver) => {
+                                            match self.read_register(frame_index, receiver) {
+                                                Ok(RuntimeValue::Reference(reference)) => reference,
+                                                Ok(RuntimeValue::Null) => {
+                                                    let outcome =
+                                                        Outcome::Crashed(GuestTrap::NullReference);
+                                                    self.lifecycle = Lifecycle::Terminal(outcome);
+                                                    return Ok(outcome);
+                                                }
+                                                Ok(_) => {
+                                                    return Ok(self.fault(VmFault::InvalidValueType))
+                                                }
+                                                Err(fault) => return Ok(self.fault(fault)),
+                                            }
+                                        }
+                                        None => return Ok(self.fault(VmFault::InvalidValueType)),
+                                    };
+                                    let actual = match self.reference_type(receiver) {
+                                        Ok(actual) => actual,
+                                        Err(fault) => return Ok(self.fault(fault)),
+                                    };
+                                    let Some(target) =
+                                        self.image.dispatch_target(actual, *declaration)
+                                    else {
+                                        return Ok(self.fault(VmFault::InvalidResolvedId));
+                                    };
+                                    (
+                                        *dst,
+                                        target,
+                                        args.as_ref(),
+                                        block_index,
+                                        instruction_index + 1,
+                                    )
+                                }
                                 _ => unreachable!(),
                             };
                         let Some(target_function) = self.image.function(target) else {

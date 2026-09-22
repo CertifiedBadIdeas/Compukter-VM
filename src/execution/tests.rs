@@ -193,6 +193,16 @@ fn managed_heap_vertical_conformance() {
     );
 }
 
+#[test]
+fn dynamic_calls_select_runtime_class_and_interface_implementations() {
+    let mut machine = fixtures::started_zero_arg(fixtures::dynamic_dispatch_artifact());
+
+    assert_eq!(
+        Outcome::Halted(Some(RuntimeValue::I32(42))),
+        machine.run_slice(64, 0).unwrap()
+    );
+}
+
 pub(super) mod allocation_counter {
     use std::{
         alloc::{GlobalAlloc, Layout, System},
