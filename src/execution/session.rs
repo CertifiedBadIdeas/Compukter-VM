@@ -228,6 +228,16 @@ impl Session {
         guest_budget: u32,
         maintenance_budget: u32,
     ) -> Result<AdvanceOutcome<'_>, RunError> {
+        self.advance_with_retirement_limit(guest_budget, maintenance_budget, u32::MAX)
+    }
+
+    pub fn advance_with_retirement_limit(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+        retirement_limit: u32,
+    ) -> Result<AdvanceOutcome<'_>, RunError> {
+        let mut remaining_retirements = retirement_limit;
         if let Some(terminal) = self.terminal {
             return Ok(match terminal {
                 SessionTerminal::HostFailed(kind) => AdvanceOutcome::HostFailed(HostFailure::new(
@@ -273,19 +283,30 @@ impl Session {
                         .consumed_maintenance_cost()
                         .saturating_sub(before_maintenance) as u32,
                 ),
+                &mut remaining_retirements,
             );
         }
-        self.run_and_map(guest_budget, maintenance_budget)
+        self.run_and_map(guest_budget, maintenance_budget, &mut remaining_retirements)
     }
 
     fn run_and_map(
         &mut self,
         guest_budget: u32,
         maintenance_budget: u32,
+        remaining_retirements: &mut u32,
     ) -> Result<AdvanceOutcome<'_>, RunError> {
         let before_guest = self.guest_units();
         let before_maintenance = self.machine.consumed_maintenance_cost();
-        let outcome = self.machine.run_slice(guest_budget, maintenance_budget)?;
+        let before_retirements = self.machine.retired_instructions();
+        let outcome = self.machine.run_slice_with_retirement_limit(
+            guest_budget,
+            maintenance_budget,
+            *remaining_retirements,
+        )?;
+        *remaining_retirements = remaining_retirements.saturating_sub(
+            u32::try_from(self.machine.retired_instructions() - before_retirements)
+                .unwrap_or(u32::MAX),
+        );
         let used_guest = self.guest_units().saturating_sub(before_guest);
         let used_maintenance = self
             .machine
@@ -295,6 +316,7 @@ impl Session {
             outcome,
             guest_budget.saturating_sub(u32::try_from(used_guest).unwrap_or(u32::MAX)),
             maintenance_budget.saturating_sub(u32::try_from(used_maintenance).unwrap_or(u32::MAX)),
+            remaining_retirements,
         )
     }
 
@@ -309,6 +331,7 @@ impl Session {
         outcome: super::error::Outcome,
         guest_budget: u32,
         maintenance_budget: u32,
+        remaining_retirements: &mut u32,
     ) -> Result<AdvanceOutcome<'_>, RunError> {
         match outcome {
             super::error::Outcome::SliceExhausted => {
@@ -353,8 +376,9 @@ impl Session {
                 );
                 if self.machine.has_active_task()
                     && guest_budget >= self.machine.minimum_run_budget()
+                    && *remaining_retirements != 0
                 {
-                    self.run_and_map(guest_budget, maintenance_budget)
+                    self.run_and_map(guest_budget, maintenance_budget, remaining_retirements)
                 } else {
                     self.request_outcome().map_err(|_| RunError::NotRunnable)
                 }
@@ -526,6 +550,7 @@ impl Session {
             maintenance_units: self.machine.consumed_maintenance_cost(),
             entered_blocks: self.machine.entered_blocks(),
             executed_instructions: self.machine.executed_instructions(),
+            retired_instructions: self.machine.retired_instructions(),
             published_requests: self.published_requests,
             accepted_responses: self.accepted_responses,
             trace_digest: self.machine.trace_digest(),

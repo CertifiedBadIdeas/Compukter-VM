@@ -79,6 +79,42 @@ fn new_object_propagates_initializer_failure() {
         machine.run_slice(64, 64).unwrap(),
         Outcome::Faulted(super::error::VmFault::ReachedUnreachable)
     );
+    assert_eq!(
+        machine.retired_instructions() + 1,
+        machine.executed_instructions(),
+        "the faulting instruction must not retire"
+    );
+}
+
+#[test]
+fn retirement_limit_stops_inside_a_block_and_resumes_exactly() {
+    let mut machine = fixtures::started_zero_arg(fixtures::two_block_artifact(3, 5));
+
+    assert_eq!(
+        Outcome::SliceExhausted,
+        machine.run_slice_with_retirement_limit(8, 0, 0).unwrap()
+    );
+    assert_eq!(0, machine.retired_instructions());
+    for expected in 1..8 {
+        assert_eq!(
+            Outcome::SliceExhausted,
+            machine.run_slice_with_retirement_limit(8, 0, 1).unwrap()
+        );
+        assert_eq!(expected, machine.retired_instructions());
+        if expected == 3 {
+            assert_eq!(
+                3,
+                machine.consumed_fixed_cost(),
+                "the next block must not be charged before its first instruction"
+            );
+        }
+    }
+    assert_eq!(
+        Outcome::Halted(None),
+        machine.run_slice_with_retirement_limit(8, 0, 1).unwrap()
+    );
+    assert_eq!(8, machine.retired_instructions());
+    assert_eq!(8, machine.executed_instructions());
 }
 
 #[test]
@@ -728,6 +764,8 @@ fn trap_keeps_the_full_containing_block_charge() {
         machine.run_slice(7, 0).unwrap()
     );
     assert_eq!(7, machine.consumed_fixed_cost());
+    assert_eq!(2, machine.retired_instructions());
+    assert_eq!(3, machine.executed_instructions());
     assert_eq!(
         fixtures::pre_trap_registers(),
         machine.test_active_registers()

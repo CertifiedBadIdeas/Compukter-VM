@@ -504,6 +504,7 @@ pub struct AccountingSnapshot {
     pub maintenance_units: u64,
     pub entered_blocks: u64,
     pub executed_instructions: u64,
+    pub retired_instructions: u64,
     pub published_requests: u64,
     pub accepted_responses: u64,
     pub trace_digest: [u8; 32],

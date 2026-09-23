@@ -47,6 +47,29 @@ fn only_request(outcome: AdvanceOutcome<'_>) -> super::host::HostRequestView<'_>
 }
 
 #[test]
+fn session_retirement_limit_is_shared_across_an_advance() {
+    let mut session = Session::admit(fixtures::two_block_artifact(3, 5), profile(), &[]).unwrap();
+    session.start(&[]).unwrap();
+    assert_eq!(
+        AdvanceOutcome::SliceExhausted,
+        session.advance_with_retirement_limit(8, 0, 0).unwrap()
+    );
+    assert_eq!(0, session.accounting().retired_instructions);
+    for expected in 1..8 {
+        assert_eq!(
+            AdvanceOutcome::SliceExhausted,
+            session.advance_with_retirement_limit(8, 0, 1).unwrap()
+        );
+        assert_eq!(expected, session.accounting().retired_instructions);
+    }
+    assert_eq!(
+        AdvanceOutcome::Halted(None),
+        session.advance_with_retirement_limit(8, 0, 1).unwrap()
+    );
+    assert_eq!(8, session.accounting().retired_instructions);
+}
+
+#[test]
 fn independent_tasks_publish_together_and_resume_out_of_order() {
     let operations = [
         OperationSchema::asynchronous(&[], HostValueType::I32),

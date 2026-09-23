@@ -237,6 +237,7 @@ pub struct ComputerResourceSnapshot {
     pub maintenance_units: u64,
     pub entered_blocks: u64,
     pub executed_instructions: u64,
+    pub retired_instructions: u64,
     pub heap_capacity_bytes: u64,
     pub heap_used_bytes: u64,
     pub live_objects: u64,
@@ -260,6 +261,7 @@ struct RetiredExecutionAccounting {
     maintenance_units: u64,
     entered_blocks: u64,
     executed_instructions: u64,
+    retired_instructions: u64,
     saturated: bool,
 }
 
@@ -288,6 +290,11 @@ impl RetiredExecutionAccounting {
         add_counter(
             &mut self.executed_instructions,
             accounting.executed_instructions,
+            &mut self.saturated,
+        );
+        add_counter(
+            &mut self.retired_instructions,
+            accounting.retired_instructions,
             &mut self.saturated,
         );
     }
@@ -548,6 +555,7 @@ impl ComputerMachine {
             maintenance_units: self.retired_execution.maintenance_units,
             entered_blocks: self.retired_execution.entered_blocks,
             executed_instructions: self.retired_execution.executed_instructions,
+            retired_instructions: self.retired_execution.retired_instructions,
             filesystem_logical_bytes: self.filesystem.logical_bytes(),
             filesystem_logical_capacity_bytes: self.filesystem.limits().maximum_logical_bytes,
             filesystem_nodes: self.filesystem.node_count(),
@@ -580,6 +588,11 @@ impl ComputerMachine {
             add_counter(
                 &mut snapshot.executed_instructions,
                 resource.accounting.executed_instructions,
+                &mut snapshot.counters_saturated,
+            );
+            add_counter(
+                &mut snapshot.retired_instructions,
+                resource.accounting.retired_instructions,
                 &mut snapshot.counters_saturated,
             );
             add_counter(
@@ -933,6 +946,21 @@ impl ComputerMachine {
         maintenance_budget: u32,
         host_request_budget: u32,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        self.advance_with_retirement_limit(
+            guest_budget,
+            maintenance_budget,
+            host_request_budget,
+            u32::MAX,
+        )
+    }
+
+    pub fn advance_with_retirement_limit(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+        host_request_budget: u32,
+        retirement_limit: u32,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
         if self.active_frame().pending_stdio_read.is_some()
             && self.advance_pending_stdio()? != ComputerAdvanceOutcome::WaitingForTerminalEvent
         {
@@ -961,7 +989,7 @@ impl ComputerMachine {
                 .last_mut()
                 .expect("a computer always has a root process")
                 .session
-                .advance(guest_budget, maintenance_budget)
+                .advance_with_retirement_limit(guest_budget, maintenance_budget, retirement_limit)
                 .map_err(ComputerError::Run)?;
             match outcome {
                 AdvanceOutcome::HostRequestBatch(batch) => {
@@ -3143,10 +3171,13 @@ mod tests {
             let before = computer.resource_snapshot();
             assert_eq!(
                 ComputerAdvanceOutcome::SliceExhausted,
-                computer.advance(64, 64, u32::MAX).unwrap(),
+                computer
+                    .advance_with_retirement_limit(64, 64, u32::MAX, 1)
+                    .unwrap(),
             );
             let after = computer.resource_snapshot();
             assert!(after.executed_instructions >= before.executed_instructions);
+            assert!(after.retired_instructions - before.retired_instructions <= 1);
         }
         let without_child = computer.resource_snapshot();
         assert_eq!(
@@ -3154,6 +3185,7 @@ mod tests {
             without_child.heap_capacity_bytes
         );
         assert!(without_child.executed_instructions >= with_child.executed_instructions);
+        assert!(without_child.retired_instructions >= with_child.retired_instructions);
         assert!(
             without_child.mutable_execution_resident_bytes
                 < with_child.mutable_execution_resident_bytes

@@ -1040,6 +1040,63 @@ pub unsafe extern "C" fn compukter_advance(
 }
 
 #[unsafe(no_mangle)]
+/// Advances with an instruction retirement limit and reports retired work.
+///
+/// # Safety
+///
+/// `retired_out` and `written_out` must point to writable values. When
+/// `output_capacity` is non-zero, `output` must be writable for that size.
+pub unsafe extern "C" fn compukter_advance_with_retirement_limit(
+    handle: u64,
+    guest_budget: u32,
+    maintenance_budget: u32,
+    host_request_budget: u32,
+    retirement_limit: u32,
+    output: *mut u8,
+    output_capacity: usize,
+    written_out: *mut usize,
+    retired_out: *mut u64,
+) -> FfiStatus {
+    ffi_status(|| {
+        if written_out.is_null()
+            || retired_out.is_null()
+            || (output_capacity != 0 && output.is_null())
+        {
+            return FfiStatus::InvalidArgument;
+        }
+        if output_capacity < MAXIMUM_OUTCOME_BYTES {
+            unsafe { written_out.write(MAXIMUM_OUTCOME_BYTES) };
+            return FfiStatus::BufferTooSmall;
+        }
+        let (outcome, retired) = match bridge::advance_with_retirement_limit(
+            handle,
+            guest_budget,
+            maintenance_budget,
+            host_request_budget,
+            retirement_limit,
+        ) {
+            Ok(result) => result,
+            Err(BridgeError::Handle(error)) => return handle_status(error),
+            Err(BridgeError::Run(_)) => return FfiStatus::Run,
+            Err(BridgeError::Resume(_) | BridgeError::InvalidRequestId) => {
+                return FfiStatus::Resume
+            }
+            Err(BridgeError::InvalidOperation) => return FfiStatus::InvalidArgument,
+        };
+        let encoded = crate::wire::encode_outcome(outcome);
+        if encoded.len() > output_capacity || retired > u64::from(retirement_limit) {
+            return FfiStatus::Internal;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
+            written_out.write(encoded.len());
+            retired_out.write(retired);
+        }
+        FfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Writes the exact byte count required for the pending compilation request.
 ///
 /// # Safety
