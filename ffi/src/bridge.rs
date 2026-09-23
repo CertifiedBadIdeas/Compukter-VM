@@ -349,6 +349,41 @@ pub(crate) fn advance(
         .map_err(BridgeError::Handle)?
 }
 
+pub(crate) fn advance_with_retirement_limit(
+    handle: u64,
+    guest_budget: u32,
+    maintenance_budget: u32,
+    host_request_budget: u32,
+    retirement_limit: u32,
+) -> Result<(OwnedOutcome, u64), BridgeError> {
+    sessions()
+        .with(handle, |session| {
+            let before = session.computer.resource_snapshot().retired_instructions;
+            let outcome = session
+                .computer
+                .advance_with_retirement_limit(
+                    guest_budget,
+                    maintenance_budget,
+                    host_request_budget,
+                    retirement_limit,
+                )
+                .map_err(copy_error)?;
+            let retired = session
+                .computer
+                .resource_snapshot()
+                .retired_instructions
+                .saturating_sub(before);
+            if let ComputerAdvanceOutcome::CompilationRequested(request) = outcome {
+                let token = request.token;
+                session.compilation = Some(request);
+                Ok((OwnedOutcome::CompilationRequested { token }, retired))
+            } else {
+                Ok((copy_outcome(outcome), retired))
+            }
+        })
+        .map_err(BridgeError::Handle)?
+}
+
 pub(crate) fn submit_redstone_input(handle: u64, packet: u32) -> Result<(), BridgeError> {
     sessions()
         .with(handle, |session| {

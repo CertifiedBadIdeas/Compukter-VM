@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "compukter-ffi"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "compukter-vm",
  "sha2",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "compukter-jni"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "compukter-ffi",
  "jni",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "compukter-vm"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ryu",
  "sha2",
@@ -294,7 +294,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "persistence-crash-fixture"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "compukter-vm",
  "sha2",
@@ -326,7 +326,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "runtime-bundler"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "flate2",
  "libloading",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "tempfile",
  "toml_edit",

@@ -146,6 +146,7 @@ pub(super) struct Machine {
     consumed_maintenance_cost: u64,
     entered_blocks: u64,
     executed_instructions: u64,
+    retired_instructions: u64,
     maximum_observed_frame_depth: usize,
     trace: Sha256,
     trace_enabled: bool,
@@ -345,6 +346,7 @@ impl Machine {
             consumed_maintenance_cost: 0,
             entered_blocks: 0,
             executed_instructions: 0,
+            retired_instructions: 0,
             maximum_observed_frame_depth: 0,
             trace: Sha256::new(),
             trace_enabled,
@@ -773,6 +775,50 @@ impl Machine {
         guest_budget: u32,
         maintenance_budget: u32,
     ) -> Result<Outcome, RunError> {
+        self.run_slice_with_retirement_limit(guest_budget, maintenance_budget, u32::MAX)
+    }
+
+    pub(super) fn run_slice_with_retirement_limit(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+        retirement_limit: u32,
+    ) -> Result<Outcome, RunError> {
+        let attempts_before = self.executed_instructions;
+        let pending_before = u64::from(self.has_pending_guest_instruction());
+        let outcome = self.run_slice_inner(guest_budget, maintenance_budget, retirement_limit)?;
+        let attempts = self.executed_instructions - attempts_before;
+        let pending_after = u64::from(self.has_pending_guest_instruction());
+        let completed = attempts + pending_before - pending_after;
+        let faulting_instruction = matches!(
+            outcome,
+            Outcome::AllocationExhausted(_) | Outcome::Crashed(_) | Outcome::Faulted(_)
+        ) && completed != 0;
+        let retired = completed - u64::from(faulting_instruction);
+        self.retired_instructions = self
+            .retired_instructions
+            .checked_add(retired)
+            .expect("retired instruction count cannot exceed attempted count");
+        Ok(outcome)
+    }
+
+    fn has_pending_guest_instruction(&self) -> bool {
+        self.pending_allocation.is_some()
+            || self.pending_text.is_some()
+            || self.pending_concat.is_some()
+            || self.allocation_retry.is_some()
+            || matches!(
+                self.string_collection_pending,
+                Some(StringCollectionTarget::Concat)
+            )
+    }
+
+    fn run_slice_inner(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+        retirement_limit: u32,
+    ) -> Result<Outcome, RunError> {
         match self.lifecycle {
             Lifecycle::Terminal(outcome) => return Ok(outcome),
             Lifecycle::Pristine => return Err(RunError::NotStarted),
@@ -803,6 +849,12 @@ impl Machine {
         if self.collector.is_active() {
             return self.run_maintenance(maintenance_budget);
         }
+        if retirement_limit == 0 {
+            return Ok(Outcome::SliceExhausted);
+        }
+        let attempts_before = self.executed_instructions;
+        let attempt_limit = u64::from(retirement_limit)
+            .saturating_sub(u64::from(self.has_pending_guest_instruction()));
         let mut remaining = guest_budget;
         'run: loop {
             let frame_index = self
@@ -823,6 +875,9 @@ impl Machine {
                 if let Some(outcome) = self.resume_pending_concat(frame_index, &mut remaining) {
                     return Ok(outcome);
                 }
+            }
+            if self.executed_instructions - attempts_before >= attempt_limit {
+                return Ok(Outcome::SliceExhausted);
             }
             let block_index = self.frames[frame_index].block;
             let block_cost = self
@@ -854,6 +909,9 @@ impl Machine {
                 .len();
 
             while self.frames[frame_index].instruction < block_len {
+                if self.executed_instructions - attempts_before >= attempt_limit {
+                    return Ok(Outcome::SliceExhausted);
+                }
                 let instruction_index = self.frames[frame_index].instruction;
                 let active_type = match &self
                     .image
@@ -2904,6 +2962,10 @@ impl Machine {
 
     pub(super) fn executed_instructions(&self) -> u64 {
         self.executed_instructions
+    }
+
+    pub(super) fn retired_instructions(&self) -> u64 {
+        self.retired_instructions
     }
 
     fn trace_block_entry(

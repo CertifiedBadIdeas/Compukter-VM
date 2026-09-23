@@ -516,13 +516,21 @@ fn allocation_resumes_without_recharging_or_publishing_a_prefix() {
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
 
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
+    assert_eq!(
+        Outcome::SliceExhausted,
+        machine.run_slice_with_retirement_limit(5, 0, 1).unwrap()
+    );
+    assert_eq!(0, machine.retired_instructions());
     assert_eq!(5, machine.consumed_fixed_cost());
     assert_eq!(0, machine.consumed_dynamic_cost());
     assert_eq!(None, machine.test_register(0));
     assert_eq!(0, machine.test_pending_initialized_bytes());
 
-    assert_eq!(Outcome::SliceExhausted, machine.run_slice(1, 0).unwrap());
+    assert_eq!(
+        Outcome::SliceExhausted,
+        machine.run_slice_with_retirement_limit(1, 0, 1).unwrap()
+    );
+    assert_eq!(0, machine.retired_instructions());
     assert_eq!(16, machine.test_pending_initialized_bytes());
     let Outcome::Halted(Some(RuntimeValue::Reference(reference))) =
         machine.run_slice(1, 0).unwrap()
@@ -532,6 +540,10 @@ fn allocation_resumes_without_recharging_or_publishing_a_prefix() {
     assert_eq!(5, machine.consumed_fixed_cost());
     assert_eq!(2, machine.consumed_dynamic_cost());
     assert_eq!(1, machine.test_heap_diagnostic().live_handles);
+    assert_eq!(
+        machine.executed_instructions(),
+        machine.retired_instructions()
+    );
     assert!(machine
         .test_managed_payload(reference)
         .unwrap()

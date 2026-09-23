@@ -21,20 +21,21 @@
 mod support;
 
 use compukter_ffi::{
-    compukter_abi_version, compukter_advance, compukter_close, compukter_compilation_complete,
-    compukter_compilation_request_copy, compukter_compilation_request_size, compukter_create,
-    compukter_create_boot_in_store, compukter_create_in_store, compukter_deploy,
-    compukter_deployment_candidate_close, compukter_executable_revision,
-    compukter_filesystem_generation, compukter_filesystem_list, compukter_filesystem_read,
-    compukter_filesystem_stat, compukter_max_create_bytes, compukter_max_outcome_bytes,
-    compukter_redstone_confirm_output, compukter_redstone_submit_input,
-    compukter_resource_snapshot, compukter_resume_bool, compukter_resume_f32_bits,
-    compukter_resume_failure, compukter_resume_i32, compukter_store_close,
-    compukter_store_durable_generation, compukter_store_flush, compukter_store_health,
-    compukter_store_open, compukter_store_recover, compukter_store_tombstone,
-    compukter_submit_canonical_line, compukter_terminal_changes_since, compukter_terminal_commit,
-    compukter_terminal_full_state, compukter_terminal_key, compukter_terminal_text,
-    compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus, COMPUKTER_FFI_ABI_VERSION,
+    compukter_abi_version, compukter_advance, compukter_advance_with_retirement_limit,
+    compukter_close, compukter_compilation_complete, compukter_compilation_request_copy,
+    compukter_compilation_request_size, compukter_create, compukter_create_boot_in_store,
+    compukter_create_in_store, compukter_deploy, compukter_deployment_candidate_close,
+    compukter_executable_revision, compukter_filesystem_generation, compukter_filesystem_list,
+    compukter_filesystem_read, compukter_filesystem_stat, compukter_max_create_bytes,
+    compukter_max_outcome_bytes, compukter_redstone_confirm_output,
+    compukter_redstone_submit_input, compukter_resource_snapshot, compukter_resume_bool,
+    compukter_resume_f32_bits, compukter_resume_failure, compukter_resume_i32,
+    compukter_store_close, compukter_store_durable_generation, compukter_store_flush,
+    compukter_store_health, compukter_store_open, compukter_store_recover,
+    compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
+    compukter_terminal_commit, compukter_terminal_full_state, compukter_terminal_key,
+    compukter_terminal_text, compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
+    COMPUKTER_FFI_ABI_VERSION,
 };
 use compukter_vm::ProcessFailureReason;
 use std::path::{Path, PathBuf};
@@ -44,7 +45,7 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(15, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(16, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
@@ -721,6 +722,63 @@ fn advance_rejects_a_short_buffer_before_advancing_the_machine() {
     assert_eq!(&control_output[..control_written], &output[..written]);
     assert_eq!(FfiStatus::Ok, compukter_close(handle));
     assert_eq!(FfiStatus::Ok, compukter_close(control));
+}
+
+#[test]
+fn retirement_limited_advance_reports_bounded_work_and_checks_output_first() {
+    let artifact = terminal_artifact();
+    let handle = create_machine(&artifact);
+    let mut written = 0_usize;
+    let mut retired = u64::MAX;
+    let mut short = [0_u8; 1];
+    assert_eq!(FfiStatus::BufferTooSmall, unsafe {
+        compukter_advance_with_retirement_limit(
+            handle,
+            64,
+            64,
+            u32::MAX,
+            1,
+            short.as_mut_ptr(),
+            short.len(),
+            &mut written,
+            &mut retired,
+        )
+    });
+    assert_eq!(compukter_max_outcome_bytes(), written);
+    assert_eq!(u64::MAX, retired);
+
+    let mut output = vec![0_u8; compukter_max_outcome_bytes()];
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_advance_with_retirement_limit(
+            handle,
+            64,
+            64,
+            u32::MAX,
+            0,
+            output.as_mut_ptr(),
+            output.len(),
+            &mut written,
+            &mut retired,
+        )
+    });
+    assert_eq!(&[0], &output[..written]);
+    assert_eq!(0, retired);
+
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_advance_with_retirement_limit(
+            handle,
+            64,
+            64,
+            u32::MAX,
+            1,
+            output.as_mut_ptr(),
+            output.len(),
+            &mut written,
+            &mut retired,
+        )
+    });
+    assert!(retired <= 1);
+    assert_eq!(FfiStatus::Ok, compukter_close(handle));
 }
 
 #[test]
