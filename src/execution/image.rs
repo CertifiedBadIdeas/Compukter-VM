@@ -2455,6 +2455,8 @@ fn resolve_dispatch_entries(
                 if let Some(implementation) = find_method_implementation(
                     artifact,
                     function_offsets,
+                    type_offsets,
+                    assignable_types,
                     functions,
                     actual,
                     declaration,
@@ -2476,6 +2478,8 @@ fn resolve_dispatch_entries(
 fn find_method_implementation(
     artifact: &DecodedArtifact,
     function_offsets: &[usize],
+    type_offsets: &[usize],
+    assignable_types: &[Box<[TypeKey]>],
     functions: &[ResolvedFunction],
     actual: TypeKey,
     declaration: usize,
@@ -2503,15 +2507,70 @@ fn find_method_implementation(
                 .functions
                 .get(local_method as usize)
                 .ok_or(AdmissionError::InvalidEntry)?;
-            if decoded.flags & (1 << 3) == 0
-                && same_method_shape(artifact, functions, declaration, candidate)?
-            {
-                return Ok(Some(candidate));
+            if same_method_shape(artifact, functions, declaration, candidate)? {
+                return Ok((decoded.flags & (1 << 3) == 0).then_some(candidate));
             }
         }
         current = resolve_type(artifact, owner.module as usize, *super_type);
     }
-    Ok(None)
+
+    let actual_type = global_index(type_offsets, actual)?;
+    let mut candidates = reserved(functions.len())?;
+    for &owner in &*assignable_types[actual_type] {
+        let module = &artifact.modules[owner.module as usize];
+        let NominalType::Interface {
+            method_start,
+            method_count,
+            ..
+        } = &module.types[owner.ty as usize]
+        else {
+            continue;
+        };
+        let end = method_start
+            .checked_add(*method_count)
+            .ok_or(AdmissionError::StoragePlanOverflow)?;
+        for local_method in *method_start..end {
+            let candidate = function_offsets[owner.module as usize]
+                .checked_add(local_method as usize)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            if same_method_shape(artifact, functions, declaration, candidate)? {
+                candidates.push((owner, candidate));
+            }
+        }
+    }
+
+    let selected = most_specific_interface_method(&candidates, type_offsets, assignable_types)?;
+    Ok(selected.filter(|&candidate| {
+        let key = functions[candidate].key;
+        artifact.modules[key.module as usize].functions[key.function as usize].flags & (1 << 3) == 0
+    }))
+}
+
+fn most_specific_interface_method(
+    candidates: &[(TypeKey, usize)],
+    type_offsets: &[usize],
+    assignable_types: &[Box<[TypeKey]>],
+) -> Result<Option<usize>, AdmissionError> {
+    let mut selected = None;
+    for &(owner, candidate) in candidates {
+        let mut shadowed = false;
+        for &(other, _) in candidates {
+            if other != owner
+                && assignable_types[global_index(type_offsets, other)?].contains(&owner)
+            {
+                shadowed = true;
+                break;
+            }
+        }
+        if shadowed {
+            continue;
+        }
+        if selected.is_some() {
+            return Ok(None);
+        }
+        selected = Some(candidate);
+    }
+    Ok(selected)
 }
 
 fn same_method_shape(
@@ -2605,6 +2664,35 @@ fn assignable_types(
 mod tests {
     use super::*;
     use crate::execution::{error::AdmissionError, fixtures, FunctionKey};
+
+    #[test]
+    fn interface_defaults_choose_most_specific_or_reject_conflicts() {
+        let root = TypeKey { module: 0, ty: 0 };
+        let branch = TypeKey { module: 0, ty: 1 };
+        let unrelated = TypeKey { module: 0, ty: 2 };
+        let assignable: [Box<[TypeKey]>; 3] = [
+            vec![root].into_boxed_slice(),
+            vec![branch, root].into_boxed_slice(),
+            vec![unrelated].into_boxed_slice(),
+        ];
+        let offsets = [0, 3];
+
+        assert_eq!(
+            Some(11),
+            most_specific_interface_method(&[(root, 10), (branch, 11)], &offsets, &assignable)
+                .unwrap()
+        );
+        assert_eq!(
+            None,
+            most_specific_interface_method(&[(root, 10), (unrelated, 12)], &offsets, &assignable)
+                .unwrap()
+        );
+        assert_eq!(
+            None,
+            most_specific_interface_method(&[(root, 10), (root, 11)], &offsets, &assignable)
+                .unwrap()
+        );
+    }
 
     #[test]
     fn portable_frame_charge_uses_physical_shapes() {
