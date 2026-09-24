@@ -3005,6 +3005,11 @@ impl Machine {
                 .image
                 .function(frame.function)
                 .ok_or(RunError::NotRunnable)?;
+            let safepoint = self.image.safepoint_map(
+                frame.function,
+                frame.block,
+                u32::try_from(frame.instruction).map_err(|_| RunError::NotRunnable)?,
+            );
             trace_field(
                 &mut self.trace,
                 &u32::try_from(active_function.register_count)
@@ -3012,6 +3017,22 @@ impl Machine {
                     .to_le_bytes(),
             );
             for register in 0..active_function.register_count {
+                if let Some(map) = safepoint {
+                    let register_layout = active_function
+                        .frame_layout
+                        .values
+                        .get(register)
+                        .ok_or(RunError::NotRunnable)?;
+                    // Dead reference slots may still contain IDs reclaimed by the collector.
+                    if active_function.registers[register].kind == 7
+                        && register_layout.components.first().is_some_and(|component| {
+                            !map.reference_offsets.contains(&component.offset)
+                        })
+                    {
+                        trace_register(&mut self.trace, None, None)?;
+                        continue;
+                    }
+                }
                 let value =
                     read_frame_value(&self.frame_arena, frame, active_function, register as u16)
                         .map_err(|_| RunError::NotRunnable)?;
