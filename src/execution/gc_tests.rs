@@ -408,6 +408,33 @@ fn oom_dropped_root_is_collected_and_the_retry_recovers() {
 }
 
 #[test]
+fn post_collection_array_initialization_resumes_across_slices() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 1536;
+    let image = ExecutionImage::admit(fixtures::gc_array_retry_artifact(256), profile).unwrap();
+    let minimum = image.minimum_slice_cost();
+    let mut machine = super::machine::Machine::new(image).unwrap();
+    machine.start(&[]).unwrap();
+    let mut slices = 0;
+    loop {
+        match machine.run_slice(minimum, 1).unwrap() {
+            Outcome::SliceExhausted => {
+                slices += 1;
+                assert!(slices < 10000);
+            }
+            Outcome::Halted(value) => {
+                assert!(matches!(value, Some(RuntimeValue::Reference(_))));
+                break;
+            }
+            outcome => panic!("unexpected post-collection array outcome: {outcome:?}"),
+        }
+    }
+    assert!(slices > 1);
+    assert!(machine.consumed_maintenance_cost() > 0);
+    assert_eq!(1, machine.test_heap_diagnostic().live_handles);
+}
+
+#[test]
 fn machine_reports_one_failed_post_collection_retry() {
     let mut profile = fixtures::profile();
     profile.heap_bytes = 32;

@@ -2389,7 +2389,6 @@ impl Machine {
     ) -> Option<Outcome> {
         let mut pending = self.pending_allocation.take()?;
         let destination = pending.state().destination;
-        let collection_attempted = pending.state().collection_attempted;
         let expected_units = pending.units_for_budget(*remaining);
         let Some(consumed_dynamic_cost) = self
             .consumed_dynamic_cost
@@ -2409,7 +2408,7 @@ impl Machine {
         *remaining -= used;
         self.consumed_dynamic_cost = consumed_dynamic_cost;
         let Some(reference) = published else {
-            debug_assert!(!collection_attempted);
+            // A successful reservation after collection still initializes incrementally.
             self.pending_allocation = Some(pending);
             return Some(Outcome::SliceExhausted);
         };
