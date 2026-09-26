@@ -4658,6 +4658,65 @@ pub(super) fn gc_retry_artifact() -> VerifiedArtifact {
     })
 }
 
+pub(super) fn gc_array_retry_artifact(length: i32) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let reference = ValueType {
+            kind: 7,
+            flags: 1,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: reference,
+            parameters: Vec::new(),
+        };
+        artifact.modules[0].types.push(NominalType::Array {
+            name: 0,
+            element: primitive(1),
+        });
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].constants = vec![Constant::I32(length)];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 2;
+        function.values = crate::artifact::scalar_values(vec![primitive(1), reference]);
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::NewArray {
+                        dst: 1,
+                        type_ref: 1,
+                        length: 0,
+                    },
+                    Instruction::Jump { target: 2 },
+                ],
+                vec![
+                    Instruction::Null { dst: 1 },
+                    Instruction::Jump { target: 3 },
+                ],
+                vec![
+                    Instruction::NewArray {
+                        dst: 1,
+                        type_ref: 1,
+                        length: 0,
+                    },
+                    Instruction::Jump { target: 4 },
+                ],
+                vec![Instruction::Return { value: 1 }],
+            ],
+        );
+        configure_stack(artifact, 1, 1);
+    })
+}
+
 pub(super) fn gc_failed_retry_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let reference = ValueType {
