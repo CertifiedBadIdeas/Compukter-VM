@@ -1,7 +1,7 @@
 use super::{
     error::VmFault,
     heap::{AllocationRequest, Heap, ReservedAllocation},
-    layout::ValueWidth,
+    layout::{ValueWidth, HEAP_HEADER_BYTES},
     value::{Ref32, RuntimeValue},
 };
 
@@ -115,7 +115,7 @@ impl PendingAllocation {
         let physical_payload = state
             .request
             .block_bytes
-            .checked_sub(24)
+            .checked_sub(HEAP_HEADER_BYTES)
             .ok_or(VmFault::InvalidStoragePlan)?;
         if units != 0 {
             let end = state

@@ -28,10 +28,11 @@ fn managed_object_header_is_eight_bytes() {
 fn allocator_size_classes_map_free_blocks_down_and_requests_up() {
     let class = |first, second| Some(SizeClass { first, second });
     for (size, expected) in [
+        (24, class(4, 1)),
         (32, class(5, 0)),
-        (48, class(5, 1)),
+        (48, class(5, 2)),
         (64, class(6, 0)),
-        (112, class(6, 3)),
+        (112, class(6, 6)),
         (128, class(7, 0)),
         (240, class(7, 7)),
         (256, class(8, 0)),
@@ -131,7 +132,7 @@ fn allocator_commits_direct_offsets_and_reuses_freed_blocks() -> Result<(), Admi
     assert_eq!(aborted.block, reused.block);
 
     let first = heap.commit(reused).unwrap();
-    assert_eq!(16, first.payload());
+    assert_eq!(8, first.payload());
     assert_eq!(Some(1), heap.runtime_type(first));
     assert_eq!(Some(splitmix64(1) as u32), heap.identity_hash(first));
     assert!(heap.free(first).unwrap());
@@ -249,13 +250,13 @@ fn managed_heap_performance_allocator_and_fragmentation() {
 
 #[test]
 fn portable_minimum_and_representative_layouts() -> Result<(), AdmissionError> {
-    assert_eq!(32, empty_object_layout()?.block_bytes);
-    assert_eq!(64, array_layout(ValueWidth::Char, 9)?.block_bytes);
+    assert_eq!(24, empty_object_layout()?.block_bytes);
+    assert_eq!(48, array_layout(ValueWidth::Char, 9)?.block_bytes);
     let references = array_layout(ValueWidth::Ref, 3)?;
     assert_eq!(4, references.element_bytes);
-    assert_eq!(48, references.block_bytes);
-    assert_eq!(48, string_layout(StringEncoding::Latin1, 8)?.block_bytes);
-    assert_eq!(48, string_layout(StringEncoding::Utf16, 8)?.block_bytes);
+    assert_eq!(40, references.block_bytes);
+    assert_eq!(32, string_layout(StringEncoding::Latin1, 8)?.block_bytes);
+    assert_eq!(40, string_layout(StringEncoding::Utf16, 8)?.block_bytes);
     Ok(())
 }
 
@@ -291,7 +292,7 @@ fn portable_object_fields_use_stable_natural_alignment_groups() -> Result<(), Ad
     assert_eq!(vec![(2, 0), (3, 8), (1, 12), (0, 14)], offsets);
     assert_eq!(&[8], layout.reference_offsets.as_ref());
     assert_eq!(15, layout.payload_bytes);
-    assert_eq!(48, layout.block_bytes);
+    assert_eq!(32, layout.block_bytes);
     Ok(())
 }
 
@@ -329,7 +330,7 @@ fn portable_subclass_preserves_the_superclass_prefix() -> Result<(), AdmissionEr
     assert_eq!(16, subclass.fields[3].offset);
     assert_eq!(&[16], subclass.reference_offsets.as_ref());
     assert_eq!(20, subclass.payload_bytes);
-    assert_eq!(48, subclass.block_bytes);
+    assert_eq!(40, subclass.block_bytes);
 
     Ok(())
 }
@@ -352,8 +353,8 @@ fn portable_literal_deduplication_uses_exact_raw_bytes() -> Result<(), Admission
 }
 
 #[test]
-fn portable_block_alignment_covers_15_16_17_byte_edges() -> Result<(), AdmissionError> {
-    for (field_count, expected) in [(15, 48), (16, 48), (17, 48)] {
+fn portable_block_alignment_covers_eight_byte_edges() -> Result<(), AdmissionError> {
+    for (field_count, expected) in [(7, 24), (8, 24), (9, 32), (15, 32), (16, 32), (17, 40)] {
         let fields: Vec<_> = (0..field_count)
             .map(|field| FieldSpec {
                 field,
@@ -446,7 +447,7 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
         .collect();
     assert_eq!(vec![(0, 0), (1, 8), (3, 12), (2, 16)], offsets);
     assert_eq!(&[12], subclass.reference_offsets.as_ref());
-    assert_eq!(48, subclass.block_bytes);
+    assert_eq!(40, subclass.block_bytes);
 
     let static_field = image.field(4).expect("resolved static field");
     assert_eq!(None, static_field.offset);
@@ -609,7 +610,7 @@ fn allocation_cancellation_rolls_back_private_storage() {
     machine.start(&[]).unwrap();
 
     assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
-    assert_eq!(80, machine.test_heap_diagnostic().total_free);
+    assert_eq!(88, machine.test_heap_diagnostic().total_free);
     machine.test_cancel_pending().unwrap();
     assert_eq!(128, machine.test_heap_diagnostic().total_free);
     assert_eq!(None, machine.test_register(0));
@@ -844,4 +845,82 @@ fn heap_instructions_is_type_returns_false_for_null() {
         Outcome::Halted(Some(RuntimeValue::Bool(false))),
         machine.run_slice(32, 0).unwrap()
     );
+}
+
+#[test]
+fn gray_queue_restores_predecessors_for_repeated_sweep_and_reuse() {
+    let mut heap = Heap::new(&allocator_plan(512)).unwrap();
+    for cycle in 0..32_u32 {
+        let mut references = Vec::new();
+        let mut identities = Vec::new();
+        for (index, size) in [24, 40, 32, 24, 48, 24, 40, 32].into_iter().enumerate() {
+            let reservation = heap
+                .reserve(AllocationRequest {
+                    block_bytes: size,
+                    type_id: 100 + index as u32,
+                })
+                .unwrap()
+                .unwrap();
+            heap.write_reserved(reservation, 0, &(cycle * 100 + index as u32).to_le_bytes())
+                .unwrap();
+            let reference = heap.commit(reservation).unwrap();
+            identities.push(heap.identity_hash(reference).unwrap());
+            references.push(reference);
+        }
+        assert!(references
+            .iter()
+            .any(|reference| reference.payload() % 16 == 8));
+        // Mix existing free blocks with newly dead blocks around surviving objects.
+        assert!(heap.free(references[2]).unwrap());
+        assert!(heap.free(references[4]).unwrap());
+        let mut head = None;
+        let mut tail = None;
+        for index in [5, 1, 7, 0] {
+            heap.enqueue_gray(references[index], 1, &mut head, &mut tail)
+                .unwrap();
+        }
+        for index in [5, 1, 7, 0] {
+            assert_eq!(
+                Some((references[index], 100 + index as u32)),
+                heap.dequeue_gray(&mut head, &mut tail).unwrap()
+            );
+            assert_eq!(
+                Some(identities[index]),
+                heap.identity_hash(references[index])
+            );
+        }
+        assert_eq!(None, heap.dequeue_gray(&mut head, &mut tail).unwrap());
+        let mut offset = 0;
+        let mut previous_size = 0;
+        let mut steps = 0;
+        while offset < heap.arena_bytes() {
+            (offset, previous_size) = heap.sweep_block(offset, previous_size).unwrap();
+            steps += 1;
+            assert!(steps <= 9);
+        }
+        assert_eq!(512, offset);
+        for index in [0, 1, 5, 7] {
+            assert_eq!(
+                Some(100 + index as u32),
+                heap.runtime_type(references[index])
+            );
+            assert_eq!(
+                Some(identities[index]),
+                heap.identity_hash(references[index])
+            );
+            let payload = heap.read_payload(references[index], 0, 4).unwrap();
+            assert_eq!((cycle * 100 + index as u32).to_le_bytes(), payload[..4]);
+        }
+        for index in [2, 3, 4, 6] {
+            assert_eq!(None, heap.runtime_type(references[index]));
+        }
+        // Free in a different order to require restored backward-coalescing metadata.
+        for index in [7, 1, 5, 0] {
+            assert!(heap.free(references[index]).unwrap());
+        }
+        assert_eq!(512, heap.diagnostic().total_free);
+        assert_eq!(512, heap.diagnostic().largest_free_block);
+        let whole_arena = heap.reserve(allocator_request(512)).unwrap().unwrap();
+        heap.abort(whole_arena).unwrap();
+    }
 }

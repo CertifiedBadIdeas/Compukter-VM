@@ -12,7 +12,7 @@ use super::{
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
     host::{EntryArgumentLimits, RequestId, TaskId},
     image::{ExecutionImage, ResolvedFunction, ResolvedInstruction, ResolvedValueType},
-    layout::{array_layout, RuntimeTypeLayout, ValueWidth},
+    layout::{array_layout, RuntimeTypeLayout, ValueWidth, HEAP_HEADER_BYTES},
     numeric,
     task::{TaskError, TaskScheduler},
     text,
@@ -735,8 +735,11 @@ impl Machine {
             }
         };
         let initialize = (|| {
-            self.heap
-                .zero_reserved_payload(reservation, 0, layout.block_bytes - 24)?;
+            self.heap.zero_reserved_payload(
+                reservation,
+                0,
+                layout.block_bytes - HEAP_HEADER_BYTES,
+            )?;
             self.heap.write_reserved_u32(reservation, 0, count)?;
             for (index, reference) in strings.iter().copied().enumerate() {
                 let offset = 8_u32

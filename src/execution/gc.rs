@@ -66,6 +66,7 @@ pub(super) struct Collector {
     gray_tail: Option<u32>,
     scan: Option<Scan>,
     sweep_offset: u32,
+    sweep_previous_size: u32,
     #[cfg(test)]
     last_action: Option<CollectorAction>,
 }
@@ -85,6 +86,7 @@ impl Collector {
             gray_tail: None,
             scan: None,
             sweep_offset: 0,
+            sweep_previous_size: 0,
             #[cfg(test)]
             last_action: None,
         }
@@ -104,6 +106,7 @@ impl Collector {
         self.gray_tail = None;
         self.scan = None;
         self.sweep_offset = 0;
+        self.sweep_previous_size = 0;
         #[cfg(test)]
         {
             self.last_action = None;
@@ -162,7 +165,8 @@ impl Collector {
                     {
                         self.last_action = Some(CollectorAction::Sweep(self.sweep_offset));
                     }
-                    self.sweep_offset = heap.sweep_block(self.sweep_offset, self.epoch)?;
+                    (self.sweep_offset, self.sweep_previous_size) =
+                        heap.sweep_block(self.sweep_offset, self.sweep_previous_size)?;
                 }
                 Ok(1)
             }
@@ -331,6 +335,7 @@ impl Collector {
         else {
             self.phase = CollectorPhase::Sweep;
             self.sweep_offset = 0;
+            self.sweep_previous_size = 0;
             #[cfg(test)]
             {
                 self.last_action = Some(CollectorAction::Transition);
