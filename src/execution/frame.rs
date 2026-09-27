@@ -80,6 +80,10 @@ impl PhysicalValue {
 }
 
 pub(super) struct FrameArena {
+    #[cfg(test)]
+    active_bytes: u32,
+    #[cfg(test)]
+    peak_active_bytes: u32,
     bytes: Box<[u8]>,
     free_head: Option<u32>,
     #[cfg(test)]
@@ -101,6 +105,10 @@ impl FrameArena {
             .map_err(|_| VmFault::InvalidStoragePlan)?;
         bytes.resize(length, 0);
         let mut arena = Self {
+            #[cfg(test)]
+            active_bytes: 0,
+            #[cfg(test)]
+            peak_active_bytes: 0,
             bytes: bytes.into_boxed_slice(),
             free_head: (capacity >= 8).then_some(0),
             #[cfg(test)]
@@ -152,10 +160,29 @@ impl FrameArena {
         self.bytes[reservation.base as usize..end as usize].fill(0);
         #[cfg(test)]
         self.initialized[reservation.base as usize..end as usize].fill(false);
+        #[cfg(test)]
+        {
+            self.active_bytes += byte_len;
+            self.peak_active_bytes = self.peak_active_bytes.max(self.active_bytes);
+        }
         Ok(reservation)
     }
 
+    #[cfg(test)]
+    pub(super) fn peak_active_bytes(&self) -> u32 {
+        self.peak_active_bytes
+    }
+
     pub(super) fn pop(&mut self, frame: FrameReservation) -> Result<(), VmFault> {
+        self.release(frame)?;
+        #[cfg(test)]
+        {
+            self.active_bytes -= frame.byte_len;
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, frame: FrameReservation) -> Result<(), VmFault> {
         if frame.byte_len == 0 {
             return Ok(());
         }
@@ -1056,6 +1083,8 @@ mod tests {
         let first = arena.push(&layout).unwrap();
         let middle = arena.push(&layout).unwrap();
         let last = arena.push(&layout).unwrap();
+        assert_eq!(24, arena.peak_active_bytes());
+        assert_eq!(24, arena.active_bytes);
 
         arena.pop(middle).unwrap();
         assert_eq!(middle, arena.push(&layout).unwrap());
@@ -1063,6 +1092,10 @@ mod tests {
         arena.pop(middle).unwrap();
         assert_eq!(first.base, arena.push(&double).unwrap().base);
         arena.pop(last).unwrap();
+        assert_eq!(16, arena.active_bytes);
+        assert_eq!(24, arena.peak_active_bytes());
+        assert_eq!(Err(VmFault::CorruptLifecycle), arena.pop(last));
+        assert_eq!(16, arena.active_bytes);
     }
 
     #[test]

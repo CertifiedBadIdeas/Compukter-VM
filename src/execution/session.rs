@@ -557,6 +557,11 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn test_peak_active_frame_bytes(&self) -> u32 {
+        self.machine.test_peak_active_frame_bytes()
+    }
+
     pub(crate) fn resource_snapshot(&self) -> SessionResourceSnapshot {
         SessionResourceSnapshot {
             accounting: self.accounting(),

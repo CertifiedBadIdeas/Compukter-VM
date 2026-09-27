@@ -3145,6 +3145,11 @@ impl Machine {
     }
 
     #[cfg(test)]
+    pub(super) fn test_peak_active_frame_bytes(&self) -> u32 {
+        self.frame_arena.peak_active_bytes()
+    }
+
+    #[cfg(test)]
     pub(super) fn test_register(&self, register: usize) -> Option<RuntimeValue> {
         let width = self.image.registers_per_frame();
         let frame_index = register.checked_div(width)?;
