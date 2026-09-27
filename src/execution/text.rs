@@ -2,7 +2,7 @@ use super::{
     error::{GuestTrap, VmFault},
     heap::{AllocationRequest, Heap, ReservedAllocation},
     image::{ExecutionImage, ResolvedLiteral},
-    layout::{string_layout, StringEncoding, StringLayout},
+    layout::{string_layout, StringEncoding, StringLayout, HEAP_HEADER_BYTES},
     value::{Ref32, RuntimeValue},
 };
 
@@ -421,7 +421,7 @@ impl PendingConcat {
         let reservation = self
             .reservation
             .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
-        let initialized_bytes = layout.block_bytes - 24;
+        let initialized_bytes = layout.block_bytes - HEAP_HEADER_BYTES;
         while self.written < initialized_bytes && used < budget {
             let end = self.written.saturating_add(16).min(initialized_bytes);
             let mut chunk = [0_u8; 16];
@@ -576,7 +576,7 @@ impl PendingHostString {
         let reservation = self
             .reservation
             .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
-        let initialized_bytes = layout.block_bytes - 24;
+        let initialized_bytes = layout.block_bytes - HEAP_HEADER_BYTES;
         while self.written < initialized_bytes && used < budget {
             let end = self.written.saturating_add(16).min(initialized_bytes);
             let mut chunk = [0_u8; 16];

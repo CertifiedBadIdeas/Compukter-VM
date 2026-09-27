@@ -329,7 +329,8 @@ fn string_concat_resumes_without_publishing_a_prefix() {
     else {
         panic!("concat did not publish its completed result");
     };
-    assert_eq!(12, machine.consumed_dynamic_cost());
+    // The compact block has less padding to initialize in the final bounded chunk.
+    assert_eq!(11, machine.consumed_dynamic_cost());
     assert_eq!(50, machine.string_length(reference));
 }
 

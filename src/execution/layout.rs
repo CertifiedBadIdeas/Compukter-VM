@@ -1,10 +1,11 @@
 use super::error::{AdmissionError, ResidentStorageComponent};
 
-const BLOCK_HEADER_BYTES: u32 = 16;
+pub(super) const BLOCK_HEADER_BYTES: u32 = 8;
 const MANAGED_HEADER_BYTES: u32 = 8;
+pub(super) const HEAP_HEADER_BYTES: u32 = BLOCK_HEADER_BYTES + MANAGED_HEADER_BYTES;
 const INDEXED_HEADER_BYTES: u32 = 8;
-const BLOCK_ALIGNMENT: u32 = 16;
-const MINIMUM_BLOCK_BYTES: u32 = 32;
+pub(super) const BLOCK_ALIGNMENT: u32 = 8;
+pub(super) const MINIMUM_BLOCK_BYTES: u32 = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ValueWidth {

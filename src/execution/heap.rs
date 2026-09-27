@@ -1,6 +1,8 @@
 use super::{
     error::{AdmissionError, ResidentStorageComponent, VmFault},
-    layout::StoragePlan,
+    layout::{
+        StoragePlan, BLOCK_ALIGNMENT, BLOCK_HEADER_BYTES, HEAP_HEADER_BYTES, MINIMUM_BLOCK_BYTES,
+    },
     value::{Ref32, ReferenceDomain},
 };
 
@@ -9,14 +11,18 @@ const CLASS_COUNT: usize = 32 * 8;
 const ALLOCATED: u32 = 1;
 const MARKED: u32 = 2;
 const LIVE: u32 = 4;
-const SIZE_MASK: u32 = !15;
+const SIZE_MASK: u32 = !(BLOCK_ALIGNMENT - 1);
 const SIZE_FLAGS: u32 = 0;
+// Phase-exclusive metadata: normal allocation/coalescing uses the predecessor size;
+// roots/mark uses this word as a gray link while Guest execution is stopped.
+// Sweep restores predecessor sizes before any block is coalesced.
 const PREVIOUS_SIZE: u32 = 4;
+const GRAY_NEXT: u32 = PREVIOUS_SIZE;
 const NEXT_FREE: u32 = 8;
 const PREVIOUS_FREE: u32 = 12;
-const OBJECT_TYPE_ID: u32 = 16;
-const OBJECT_IDENTITY_TOKEN: u32 = 20;
-const USER_PAYLOAD: u32 = 24;
+const OBJECT_TYPE_ID: u32 = BLOCK_HEADER_BYTES;
+const OBJECT_IDENTITY_TOKEN: u32 = OBJECT_TYPE_ID + 4;
+const USER_PAYLOAD: u32 = HEAP_HEADER_BYTES;
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -122,7 +128,9 @@ impl Heap {
         &mut self,
         request: AllocationRequest,
     ) -> Result<Option<ReservedAllocation>, VmFault> {
-        if request.block_bytes < 32 || !request.block_bytes.is_multiple_of(16) {
+        if request.block_bytes < MINIMUM_BLOCK_BYTES
+            || !request.block_bytes.is_multiple_of(BLOCK_ALIGNMENT)
+        {
             return Err(VmFault::InvalidStoragePlan);
         }
         let Some(block) = self.find_suitable(request.block_bytes)? else {
@@ -135,7 +143,7 @@ impl Heap {
         let previous_size = self.read_word(block, PREVIOUS_SIZE)?;
         self.remove_free(block)?;
         let remainder = block_size - request.block_bytes;
-        let allocated_size = if remainder >= 32 {
+        let allocated_size = if remainder >= MINIMUM_BLOCK_BYTES {
             let remainder_offset = BlockOffset(
                 block
                     .0
@@ -177,7 +185,7 @@ impl Heap {
         let object_header = reservation
             .block
             .0
-            .checked_add(16)
+            .checked_add(OBJECT_TYPE_ID)
             .ok_or(VmFault::CorruptHeap)?;
         Ref32::managed(object_header).ok_or(VmFault::CorruptHeap)
     }
@@ -384,14 +392,14 @@ impl Heap {
     fn live_block(&self, reference: Ref32) -> Result<BlockOffset, VmFault> {
         if reference.domain() != ReferenceDomain::Managed
             || reference.payload() < OBJECT_TYPE_ID
-            || !reference.payload().is_multiple_of(16)
+            || !reference.payload().is_multiple_of(BLOCK_ALIGNMENT)
         {
             return Err(VmFault::InvalidReference);
         }
         let block = BlockOffset(
             reference
                 .payload()
-                .checked_sub(16)
+                .checked_sub(OBJECT_TYPE_ID)
                 .ok_or(VmFault::InvalidReference)?,
         );
         if block.0 >= self.arena_bytes
@@ -458,11 +466,11 @@ impl Heap {
             return Ok(());
         }
         self.write_word(block, SIZE_FLAGS, flags | MARKED)?;
-        self.write_word(block, NEXT_FREE, NULL_OFFSET)?;
+        self.write_word(block, GRAY_NEXT, NULL_OFFSET)?;
         if let Some(previous) = *tail {
             let previous = Ref32::managed(previous).ok_or(VmFault::CorruptHeap)?;
             let previous_block = self.live_block(previous)?;
-            self.write_word(previous_block, NEXT_FREE, reference.payload())?;
+            self.write_word(previous_block, GRAY_NEXT, reference.payload())?;
         } else {
             *head = Some(reference.payload());
         }
@@ -480,8 +488,8 @@ impl Heap {
         };
         let reference = Ref32::managed(payload).ok_or(VmFault::CorruptHeap)?;
         let block = self.live_block(reference)?;
-        let next = self.read_word(block, NEXT_FREE)?;
-        self.write_word(block, NEXT_FREE, NULL_OFFSET)?;
+        let next = self.read_word(block, GRAY_NEXT)?;
+        self.write_word(block, GRAY_NEXT, NULL_OFFSET)?;
         *head = (next != NULL_OFFSET).then_some(next);
         if head.is_none() {
             *tail = None;
@@ -493,14 +501,21 @@ impl Heap {
         self.arena_bytes
     }
 
-    pub(super) fn sweep_block(&mut self, offset: u32, _epoch: u32) -> Result<u32, VmFault> {
+    pub(super) fn sweep_block(
+        &mut self,
+        offset: u32,
+        previous_size: u32,
+    ) -> Result<(u32, u32), VmFault> {
         if offset >= self.arena_bytes {
             return Err(VmFault::CorruptHeap);
         }
         let block = BlockOffset(offset);
         let size = self.block_size(block)?;
+        // Marking temporarily borrowed this word for the intrusive gray queue.
+        // The forward sweep knows the effective predecessor size even after merging.
+        self.write_word(block, PREVIOUS_SIZE, previous_size)?;
         if !self.block_allocated(block)? {
-            return offset.checked_add(size).ok_or(VmFault::CorruptHeap);
+            return Ok((offset.checked_add(size).ok_or(VmFault::CorruptHeap)?, size));
         }
         let flags = self.read_word(block, SIZE_FLAGS)?;
         if flags & LIVE == 0 {
@@ -508,8 +523,7 @@ impl Heap {
         }
         if flags & MARKED != 0 {
             self.write_word(block, SIZE_FLAGS, flags & !MARKED)?;
-            self.write_word(block, NEXT_FREE, NULL_OFFSET)?;
-            return offset.checked_add(size).ok_or(VmFault::CorruptHeap);
+            return Ok((offset.checked_add(size).ok_or(VmFault::CorruptHeap)?, size));
         }
 
         let previous_size = self.read_word(block, PREVIOUS_SIZE)?;
@@ -527,15 +541,23 @@ impl Heap {
         } else {
             block
         };
-        let reference = Ref32::managed(offset.checked_add(16).ok_or(VmFault::CorruptHeap)?)
-            .ok_or(VmFault::CorruptHeap)?;
+        let reference = Ref32::managed(
+            offset
+                .checked_add(OBJECT_TYPE_ID)
+                .ok_or(VmFault::CorruptHeap)?,
+        )
+        .ok_or(VmFault::CorruptHeap)?;
         if !self.free(reference)? {
             return Err(VmFault::CorruptHeap);
         }
-        merged
-            .0
-            .checked_add(self.block_size(merged)?)
-            .ok_or(VmFault::CorruptHeap)
+        let merged_size = self.block_size(merged)?;
+        Ok((
+            merged
+                .0
+                .checked_add(merged_size)
+                .ok_or(VmFault::CorruptHeap)?,
+            merged_size,
+        ))
     }
 
     #[cfg(test)]
@@ -689,7 +711,7 @@ impl Heap {
             }
         }
 
-        // A direct managed reference names the object header at block + 16. If
+        // A direct managed reference names the object header at block + 8. If
         // this block is absorbed into its free predecessor, its old allocator
         // header becomes interior storage and must no longer look allocated.
         if merged != block {
@@ -713,7 +735,7 @@ impl Heap {
         previous_size: u32,
         allocated: bool,
     ) -> Result<(), VmFault> {
-        if size < 32 || !size.is_multiple_of(16) {
+        if size < MINIMUM_BLOCK_BYTES || !size.is_multiple_of(BLOCK_ALIGNMENT) {
             return Err(VmFault::CorruptHeap);
         }
         self.write_word(block, SIZE_FLAGS, size | u32::from(allocated))?;
@@ -732,7 +754,7 @@ impl Heap {
 
     fn block_size(&self, block: BlockOffset) -> Result<u32, VmFault> {
         let size = self.read_word(block, SIZE_FLAGS)? & SIZE_MASK;
-        if size < 32 || !size.is_multiple_of(16) {
+        if size < MINIMUM_BLOCK_BYTES || !size.is_multiple_of(BLOCK_ALIGNMENT) {
             return Err(VmFault::CorruptHeap);
         }
         Ok(size)
@@ -804,15 +826,17 @@ pub(super) fn splitmix64(mut value: u64) -> u64 {
 }
 
 fn downward_class(size: u32) -> Option<(u8, u8, u32)> {
-    if size < 32 || !size.is_multiple_of(16) {
+    if size < MINIMUM_BLOCK_BYTES || !size.is_multiple_of(BLOCK_ALIGNMENT) {
         return None;
     }
     let first = (31 - size.leading_zeros()) as u8;
     let base = 1_u32.checked_shl(first.into())?;
     let width = if first >= 3 {
-        1_u32.checked_shl(u32::from(first - 3))?.max(16)
+        1_u32
+            .checked_shl(u32::from(first - 3))?
+            .max(BLOCK_ALIGNMENT)
     } else {
-        16
+        BLOCK_ALIGNMENT
     };
     let second = u8::try_from((size - base) / width).ok()?;
     let lower_bound = base.checked_add(u32::from(second).checked_mul(width)?)?;
