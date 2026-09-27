@@ -71,7 +71,9 @@ cargo doc --workspace --no-deps --document-private-items --locked --offline
 
 Allocated blocks have an eight-byte allocator header and a four-byte runtime
 type identifier, followed by user payload. Blocks remain eight-byte aligned
-with a 24-byte minimum. Two-Int and three-Int objects both occupy 24 bytes.
+with a 16-byte minimum. Empty and one-Int objects, including managed Int
+boxes, occupy 16 bytes. Two-Int and three-Int objects both occupy 24 bytes.
+Sixteen-byte free tails are split and reused; only smaller tails are absorbed.
 Payload access uses little-endian byte reads and writes; wide fields do not
 require the payload address itself to be eight-byte aligned.
 

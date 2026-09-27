@@ -49,6 +49,12 @@ After removing the unused managed identity token on 2026-09-27, the same
 vertical test retains totals `[69, 7, 12]` and uses digest
 `16fa5c337cd17f5943e1704f46b98b7dececaa1bb2735a4c5c07734c5ad24e56`.
 
+With the 16-byte minimum block, the retry/failure fixtures use one Long field
+instead of an empty class so that a 32-byte heap still triggers collection.
+Their added initialization accounts for three dynamic units. The current
+vertical totals are `[69, 10, 12]`, with digest
+`81f8938744cff5cadf609ab9a9474014d1bf8962f901f854e634f91f86b70d2d`.
+
 ## Collector work and pauses
 
 The graph contains a cycle, shared child, duplicate logical reachability, and a

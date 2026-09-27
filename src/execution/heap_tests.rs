@@ -20,6 +20,7 @@ use crate::artifact::ByteRange;
 fn allocator_size_classes_map_free_blocks_down_and_requests_up() {
     let class = |first, second| Some(SizeClass { first, second });
     for (size, expected) in [
+        (16, class(4, 0)),
         (24, class(4, 1)),
         (32, class(5, 0)),
         (48, class(5, 2)),
@@ -36,7 +37,7 @@ fn allocator_size_classes_map_free_blocks_down_and_requests_up() {
     assert_eq!(class(8, 0), request_size_class(256));
     assert_eq!(class(8, 1), request_size_class(272));
     assert_eq!(class(8, 1), request_size_class(288));
-    assert_eq!(None, free_size_class(16));
+    assert_eq!(None, free_size_class(8));
     assert_eq!(None, free_size_class(33));
 }
 
@@ -52,7 +53,7 @@ fn allocator_request(block_bytes: u32) -> AllocationRequest {
 }
 
 #[test]
-fn allocator_splits_exactly_and_absorbs_a_16_byte_tail() -> Result<(), AdmissionError> {
+fn allocator_splits_and_reuses_a_16_byte_tail() -> Result<(), AdmissionError> {
     let mut heap = Heap::new(&allocator_plan(128))?;
     let first = heap.reserve(allocator_request(48)).unwrap().unwrap();
     assert_eq!(BlockOffset(0), first.block);
@@ -60,8 +61,25 @@ fn allocator_splits_exactly_and_absorbs_a_16_byte_tail() -> Result<(), Admission
 
     let second = heap.reserve(allocator_request(64)).unwrap().unwrap();
     assert_eq!(BlockOffset(48), second.block);
-    assert_eq!(0, heap.diagnostic().total_free);
+    assert_eq!(16, heap.diagnostic().total_free);
     assert!(heap.reserve(allocator_request(32)).unwrap().is_none());
+    let tail = heap.reserve(allocator_request(16)).unwrap().unwrap();
+    assert_eq!(BlockOffset(112), tail.block);
+    assert_eq!(0, heap.diagnostic().total_free);
+    heap.abort(tail).unwrap();
+    heap.abort(second).unwrap();
+    heap.abort(first).unwrap();
+    assert_eq!(128, heap.diagnostic().largest_free_block);
+    Ok(())
+}
+
+#[test]
+fn allocator_absorbs_only_tails_below_16_bytes() -> Result<(), AdmissionError> {
+    let mut heap = Heap::new(&allocator_plan(32))?;
+    let reservation = heap.reserve(allocator_request(24)).unwrap().unwrap();
+    assert_eq!(0, heap.diagnostic().total_free);
+    heap.abort(reservation).unwrap();
+    assert_eq!(32, heap.diagnostic().largest_free_block);
     Ok(())
 }
 
@@ -223,7 +241,7 @@ fn managed_heap_performance_allocator_and_fragmentation() {
 
 #[test]
 fn portable_minimum_and_representative_layouts() -> Result<(), AdmissionError> {
-    assert_eq!(24, empty_object_layout()?.block_bytes);
+    assert_eq!(16, empty_object_layout()?.block_bytes);
     assert_eq!(40, array_layout(ValueWidth::Char, 9)?.block_bytes);
     let references = array_layout(ValueWidth::Ref, 3)?;
     assert_eq!(4, references.element_bytes);
@@ -283,6 +301,46 @@ fn compact_records_keep_independent_mutations_and_shared_aliases() -> Result<(),
     }
     assert_eq!(Some(7), heap.runtime_type(before));
     assert_eq!(Some(7), heap.runtime_type(after));
+    Ok(())
+}
+
+#[test]
+fn one_int_records_fit_in_two_16_byte_blocks_and_preserve_aliases() -> Result<(), AdmissionError> {
+    let layout = object_layout(
+        None,
+        &[FieldSpec {
+            field: 0,
+            width: ValueWidth::I32,
+        }],
+    )?;
+    let mut heap = Heap::new(&allocator_plan(32))?;
+    let mut records = Vec::new();
+    for value in [100, 200] {
+        let reservation = heap
+            .reserve(AllocationRequest {
+                block_bytes: layout.block_bytes,
+                type_id: 7,
+            })
+            .unwrap()
+            .expect("two one-Int records fit in 32 bytes");
+        heap.write_reserved_u32(reservation, 0, value).unwrap();
+        records.push(heap.commit(reservation).unwrap());
+    }
+    let alias = records[0];
+    assert_ne!(records[0], records[1]);
+    super::heap_ops::store_value(&mut heap, alias, 0, ValueWidth::I32, RuntimeValue::I32(300))
+        .unwrap();
+    for (reference, expected) in [(records[0], 300), (records[1], 200)] {
+        assert_eq!(
+            Ok(RuntimeValue::I32(expected)),
+            super::heap_ops::load_value(&heap, reference, 0, ValueWidth::I32)
+        );
+        assert_eq!(Some(7), heap.runtime_type(reference));
+    }
+    assert_eq!(0, heap.diagnostic().total_free);
+    assert!(heap.free(records[1]).unwrap());
+    assert!(heap.free(records[0]).unwrap());
+    assert_eq!(32, heap.diagnostic().largest_free_block);
     Ok(())
 }
 
@@ -418,7 +476,17 @@ fn portable_literal_deduplication_uses_exact_raw_bytes() -> Result<(), Admission
 
 #[test]
 fn portable_block_alignment_covers_eight_byte_edges() -> Result<(), AdmissionError> {
-    for (field_count, expected) in [(11, 24), (12, 24), (13, 32), (19, 32), (20, 32), (21, 40)] {
+    for (field_count, expected) in [
+        (3, 16),
+        (4, 16),
+        (5, 24),
+        (11, 24),
+        (12, 24),
+        (13, 32),
+        (19, 32),
+        (20, 32),
+        (21, 40),
+    ] {
         let fields: Vec<_> = (0..field_count)
             .map(|field| FieldSpec {
                 field,
@@ -916,7 +984,7 @@ fn gray_queue_restores_predecessors_for_repeated_sweep_and_reuse() {
     let mut heap = Heap::new(&allocator_plan(512)).unwrap();
     for cycle in 0..32_u32 {
         let mut references = Vec::new();
-        for (index, size) in [24, 40, 32, 24, 48, 24, 40, 32].into_iter().enumerate() {
+        for (index, size) in [16, 40, 32, 16, 48, 16, 40, 32].into_iter().enumerate() {
             let reservation = heap
                 .reserve(AllocationRequest {
                     block_bytes: size,
