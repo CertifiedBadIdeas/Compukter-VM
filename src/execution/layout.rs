@@ -1,7 +1,7 @@
 use super::error::{AdmissionError, ResidentStorageComponent};
 
 pub(super) const BLOCK_HEADER_BYTES: u32 = 8;
-const MANAGED_HEADER_BYTES: u32 = 8;
+const MANAGED_HEADER_BYTES: u32 = 4;
 pub(super) const HEAP_HEADER_BYTES: u32 = BLOCK_HEADER_BYTES + MANAGED_HEADER_BYTES;
 const INDEXED_HEADER_BYTES: u32 = 8;
 pub(super) const BLOCK_ALIGNMENT: u32 = 8;

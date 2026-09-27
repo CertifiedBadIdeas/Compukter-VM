@@ -2,10 +2,7 @@ use super::{
     error::{AdmissionError, AllocationExhaustion, GuestTrap, Outcome, VmFault},
     external_roots::ExternalRootTable,
     fixtures,
-    heap::{
-        free_size_class, request_size_class, splitmix64, AllocationRequest, BlockOffset, Heap,
-        ManagedObjectHeader, SizeClass,
-    },
+    heap::{free_size_class, request_size_class, AllocationRequest, BlockOffset, Heap, SizeClass},
     heap_ops::{PendingAllocation, PendingState},
     image::{deduplicate_literal_ranges, ExecutionImage},
     layout::{
@@ -18,11 +15,6 @@ use super::{
     TypeKey,
 };
 use crate::artifact::ByteRange;
-
-#[test]
-fn managed_object_header_is_eight_bytes() {
-    assert_eq!(8, core::mem::size_of::<ManagedObjectHeader>());
-}
 
 #[test]
 fn allocator_size_classes_map_free_blocks_down_and_requests_up() {
@@ -134,7 +126,6 @@ fn allocator_commits_direct_offsets_and_reuses_freed_blocks() -> Result<(), Admi
     let first = heap.commit(reused).unwrap();
     assert_eq!(8, first.payload());
     assert_eq!(Some(1), heap.runtime_type(first));
-    assert_eq!(Some(splitmix64(1) as u32), heap.identity_hash(first));
     assert!(heap.free(first).unwrap());
     assert_eq!(None, heap.runtime_type(first));
 
@@ -142,25 +133,7 @@ fn allocator_commits_direct_offsets_and_reuses_freed_blocks() -> Result<(), Admi
     assert_eq!(BlockOffset(0), next.block);
     let next = heap.commit(next).unwrap();
     assert_eq!(first, next);
-    assert_eq!(Some(splitmix64(2) as u32), heap.identity_hash(next));
-    Ok(())
-}
-
-#[test]
-fn identity_tokens_wrap_deterministically_and_allow_collisions() -> Result<(), AdmissionError> {
-    let mut heap = Heap::new(&allocator_plan(32))?;
-    heap.test_set_next_ordinal(u64::MAX);
-    let before_wrap = heap.reserve(allocator_request(32)).unwrap().unwrap();
-    let before_wrap = heap.commit(before_wrap).unwrap();
-    assert_eq!(
-        Some(splitmix64(u64::MAX) as u32),
-        heap.identity_hash(before_wrap)
-    );
-    assert!(heap.free(before_wrap).unwrap());
-
-    let after_wrap = heap.reserve(allocator_request(32)).unwrap().unwrap();
-    let after_wrap = heap.commit(after_wrap).unwrap();
-    assert_eq!(Some(splitmix64(0) as u32), heap.identity_hash(after_wrap));
+    assert_eq!(Some(1), heap.runtime_type(next));
     Ok(())
 }
 
@@ -251,12 +224,103 @@ fn managed_heap_performance_allocator_and_fragmentation() {
 #[test]
 fn portable_minimum_and_representative_layouts() -> Result<(), AdmissionError> {
     assert_eq!(24, empty_object_layout()?.block_bytes);
-    assert_eq!(48, array_layout(ValueWidth::Char, 9)?.block_bytes);
+    assert_eq!(40, array_layout(ValueWidth::Char, 9)?.block_bytes);
     let references = array_layout(ValueWidth::Ref, 3)?;
     assert_eq!(4, references.element_bytes);
-    assert_eq!(40, references.block_bytes);
+    assert_eq!(32, references.block_bytes);
     assert_eq!(32, string_layout(StringEncoding::Latin1, 8)?.block_bytes);
     assert_eq!(40, string_layout(StringEncoding::Utf16, 8)?.block_bytes);
+    Ok(())
+}
+
+#[test]
+fn compact_records_keep_independent_mutations_and_shared_aliases() -> Result<(), AdmissionError> {
+    let fields: Vec<_> = (0..3)
+        .map(|field| FieldSpec {
+            field,
+            width: ValueWidth::I32,
+        })
+        .collect();
+    let layout = object_layout(None, &fields)?;
+    let mut heap = Heap::new(&allocator_plan(48))?;
+    let mut records = Vec::new();
+    for _ in 0..2 {
+        let reservation = heap
+            .reserve(AllocationRequest {
+                block_bytes: layout.block_bytes,
+                type_id: 7,
+            })
+            .unwrap()
+            .expect("both three-Int records fit in 48 bytes");
+        for field in &layout.fields {
+            heap.write_reserved_u32(reservation, field.offset, 100 + field.field)
+                .unwrap();
+        }
+        records.push(heap.commit(reservation).unwrap());
+    }
+    let before = records[0];
+    let after = records[1];
+    let alias = before;
+    assert_ne!(before, after);
+    assert_eq!(0, heap.diagnostic().total_free);
+    super::heap_ops::store_value(
+        &mut heap,
+        before,
+        0,
+        ValueWidth::I32,
+        RuntimeValue::I32(200),
+    )
+    .unwrap();
+    super::heap_ops::store_value(&mut heap, after, 8, ValueWidth::I32, RuntimeValue::I32(300))
+        .unwrap();
+    for (reference, expected) in [(alias, [200, 101, 102]), (after, [100, 101, 300])] {
+        for (field, value) in layout.fields.iter().zip(expected) {
+            assert_eq!(
+                Ok(RuntimeValue::I32(value)),
+                super::heap_ops::load_value(&heap, reference, field.offset, field.width)
+            );
+        }
+    }
+    assert_eq!(Some(7), heap.runtime_type(before));
+    assert_eq!(Some(7), heap.runtime_type(after));
+    Ok(())
+}
+
+#[test]
+fn compact_header_supports_wide_fields_across_arena_units() -> Result<(), AdmissionError> {
+    let layout = object_layout(
+        None,
+        &[FieldSpec {
+            field: 0,
+            width: ValueWidth::I64,
+        }],
+    )?;
+    let mut heap = Heap::new(&allocator_plan(48))?;
+    for value in [i64::MIN + 123, i64::MAX - 456] {
+        let reservation = heap
+            .reserve(AllocationRequest {
+                block_bytes: layout.block_bytes,
+                type_id: 9,
+            })
+            .unwrap()
+            .unwrap();
+        heap.zero_reserved_payload(reservation, 0, layout.payload_bytes)
+            .unwrap();
+        let reference = heap.commit(reservation).unwrap();
+        super::heap_ops::store_value(
+            &mut heap,
+            reference,
+            0,
+            ValueWidth::I64,
+            RuntimeValue::I64(value),
+        )
+        .unwrap();
+        assert_eq!(
+            Ok(RuntimeValue::I64(value)),
+            super::heap_ops::load_value(&heap, reference, 0, ValueWidth::I64)
+        );
+        assert_eq!(Some(9), heap.runtime_type(reference));
+    }
     Ok(())
 }
 
@@ -330,7 +394,7 @@ fn portable_subclass_preserves_the_superclass_prefix() -> Result<(), AdmissionEr
     assert_eq!(16, subclass.fields[3].offset);
     assert_eq!(&[16], subclass.reference_offsets.as_ref());
     assert_eq!(20, subclass.payload_bytes);
-    assert_eq!(40, subclass.block_bytes);
+    assert_eq!(32, subclass.block_bytes);
 
     Ok(())
 }
@@ -354,7 +418,7 @@ fn portable_literal_deduplication_uses_exact_raw_bytes() -> Result<(), Admission
 
 #[test]
 fn portable_block_alignment_covers_eight_byte_edges() -> Result<(), AdmissionError> {
-    for (field_count, expected) in [(7, 24), (8, 24), (9, 32), (15, 32), (16, 32), (17, 40)] {
+    for (field_count, expected) in [(11, 24), (12, 24), (13, 32), (19, 32), (20, 32), (21, 40)] {
         let fields: Vec<_> = (0..field_count)
             .map(|field| FieldSpec {
                 field,
@@ -447,7 +511,7 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
         .collect();
     assert_eq!(vec![(0, 0), (1, 8), (3, 12), (2, 16)], offsets);
     assert_eq!(&[12], subclass.reference_offsets.as_ref());
-    assert_eq!(40, subclass.block_bytes);
+    assert_eq!(32, subclass.block_bytes);
 
     let static_field = image.field(4).expect("resolved static field");
     assert_eq!(None, static_field.offset);
@@ -610,7 +674,7 @@ fn allocation_cancellation_rolls_back_private_storage() {
     machine.start(&[]).unwrap();
 
     assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
-    assert_eq!(88, machine.test_heap_diagnostic().total_free);
+    assert_eq!(96, machine.test_heap_diagnostic().total_free);
     machine.test_cancel_pending().unwrap();
     assert_eq!(128, machine.test_heap_diagnostic().total_free);
     assert_eq!(None, machine.test_register(0));
@@ -852,7 +916,6 @@ fn gray_queue_restores_predecessors_for_repeated_sweep_and_reuse() {
     let mut heap = Heap::new(&allocator_plan(512)).unwrap();
     for cycle in 0..32_u32 {
         let mut references = Vec::new();
-        let mut identities = Vec::new();
         for (index, size) in [24, 40, 32, 24, 48, 24, 40, 32].into_iter().enumerate() {
             let reservation = heap
                 .reserve(AllocationRequest {
@@ -864,7 +927,6 @@ fn gray_queue_restores_predecessors_for_repeated_sweep_and_reuse() {
             heap.write_reserved(reservation, 0, &(cycle * 100 + index as u32).to_le_bytes())
                 .unwrap();
             let reference = heap.commit(reservation).unwrap();
-            identities.push(heap.identity_hash(reference).unwrap());
             references.push(reference);
         }
         assert!(references
@@ -884,10 +946,6 @@ fn gray_queue_restores_predecessors_for_repeated_sweep_and_reuse() {
                 Some((references[index], 100 + index as u32)),
                 heap.dequeue_gray(&mut head, &mut tail).unwrap()
             );
-            assert_eq!(
-                Some(identities[index]),
-                heap.identity_hash(references[index])
-            );
         }
         assert_eq!(None, heap.dequeue_gray(&mut head, &mut tail).unwrap());
         let mut offset = 0;
@@ -903,10 +961,6 @@ fn gray_queue_restores_predecessors_for_repeated_sweep_and_reuse() {
             assert_eq!(
                 Some(100 + index as u32),
                 heap.runtime_type(references[index])
-            );
-            assert_eq!(
-                Some(identities[index]),
-                heap.identity_hash(references[index])
             );
             let payload = heap.read_payload(references[index], 0, 4).unwrap();
             assert_eq!((cycle * 100 + index as u32).to_le_bytes(), payload[..4]);

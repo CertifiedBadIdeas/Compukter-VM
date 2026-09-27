@@ -67,6 +67,22 @@ cargo test --release --test bounded_failures --locked --offline
 cargo doc --workspace --no-deps --document-private-items --locked --offline
 ```
 
+## Managed object storage
+
+Allocated blocks have an eight-byte allocator header and a four-byte runtime
+type identifier, followed by user payload. Blocks remain eight-byte aligned
+with a 24-byte minimum. Two-Int and three-Int objects both occupy 24 bytes.
+Payload access uses little-endian byte reads and writes; wide fields do not
+require the payload address itself to be eight-byte aligned.
+
+Managed references are direct non-moving offsets. Reference equality and
+aliases do not require a separately stored identity token. The unused
+allocation token and ordinal counter have been removed; no Guest identity
+hash operation is currently exposed by the VM instruction set.
+Free-list links overlap the type identifier and first payload word only for
+free blocks. Collection continues to borrow the predecessor-size word for
+the gray queue and restores it during the bounded forward sweep.
+
 ## Native Runtime bundles
 
 Compukter Runtime releases and Rust workspace packages use one pre-1.0 SemVer

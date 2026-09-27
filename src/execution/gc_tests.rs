@@ -625,7 +625,8 @@ fn oom_oversized_string_request_skips_collection_and_reports_its_source() {
 #[test]
 fn oom_string_allocation_collects_once_then_reports_a_failed_retry() {
     let mut profile = fixtures::profile();
-    profile.heap_bytes = 48;
+    // Each concat now needs 24 bytes; 48 bytes would hold both live results.
+    profile.heap_bytes = 32;
     let image = ExecutionImage::admit(fixtures::repeated_concat_artifact(false), profile).unwrap();
     let minimum = image.minimum_slice_cost();
     let mut machine = super::machine::Machine::new(image).unwrap();
@@ -650,7 +651,7 @@ fn oom_string_allocation_collects_once_then_reports_a_failed_retry() {
         super::error::AllocationDiagnostic {
             request_kind: super::error::AllocationRequestKind::String,
             requested: 12,
-            live: 48,
+            live: 32,
             total_free: 0,
             largest_free_block: 0,
             source: super::error::AllocationSource {

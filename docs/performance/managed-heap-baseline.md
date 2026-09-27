@@ -44,6 +44,11 @@ The vertical conformance observation is identical in debug and release:
 fixed/dynamic/maintenance totals `[69, 7, 12]` and digest
 `a32f461af53924985dfdf3041e803325fe69d3f24aa010292187eb15b5434e64`.
 
+The historical digest above includes heap diagnostics and is layout-sensitive.
+After removing the unused managed identity token on 2026-09-27, the same
+vertical test retains totals `[69, 7, 12]` and uses digest
+`16fa5c337cd17f5943e1704f46b98b7dececaa1bb2735a4c5c07734c5ad24e56`.
+
 ## Collector work and pauses
 
 The graph contains a cycle, shared child, duplicate logical reachability, and a

@@ -20,8 +20,9 @@ const PREVIOUS_SIZE: u32 = 4;
 const GRAY_NEXT: u32 = PREVIOUS_SIZE;
 const NEXT_FREE: u32 = 8;
 const PREVIOUS_FREE: u32 = 12;
+// Managed identity is the non-moving Ref32 offset, not an allocation token.
+// Free-list links overlap the type and user payload only while the block is free.
 const OBJECT_TYPE_ID: u32 = BLOCK_HEADER_BYTES;
-const OBJECT_IDENTITY_TOKEN: u32 = OBJECT_TYPE_ID + 4;
 const USER_PAYLOAD: u32 = HEAP_HEADER_BYTES;
 
 #[repr(C, align(16))]
@@ -53,13 +54,6 @@ pub(super) struct ReservedAllocation {
     pub type_id: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C)]
-pub(super) struct ManagedObjectHeader {
-    pub type_id: u32,
-    pub identity_token: u32,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct HeapDiagnostic {
     pub total_free: u32,
@@ -74,7 +68,6 @@ pub(super) struct Heap {
     class_heads: Box<[u32]>,
     first_bitmap: u32,
     second_bitmaps: [u8; 32],
-    next_ordinal: u64,
     total_free: u32,
     live_objects: u32,
 }
@@ -113,7 +106,6 @@ impl Heap {
             class_heads: class_heads.into_boxed_slice(),
             first_bitmap: 0,
             second_bitmaps: [0; 32],
-            next_ordinal: 1,
             total_free: heap_bytes,
             live_objects: 0,
         };
@@ -170,14 +162,9 @@ impl Heap {
 
     pub(super) fn commit(&mut self, reservation: ReservedAllocation) -> Result<Ref32, VmFault> {
         self.validate_reservation(reservation)?;
-        let header = ManagedObjectHeader {
-            type_id: reservation.type_id,
-            identity_token: splitmix64(self.next_ordinal) as u32,
-        };
-        self.write_object_header(reservation.block, header)?;
+        self.write_word(reservation.block, OBJECT_TYPE_ID, reservation.type_id)?;
         let flags = self.read_word(reservation.block, SIZE_FLAGS)?;
         self.write_word(reservation.block, SIZE_FLAGS, flags | LIVE)?;
-        self.next_ordinal = self.next_ordinal.wrapping_add(1);
         self.live_objects = self
             .live_objects
             .checked_add(1)
@@ -411,12 +398,6 @@ impl Heap {
         Ok(block)
     }
 
-    pub(super) fn identity_hash(&self, reference: Ref32) -> Option<u32> {
-        self.live_block(reference)
-            .ok()
-            .and_then(|block| self.read_word(block, OBJECT_IDENTITY_TOKEN).ok())
-    }
-
     pub(super) fn diagnostic(&self) -> HeapDiagnostic {
         let mut largest_free_block = 0;
         let mut offset = BlockOffset(0);
@@ -569,11 +550,6 @@ impl Heap {
     pub(super) fn test_reserved_bytes(&self) -> usize {
         self.arena.len() * core::mem::size_of::<u128>()
             + self.class_heads.len() * core::mem::size_of::<u32>()
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_set_next_ordinal(&mut self, ordinal: u64) {
-        self.next_ordinal = ordinal;
     }
 
     #[cfg(test)]
@@ -779,15 +755,6 @@ impl Heap {
         Ok(u32::from_le_bytes(bytes))
     }
 
-    fn write_object_header(
-        &mut self,
-        block: BlockOffset,
-        header: ManagedObjectHeader,
-    ) -> Result<(), VmFault> {
-        self.write_word(block, OBJECT_TYPE_ID, header.type_id)?;
-        self.write_word(block, OBJECT_IDENTITY_TOKEN, header.identity_token)
-    }
-
     fn write_word(&mut self, block: BlockOffset, field: u32, value: u32) -> Result<(), VmFault> {
         let start = block.0.checked_add(field).ok_or(VmFault::CorruptHeap)?;
         let unit = usize::try_from(start / 16).map_err(|_| VmFault::CorruptHeap)?;
@@ -817,12 +784,6 @@ pub(super) fn request_size_class(size: u32) -> Option<SizeClass> {
         }
     }
     (first < 32).then_some(SizeClass { first, second })
-}
-
-pub(super) fn splitmix64(mut value: u64) -> u64 {
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 fn downward_class(size: u32) -> Option<(u8, u8, u32)> {
