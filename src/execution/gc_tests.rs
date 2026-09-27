@@ -460,7 +460,7 @@ fn machine_reports_one_failed_post_collection_retry() {
             exception: super::value::Ref32::reserved(0).unwrap(),
             diagnostic: super::error::AllocationDiagnostic {
                 request_kind: super::error::AllocationRequestKind::Object,
-                requested: 0,
+                requested: 8,
                 live: 32,
                 total_free: 0,
                 largest_free_block: 0,
