@@ -1213,3 +1213,97 @@ fn host_session_performance_baseline() {
         f64::from(ITERATIONS) / elapsed.as_secs_f64(),
     );
 }
+
+/// Run explicitly with COMPUKTER_FRAME_BENCHMARK_ARTIFACTS and COMPUKTER_FRAME_BENCHMARK_REPORT.
+/// Measures exact high-water bytes reserved by simultaneously active frames, including suspended frames.
+/// This excludes frame metadata and the preallocated arena capacity, and performs no CPU measurement.
+#[test]
+#[ignore = "requires generated object-collection benchmark artifacts"]
+fn object_collection_active_frame_measurement() {
+    use std::{fs, path::PathBuf, sync::Arc};
+
+    let directory = PathBuf::from(std::env::var("COMPUKTER_FRAME_BENCHMARK_ARTIFACTS").unwrap());
+    let report = PathBuf::from(std::env::var("COMPUKTER_FRAME_BENCHMARK_REPORT").unwrap());
+    let manifest = fs::read_to_string(directory.join("manifest.tsv")).unwrap();
+    let arguments = [HostValueType::String];
+    let operations = [
+        OperationSchema::asynchronous(&[], HostValueType::String),
+        OperationSchema::synchronous(&arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&arguments, HostValueType::Unit),
+    ];
+    let binding = CapabilityBinding::new("compukter", "stdio", 1, 0, &operations);
+    let mut output = String::from("id\tconstruction_peak_active_frame_bytes\tcompletion_peak_active_frame_bytes\tframe_arena_capacity_bytes\tconfigured_frame_limit_bytes\tmutable_execution_resident_bytes\n");
+    let mut count = 0;
+    for line in manifest.lines().skip(1) {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(10, fields.len());
+        let artifact = crate::verify_artifact(
+            Arc::from(fs::read(directory.join(format!("{}.cpkt", fields[0]))).unwrap()),
+            crate::ArtifactLimits::default(),
+        )
+        .unwrap();
+        let frame_arena_capacity = artifact.decoded().manifest.required_stack_bytes;
+        let mut execution_profile = profile();
+        execution_profile.heap_bytes = 16 * 1024 * 1024;
+        let mut session = Session::admit(artifact, execution_profile.clone(), &[binding]).unwrap();
+        session.start(&[]).unwrap();
+        let mut outputs = 0;
+        let mut construction_peak = 0;
+        let mut halted = false;
+        for _ in 0..100_000 {
+            match session.advance(4096, 4096).unwrap() {
+                AdvanceOutcome::SliceExhausted => {}
+                AdvanceOutcome::HostRequestBatch(batch) => {
+                    assert_eq!(1, batch.len());
+                    let request = batch.get(0).unwrap();
+                    assert_eq!("compukter", request.namespace());
+                    assert_eq!("stdio", request.name());
+                    assert_eq!(1, request.operation());
+                    let text = match request.arguments().get(0) {
+                        Some(HostValueView::String(text)) => String::from_utf16(text).unwrap(),
+                        other => panic!("unexpected output: {other:?}"),
+                    };
+                    let identity = (request.task_id(), request.id());
+                    assert_eq!(
+                        if outputs == 0 {
+                            "ready\n".to_owned()
+                        } else {
+                            format!("{}\n", fields[6])
+                        },
+                        text
+                    );
+                    outputs += 1;
+                    if outputs == 1 {
+                        construction_peak = session.test_peak_active_frame_bytes();
+                    }
+                    session
+                        .resume_for(
+                            identity.0,
+                            identity.1,
+                            HostResponse::Success(HostValueInput::Unit),
+                        )
+                        .unwrap();
+                }
+                AdvanceOutcome::Halted(None) => {
+                    halted = true;
+                    break;
+                }
+                outcome => panic!("unexpected measurement outcome: {outcome:?}"),
+            }
+        }
+        assert!(halted, "{} did not halt", fields[0]);
+        assert_eq!(2, outputs);
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            fields[0],
+            construction_peak,
+            session.test_peak_active_frame_bytes(),
+            frame_arena_capacity,
+            execution_profile.frame_storage_bytes,
+            session.resource_snapshot().machine.mutable_resident_bytes
+        ));
+        count += 1;
+    }
+    assert_eq!(14, count);
+    fs::write(report, output).unwrap();
+}
