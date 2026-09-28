@@ -6,8 +6,10 @@ use super::{
     heap_ops::{PendingAllocation, PendingState},
     image::{deduplicate_literal_ranges, ExecutionImage},
     layout::{
-        array_layout, empty_object_layout, object_layout, string_layout, FieldSpec,
-        RuntimeTypeLayout, StoragePlan, StringEncoding, ValueWidth,
+        array_layout as array_layout_with_header, empty_object_layout,
+        object_layout as object_layout_with_header, string_layout as string_layout_with_header,
+        ArrayLayout, FieldSpec, HeaderFormat, ObjectLayout, RuntimeTypeLayout, StoragePlan,
+        StringEncoding, StringLayout, ValueWidth,
     },
     machine::{Frame, Machine, TypeInitializationState},
     task::TaskScheduler,
@@ -15,6 +17,21 @@ use super::{
     TypeKey,
 };
 use crate::artifact::ByteRange;
+
+fn object_layout(
+    superclass: Option<&ObjectLayout>,
+    fields: &[FieldSpec],
+) -> Result<ObjectLayout, AdmissionError> {
+    object_layout_with_header(superclass, fields, HeaderFormat::Legacy)
+}
+
+fn array_layout(element: ValueWidth, length: i32) -> Result<ArrayLayout, AdmissionError> {
+    array_layout_with_header(element, length, HeaderFormat::Legacy)
+}
+
+fn string_layout(encoding: StringEncoding, length: u32) -> Result<StringLayout, AdmissionError> {
+    string_layout_with_header(encoding, length, HeaderFormat::Legacy)
+}
 
 #[test]
 fn allocator_size_classes_map_free_blocks_down_and_requests_up() {
@@ -248,6 +265,100 @@ fn portable_minimum_and_representative_layouts() -> Result<(), AdmissionError> {
     assert_eq!(32, references.block_bytes);
     assert_eq!(32, string_layout(StringEncoding::Latin1, 8)?.block_bytes);
     assert_eq!(40, string_layout(StringEncoding::Utf16, 8)?.block_bytes);
+    Ok(())
+}
+
+#[test]
+fn compact_header_selects_only_representable_heap_and_type_bounds() {
+    assert_eq!(
+        HeaderFormat::Compact {
+            size_bits: 16,
+            link_bits: 15
+        },
+        HeaderFormat::select(256 * 1024, 2),
+    );
+    assert_eq!(
+        HeaderFormat::Compact {
+            size_bits: 22,
+            link_bits: 21
+        },
+        HeaderFormat::select(16 * 1024 * 1024, 2),
+    );
+    assert_eq!(
+        HeaderFormat::Legacy,
+        HeaderFormat::select(16 * 1024 * 1024, 262_145)
+    );
+}
+
+#[test]
+fn compact_two_int_records_use_16_bytes_and_keep_type_payload_and_identity(
+) -> Result<(), AdmissionError> {
+    let format = HeaderFormat::select(256 * 1024, 2);
+    let fields = [
+        FieldSpec {
+            field: 0,
+            width: ValueWidth::I32,
+        },
+        FieldSpec {
+            field: 1,
+            width: ValueWidth::I32,
+        },
+    ];
+    let layout = object_layout_with_header(None, &fields, format)?;
+    assert_eq!(16, layout.block_bytes);
+    let mut heap = Heap::new(&allocator_plan(256 * 1024).with_header_format(format))?;
+    let before = heap.total_free_bytes();
+    let mut references = Vec::new();
+    for value in 0_u32..4096 {
+        let type_id = if value == 0 { (1 << 30) - 1 } else { 7 };
+        let reservation = heap
+            .reserve(AllocationRequest {
+                block_bytes: layout.block_bytes,
+                type_id,
+            })
+            .unwrap()
+            .unwrap();
+        heap.write_reserved_u32(reservation, 0, value).unwrap();
+        heap.write_reserved_u32(reservation, 4, !value).unwrap();
+        references.push(heap.commit(reservation).unwrap());
+    }
+    assert_eq!(64 * 1024, before - heap.total_free_bytes());
+    for (value, reference) in references.iter().copied().enumerate() {
+        let expected_type = if value == 0 { (1 << 30) - 1 } else { 7 };
+        assert_eq!(Some(expected_type), heap.runtime_type(reference));
+        assert_eq!(
+            (value as u32).to_le_bytes(),
+            heap.read_payload(reference, 0, 4).unwrap()[..4]
+        );
+        assert_eq!(
+            (!(value as u32)).to_le_bytes(),
+            heap.read_payload(reference, 4, 4).unwrap()[..4]
+        );
+        if value != 0 {
+            assert_eq!(16, reference.payload() - references[value - 1].payload());
+        }
+    }
+    let first = references[0];
+    let mut head = None;
+    let mut tail = None;
+    heap.enqueue_gray(first, 0, &mut head, &mut tail).unwrap();
+    assert_eq!(
+        Some((first, (1 << 30) - 1)),
+        heap.dequeue_gray(&mut head, &mut tail).unwrap()
+    );
+    assert_eq!(Some((1 << 30) - 1), heap.runtime_type(first));
+    assert_eq!(
+        0_u32.to_le_bytes(),
+        heap.read_payload(first, 0, 4).unwrap()[..4]
+    );
+    for index in (0..references.len()).step_by(2) {
+        assert!(heap.free(references[index]).unwrap());
+    }
+    for index in (1..references.len()).step_by(2) {
+        assert!(heap.free(references[index]).unwrap());
+    }
+    assert_eq!(before, heap.total_free_bytes());
+    assert_eq!(before, heap.diagnostic().largest_free_block);
     Ok(())
 }
 

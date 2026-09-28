@@ -4625,16 +4625,17 @@ pub(super) fn gc_retry_artifact() -> VerifiedArtifact {
         };
         artifact.modules[0]
             .types
-            .push(plain_class(TypeId(u32::MAX), 0, 1));
+            .push(plain_class(TypeId(u32::MAX), 0, 2));
         artifact.modules[0].declared_types = 2;
-        // An eight-byte payload keeps this pressure fixture larger than half
-        // its 32-byte heap even when empty objects use 16-byte blocks.
-        artifact.modules[0].fields = vec![Field {
-            owner: TypeId(1),
-            name: 0,
-            value_type: primitive(2),
-            flags: 0,
-        }];
+        // Sixteen payload bytes keep this fixture larger than half its 32-byte heap.
+        artifact.modules[0].fields = (0..2)
+            .map(|name| Field {
+                owner: TypeId(1),
+                name,
+                value_type: primitive(2),
+                flags: 0,
+            })
+            .collect();
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 1;
         function.values = crate::artifact::scalar_values(vec![reference]);
@@ -4740,16 +4741,18 @@ pub(super) fn gc_failed_retry_artifact() -> VerifiedArtifact {
         };
         artifact.modules[0]
             .types
-            .push(plain_class(TypeId(u32::MAX), 0, 1));
+            .push(plain_class(TypeId(u32::MAX), 0, 2));
         artifact.modules[0].declared_types = 2;
         // The first live object fills the tiny arena; the second requires GC
         // and must still fail after collection.
-        artifact.modules[0].fields = vec![Field {
-            owner: TypeId(1),
-            name: 0,
-            value_type: primitive(2),
-            flags: 0,
-        }];
+        artifact.modules[0].fields = (0..2)
+            .map(|name| Field {
+                owner: TypeId(1),
+                name,
+                value_type: primitive(2),
+                flags: 0,
+            })
+            .collect();
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 2;
         function.values = crate::artifact::scalar_values(vec![reference, reference]);

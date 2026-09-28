@@ -12,7 +12,7 @@ use super::{
     heap_ops::{load_value, store_value, PendingAllocation, PendingState},
     host::{EntryArgumentLimits, RequestId, TaskId},
     image::{ExecutionImage, ResolvedFunction, ResolvedInstruction, ResolvedValueType},
-    layout::{array_layout, RuntimeTypeLayout, ValueWidth, HEAP_HEADER_BYTES},
+    layout::{array_layout, RuntimeTypeLayout, ValueWidth},
     numeric,
     task::{TaskError, TaskScheduler},
     text,
@@ -717,10 +717,11 @@ impl Machine {
             strings.push(reference);
         }
 
-        let layout = array_layout(ValueWidth::Ref, count as i32).map_err(|_| {
-            self.rollback_entry_references(&strings);
-            RunError::EntryAllocationFailed
-        })?;
+        let layout = array_layout(ValueWidth::Ref, count as i32, self.heap.header_format())
+            .map_err(|_| {
+                self.rollback_entry_references(&strings);
+                RunError::EntryAllocationFailed
+            })?;
         let reservation = match self.heap.reserve(AllocationRequest {
             block_bytes: layout.block_bytes,
             type_id: self
@@ -738,7 +739,7 @@ impl Machine {
             self.heap.zero_reserved_payload(
                 reservation,
                 0,
-                layout.block_bytes - HEAP_HEADER_BYTES,
+                layout.block_bytes - self.heap.payload_offset(),
             )?;
             self.heap.write_reserved_u32(reservation, 0, count)?;
             for (index, reference) in strings.iter().copied().enumerate() {
@@ -1316,7 +1317,8 @@ impl Machine {
                         else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));
                         };
-                        let layout = match array_layout(*element, length) {
+                        let layout = match array_layout(*element, length, self.heap.header_format())
+                        {
                             Ok(layout) => layout,
                             Err(_) => {
                                 return Ok(self.allocation_exhausted(
