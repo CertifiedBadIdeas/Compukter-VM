@@ -2,7 +2,7 @@ use super::{
     error::{GuestTrap, VmFault},
     heap::{AllocationRequest, Heap, ReservedAllocation},
     image::{ExecutionImage, ResolvedLiteral},
-    layout::{string_layout, StringEncoding, StringLayout, HEAP_HEADER_BYTES},
+    layout::{string_layout, StringEncoding, StringLayout},
     value::{Ref32, RuntimeValue},
 };
 
@@ -391,7 +391,7 @@ impl PendingConcat {
             } else {
                 StringEncoding::Utf16
             };
-            let layout = string_layout(encoding, length)
+            let layout = string_layout(encoding, length, heap.header_format())
                 .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?;
             let ty = image
                 .string_type()
@@ -421,7 +421,7 @@ impl PendingConcat {
         let reservation = self
             .reservation
             .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
-        let initialized_bytes = layout.block_bytes - HEAP_HEADER_BYTES;
+        let initialized_bytes = layout.block_bytes - heap.payload_offset();
         while self.written < initialized_bytes && used < budget {
             let end = self.written.saturating_add(16).min(initialized_bytes);
             let mut chunk = [0_u8; 16];
@@ -546,7 +546,7 @@ impl PendingHostString {
             } else {
                 StringEncoding::Utf16
             };
-            let layout = string_layout(encoding, length)
+            let layout = string_layout(encoding, length, heap.header_format())
                 .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?;
             let ty = image
                 .string_type()
@@ -576,7 +576,7 @@ impl PendingHostString {
         let reservation = self
             .reservation
             .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
-        let initialized_bytes = layout.block_bytes - HEAP_HEADER_BYTES;
+        let initialized_bytes = layout.block_bytes - heap.payload_offset();
         while self.written < initialized_bytes && used < budget {
             let end = self.written.saturating_add(16).min(initialized_bytes);
             let mut chunk = [0_u8; 16];

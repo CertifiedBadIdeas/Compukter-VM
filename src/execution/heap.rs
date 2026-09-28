@@ -1,8 +1,6 @@
 use super::{
     error::{AdmissionError, ResidentStorageComponent, VmFault},
-    layout::{
-        StoragePlan, BLOCK_ALIGNMENT, BLOCK_HEADER_BYTES, HEAP_HEADER_BYTES, MINIMUM_BLOCK_BYTES,
-    },
+    layout::{HeaderFormat, StoragePlan, BLOCK_ALIGNMENT, BLOCK_HEADER_BYTES, MINIMUM_BLOCK_BYTES},
     value::{Ref32, ReferenceDomain},
 };
 
@@ -13,17 +11,15 @@ const MARKED: u32 = 2;
 const LIVE: u32 = 4;
 const SIZE_MASK: u32 = !(BLOCK_ALIGNMENT - 1);
 const SIZE_FLAGS: u32 = 0;
-// Phase-exclusive metadata: normal allocation/coalescing uses the predecessor size;
-// roots/mark uses this word as a gray link while Guest execution is stopped.
+// In the legacy format, this word holds phase-exclusive predecessor size or gray link.
+// The compact format packs the same phase-exclusive value into the 64-bit header.
 // Sweep restores predecessor sizes before any block is coalesced.
 const PREVIOUS_SIZE: u32 = 4;
-const GRAY_NEXT: u32 = PREVIOUS_SIZE;
 const NEXT_FREE: u32 = 8;
 const PREVIOUS_FREE: u32 = 12;
 // Managed identity is the non-moving Ref32 offset, not an allocation token.
-// Free-list links overlap the type and user payload only while the block is free.
+// Free-list links overlap user payload only while the block is free.
 const OBJECT_TYPE_ID: u32 = BLOCK_HEADER_BYTES;
-const USER_PAYLOAD: u32 = HEAP_HEADER_BYTES;
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -63,6 +59,7 @@ pub(super) struct HeapDiagnostic {
 }
 
 pub(super) struct Heap {
+    header_format: HeaderFormat,
     arena: Box<[ArenaUnit]>,
     arena_bytes: u32,
     class_heads: Box<[u32]>,
@@ -101,6 +98,7 @@ impl Heap {
             .map_err(|_| AdmissionError::AllocationFailed)?;
         class_heads.resize(CLASS_COUNT, NULL_OFFSET);
         let mut heap = Self {
+            header_format: plan.header_format,
             arena: arena.into_boxed_slice(),
             arena_bytes: heap_bytes,
             class_heads: class_heads.into_boxed_slice(),
@@ -132,7 +130,7 @@ impl Heap {
         if block_size < request.block_bytes {
             return Err(VmFault::CorruptHeap);
         }
-        let previous_size = self.read_word(block, PREVIOUS_SIZE)?;
+        let previous_size = self.read_previous_or_gray(block)?;
         self.remove_free(block)?;
         let remainder = block_size - request.block_bytes;
         let allocated_size = if remainder >= MINIMUM_BLOCK_BYTES {
@@ -162,9 +160,9 @@ impl Heap {
 
     pub(super) fn commit(&mut self, reservation: ReservedAllocation) -> Result<Ref32, VmFault> {
         self.validate_reservation(reservation)?;
-        self.write_word(reservation.block, OBJECT_TYPE_ID, reservation.type_id)?;
-        let flags = self.read_word(reservation.block, SIZE_FLAGS)?;
-        self.write_word(reservation.block, SIZE_FLAGS, flags | LIVE)?;
+        self.write_type(reservation.block, reservation.type_id)?;
+        let flags = self.read_flags(reservation.block)?;
+        self.write_flags(reservation.block, flags | LIVE)?;
         self.live_objects = self
             .live_objects
             .checked_add(1)
@@ -191,7 +189,7 @@ impl Heap {
         self.validate_reservation(reservation)?;
         let capacity = self
             .block_size(reservation.block)?
-            .checked_sub(USER_PAYLOAD)
+            .checked_sub(self.payload_offset())
             .ok_or(VmFault::CorruptHeap)?;
         let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
         if end > capacity {
@@ -200,7 +198,7 @@ impl Heap {
         let start = reservation
             .block
             .0
-            .checked_add(USER_PAYLOAD)
+            .checked_add(self.payload_offset())
             .and_then(|value| value.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         for byte in start..start + length {
@@ -222,7 +220,7 @@ impl Heap {
         self.validate_reservation(reservation)?;
         let capacity = self
             .block_size(reservation.block)?
-            .checked_sub(USER_PAYLOAD)
+            .checked_sub(self.payload_offset())
             .ok_or(VmFault::CorruptHeap)?;
         if offset.checked_add(4).ok_or(VmFault::CorruptHeap)? > capacity {
             return Err(VmFault::CorruptHeap);
@@ -230,7 +228,7 @@ impl Heap {
         let start = reservation
             .block
             .0
-            .checked_add(USER_PAYLOAD)
+            .checked_add(self.payload_offset())
             .and_then(|base| base.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
@@ -255,7 +253,7 @@ impl Heap {
         self.validate_reservation(reservation)?;
         let capacity = self
             .block_size(reservation.block)?
-            .checked_sub(USER_PAYLOAD)
+            .checked_sub(self.payload_offset())
             .ok_or(VmFault::CorruptHeap)?;
         let length = u32::try_from(bytes.len()).map_err(|_| VmFault::CorruptHeap)?;
         if offset.checked_add(length).ok_or(VmFault::CorruptHeap)? > capacity {
@@ -264,7 +262,7 @@ impl Heap {
         let start = reservation
             .block
             .0
-            .checked_add(USER_PAYLOAD)
+            .checked_add(self.payload_offset())
             .and_then(|base| base.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         for (index, byte) in bytes.iter().copied().enumerate() {
@@ -280,7 +278,7 @@ impl Heap {
 
     fn validate_reservation(&self, reservation: ReservedAllocation) -> Result<(), VmFault> {
         if self.block_allocated(reservation.block)?
-            && self.read_word(reservation.block, SIZE_FLAGS)? & LIVE == 0
+            && self.read_flags(reservation.block)? & LIVE == 0
         {
             Ok(())
         } else {
@@ -309,7 +307,7 @@ impl Heap {
 
     pub(super) fn managed_type(&self, reference: Ref32) -> Result<u32, VmFault> {
         let block = self.live_block(reference)?;
-        self.read_word(block, OBJECT_TYPE_ID)
+        self.read_type(block)
     }
 
     pub(super) fn read_payload(
@@ -321,7 +319,7 @@ impl Heap {
         let block = self.live_block(reference)?;
         let capacity = self
             .block_size(block)?
-            .checked_sub(USER_PAYLOAD)
+            .checked_sub(self.payload_offset())
             .ok_or(VmFault::CorruptHeap)?;
         let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
         if length > 8 || end > capacity {
@@ -329,7 +327,7 @@ impl Heap {
         }
         let start = block
             .0
-            .checked_add(USER_PAYLOAD)
+            .checked_add(self.payload_offset())
             .and_then(|base| base.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         let mut bytes = [0; 8];
@@ -354,7 +352,7 @@ impl Heap {
         let length = u32::try_from(bytes.len()).map_err(|_| VmFault::CorruptHeap)?;
         let capacity = self
             .block_size(block)?
-            .checked_sub(USER_PAYLOAD)
+            .checked_sub(self.payload_offset())
             .ok_or(VmFault::CorruptHeap)?;
         let end = offset.checked_add(length).ok_or(VmFault::CorruptHeap)?;
         if end > capacity {
@@ -362,7 +360,7 @@ impl Heap {
         }
         let start = block
             .0
-            .checked_add(USER_PAYLOAD)
+            .checked_add(self.payload_offset())
             .and_then(|base| base.checked_add(offset))
             .ok_or(VmFault::CorruptHeap)?;
         for (index, byte) in bytes.iter().copied().enumerate() {
@@ -391,7 +389,7 @@ impl Heap {
         );
         if block.0 >= self.arena_bytes
             || !self.block_allocated(block)?
-            || self.read_word(block, SIZE_FLAGS)? & LIVE == 0
+            || self.read_flags(block)? & LIVE == 0
         {
             return Err(VmFault::InvalidReference);
         }
@@ -442,16 +440,16 @@ impl Heap {
             return Ok(());
         }
         let block = self.live_block(reference)?;
-        let flags = self.read_word(block, SIZE_FLAGS)?;
+        let flags = self.read_flags(block)?;
         if flags & MARKED != 0 {
             return Ok(());
         }
-        self.write_word(block, SIZE_FLAGS, flags | MARKED)?;
-        self.write_word(block, GRAY_NEXT, NULL_OFFSET)?;
+        self.write_flags(block, flags | MARKED)?;
+        self.write_previous_or_gray(block, NULL_OFFSET)?;
         if let Some(previous) = *tail {
             let previous = Ref32::managed(previous).ok_or(VmFault::CorruptHeap)?;
             let previous_block = self.live_block(previous)?;
-            self.write_word(previous_block, GRAY_NEXT, reference.payload())?;
+            self.write_previous_or_gray(previous_block, reference.payload())?;
         } else {
             *head = Some(reference.payload());
         }
@@ -469,9 +467,9 @@ impl Heap {
         };
         let reference = Ref32::managed(payload).ok_or(VmFault::CorruptHeap)?;
         let block = self.live_block(reference)?;
-        let next = self.read_word(block, GRAY_NEXT)?;
-        self.write_word(block, GRAY_NEXT, NULL_OFFSET)?;
-        *head = (next != NULL_OFFSET).then_some(next);
+        let next = self.read_previous_or_gray(block)?;
+        self.write_previous_or_gray(block, NULL_OFFSET)?;
+        *head = (next != NULL_OFFSET && next != 0).then_some(next);
         if head.is_none() {
             *tail = None;
         }
@@ -480,6 +478,14 @@ impl Heap {
 
     pub(super) fn arena_bytes(&self) -> u32 {
         self.arena_bytes
+    }
+
+    pub(super) const fn payload_offset(&self) -> u32 {
+        self.header_format.bytes()
+    }
+
+    pub(super) const fn header_format(&self) -> HeaderFormat {
+        self.header_format
     }
 
     pub(super) fn sweep_block(
@@ -494,20 +500,20 @@ impl Heap {
         let size = self.block_size(block)?;
         // Marking temporarily borrowed this word for the intrusive gray queue.
         // The forward sweep knows the effective predecessor size even after merging.
-        self.write_word(block, PREVIOUS_SIZE, previous_size)?;
+        self.write_previous_or_gray(block, previous_size)?;
         if !self.block_allocated(block)? {
             return Ok((offset.checked_add(size).ok_or(VmFault::CorruptHeap)?, size));
         }
-        let flags = self.read_word(block, SIZE_FLAGS)?;
+        let flags = self.read_flags(block)?;
         if flags & LIVE == 0 {
             return Err(VmFault::CorruptHeap);
         }
         if flags & MARKED != 0 {
-            self.write_word(block, SIZE_FLAGS, flags & !MARKED)?;
+            self.write_flags(block, flags & !MARKED)?;
             return Ok((offset.checked_add(size).ok_or(VmFault::CorruptHeap)?, size));
         }
 
-        let previous_size = self.read_word(block, PREVIOUS_SIZE)?;
+        let previous_size = self.read_previous_or_gray(block)?;
         let merged = if offset != 0 {
             let previous = BlockOffset(
                 offset
@@ -555,8 +561,11 @@ impl Heap {
     #[cfg(test)]
     pub(super) fn test_managed_payload(&self, reference: Ref32) -> Option<Box<[u8]>> {
         let block = self.live_block(reference).ok()?;
-        let length = self.block_size(block).ok()?.checked_sub(USER_PAYLOAD)?;
-        let start = block.0.checked_add(USER_PAYLOAD)?;
+        let length = self
+            .block_size(block)
+            .ok()?
+            .checked_sub(self.payload_offset())?;
+        let start = block.0.checked_add(self.payload_offset())?;
         let mut bytes = Vec::with_capacity(length as usize);
         for position in start..start + length {
             let unit = self.arena.get((position / 16) as usize)?;
@@ -654,7 +663,7 @@ impl Heap {
         let original_size = self.block_size(block)?;
         let mut merged = block;
         let mut merged_size = original_size;
-        let mut previous_size = self.read_word(block, PREVIOUS_SIZE)?;
+        let mut previous_size = self.read_previous_or_gray(block)?;
 
         if block.0 != 0 {
             let previous = BlockOffset(
@@ -669,7 +678,7 @@ impl Heap {
                 merged_size = merged_size
                     .checked_add(self.block_size(previous)?)
                     .ok_or(VmFault::CorruptHeap)?;
-                previous_size = self.read_word(previous, PREVIOUS_SIZE)?;
+                previous_size = self.read_previous_or_gray(previous)?;
             }
         }
 
@@ -691,7 +700,7 @@ impl Heap {
         // this block is absorbed into its free predecessor, its old allocator
         // header becomes interior storage and must no longer look allocated.
         if merged != block {
-            self.write_word(block, SIZE_FLAGS, 0)?;
+            self.write_flags(block, 0)?;
         }
 
         self.write_header(merged, merged_size, previous_size, false)?;
@@ -714,8 +723,7 @@ impl Heap {
         if size < MINIMUM_BLOCK_BYTES || !size.is_multiple_of(BLOCK_ALIGNMENT) {
             return Err(VmFault::CorruptHeap);
         }
-        self.write_word(block, SIZE_FLAGS, size | u32::from(allocated))?;
-        self.write_word(block, PREVIOUS_SIZE, previous_size)?;
+        self.write_block_header(block, size, previous_size, allocated)?;
         self.write_word(block, NEXT_FREE, NULL_OFFSET)?;
         self.write_word(block, PREVIOUS_FREE, NULL_OFFSET)
     }
@@ -723,13 +731,20 @@ impl Heap {
     fn update_next_previous_size(&mut self, block: BlockOffset, size: u32) -> Result<(), VmFault> {
         let next = block.0.checked_add(size).ok_or(VmFault::CorruptHeap)?;
         if next < self.arena_bytes {
-            self.write_word(BlockOffset(next), PREVIOUS_SIZE, size)?;
+            self.write_previous_or_gray(BlockOffset(next), size)?;
         }
         Ok(())
     }
 
     fn block_size(&self, block: BlockOffset) -> Result<u32, VmFault> {
-        let size = self.read_word(block, SIZE_FLAGS)? & SIZE_MASK;
+        let size = match self.header_format {
+            HeaderFormat::Legacy => self.read_word(block, SIZE_FLAGS)? & SIZE_MASK,
+            HeaderFormat::Compact { size_bits, .. } => {
+                let units = (self.read_compact_header(block)? >> 3) & bit_mask(size_bits);
+                u32::try_from(units * u64::from(BLOCK_ALIGNMENT))
+                    .map_err(|_| VmFault::CorruptHeap)?
+            }
+        };
         if size < MINIMUM_BLOCK_BYTES || !size.is_multiple_of(BLOCK_ALIGNMENT) {
             return Err(VmFault::CorruptHeap);
         }
@@ -737,7 +752,161 @@ impl Heap {
     }
 
     fn block_allocated(&self, block: BlockOffset) -> Result<bool, VmFault> {
-        Ok(self.read_word(block, SIZE_FLAGS)? & ALLOCATED != 0)
+        Ok(self.read_flags(block)? & ALLOCATED != 0)
+    }
+
+    fn read_flags(&self, block: BlockOffset) -> Result<u32, VmFault> {
+        match self.header_format {
+            HeaderFormat::Legacy => Ok(self.read_word(block, SIZE_FLAGS)? & !SIZE_MASK),
+            HeaderFormat::Compact { .. } => Ok((self.read_compact_header(block)? & 7) as u32),
+        }
+    }
+
+    fn write_flags(&mut self, block: BlockOffset, flags: u32) -> Result<(), VmFault> {
+        if flags & !7 != 0 {
+            return Err(VmFault::CorruptHeap);
+        }
+        match self.header_format {
+            HeaderFormat::Legacy => {
+                let size = self.read_word(block, SIZE_FLAGS)? & SIZE_MASK;
+                self.write_word(block, SIZE_FLAGS, size | flags)
+            }
+            HeaderFormat::Compact { .. } => {
+                let header = self.read_compact_header(block)?;
+                self.write_compact_header(block, (header & !7) | u64::from(flags))
+            }
+        }
+    }
+
+    fn read_previous_or_gray(&self, block: BlockOffset) -> Result<u32, VmFault> {
+        match self.header_format {
+            HeaderFormat::Legacy => self.read_word(block, PREVIOUS_SIZE),
+            HeaderFormat::Compact {
+                size_bits,
+                link_bits,
+            } => {
+                let units =
+                    (self.read_compact_header(block)? >> (3 + size_bits)) & bit_mask(link_bits);
+                u32::try_from(units * u64::from(BLOCK_ALIGNMENT)).map_err(|_| VmFault::CorruptHeap)
+            }
+        }
+    }
+
+    fn write_previous_or_gray(&mut self, block: BlockOffset, value: u32) -> Result<(), VmFault> {
+        match self.header_format {
+            HeaderFormat::Legacy => self.write_word(block, PREVIOUS_SIZE, value),
+            HeaderFormat::Compact {
+                size_bits,
+                link_bits,
+            } => {
+                let units = if value == NULL_OFFSET {
+                    0
+                } else {
+                    if !value.is_multiple_of(BLOCK_ALIGNMENT) {
+                        return Err(VmFault::CorruptHeap);
+                    }
+                    u64::from(value / BLOCK_ALIGNMENT)
+                };
+                if units > bit_mask(link_bits) {
+                    return Err(VmFault::CorruptHeap);
+                }
+                let shift = 3 + size_bits;
+                let mask = bit_mask(link_bits) << shift;
+                let header = self.read_compact_header(block)?;
+                self.write_compact_header(block, (header & !mask) | (units << shift))
+            }
+        }
+    }
+
+    fn read_type(&self, block: BlockOffset) -> Result<u32, VmFault> {
+        match self.header_format {
+            HeaderFormat::Legacy => self.read_word(block, OBJECT_TYPE_ID),
+            HeaderFormat::Compact {
+                size_bits,
+                link_bits,
+            } => u32::try_from(self.read_compact_header(block)? >> (3 + size_bits + link_bits))
+                .map_err(|_| VmFault::CorruptHeap),
+        }
+    }
+
+    fn write_type(&mut self, block: BlockOffset, type_id: u32) -> Result<(), VmFault> {
+        match self.header_format {
+            HeaderFormat::Legacy => self.write_word(block, OBJECT_TYPE_ID, type_id),
+            HeaderFormat::Compact {
+                size_bits,
+                link_bits,
+            } => {
+                let shift = 3 + size_bits + link_bits;
+                let mask = bit_mask(64 - shift);
+                if u64::from(type_id) > mask {
+                    return Err(VmFault::CorruptHeap);
+                }
+                let header = self.read_compact_header(block)?;
+                self.write_compact_header(
+                    block,
+                    (header & !(mask << shift)) | (u64::from(type_id) << shift),
+                )
+            }
+        }
+    }
+
+    fn write_block_header(
+        &mut self,
+        block: BlockOffset,
+        size: u32,
+        previous_size: u32,
+        allocated: bool,
+    ) -> Result<(), VmFault> {
+        match self.header_format {
+            HeaderFormat::Legacy => {
+                self.write_word(block, SIZE_FLAGS, size | u32::from(allocated))?;
+                self.write_word(block, PREVIOUS_SIZE, previous_size)
+            }
+            HeaderFormat::Compact {
+                size_bits,
+                link_bits,
+            } => {
+                if !previous_size.is_multiple_of(BLOCK_ALIGNMENT) {
+                    return Err(VmFault::CorruptHeap);
+                }
+                let size_units = u64::from(size / BLOCK_ALIGNMENT);
+                let previous_units = u64::from(previous_size / BLOCK_ALIGNMENT);
+                if size_units > bit_mask(size_bits) || previous_units > bit_mask(link_bits) {
+                    return Err(VmFault::CorruptHeap);
+                }
+                let header =
+                    u64::from(allocated) | (size_units << 3) | (previous_units << (3 + size_bits));
+                self.write_compact_header(block, header)
+            }
+        }
+    }
+
+    fn read_compact_header(&self, block: BlockOffset) -> Result<u64, VmFault> {
+        let unit = self
+            .arena
+            .get((block.0 / 16) as usize)
+            .ok_or(VmFault::CorruptHeap)?;
+        let within = (block.0 % 16) as usize;
+        let bytes: [u8; 8] = unit
+            .0
+            .get(within..within + 8)
+            .ok_or(VmFault::CorruptHeap)?
+            .try_into()
+            .map_err(|_| VmFault::CorruptHeap)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn write_compact_header(&mut self, block: BlockOffset, header: u64) -> Result<(), VmFault> {
+        let unit = self
+            .arena
+            .get_mut((block.0 / 16) as usize)
+            .ok_or(VmFault::CorruptHeap)?;
+        let within = (block.0 % 16) as usize;
+        unit.0
+            .get_mut(within..within + 8)
+            .ok_or(VmFault::CorruptHeap)?
+            .copy_from_slice(&header.to_le_bytes());
+        Ok(())
     }
 
     fn read_word(&self, block: BlockOffset, field: u32) -> Result<u32, VmFault> {
@@ -767,6 +936,10 @@ impl Heap {
             .copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
+}
+
+const fn bit_mask(bits: u32) -> u64 {
+    u64::MAX >> (64 - bits)
 }
 
 pub(super) fn free_size_class(size: u32) -> Option<SizeClass> {

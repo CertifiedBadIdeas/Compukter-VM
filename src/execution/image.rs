@@ -14,7 +14,8 @@ use super::{
     heap::Heap,
     host::{HostValueType, ResolvedCapability},
     layout::{
-        object_layout, FieldSpec, RuntimeTypeLayout, StorageCharges, StoragePlan, ValueWidth,
+        object_layout, FieldSpec, HeaderFormat, RuntimeTypeLayout, StorageCharges, StoragePlan,
+        ValueWidth,
     },
     machine::{Frame, Machine, TypeInitializationState},
     task::TaskScheduler,
@@ -488,6 +489,10 @@ impl ExecutionImage {
         let constant_offsets =
             offsets(decoded.modules.iter().map(|module| module.constants.len()))?;
         let type_offsets = offsets(decoded.modules.iter().map(|module| module.types.len()))?;
+        let header_format = HeaderFormat::select(
+            profile.heap_bytes,
+            *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?,
+        );
         let field_offsets = offsets(decoded.modules.iter().map(|module| module.fields.len()))?;
         let literal_offsets = offsets(
             decoded
@@ -495,7 +500,8 @@ impl ExecutionImage {
                 .iter()
                 .map(|module| module.utf16_literals.len()),
         )?;
-        let type_layouts = derive_type_layouts(decoded, &type_offsets, &field_offsets)?;
+        let type_layouts =
+            derive_type_layouts(decoded, &type_offsets, &field_offsets, header_format)?;
         let total_types = *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?;
         let mut type_initializers = reserved(total_types)?;
         let mut type_superclasses = reserved(total_types)?;
@@ -749,7 +755,8 @@ impl ExecutionImage {
             external_root_bytes,
             pending_state_bytes: Machine::pending_state_bytes(),
             machine_fixed_bytes: Machine::fixed_state_bytes(),
-        })?;
+        })?
+        .with_header_format(header_format);
 
         let mut blocks = reserved(*block_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
         let instruction_resolution = InstructionResolution {
@@ -1122,6 +1129,7 @@ fn derive_type_layouts(
     artifact: &DecodedArtifact,
     type_offsets: &[usize],
     field_offsets: &[usize],
+    header_format: HeaderFormat,
 ) -> Result<Box<[RuntimeTypeLayout]>, AdmissionError> {
     let total = *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?;
     let mut layouts = reserved(total)?;
@@ -1134,6 +1142,7 @@ fn derive_type_layouts(
                 artifact,
                 type_offsets,
                 field_offsets,
+                header_format,
                 TypeKey {
                     module: checked_u32(module)?,
                     ty: checked_u32(ty)?,
@@ -1154,6 +1163,7 @@ fn derive_type_layout(
     artifact: &DecodedArtifact,
     type_offsets: &[usize],
     field_offsets: &[usize],
+    header_format: HeaderFormat,
     key: TypeKey,
     layouts: &mut [Option<RuntimeTypeLayout>],
     visiting: &mut [bool],
@@ -1186,6 +1196,7 @@ fn derive_type_layout(
                     artifact,
                     type_offsets,
                     field_offsets,
+                    header_format,
                     superclass,
                     layouts,
                     visiting,
@@ -1222,7 +1233,7 @@ fn derive_type_layout(
                     width: value_width(field_value_type(module, local_field)?)?,
                 });
             }
-            RuntimeTypeLayout::Object(object_layout(inherited, &specs)?)
+            RuntimeTypeLayout::Object(object_layout(inherited, &specs, header_format)?)
         }
         NominalType::Array { element, .. } => RuntimeTypeLayout::Array {
             element: value_width(*element)?,

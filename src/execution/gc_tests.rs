@@ -7,7 +7,7 @@ use super::{
     heap::{AllocationRequest, Heap},
     heap_ops::store_value,
     image::ExecutionImage,
-    layout::{array_layout, RuntimeTypeLayout, ValueWidth},
+    layout::{array_layout, HeaderFormat, RuntimeTypeLayout, ValueWidth},
     machine::{write_frame_value, Frame},
     value::{ReferenceDomain, RuntimeValue},
     TypeKey,
@@ -460,7 +460,7 @@ fn machine_reports_one_failed_post_collection_retry() {
             exception: super::value::Ref32::reserved(0).unwrap(),
             diagnostic: super::error::AllocationDiagnostic {
                 request_kind: super::error::AllocationRequestKind::Object,
-                requested: 8,
+                requested: 16,
                 live: 32,
                 total_free: 0,
                 largest_free_block: 0,
@@ -819,7 +819,7 @@ fn collector_scans_reference_arrays() {
         unreachable!()
     };
     let array_ty = TypeKey { module: 0, ty: 3 };
-    let array_layout = array_layout(ValueWidth::Ref, 2).unwrap();
+    let array_layout = array_layout(ValueWidth::Ref, 2, HeaderFormat::Legacy).unwrap();
     let first = allocate(&mut heap, object_ty, object_layout.block_bytes);
     let second = allocate(&mut heap, object_ty, object_layout.block_bytes);
     let unreachable = allocate(&mut heap, object_ty, object_layout.block_bytes);

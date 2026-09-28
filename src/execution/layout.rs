@@ -1,12 +1,53 @@
 use super::error::{AdmissionError, ResidentStorageComponent};
+use super::value::Ref32;
 
 pub(super) const BLOCK_HEADER_BYTES: u32 = 8;
-const MANAGED_HEADER_BYTES: u32 = 4;
-pub(super) const HEAP_HEADER_BYTES: u32 = BLOCK_HEADER_BYTES + MANAGED_HEADER_BYTES;
+const LEGACY_HEAP_HEADER_BYTES: u32 = 12;
 const INDEXED_HEADER_BYTES: u32 = 8;
 pub(super) const BLOCK_ALIGNMENT: u32 = 8;
 // Free blocks need the eight-byte allocator header and two four-byte links.
 pub(super) const MINIMUM_BLOCK_BYTES: u32 = 16;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum HeaderFormat {
+    #[default]
+    Legacy,
+    Compact {
+        size_bits: u32,
+        link_bits: u32,
+    },
+}
+
+impl HeaderFormat {
+    pub(super) fn select(heap_bytes: u32, type_count: usize) -> Self {
+        if heap_bytes < 32 || !heap_bytes.is_multiple_of(16) || heap_bytes > Ref32::MAX_PAYLOAD {
+            return Self::Legacy;
+        }
+        let units = u64::from(heap_bytes / BLOCK_ALIGNMENT);
+        let size_bits = 64 - units.leading_zeros();
+        let link_bits = 64 - (units - 1).leading_zeros();
+        let Some(type_bits) = 64_u32.checked_sub(3 + size_bits + link_bits) else {
+            return Self::Legacy;
+        };
+        if type_bits == 0
+            || u64::try_from(type_count).map_or(true, |count| count > 1_u64 << type_bits)
+        {
+            Self::Legacy
+        } else {
+            Self::Compact {
+                size_bits,
+                link_bits,
+            }
+        }
+    }
+
+    pub(super) const fn bytes(self) -> u32 {
+        match self {
+            Self::Legacy => LEGACY_HEAP_HEADER_BYTES,
+            Self::Compact { .. } => BLOCK_HEADER_BYTES,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ValueWidth {
@@ -86,6 +127,7 @@ pub(super) struct StorageCharges {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct StoragePlan {
+    pub header_format: HeaderFormat,
     pub heap_arena_bytes: u64,
     pub heap_allocator_bytes: u64,
     pub frame_arena_bytes: u64,
@@ -126,6 +168,12 @@ impl StoragePlan {
             machine_fixed_bytes: self.machine_fixed_bytes,
         })
         .expect("test storage plan must fit")
+        .with_header_format(self.header_format)
+    }
+
+    pub(super) fn with_header_format(mut self, header_format: HeaderFormat) -> Self {
+        self.header_format = header_format;
+        self
     }
 
     pub(super) fn checked(charges: StorageCharges) -> Result<Self, AdmissionError> {
@@ -176,6 +224,7 @@ impl StoragePlan {
                         .ok_or(AdmissionError::ResidentStorageOverflow { component })
                 })?;
         Ok(Self {
+            header_format: HeaderFormat::Legacy,
             heap_arena_bytes,
             heap_allocator_bytes,
             frame_arena_bytes,
@@ -197,12 +246,13 @@ impl StoragePlan {
 }
 
 pub(super) fn empty_object_layout() -> Result<ObjectLayout, AdmissionError> {
-    object_layout(None, &[])
+    object_layout(None, &[], HeaderFormat::Legacy)
 }
 
 pub(super) fn object_layout(
     superclass: Option<&ObjectLayout>,
     declared_fields: &[FieldSpec],
+    header_format: HeaderFormat,
 ) -> Result<ObjectLayout, AdmissionError> {
     let inherited_count = superclass.map_or(0, |layout| layout.fields.len());
     let field_capacity = inherited_count
@@ -259,7 +309,7 @@ pub(super) fn object_layout(
 
     Ok(ObjectLayout {
         payload_bytes: offset,
-        block_bytes: block_bytes(offset)?,
+        block_bytes: block_bytes(offset, header_format)?,
         fields: fields.into_boxed_slice(),
         reference_offsets: reference_offsets.into_boxed_slice(),
     })
@@ -268,6 +318,7 @@ pub(super) fn object_layout(
 pub(super) fn array_layout(
     element: ValueWidth,
     length: i32,
+    header_format: HeaderFormat,
 ) -> Result<ArrayLayout, AdmissionError> {
     let length = u32::try_from(length).map_err(|_| AdmissionError::StoragePlanOverflow)?;
     let element_bytes = element.bytes();
@@ -281,13 +332,14 @@ pub(super) fn array_layout(
         element_bytes,
         length,
         payload_bytes,
-        block_bytes: block_bytes(payload_bytes)?,
+        block_bytes: block_bytes(payload_bytes, header_format)?,
     })
 }
 
 pub(super) fn string_layout(
     encoding: StringEncoding,
     length: u32,
+    header_format: HeaderFormat,
 ) -> Result<StringLayout, AdmissionError> {
     let characters_bytes = encoding
         .element_bytes()
@@ -300,7 +352,7 @@ pub(super) fn string_layout(
         encoding,
         length,
         payload_bytes,
-        block_bytes: block_bytes(payload_bytes)?,
+        block_bytes: block_bytes(payload_bytes, header_format)?,
     })
 }
 
@@ -324,10 +376,10 @@ impl StringEncoding {
     }
 }
 
-fn block_bytes(payload_bytes: u32) -> Result<u32, AdmissionError> {
-    let unaligned = BLOCK_HEADER_BYTES
-        .checked_add(MANAGED_HEADER_BYTES)
-        .and_then(|value| value.checked_add(payload_bytes))
+fn block_bytes(payload_bytes: u32, header_format: HeaderFormat) -> Result<u32, AdmissionError> {
+    let unaligned = header_format
+        .bytes()
+        .checked_add(payload_bytes)
         .ok_or(AdmissionError::StoragePlanOverflow)?;
     Ok(align_up(unaligned, BLOCK_ALIGNMENT)?.max(MINIMUM_BLOCK_BYTES))
 }
