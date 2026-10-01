@@ -237,12 +237,6 @@ pub(crate) fn verify_exceptions(
                     if !functions::value_assignable(
                         artifact,
                         module_id,
-                        register,
-                        module_id,
-                        catch_value,
-                    ) && !functions::value_assignable(
-                        artifact,
-                        module_id,
                         catch_value,
                         module_id,
                         register,
