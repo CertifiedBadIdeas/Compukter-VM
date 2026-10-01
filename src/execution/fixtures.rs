@@ -54,6 +54,14 @@ pub(super) fn started_untraced(artifact: VerifiedArtifact, args: &[EntryArgument
 }
 
 pub(super) fn nested_call_artifact() -> VerifiedArtifact {
+    nested_call_program(false)
+}
+
+pub(crate) fn nested_fault_artifact() -> VerifiedArtifact {
+    nested_call_program(true)
+}
+
+fn nested_call_program(fault: bool) -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let i32_type = primitive(1);
         artifact.modules[0].types = vec![
@@ -94,15 +102,19 @@ pub(super) fn nested_call_artifact() -> VerifiedArtifact {
                 },
                 Instruction::Return { value: 0 },
             ],
-            vec![
-                Instruction::Add {
-                    form: 1,
-                    dst: 0,
-                    lhs: 0,
-                    rhs: 1,
-                },
-                Instruction::Return { value: 0 },
-            ],
+            if fault {
+                vec![Instruction::Unreachable]
+            } else {
+                vec![
+                    Instruction::Add {
+                        form: 1,
+                        dst: 0,
+                        lhs: 0,
+                        rhs: 1,
+                    },
+                    Instruction::Return { value: 0 },
+                ]
+            },
         ];
         install_function_blocks(artifact, programs);
         configure_stack(artifact, 2, 3);

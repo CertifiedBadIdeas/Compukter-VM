@@ -338,6 +338,7 @@ pub(crate) struct DebugEntry {
     pub end_utf16: u32,
     pub inline_parent: u32,
     pub source_path: ByteRange,
+    pub source_position: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]

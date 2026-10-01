@@ -333,6 +333,33 @@ fn direct_calls_copy_arguments_and_publish_results_on_return() {
 }
 
 #[test]
+fn vm_fault_stack_retains_distinct_nested_functions_at_their_call_instructions() {
+    let mut machine = fixtures::started_zero_arg(fixtures::nested_fault_artifact());
+    assert_eq!(
+        Outcome::Faulted(super::error::VmFault::ReachedUnreachable),
+        machine.run_slice(128, 0).unwrap()
+    );
+    let stack = machine.failure_stack();
+    assert_eq!(3, stack.length);
+    assert_eq!(
+        [2, 1, 0],
+        stack.frames[..3]
+            .iter()
+            .map(|frame| frame.function)
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+    assert_eq!(
+        [0, 1, 1],
+        stack.frames[..3]
+            .iter()
+            .map(|frame| frame.instruction)
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+}
+
+#[test]
 fn suspend_call_returns_through_the_encoded_resume_block() {
     let mut machine = fixtures::started_zero_arg(fixtures::suspend_value_call_artifact());
     assert_eq!(
@@ -366,6 +393,41 @@ fn stack_overflow_happens_before_a_new_frame_exists() {
         fixtures::recursive_pre_call_state(),
         machine.test_active_registers()
     );
+}
+
+#[test]
+fn failure_stack_keeps_call_sites_innermost_first_and_survives_later_slices() {
+    let mut machine = fixtures::started_zero_arg(fixtures::recursive_suspend_artifact(3));
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::StackOverflow),
+        machine.run_slice(128, 0).unwrap()
+    );
+    let stack = machine.failure_stack();
+    assert_eq!(3, stack.length);
+    assert_eq!(0, stack.omitted);
+    assert!(stack.frames[..stack.length]
+        .iter()
+        .all(|frame| frame.function == 0));
+    let before = stack.frames;
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::StackOverflow),
+        machine.run_slice(128, 0).unwrap()
+    );
+    assert_eq!(before, machine.failure_stack().frames);
+}
+
+#[test]
+fn deep_recursion_has_a_bounded_failure_stack_with_explicit_omissions() {
+    let mut profile = fixtures::profile();
+    profile.maximum_call_depth = 64;
+    let mut machine = fixtures::started_with_profile(fixtures::recursive_artifact(64), profile);
+    assert_eq!(
+        Outcome::Crashed(GuestTrap::StackOverflow),
+        machine.run_slice(4096, 0).unwrap()
+    );
+    let stack = machine.failure_stack();
+    assert_eq!(32, stack.length);
+    assert_eq!(32, stack.omitted);
 }
 
 #[test]
