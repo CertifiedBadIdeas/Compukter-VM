@@ -76,13 +76,14 @@ pub(super) fn store_value(
 #[derive(Clone, Copy, Debug)]
 pub(super) enum PendingAllocation {
     Object(PendingState),
+    Exception(PendingState),
     Array { state: PendingState, length: u32 },
 }
 
 impl PendingAllocation {
     pub(super) fn state(self) -> PendingState {
         match self {
-            Self::Object(state) | Self::Array { state, .. } => state,
+            Self::Object(state) | Self::Exception(state) | Self::Array { state, .. } => state,
         }
     }
 
@@ -103,11 +104,11 @@ impl PendingAllocation {
     ) -> Result<(u32, Option<Ref32>), VmFault> {
         let array_length = match *self {
             Self::Array { length, .. } => Some(length),
-            Self::Object(_) => None,
+            Self::Object(_) | Self::Exception(_) => None,
         };
         let units = self.units_for_budget(budget);
         let state = match self {
-            Self::Object(state) | Self::Array { state, .. } => state,
+            Self::Object(state) | Self::Exception(state) | Self::Array { state, .. } => state,
         };
         if !state.fixed_cost_paid {
             return Err(VmFault::CorruptLifecycle);

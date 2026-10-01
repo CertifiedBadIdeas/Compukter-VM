@@ -508,6 +508,13 @@ fn scalar_vectors_match_kotlin_jvm_semantics() {
         let outcome = machine.run_slice(budget, 0).unwrap();
         match case.expected {
             Ok(value) => assert_eq!(Outcome::Halted(Some(value)), outcome, "{}", case.name),
+            Err(super::error::GuestTrap::DivisionByZero) => {
+                assert_eq!(Outcome::SliceExhausted, outcome, "{}", case.name);
+                assert_eq!(
+                    Outcome::UncaughtException,
+                    machine.run_slice(budget, 0).unwrap()
+                );
+            }
             Err(trap) => assert_eq!(Outcome::Crashed(trap), outcome, "{}", case.name),
         }
         assert_eq!(
@@ -886,12 +893,56 @@ fn while_true_executes_floor_budget_over_block_cost_iterations() {
 }
 
 #[test]
-fn trap_keeps_the_full_containing_block_charge() {
+fn arithmetic_factory_respects_single_unit_slices_and_roots_its_unpublished_payload() {
+    let artifact = fixtures::trap_after_write_artifact(7);
+    let decoded = crate::decode::records::decode_artifact(
+        artifact.decoded().bytes.clone(),
+        &crate::ArtifactLimits::default(),
+    )
+    .unwrap();
+    let mut machine = fixtures::started_zero_arg(artifact);
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(7, 0).unwrap());
+    let mut collected = false;
+    for _ in 0..32 {
+        let before = machine.consumed_dynamic_cost();
+        let outcome = machine.run_slice(1, 0).unwrap();
+        assert!(machine.consumed_dynamic_cost() - before <= 1);
+        if machine.test_factory_payload_published() {
+            machine.test_collect_exception_roots().unwrap();
+            collected = true;
+        }
+        if outcome == Outcome::UncaughtException {
+            assert!(collected);
+            assert!(machine.exception_diagnostic(&decoded).contains("/ by zero"));
+            assert_eq!(Outcome::UncaughtException, machine.run_slice(1, 0).unwrap());
+            return;
+        }
+        assert_eq!(Outcome::SliceExhausted, outcome);
+    }
+    panic!("bounded arithmetic factory did not finish");
+}
+
+#[test]
+fn arithmetic_factory_allocation_failure_remains_noncatchable() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 32;
+    let mut machine =
+        fixtures::started_with_profile(fixtures::trap_after_write_artifact(7), profile);
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(7, 0).unwrap());
+    for _ in 0..256 {
+        match machine.run_slice(1, 1).unwrap() {
+            Outcome::SliceExhausted => {}
+            Outcome::AllocationExhausted(_) => return,
+            other => panic!("factory OOM must not become catchable: {other:?}"),
+        }
+    }
+    panic!("factory OOM did not finish");
+}
+
+#[test]
+fn arithmetic_exception_keeps_the_full_containing_block_charge() {
     let mut machine = fixtures::started_zero_arg(fixtures::trap_after_write_artifact(7));
-    assert_eq!(
-        Outcome::Crashed(super::error::GuestTrap::DivisionByZero),
-        machine.run_slice(7, 0).unwrap()
-    );
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(7, 0).unwrap());
     assert_eq!(7, machine.consumed_fixed_cost());
     assert_eq!(2, machine.retired_instructions());
     assert_eq!(3, machine.executed_instructions());
