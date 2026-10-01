@@ -6,6 +6,103 @@ use crate::{
 
 use super::{functions, modules};
 
+pub(crate) fn verify_throwable_root(
+    artifact: &DecodedArtifact,
+    limits: &ArtifactLimits,
+) -> Result<Option<(usize, usize)>, DiagnosticSet> {
+    let mut root = None;
+    for (module_id, module) in artifact.modules.iter().enumerate() {
+        for (type_id, nominal) in module.types.iter().enumerate() {
+            let NominalType::Class {
+                flags,
+                generic_arity,
+                super_type,
+                interfaces,
+                field_start,
+                field_count,
+                method_count,
+                initializer,
+                ..
+            } = nominal
+            else {
+                continue;
+            };
+            if flags & 4 == 0 {
+                continue;
+            }
+            if root.replace((module_id, type_id)).is_some() {
+                return Err(failure(limits, module_id, 0, "multiple Throwable roots"));
+            }
+            if artifact.header.runtime_major < 1
+                || (artifact.header.runtime_major == 1 && artifact.header.runtime_minor < 8)
+            {
+                return Err(failure(
+                    limits,
+                    module_id,
+                    0,
+                    "Throwable root requires Runtime ABI 1.8",
+                ));
+            }
+            let fields = module
+                .fields
+                .get(*field_start as usize..(*field_start as usize).saturating_add(2));
+            let valid_fields = fields.is_some_and(|fields| {
+                fields.iter().all(|field| {
+                    field.flags & 2 == 0
+                        && modules::resolved_type(artifact, module_id, field.owner)
+                            == Some((module_id, type_id))
+                }) && fields[0].value_type.kind == 7
+                    && fields[0].value_type.flags == 1
+                    && modules::resolved_type(
+                        artifact,
+                        module_id,
+                        fields[0].value_type.nominal_type,
+                    )
+                    .is_some_and(|identity| {
+                        let NominalType::Class { name, .. } =
+                            artifact.modules[identity.0].types[identity.1]
+                        else {
+                            return false;
+                        };
+                        artifact.modules[identity.0]
+                            .strings
+                            .get(name as usize)
+                            .is_some_and(|name| name.slice(&artifact.bytes) == b"kotlin.String")
+                    })
+                    && fields[1].value_type.kind == 7
+                    && fields[1].value_type.flags == 1
+                    && modules::resolved_type(
+                        artifact,
+                        module_id,
+                        fields[1].value_type.nominal_type,
+                    ) == Some((module_id, type_id))
+            });
+            let valid_parent = super_type.0 == u32::MAX || modules::resolved_type(artifact, module_id, *super_type).is_some_and(|identity| {
+                matches!(&artifact.modules[identity.0].types[identity.1], NominalType::Class {
+                    flags: 0, generic_arity: 0, super_type, interfaces, field_count: 0, method_count: 0, initializer: None, ..
+                } if super_type.0 == u32::MAX && interfaces.is_empty())
+            });
+            if *flags != 4
+                || *generic_arity != 0
+                || !interfaces.is_empty()
+                || *field_count != 2
+                || *method_count != 0
+                || initializer.is_some()
+                || !valid_fields
+                || !valid_parent
+            {
+                return Err(failure(
+                    limits,
+                    module_id,
+                    0,
+                    "invalid Throwable root layout or superclass",
+                ));
+            }
+        }
+    }
+    Ok(root)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Handler {
     pub protected_start: usize,
@@ -23,6 +120,7 @@ pub(crate) fn verify_exceptions(
     artifact: &DecodedArtifact,
     limits: &ArtifactLimits,
 ) -> Result<ExceptionModel, DiagnosticSet> {
+    verify_throwable_root(artifact, limits)?;
     let mut modules_model = Vec::new();
     modules_model
         .try_reserve_exact(artifact.modules.len())
