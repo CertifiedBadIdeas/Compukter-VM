@@ -1341,6 +1341,34 @@ fn exception_rejects_incompatible_exception_register() {
 }
 
 #[test]
+fn exception_register_must_accept_the_catch_type_not_only_its_subtype() {
+    use crate::artifact::{BlockId, ExceptionEntry, FunctionId, NominalType, TypeId};
+    let mut artifact = decoded(support::minimal_vector());
+    let parent = artifact.modules[0].types.len() as u32;
+    artifact.modules[0].types.push(class(0, 0, u32::MAX));
+    let child = artifact.modules[0].types.len() as u32;
+    let mut child_type = class(0, 0, u32::MAX);
+    if let NominalType::Class { super_type, .. } = &mut child_type {
+        *super_type = TypeId(parent);
+    }
+    artifact.modules[0].types.push(child_type);
+    add_exception_register(&mut artifact, reference(child, false));
+    artifact.modules[0].exceptions.push(ExceptionEntry {
+        owner_function: FunctionId(0),
+        first_protected_block: BlockId(0),
+        protected_block_count: 1,
+        catch_type: TypeId(parent),
+        handler_block: BlockId(0),
+        exception_register: 0,
+    });
+    assert!(verify_exceptions(&artifact).is_err());
+    artifact.modules[0].functions[0].values =
+        crate::artifact::scalar_values(vec![reference(parent, false)]);
+    artifact.modules[0].exceptions[0].catch_type = TypeId(child);
+    verify_exceptions(&artifact).unwrap();
+}
+
+#[test]
 fn exception_rejects_crossing_ranges() {
     let mut artifact = decoded(support::minimal_vector());
     add_exception_register(&mut artifact, reference(0, false));
