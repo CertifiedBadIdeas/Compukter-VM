@@ -42,6 +42,41 @@ fn array_copy_requires_runtime_feature_and_typed_operands() {
 }
 
 #[test]
+fn heterogeneous_reference_identity_requires_abi_1_6_and_reference_operands() {
+    for not_equal in [false, true] {
+        let source =
+            crate::execution::fixtures::reference_identity_artifact(false, true, not_equal);
+        for failure in 0..3 {
+            let mut artifact = crate::decode::records::decode_artifact(
+                source.decoded().bytes.clone(),
+                &ArtifactLimits::default(),
+            )
+            .unwrap();
+            if failure == 0 {
+                artifact.header.runtime_minor = 5;
+            } else {
+                match &mut artifact.modules[0].code[2].instructions[1] {
+                    crate::artifact::Instruction::RefEqual { dst, lhs, .. }
+                    | crate::artifact::Instruction::RefNotEqual { dst, lhs, .. } => {
+                        if failure == 1 {
+                            *lhs = 0;
+                        } else {
+                            *dst = 0;
+                        }
+                    }
+                    _ => panic!("fixture comparison missing"),
+                }
+            }
+            let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+            assert!(
+                super::verify_artifact(Arc::from(bytes), ArtifactLimits::default()).is_err(),
+                "case {failure}"
+            );
+        }
+    }
+}
+
+#[test]
 fn module_accepts_vector_a_identity() {
     super::modules::verify_modules(
         &decoded(support::minimal_vector()),

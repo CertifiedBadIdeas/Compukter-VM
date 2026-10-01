@@ -18,6 +18,33 @@ use super::{
 };
 use crate::artifact::ByteRange;
 
+#[test]
+fn reference_identity_compares_typed_arrays_and_null_without_casts() {
+    for same_type in [false, true] {
+        for right_is_null in [false, true] {
+            for not_equal in [false, true] {
+                let mut machine = fixtures::started(
+                    fixtures::reference_identity_artifact(same_type, right_is_null, not_equal),
+                    &[],
+                );
+                let expected = (same_type && !right_is_null) != not_equal;
+                loop {
+                    match machine.run_slice(32, 8).unwrap() {
+                        Outcome::SliceExhausted => {}
+                        outcome => {
+                            assert_eq!(
+                                Outcome::Halted(Some(RuntimeValue::Bool(expected))),
+                                outcome
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn object_layout(
     superclass: Option<&ObjectLayout>,
     fields: &[FieldSpec],

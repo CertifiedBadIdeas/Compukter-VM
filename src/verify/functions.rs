@@ -647,12 +647,13 @@ fn verify_instruction(
             let right = require_kind(function, *rhs, 7, module_id, function_id, limits)?;
             if modules::resolved_type(artifact, module_id, left.nominal_type)
                 != modules::resolved_type(artifact, module_id, right.nominal_type)
+                && (artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 6)
             {
                 return Err(type_failure(
                     limits,
                     module_id,
                     function_id,
-                    "reference comparison types are incompatible",
+                    "heterogeneous reference comparison requires Runtime ABI 1.6",
                 ));
             }
             require_kind(function, *dst, 5, module_id, function_id, limits)?;
