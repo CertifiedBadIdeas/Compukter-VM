@@ -4908,6 +4908,95 @@ pub(crate) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
     })
 }
 
+pub(crate) fn reference_identity_artifact(
+    same_type: bool,
+    right_is_null: bool,
+    not_equal: bool,
+) -> VerifiedArtifact {
+    let base = array_allocation_artifact(0);
+    let mut artifact = crate::decode::records::decode_artifact(
+        base.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    artifact.header.runtime_minor = if same_type { 0 } else { 6 };
+    let module = &mut artifact.modules[0];
+    if let NominalType::Function { result, .. } = &mut module.types[0] {
+        *result = primitive(5);
+    }
+    let name = match module.types[1] {
+        NominalType::Array { name, .. } => name,
+        _ => unreachable!(),
+    };
+    module.types.push(NominalType::Array {
+        name,
+        element: primitive(6),
+    });
+    module.declared_types = module.types.len() as u32;
+    let source = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    let destination = ValueType {
+        kind: 7,
+        flags: u8::from(right_is_null),
+        nominal_type: TypeId(if same_type { 1 } else { 2 }),
+    };
+    module.functions[0].register_count = 4;
+    module.functions[0].values =
+        crate::artifact::scalar_values(vec![primitive(1), source, destination, primitive(5)]);
+    let right = if right_is_null {
+        Instruction::Null { dst: 2 }
+    } else if same_type {
+        Instruction::Move { dst: 2, src: 1 }
+    } else {
+        Instruction::NewArray {
+            dst: 2,
+            type_ref: 2,
+            length: 0,
+        }
+    };
+    let compare = if not_equal {
+        Instruction::RefNotEqual {
+            dst: 3,
+            lhs: 1,
+            rhs: 2,
+        }
+    } else {
+        Instruction::RefEqual {
+            dst: 3,
+            lhs: 1,
+            rhs: 2,
+        }
+    };
+    install_entry_blocks(
+        &mut artifact,
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::NewArray {
+                    dst: 1,
+                    type_ref: 1,
+                    length: 0,
+                },
+                Instruction::Jump { target: 2 },
+            ],
+            vec![right, compare, Instruction::Return { value: 3 }],
+        ],
+    );
+    configure_stack(&mut artifact, 4, 1);
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default())
+        .expect("reference comparison fixture verifies")
+}
+
 pub(crate) fn array_copy_artifact() -> VerifiedArtifact {
     let artifact = array_allocation_artifact(700);
     let mut decoded = crate::decode::records::decode_artifact(
