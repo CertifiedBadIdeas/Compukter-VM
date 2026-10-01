@@ -1848,7 +1848,14 @@ fn nominal_assignable(
                     modules::resolved_type(artifact, identity.0, *interface)
                 }));
             }
-            NominalType::Array { .. } | NominalType::Function { .. } => {}
+            NominalType::Array { super_type, .. } => {
+                if let Some(parent) = super_type
+                    .and_then(|parent| modules::resolved_type(artifact, identity.0, parent))
+                {
+                    stack.push(parent);
+                }
+            }
+            NominalType::Function { .. } => {}
         }
     }
     false
