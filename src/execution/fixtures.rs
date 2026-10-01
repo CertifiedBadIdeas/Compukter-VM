@@ -2353,6 +2353,55 @@ pub(super) fn literal_string_artifact() -> VerifiedArtifact {
     )
 }
 
+pub(crate) fn throwable_root_artifact() -> VerifiedArtifact {
+    let base = literal_string_artifact();
+    let mut artifact = crate::decode::records::decode_artifact(
+        base.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    artifact.header.runtime_minor = 8;
+    let module = &mut artifact.modules[1];
+    module.types.push(NominalType::Class {
+        flags: 4,
+        generic_arity: 0,
+        name: 0,
+        super_type: TypeId(u32::MAX),
+        interfaces: Vec::new(),
+        field_start: 0,
+        field_count: 2,
+        method_start: 0,
+        method_count: 0,
+        initializer: None,
+    });
+    module.fields = vec![
+        Field {
+            owner: TypeId(2),
+            name: 0,
+            value_type: ValueType {
+                kind: 7,
+                flags: 1,
+                nominal_type: TypeId(1),
+            },
+            flags: 0,
+        },
+        Field {
+            owner: TypeId(2),
+            name: 1,
+            value_type: ValueType {
+                kind: 7,
+                flags: 1,
+                nominal_type: TypeId(2),
+            },
+            flags: 0,
+        },
+    ];
+    module.declared_types = 3;
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default())
+        .expect("Throwable root fixture verifies")
+}
+
 pub(super) fn literal_string_length_artifact() -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,

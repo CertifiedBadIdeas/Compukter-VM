@@ -429,7 +429,7 @@ fn parse_types(
                     ));
                 }
                 if tag == 0 {
-                    if flags & !0b11 != 0 {
+                    if flags & !0b111 != 0 {
                         return Err(raw(Code::BadType, "invalid class flags"));
                     }
                     let initializer = if cursor.position() < record.len() {

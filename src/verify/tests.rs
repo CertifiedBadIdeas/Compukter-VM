@@ -9,6 +9,55 @@ fn decoded(bytes: Vec<u8>) -> crate::artifact::DecodedArtifact {
 }
 
 #[test]
+fn throwable_root_requires_runtime_abi_and_a_checked_reference_payload() {
+    use crate::artifact::{NominalType, TypeId};
+    let source = crate::execution::fixtures::throwable_root_artifact();
+    for failure in 0..12 {
+        let mut artifact = decoded(source.decoded().bytes.to_vec());
+        match failure {
+            0 => artifact.header.runtime_minor = 7,
+            1..=7 => {
+                if let NominalType::Class {
+                    flags,
+                    generic_arity,
+                    super_type,
+                    field_start,
+                    field_count,
+                    method_count,
+                    initializer,
+                    ..
+                } = &mut artifact.modules[1].types[2]
+                {
+                    match failure {
+                        1 => *flags |= 1,
+                        2 => *flags |= 2,
+                        3 => *generic_arity = 1,
+                        4 => *field_count = 1,
+                        5 => *field_start = u32::MAX,
+                        6 => *method_count = 1,
+                        7 => {
+                            *super_type = TypeId(2);
+                            *initializer = Some(crate::artifact::FunctionId(0));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            8 => artifact.modules[1].fields[0].value_type.kind = 1,
+            9 => artifact.modules[1].fields[0].value_type.flags = 0,
+            10 => artifact.modules[1].fields[1].value_type.nominal_type = TypeId(1),
+            11 => artifact.modules[1].fields[1].flags = 2,
+            _ => unreachable!(),
+        }
+        let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+        assert!(
+            super::verify_artifact(Arc::from(bytes), ArtifactLimits::default()).is_err(),
+            "case {failure}"
+        );
+    }
+}
+
+#[test]
 fn array_roots_require_abi_1_7_and_a_stateless_root_class() {
     use crate::artifact::{NominalType, TypeId};
     let source = crate::execution::fixtures::array_root_cast_artifact(false, false, false);
