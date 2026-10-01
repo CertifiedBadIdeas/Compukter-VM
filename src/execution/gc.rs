@@ -6,7 +6,7 @@ use super::{
     heap_ops::load_value,
     image::ExecutionImage,
     layout::{RuntimeTypeLayout, ValueWidth},
-    machine::Frame,
+    machine::{Frame, TaskFailure},
     value::{Ref32, RuntimeValue},
 };
 
@@ -23,6 +23,7 @@ pub(super) struct RootSet<'a> {
     pub statics: &'a StaticArena,
     pub frames: &'a [Frame],
     pub saved_frames: &'a [Frame],
+    pub task_failures: &'a [Option<TaskFailure>],
     pub frame_arena: &'a FrameArena,
     pub frame_depth: usize,
     pub runtime_roots: &'a [Option<Ref32>],
@@ -57,6 +58,7 @@ pub(super) struct Collector {
     phase: CollectorPhase,
     epoch: u32,
     runtime_root: usize,
+    task_failure: usize,
     external_root: usize,
     static_field: usize,
     frame: usize,
@@ -77,6 +79,7 @@ impl Collector {
             phase: CollectorPhase::Idle,
             epoch: 0,
             runtime_root: 0,
+            task_failure: 0,
             external_root: 0,
             static_field: 0,
             frame: 0,
@@ -97,6 +100,7 @@ impl Collector {
         self.epoch = if self.epoch == 1 { 2 } else { 1 };
         self.phase = CollectorPhase::Roots;
         self.runtime_root = 0;
+        self.task_failure = 0;
         self.external_root = 0;
         self.static_field = 0;
         self.frame = 0;
@@ -184,6 +188,12 @@ impl Collector {
             if let Some(reference) = roots.runtime_roots[index] {
                 return Ok(Some(RuntimeValue::Reference(reference)));
             }
+        }
+        if let Some(failure) = roots.task_failures.get(self.task_failure) {
+            self.task_failure += 1;
+            return Ok(Some(failure.map_or(RuntimeValue::Null, |failure| {
+                RuntimeValue::Reference(failure.exception)
+            })));
         }
         while self.external_root < roots.external.len() {
             let index = self.external_root;

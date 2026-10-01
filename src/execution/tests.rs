@@ -8,6 +8,73 @@ use super::{
 use sha2::{Digest, Sha256};
 
 #[test]
+fn explicit_exceptions_preserve_identity_across_calls_and_repeated_task_joins() {
+    for (cross_call, task) in [(false, false), (true, false), (false, true)] {
+        let mut machine =
+            fixtures::started_zero_arg(fixtures::exception_artifact(cross_call, true, task));
+        let mut slices = 0;
+        loop {
+            slices += 1;
+            assert!(slices < 1000);
+            let budget = machine.minimum_run_budget();
+            let outcome = machine.run_slice(budget, 8).unwrap();
+            if outcome == Outcome::SliceExhausted {
+                if machine.test_has_exception_work() && !machine.test_collector_active() {
+                    machine.test_collect_exception_roots().unwrap();
+                }
+                continue;
+            }
+            assert_eq!(
+                Outcome::Halted(Some(RuntimeValue::Bool(true))),
+                outcome,
+                "call={cross_call}, task={task}"
+            );
+            break;
+        }
+    }
+}
+
+#[test]
+fn uncaught_exception_is_a_distinct_stable_terminal_outcome() {
+    let mut machine = fixtures::started_zero_arg(fixtures::exception_artifact(false, false, false));
+    let mut slices = 0;
+    loop {
+        slices += 1;
+        assert!(slices < 100);
+        let outcome = machine.run_slice(machine.minimum_run_budget(), 8).unwrap();
+        if outcome == Outcome::SliceExhausted {
+            continue;
+        }
+        assert_eq!(Outcome::UncaughtException, outcome);
+        assert_eq!(1, machine.failure_stack().length);
+        assert_eq!(
+            Outcome::UncaughtException,
+            machine.run_slice(64, 8).unwrap()
+        );
+        break;
+    }
+}
+
+#[test]
+fn exception_handlers_choose_innermost_region_and_source_order_and_rethrow_to_outer() {
+    for rethrow in [false, true] {
+        let mut machine = fixtures::started_zero_arg(fixtures::nested_exception_artifact(rethrow));
+        for _ in 0..100 {
+            let outcome = machine.run_slice(machine.minimum_run_budget(), 8).unwrap();
+            if outcome == Outcome::SliceExhausted {
+                continue;
+            }
+            assert_eq!(Outcome::Halted(Some(RuntimeValue::Bool(true))), outcome);
+            break;
+        }
+        assert_eq!(
+            Outcome::Halted(Some(RuntimeValue::Bool(true))),
+            machine.run_slice(64, 8).unwrap()
+        );
+    }
+}
+
+#[test]
 fn active_static_get_runs_its_class_initializer_exactly_once() {
     let mut machine = fixtures::started_zero_arg(fixtures::lazy_type_initializer_artifact());
 
@@ -219,10 +286,10 @@ fn managed_heap_vertical_conformance() {
     let observation = (totals, <[u8; 32]>::from(digest.finalize()));
     assert_eq!(
         (
-            [69, 10, 12],
+            [69, 10, 14],
             [
-                35, 163, 182, 100, 211, 76, 129, 90, 166, 168, 87, 92, 107, 94, 32, 239, 78, 191,
-                161, 155, 183, 21, 125, 162, 240, 204, 92, 60, 7, 107, 70, 49,
+                215, 94, 23, 246, 18, 230, 102, 225, 160, 47, 246, 220, 20, 213, 41, 167, 198, 188,
+                39, 132, 241, 183, 63, 193, 89, 93, 232, 75, 11, 122, 169, 243,
             ],
         ),
         observation

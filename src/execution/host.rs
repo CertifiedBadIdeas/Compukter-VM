@@ -518,6 +518,7 @@ pub enum AdvanceOutcome<'a> {
     QuotaExhausted(QuotaExhaustion),
     Halted(Option<HostValueView<'a>>),
     Crashed(super::error::GuestTrap),
+    UncaughtException,
     Faulted(super::error::VmFault),
     HostFailed(HostFailure<'a>),
 }

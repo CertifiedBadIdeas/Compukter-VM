@@ -47,6 +47,25 @@ fn only_request(outcome: AdvanceOutcome<'_>) -> super::host::HostRequestView<'_>
 }
 
 #[test]
+fn session_distinguishes_uncaught_exceptions_and_keeps_terminal_diagnostic() {
+    let artifact = fixtures::exception_artifact(false, false, false);
+    let mut session = Session::admit(artifact.clone(), profile(), &[]).unwrap();
+    session.start(&[]).unwrap();
+    assert_eq!(
+        AdvanceOutcome::UncaughtException,
+        session.advance(64, 64).unwrap()
+    );
+    assert_eq!(
+        AdvanceOutcome::UncaughtException,
+        session.advance(64, 64).unwrap()
+    );
+    assert!(session
+        .exception_diagnostic(&artifact)
+        .starts_with("Uncaught exception: "));
+    assert_eq!(1, session.failure_stack().length);
+}
+
+#[test]
 fn session_retirement_limit_is_shared_across_an_advance() {
     let mut session = Session::admit(fixtures::two_block_artifact(3, 5), profile(), &[]).unwrap();
     session.start(&[]).unwrap();

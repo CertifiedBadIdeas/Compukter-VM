@@ -120,7 +120,34 @@ pub(crate) fn verify_exceptions(
     artifact: &DecodedArtifact,
     limits: &ArtifactLimits,
 ) -> Result<ExceptionModel, DiagnosticSet> {
-    verify_throwable_root(artifact, limits)?;
+    let root = verify_throwable_root(artifact, limits)?;
+    let uses_exceptions = artifact.modules.iter().any(|module| {
+        !module.exceptions.is_empty()
+            || module.code.iter().any(|code| {
+                code.instructions
+                    .iter()
+                    .any(|instruction| matches!(instruction, Instruction::Throw { .. }))
+            })
+    });
+    if uses_exceptions
+        && (artifact.header.runtime_major < 1
+            || artifact.header.runtime_major == 1 && artifact.header.runtime_minor < 8)
+    {
+        return Err(failure(
+            limits,
+            0,
+            0,
+            "legacy exception artifact: rebuild for Runtime ABI 1.8",
+        ));
+    }
+    if uses_exceptions && root.is_none() {
+        return Err(failure(
+            limits,
+            0,
+            0,
+            "exception artifact requires a verified Throwable root; rebuild libraries",
+        ));
+    }
     let mut modules_model = Vec::new();
     modules_model
         .try_reserve_exact(artifact.modules.len())
@@ -208,6 +235,14 @@ pub(crate) fn verify_exceptions(
                         "exception register is not a non-null reference",
                     ));
                 }
+                let (root_module, root_type) = root.ok_or_else(|| {
+                    failure(limits, module_id, function_id, "missing Throwable root")
+                })?;
+                let root_value = crate::artifact::ValueType {
+                    kind: 7,
+                    flags: 0,
+                    nominal_type: crate::artifact::TypeId(root_type as u32),
+                };
                 if entry.catch_type.0 != u32::MAX {
                     let catch = modules::resolved_type(artifact, module_id, entry.catch_type)
                         .ok_or_else(|| {
@@ -238,6 +273,20 @@ pub(crate) fn verify_exceptions(
                         artifact,
                         module_id,
                         catch_value,
+                        root_module,
+                        root_value,
+                    ) {
+                        return Err(failure(
+                            limits,
+                            module_id,
+                            function_id,
+                            "catch type is not a Throwable subclass",
+                        ));
+                    }
+                    if !functions::value_assignable(
+                        artifact,
+                        module_id,
+                        catch_value,
                         module_id,
                         register,
                     ) {
@@ -248,6 +297,15 @@ pub(crate) fn verify_exceptions(
                             "exception register and catch type are incompatible",
                         ));
                     }
+                } else if modules::resolved_type(artifact, module_id, register.nominal_type)
+                    != Some((root_module, root_type))
+                {
+                    return Err(failure(
+                        limits,
+                        module_id,
+                        function_id,
+                        "catch-all register must be the Throwable root",
+                    ));
                 }
                 handlers.push(Handler {
                     protected_start,
@@ -257,6 +315,49 @@ pub(crate) fn verify_exceptions(
                 });
             }
             reject_crossing_ranges(&handlers, limits, module_id, function_id)?;
+            for code in &module.code[block_start..block_end] {
+                for instruction in &code.instructions {
+                    if let Instruction::Throw { exception } = instruction {
+                        let value = function
+                            .values
+                            .get(*exception as usize)
+                            .map(|value| value.semantic_type)
+                            .ok_or_else(|| {
+                                failure(
+                                    limits,
+                                    module_id,
+                                    function_id,
+                                    "throw register is out of range",
+                                )
+                            })?;
+                        let (root_module, root_type) = root.ok_or_else(|| {
+                            failure(limits, module_id, function_id, "missing Throwable root")
+                        })?;
+                        let root_value = crate::artifact::ValueType {
+                            kind: 7,
+                            flags: 0,
+                            nominal_type: crate::artifact::TypeId(root_type as u32),
+                        };
+                        if value.kind != 7
+                            || value.flags != 0
+                            || !functions::value_assignable(
+                                artifact,
+                                module_id,
+                                value,
+                                root_module,
+                                root_value,
+                            )
+                        {
+                            return Err(failure(
+                                limits,
+                                module_id,
+                                function_id,
+                                "throw operand is not a non-null Throwable",
+                            ));
+                        }
+                    }
+                }
+            }
             functions_model.push(handlers);
         }
         modules_model.push(functions_model);

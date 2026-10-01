@@ -8,7 +8,7 @@ use crate::VerifiedArtifact;
 
 use super::{
     channel::ChannelArena,
-    error::{AdmissionError, GuestTrap, ResidentStorageComponent},
+    error::{AdmissionError, ResidentStorageComponent},
     external_roots::ExternalRootTable,
     frame::{FrameLayout, FrameValueAccess, SafepointMap},
     heap::Heap,
@@ -68,6 +68,16 @@ pub(super) struct ResolvedFunction {
     pub first_block: usize,
     pub block_count: usize,
     pub static_owner: Option<TypeKey>,
+    pub handlers: Box<[ResolvedExceptionHandler]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ResolvedExceptionHandler {
+    pub protected_start: usize,
+    pub protected_end: usize,
+    pub catch_type: Option<TypeKey>,
+    pub handler_block: usize,
+    pub exception_register: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -402,7 +412,7 @@ pub(super) enum ResolvedInstruction {
         value: u16,
     },
     Throw {
-        trap: GuestTrap,
+        exception: u16,
     },
     Unreachable,
 }
@@ -682,6 +692,40 @@ impl ExecutionImage {
                     return Err(AdmissionError::InvalidEntry);
                 }
                 registers_per_frame = registers_per_frame.max(registers.len());
+                let exception_start = function.first_exception as usize;
+                let exception_end = exception_start
+                    .checked_add(function.exception_count as usize)
+                    .ok_or(AdmissionError::InvalidEntry)?;
+                let entries = module
+                    .exceptions
+                    .get(exception_start..exception_end)
+                    .ok_or(AdmissionError::InvalidEntry)?;
+                let mut handlers = reserved(entries.len())?;
+                for entry in entries {
+                    let protected_start = block_offsets[module_id]
+                        .checked_add(entry.first_protected_block.0 as usize)
+                        .ok_or(AdmissionError::StoragePlanOverflow)?;
+                    handlers.push(ResolvedExceptionHandler {
+                        protected_start,
+                        protected_end: protected_start
+                            .checked_add(entry.protected_block_count as usize)
+                            .ok_or(AdmissionError::StoragePlanOverflow)?,
+                        catch_type: if entry.catch_type.0 == u32::MAX {
+                            None
+                        } else {
+                            Some(
+                                resolve_type(decoded, module_id, entry.catch_type)
+                                    .ok_or(AdmissionError::InvalidEntry)?,
+                            )
+                        },
+                        handler_block: block_offsets[module_id]
+                            .checked_add(entry.handler_block.0 as usize)
+                            .ok_or(AdmissionError::StoragePlanOverflow)?,
+                        exception_register: entry.exception_register,
+                    });
+                }
+                // Stable ordering preserves source order for catches of the same region.
+                handlers.sort_by_key(|handler| handler.protected_end - handler.protected_start);
                 functions.push(ResolvedFunction {
                     key: FunctionKey {
                         module: module_id as u32,
@@ -693,6 +737,7 @@ impl ExecutionImage {
                     register_accesses: register_accesses.into_boxed_slice(),
                     frame_layout,
                     safepoints: safepoints.into_boxed_slice(),
+                    handlers: handlers.into_boxed_slice(),
                     result: resolve_value_type(decoded, signature_key.module as usize, *result)?,
                     first_block: block_offsets[module_id]
                         .checked_add(function.first_block.0 as usize)
@@ -729,11 +774,11 @@ impl ExecutionImage {
             .ok_or(AdmissionError::ResidentStorageOverflow {
                 component: ResidentStorageComponent::FrameRecords,
             })?;
-        let task_scheduler_bytes = TaskScheduler::resident_bytes(maximum_coroutines).ok_or(
-            AdmissionError::ResidentStorageOverflow {
+        let task_scheduler_bytes = TaskScheduler::resident_bytes(maximum_coroutines)
+            .and_then(|bytes| Machine::task_failure_bytes(maximum_coroutines)?.checked_add(bytes))
+            .ok_or(AdmissionError::ResidentStorageOverflow {
                 component: ResidentStorageComponent::TaskScheduler,
-            },
-        )?;
+            })?;
         let channel_bytes = ChannelArena::resident_bytes(
             u64::from(decoded.manifest.maximum_channels),
             u64::from(decoded.manifest.maximum_channel_values),
@@ -2326,37 +2371,12 @@ fn resolve_instruction(
             }
         }
         Instruction::Return { value } => ResolvedInstruction::Return { value: *value },
-        Instruction::Throw { exception } => {
-            let ty = resolution
-                .functions
-                .get(function)
-                .and_then(|function| function.registers.get(*exception as usize))
-                .and_then(|register| register.nominal)
-                .ok_or(AdmissionError::InvalidEntry)?;
-            match nominal_type_name(artifact, ty) {
-                Some(b"runtime.IllegalArgumentException") => ResolvedInstruction::Throw {
-                    trap: GuestTrap::InvalidArgument,
-                },
-                _ => return Err(AdmissionError::InvalidEntry),
-            }
-        }
+        Instruction::Throw { exception } => ResolvedInstruction::Throw {
+            exception: *exception,
+        },
         Instruction::Unreachable => ResolvedInstruction::Unreachable,
         _ => return Err(AdmissionError::InvalidEntry),
     })
-}
-
-fn nominal_type_name(artifact: &DecodedArtifact, key: TypeKey) -> Option<&[u8]> {
-    let module = artifact.modules.get(key.module as usize)?;
-    let name = match module.types.get(key.ty as usize)? {
-        NominalType::Class { name, .. }
-        | NominalType::Interface { name, .. }
-        | NominalType::Array { name, .. }
-        | NominalType::Function { name, .. } => *name,
-    };
-    module
-        .strings
-        .get(name as usize)
-        .map(|range| range.slice(&artifact.bytes))
 }
 
 fn validate_capability_call(
@@ -2764,7 +2784,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_resolves_entry_and_rejects_non_tier0_families() {
+    fn admission_resolves_entry_and_exception_handlers() {
         let artifact = fixtures::scalar_artifact();
         let image = ExecutionImage::admit(artifact, fixtures::profile()).unwrap();
         assert_eq!(
@@ -2780,10 +2800,8 @@ mod tests {
             .all(|function| function.register_count <= image.registers_per_frame()));
 
         let artifact = fixtures::artifact_with_new_object();
-        assert_eq!(
-            Err(AdmissionError::InvalidEntry),
-            ExecutionImage::admit(artifact, fixtures::profile()).map(|_| ())
-        );
+        let image = ExecutionImage::admit(artifact, fixtures::profile()).unwrap();
+        assert_eq!(1, image.functions()[0].handlers.len());
     }
 
     #[test]

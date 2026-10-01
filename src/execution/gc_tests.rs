@@ -107,6 +107,7 @@ fn collect_with_external_roots(
                     heap,
                     image,
                     RootSet {
+                        task_failures: &[],
                         statics: &statics,
                         frames: &frames,
                         saved_frames: &[],
@@ -191,6 +192,7 @@ fn collector_keeps_explicit_pending_runtime_roots() {
                 &mut heap,
                 &image,
                 RootSet {
+                    task_failures: &[],
                     statics: &statics,
                     frames: &[],
                     saved_frames: &[],
@@ -265,6 +267,7 @@ fn collector_faults_on_missing_or_out_of_frame_root_maps() {
                 &mut heap,
                 &image,
                 RootSet {
+                    task_failures: &[],
                     statics: &statics,
                     frames: &frames,
                     saved_frames: &[],
@@ -317,6 +320,7 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                 &mut heap,
                 &image,
                 RootSet {
+                    task_failures: &[],
                     statics: &statics,
                     frames: &frames,
                     saved_frames: &[],
@@ -339,6 +343,7 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                     &mut heap,
                     &image,
                     RootSet {
+                        task_failures: &[],
                         statics: &statics,
                         frames: &frames,
                         saved_frames: &[],
@@ -362,6 +367,7 @@ fn collector_advances_one_bounded_action_and_does_nothing_while_idle() {
                 &mut heap,
                 &image,
                 RootSet {
+                    task_failures: &[],
                     statics: &statics,
                     frames: &frames,
                     saved_frames: &[],
@@ -940,6 +946,7 @@ fn collector_steady_state_allocates_nothing() {
                 &mut heap,
                 &image,
                 RootSet {
+                    task_failures: &[],
                     statics: &statics,
                     frames: &frames,
                     saved_frames: &[],
@@ -1010,6 +1017,7 @@ fn managed_heap_performance_gc_units() {
                         &mut heap,
                         &image,
                         RootSet {
+                            task_failures: &[],
                             statics: &statics,
                             frames: &frames,
                             saved_frames: &[],
@@ -1072,6 +1080,7 @@ fn managed_heap_performance_gc_units() {
                     &mut leaf_heap,
                     &leaf_image,
                     RootSet {
+                        task_failures: &[],
                         statics: &leaf_statics,
                         frames: &leaf_frames,
                         saved_frames: &[],

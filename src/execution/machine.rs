@@ -123,6 +123,7 @@ pub(super) struct Machine {
     frames: Box<[Frame]>,
     task_frames: Box<[Frame]>,
     task_frame_depths: Box<[usize]>,
+    task_failures: Box<[Option<TaskFailure>]>,
     tasks: TaskScheduler,
     channels: ChannelArena,
     frame_arena: FrameArena,
@@ -134,6 +135,7 @@ pub(super) struct Machine {
     allocation_retry: Option<AllocationRetry>,
     pending_allocation: Option<PendingAllocation>,
     pending_array_copy: Option<PendingArrayCopy>,
+    pending_exception: Option<PendingException>,
     pending_text: Option<text::PendingText>,
     pending_concat: Option<text::PendingConcat>,
     pending_concat_source: Option<AllocationSource>,
@@ -163,6 +165,19 @@ pub(crate) struct FailureStack {
     pub frames: [AllocationSource; MAXIMUM_FAILURE_FRAMES],
     pub length: usize,
     pub omitted: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TaskFailure {
+    pub exception: Ref32,
+    pub stack: FailureStack,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingException {
+    failure: TaskFailure,
+    actual_type: TypeKey,
+    next_handler: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -254,9 +269,14 @@ impl AllocationRetry {
 }
 
 impl Machine {
+    pub(super) const fn task_failure_bytes(capacity: u64) -> Option<u64> {
+        (core::mem::size_of::<Option<TaskFailure>>() as u64).checked_mul(capacity)
+    }
+
     pub(super) const fn pending_state_bytes() -> u64 {
         (core::mem::size_of::<Option<AllocationRetry>>()
             + core::mem::size_of::<Option<PendingArrayCopy>>()
+            + core::mem::size_of::<Option<PendingException>>()
             + core::mem::size_of::<Option<PendingAllocation>>()
             + core::mem::size_of::<Option<text::PendingText>>()
             + core::mem::size_of::<Option<text::PendingConcat>>()
@@ -309,6 +329,11 @@ impl Machine {
             .try_reserve_exact(task_count)
             .map_err(|_| AdmissionError::AllocationFailed)?;
         task_frame_depths.resize(task_count, 0);
+        let mut task_failures = Vec::new();
+        task_failures
+            .try_reserve_exact(task_count)
+            .map_err(|_| AdmissionError::AllocationFailed)?;
+        task_failures.resize(task_count, None);
         let tasks = TaskScheduler::new(task_count).map_err(|_| AdmissionError::AllocationFailed)?;
         let channels = ChannelArena::new(
             image.maximum_channels(),
@@ -336,6 +361,7 @@ impl Machine {
             frames: frames.into_boxed_slice(),
             task_frames: task_frames.into_boxed_slice(),
             task_frame_depths: task_frame_depths.into_boxed_slice(),
+            task_failures: task_failures.into_boxed_slice(),
             tasks,
             channels,
             frame_arena,
@@ -347,6 +373,7 @@ impl Machine {
             allocation_retry: None,
             pending_allocation: None,
             pending_array_copy: None,
+            pending_exception: None,
             pending_text: None,
             pending_concat: None,
             pending_concat_source: None,
@@ -541,7 +568,7 @@ impl Machine {
     }
 
     pub(super) fn minimum_run_budget(&self) -> u32 {
-        if self.pending_allocation.is_some() {
+        if self.pending_allocation.is_some() || self.pending_exception.is_some() {
             1
         } else {
             self.image.minimum_slice_cost()
@@ -830,6 +857,7 @@ impl Machine {
 
     fn has_pending_guest_instruction(&self) -> bool {
         self.pending_allocation.is_some()
+            || self.pending_exception.is_some()
             || self.pending_array_copy.is_some()
             || self.pending_text.is_some()
             || self.pending_concat.is_some()
@@ -851,7 +879,7 @@ impl Machine {
             Lifecycle::Pristine => return Err(RunError::NotStarted),
             Lifecycle::Runnable => {}
         }
-        let minimum = if self.pending_allocation.is_some() {
+        let minimum = if self.pending_allocation.is_some() || self.pending_exception.is_some() {
             1
         } else {
             self.image.minimum_slice_cost()
@@ -884,6 +912,13 @@ impl Machine {
             .saturating_sub(u64::from(self.has_pending_guest_instruction()));
         let mut remaining = guest_budget;
         'run: loop {
+            if self.pending_exception.is_some() {
+                match self.resume_exception(&mut remaining) {
+                    Ok(Some(outcome)) => return Ok(outcome),
+                    Ok(None) => {}
+                    Err(fault) => return Ok(self.fault(fault)),
+                }
+            }
             let frame_index = self
                 .frame_depth
                 .checked_sub(1)
@@ -2004,6 +2039,31 @@ impl Machine {
                         };
                         match self.tasks.join(target) {
                             Ok(false) => {
+                                let failure = self
+                                    .tasks
+                                    .slot_of(target)
+                                    .and_then(|slot| self.task_failures.get(slot))
+                                    .copied()
+                                    .flatten();
+                                if let Some(failure) = failure {
+                                    let join_stack = self.failure_stack();
+                                    let mut failure = failure;
+                                    let available = MAXIMUM_FAILURE_FRAMES - failure.stack.length;
+                                    let copied = available.min(join_stack.length);
+                                    let start = failure.stack.length;
+                                    failure.stack.frames[start..start + copied]
+                                        .copy_from_slice(&join_stack.frames[..copied]);
+                                    failure.stack.length += copied;
+                                    failure.stack.omitted = failure
+                                        .stack
+                                        .omitted
+                                        .saturating_add(join_stack.omitted)
+                                        .saturating_add(join_stack.length - copied);
+                                    if let Err(fault) = self.begin_exception(failure) {
+                                        return Ok(self.fault(fault));
+                                    }
+                                    continue 'run;
+                                }
                                 self.frames[frame_index].block = *resume_block;
                                 self.frames[frame_index].instruction = 0;
                                 break;
@@ -2198,12 +2258,20 @@ impl Machine {
                     | ResolvedInstruction::CapabilityCallAsync { .. } => {
                         return Ok(Outcome::HostRequest);
                     }
-                    ResolvedInstruction::Throw { trap } => {
-                        let outcome = Outcome::Crashed(*trap);
-                        self.capture_failure_stack();
-                        self.lifecycle = Lifecycle::Terminal(outcome);
-                        self.frame_depth = 0;
-                        return Ok(outcome);
+                    ResolvedInstruction::Throw { exception } => {
+                        let reference = match self.read_register(frame_index, *exception) {
+                            Ok(RuntimeValue::Reference(reference)) => reference,
+                            Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let failure = TaskFailure {
+                            exception: reference,
+                            stack: self.failure_stack(),
+                        };
+                        if let Err(fault) = self.begin_exception(failure) {
+                            return Ok(self.fault(fault));
+                        }
+                        continue 'run;
                     }
                     ResolvedInstruction::Unreachable => {
                         return Ok(self.fault(VmFault::ReachedUnreachable));
@@ -2239,6 +2307,168 @@ impl Machine {
                 return Ok(self.fault(VmFault::CorruptLifecycle));
             }
         }
+    }
+
+    fn begin_exception(&mut self, failure: TaskFailure) -> Result<(), VmFault> {
+        if self.pending_exception.is_some() {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        let actual_type = self.reference_type(failure.exception)?;
+        self.pending_exception = Some(PendingException {
+            failure,
+            actual_type,
+            next_handler: 0,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn exception_diagnostic(
+        &self,
+        artifact: &crate::artifact::DecodedArtifact,
+    ) -> String {
+        let Some(pending) = self.pending_exception else {
+            return String::new();
+        };
+        let mut result = String::from("Uncaught exception: ");
+        let mut reference = pending.failure.exception;
+        let mut seen = [None; 4];
+        for index in 0..seen.len() {
+            if seen[..index].contains(&Some(reference)) {
+                result.push_str("[cyclic cause]");
+                break;
+            }
+            seen[index] = Some(reference);
+            let Ok(ty) = self.reference_type(reference) else {
+                result.push_str("[invalid exception]");
+                break;
+            };
+            let module = &artifact.modules[ty.module as usize];
+            let crate::artifact::NominalType::Class { name, .. } = module.types[ty.ty as usize]
+            else {
+                break;
+            };
+            let name = module.strings[name as usize].slice(&artifact.bytes);
+            // Metadata and Guest text are bounded and cannot inject diagnostic control characters.
+            result.extend(String::from_utf8_lossy(name).chars().take(256).map(|c| {
+                if c.is_control() {
+                    ' '
+                } else {
+                    c
+                }
+            }));
+            if let Ok(value @ RuntimeValue::Reference(_)) =
+                load_value(&self.heap, reference, 0, ValueWidth::Ref)
+            {
+                if let Ok(backing) = text::backing(&self.image, &self.heap, value) {
+                    result.push_str(": ");
+                    let units = (0..backing.length().min(256)).map(|i| {
+                        text::code_unit(&self.image, &self.heap, backing, i).unwrap_or(0xfffd)
+                    });
+                    result.extend(
+                        char::decode_utf16(units)
+                            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+                            .map(|c| if c.is_control() { ' ' } else { c }),
+                    );
+                    if backing.length() > 256 {
+                        result.push('…');
+                    }
+                }
+            }
+            match load_value(&self.heap, reference, 4, ValueWidth::Ref) {
+                Ok(RuntimeValue::Reference(cause)) => {
+                    result.push_str("\nCaused by: ");
+                    reference = cause;
+                    if index == seen.len() - 1 {
+                        result.push_str("[further causes omitted]");
+                    }
+                }
+                _ => break,
+            }
+        }
+        result
+    }
+
+    fn resume_exception(&mut self, remaining: &mut u32) -> Result<Option<Outcome>, VmFault> {
+        while let Some(pending) = self.pending_exception {
+            if *remaining == 0 {
+                return Ok(Some(Outcome::SliceExhausted));
+            }
+            *remaining -= 1;
+            self.consumed_dynamic_cost = self
+                .consumed_dynamic_cost
+                .checked_add(1)
+                .ok_or(VmFault::AccountingOverflow)?;
+            let index = self
+                .frame_depth
+                .checked_sub(1)
+                .ok_or(VmFault::CorruptLifecycle)?;
+            let frame = self.frames[index];
+            let function = self
+                .image
+                .function(frame.function)
+                .ok_or(VmFault::InvalidResolvedId)?;
+            if let Some(handler) = function.handlers.get(pending.next_handler).copied() {
+                self.pending_exception
+                    .as_mut()
+                    .ok_or(VmFault::CorruptLifecycle)?
+                    .next_handler += 1;
+                if (handler.protected_start..handler.protected_end).contains(&frame.block)
+                    && handler
+                        .catch_type
+                        .is_none_or(|catch| self.image.is_assignable(pending.actual_type, catch))
+                {
+                    self.write_register(
+                        index,
+                        handler.exception_register,
+                        RuntimeValue::Reference(pending.failure.exception),
+                    )?;
+                    self.frames[index].block = handler.handler_block;
+                    self.frames[index].instruction = 0;
+                    self.pending_exception = None;
+                    return Ok(None);
+                }
+                continue;
+            }
+            self.frame_arena.pop(FrameReservation {
+                base: frame.base,
+                byte_len: frame.byte_len,
+            })?;
+            self.frames[index] = Frame::EMPTY;
+            self.frame_depth = index;
+            if let Some(ty) = frame.initializer {
+                let ty = self
+                    .image
+                    .type_index(ty)
+                    .ok_or(VmFault::InvalidResolvedId)?;
+                self.type_initialization[ty] = TypeInitializationState::Failed;
+            }
+            if index != 0 {
+                // The caller remains at its original call instruction, not its return continuation.
+                self.pending_exception
+                    .as_mut()
+                    .ok_or(VmFault::CorruptLifecycle)?
+                    .next_handler = 0;
+                continue;
+            }
+            let task = self.tasks.current().map_err(task_fault)?;
+            if task == TaskId::ROOT {
+                self.failure_stack = Some(pending.failure.stack);
+                let outcome = Outcome::UncaughtException;
+                self.lifecycle = Lifecycle::Terminal(outcome);
+                self.tasks.cancel_all();
+                return Ok(Some(outcome));
+            }
+            let slot = self.tasks.slot_of(task).ok_or(VmFault::CorruptLifecycle)?;
+            self.task_failures[slot] = Some(pending.failure);
+            self.pending_exception = None;
+            self.tasks.complete_current().map_err(task_fault)?;
+            return Ok(if self.activate_next_task()? {
+                None
+            } else {
+                Some(Outcome::TasksWaiting)
+            });
+        }
+        Ok(None)
     }
 
     fn read_register(&self, frame: usize, register: u16) -> Result<RuntimeValue, VmFault> {
@@ -2461,7 +2691,7 @@ impl Machine {
             };
             remaining -= 1;
             self.consumed_maintenance_cost = consumed;
-            let mut runtime_roots = [None; 6];
+            let mut runtime_roots = [None; 7];
             let mut runtime_root_count = 0_usize;
             self.visit_runtime_roots(|reference| {
                 if let Some(slot) = runtime_roots.get_mut(runtime_root_count) {
@@ -2479,6 +2709,7 @@ impl Machine {
                     statics: &self.statics,
                     frames: &self.frames,
                     saved_frames: &self.task_frames,
+                    task_failures: &self.task_failures,
                     frame_arena: &self.frame_arena,
                     frame_depth: self.frame_depth,
                     runtime_roots: &runtime_roots[..runtime_root_count],
@@ -2775,6 +3006,9 @@ impl Machine {
     }
 
     fn visit_runtime_roots(&self, mut visit: impl FnMut(Ref32)) {
+        if let Some(pending) = self.pending_exception {
+            visit(pending.failure.exception);
+        }
         if let Some(pending) = self.pending_array_copy {
             visit(pending.source);
             visit(pending.destination);
@@ -3365,6 +3599,39 @@ impl Machine {
     }
 
     #[cfg(test)]
+    pub(super) fn test_collect_exception_roots(&mut self) -> Result<(), VmFault> {
+        let mut runtime_roots = [None; 7];
+        let mut count = 0;
+        self.visit_runtime_roots(|reference| {
+            runtime_roots[count] = Some(reference);
+            count += 1;
+        });
+        self.collector.start();
+        while self.collector.is_active() {
+            self.collector.step(
+                &mut self.heap,
+                &self.image,
+                RootSet {
+                    statics: &self.statics,
+                    frames: &self.frames,
+                    saved_frames: &self.task_frames,
+                    task_failures: &self.task_failures,
+                    frame_arena: &self.frame_arena,
+                    frame_depth: self.frame_depth,
+                    runtime_roots: &runtime_roots[..count],
+                    external: &self.external_roots,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_has_exception_work(&self) -> bool {
+        self.pending_exception.is_some() || self.task_failures.iter().any(Option::is_some)
+    }
+
+    #[cfg(test)]
     pub(super) fn test_remove_emergency_oom(&mut self) {
         self.emergency_oom = None;
     }
@@ -3375,6 +3642,7 @@ impl Machine {
             + self.frames.len() * core::mem::size_of::<Frame>()
             + self.task_frames.len() * core::mem::size_of::<Frame>()
             + self.task_frame_depths.len() * core::mem::size_of::<usize>()
+            + self.task_failures.len() * core::mem::size_of::<Option<TaskFailure>>()
             + self.tasks.reserved_bytes()
             + self.channels.reserved_bytes()
             + self.frame_arena.reserved_bytes()

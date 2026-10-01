@@ -193,6 +193,7 @@ pub(super) enum Outcome {
     AllocationExhausted(AllocationExhaustion),
     Halted(Option<RuntimeValue>),
     Crashed(GuestTrap),
+    UncaughtException,
     Faulted(VmFault),
 }
 

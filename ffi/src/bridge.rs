@@ -86,6 +86,7 @@ pub(crate) enum OwnedOutcome {
     QuotaExhausted(QuotaExhaustion),
     Halted(Option<OwnedValue>),
     Crashed(GuestTrap, String),
+    UncaughtException(String),
     Faulted(VmFault, String),
     HostFailed(OwnedHostFailure),
     WaitingForTerminalEvent,
@@ -865,6 +866,7 @@ fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
         ComputerAdvanceOutcome::QuotaExhausted(value) => OwnedOutcome::QuotaExhausted(value),
         ComputerAdvanceOutcome::Halted(value) => OwnedOutcome::Halted(value.map(copy_value)),
         ComputerAdvanceOutcome::Crashed(value) => OwnedOutcome::Crashed(value, String::new()),
+        ComputerAdvanceOutcome::UncaughtException(value) => OwnedOutcome::UncaughtException(value),
         ComputerAdvanceOutcome::Faulted(value) => OwnedOutcome::Faulted(value, String::new()),
         ComputerAdvanceOutcome::HostFailed(value) => OwnedOutcome::HostFailed(value),
         ComputerAdvanceOutcome::CompilationRequested(_) => {

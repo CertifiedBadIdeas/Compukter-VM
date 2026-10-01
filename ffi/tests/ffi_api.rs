@@ -45,7 +45,7 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(17, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(18, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
