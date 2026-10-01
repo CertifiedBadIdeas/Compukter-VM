@@ -343,6 +343,7 @@ pub struct ComputerMachine {
 #[derive(Debug)]
 struct ProcessFrame {
     session: Session,
+    executable: Option<(VirtualPath, VerifiedArtifact)>,
     process_diagnostics: Vec<(TaskId, Box<[u16]>)>,
     compiler_diagnostics: Box<[u16]>,
     pending_terminal_event: Option<(TaskId, RequestId)>,
@@ -486,6 +487,7 @@ impl ComputerMachine {
             machine_identity: Arc::new(()),
             sessions: vec![ProcessFrame {
                 session,
+                executable: None,
                 process_diagnostics: Vec::new(),
                 compiler_diagnostics: Box::new([]),
                 pending_terminal_event: None,
@@ -1062,10 +1064,10 @@ impl ComputerMachine {
                 }
                 AdvanceOutcome::AllocationExhausted(value) => {
                     if self.sessions.len() > 1 {
-                        return self.finish_child(self.process_failure(
-                            ProcessFailureReason::LimitExceeded,
-                            "child allocation limit exceeded",
-                        ));
+                        let diagnostic = self.child_allocation_diagnostic(value);
+                        return self.finish_child(
+                            self.process_failure(ProcessFailureReason::LimitExceeded, &diagnostic),
+                        );
                     }
                     return Ok(ComputerAdvanceOutcome::AllocationExhausted(value));
                 }
@@ -1807,17 +1809,18 @@ impl ComputerMachine {
             );
         }
         let entry_arguments = artifact.entry().arguments;
-        let mut child = match admit_session(artifact, self.profile.clone(), &self.addon_bindings) {
-            Ok(session) => session,
-            Err(_) => {
-                return self.resume_process_failure(
-                    task,
-                    id,
-                    ProcessFailureReason::Incompatible,
-                    "program is incompatible with this machine",
-                )
-            }
-        };
+        let mut child =
+            match admit_session(artifact.clone(), self.profile.clone(), &self.addon_bindings) {
+                Ok(session) => session,
+                Err(_) => {
+                    return self.resume_process_failure(
+                        task,
+                        id,
+                        ProcessFailureReason::Incompatible,
+                        "program is incompatible with this machine",
+                    )
+                }
+            };
         let started = match entry_arguments {
             crate::EntryArguments::None if arguments.is_empty() => child.start(&[]),
             crate::EntryArguments::None => {
@@ -1851,6 +1854,7 @@ impl ComputerMachine {
         self.reserved_frame_storage_bytes = reserved_frame_storage_bytes;
         self.sessions.push(ProcessFrame {
             session: child,
+            executable: Some((path, artifact)),
             process_diagnostics: Vec::new(),
             compiler_diagnostics: Box::new([]),
             pending_terminal_event: None,
@@ -2063,6 +2067,78 @@ impl ComputerMachine {
                 HostResponse::Success(HostValueInput::I32(status)),
             )
             .map_err(ComputerError::Resume)
+    }
+
+    fn child_allocation_diagnostic(&self, failure: ManagedAllocationFailure) -> String {
+        let frame = self.active_frame();
+        let Some((path, artifact)) = &frame.executable else {
+            return "OutOfMemory".to_owned();
+        };
+        let diagnostic = failure.diagnostic;
+        let heap_bytes = self.profile.heap_bytes;
+        let heap_limit = if heap_bytes.is_multiple_of(1024) {
+            format!("{} KiB", heap_bytes / 1024)
+        } else {
+            format!("{heap_bytes} bytes")
+        };
+        let kind = diagnostic.request_kind.diagnostic_name();
+        let gc = if failure.collection_attempted {
+            "completed"
+        } else {
+            "not attempted"
+        };
+        let mut message = format!(
+            "{path}: OutOfMemory\nHeap limit: {heap_limit}\nUsed: {} bytes; free: {} bytes\nAllocation: {} bytes ({kind})\nLargest free block: {} bytes\nGC: {gc}",
+            diagnostic.live, diagnostic.total_free, diagnostic.requested, diagnostic.largest_free_block,
+        );
+        let decoded = artifact.decoded();
+        let source = diagnostic.source;
+        if let Some(module) = decoded.modules.get(source.module as usize) {
+            // AllocationSource uses execution-image block IDs; DEBUG uses module-local IDs.
+            let first_block: usize = decoded.modules[..source.module as usize]
+                .iter()
+                .map(|module| module.blocks.len())
+                .sum();
+            if let Some(block) = (source.block as usize).checked_sub(first_block) {
+                let entry = module.debug.iter().rev().find(|entry| {
+                    entry.function.0 == source.function
+                        && entry.block.0 as usize == block
+                        && entry.instruction <= source.instruction
+                });
+                if let Some(entry) = entry {
+                    let path = std::str::from_utf8(entry.source_path.slice(&decoded.bytes))
+                        .expect("verified debug paths are UTF-8");
+                    // A verified artifact may still contain control characters in debug paths.
+                    let path: String = path
+                        .chars()
+                        .map(|ch| if ch.is_control() { '?' } else { ch })
+                        .collect();
+                    message.push_str(&format!(
+                        "\nat {path} (UTF-16 offset {})",
+                        entry.start_utf16
+                    ));
+                    return message;
+                }
+                let function = module
+                    .functions
+                    .get(source.function as usize)
+                    .and_then(|function| module.strings.get(function.name as usize))
+                    .map(|name| {
+                        std::str::from_utf8(name.slice(&decoded.bytes))
+                            .expect("verified function names are UTF-8")
+                    })
+                    .unwrap_or("bytecode");
+                let function: String = function
+                    .chars()
+                    .map(|ch| if ch.is_control() { '?' } else { ch })
+                    .collect();
+                message.push_str(&format!(
+                    "\nat {function} (module {}, block {block}, instruction {})",
+                    source.module, source.instruction,
+                ));
+            }
+        }
+        message
     }
 
     fn finish_child(
@@ -3667,6 +3743,98 @@ mod tests {
             computer.take_process_diagnostic(TaskId::ROOT),
         );
         assert_eq!(None, computer.take_process_diagnostic(TaskId::ROOT));
+    }
+
+    #[test]
+    fn process_oom_reports_details_and_releases_child_before_resuming_parent() {
+        for with_debug in [false, true] {
+            let child = crate::execution::fixtures::array_allocation_artifact(1024 * 1024);
+            let mut decoded = crate::decode::records::decode_artifact(
+                Arc::from(crate::test_encode::encode_artifact(child.decoded()).unwrap()),
+                &ArtifactLimits::default(),
+            )
+            .unwrap();
+            if with_debug {
+                let mut bytes = decoded.bytes.to_vec();
+                let start = bytes.len();
+                bytes.extend_from_slice(b"src/main.kt");
+                decoded.modules[0].debug.push(crate::artifact::DebugEntry {
+                    function: crate::artifact::FunctionId(0),
+                    block: crate::artifact::BlockId(1),
+                    instruction: 0,
+                    start_utf16: 42,
+                    end_utf16: 55,
+                    inline_parent: u32::MAX,
+                    source_path: crate::artifact::ByteRange {
+                        start,
+                        end: bytes.len(),
+                    },
+                });
+                decoded.bytes = bytes.into();
+            }
+            let limits = FileSystemLimits::testing();
+            let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+            let mut filesystem = ComputerFileSystem::with_limits(limits);
+            filesystem
+                .write_file(
+                    &owner,
+                    &path("/home/oom", filesystem.limits()),
+                    &crate::test_encode::encode_artifact(&decoded).unwrap(),
+                    true,
+                )
+                .unwrap();
+            let parent = crate::execution::fixtures::process_v2_run_artifact(
+                &"/home/oom".encode_utf16().collect::<Vec<_>>(),
+                &[0, 0],
+            );
+            let mut execution_profile = profile();
+            execution_profile.heap_bytes = 256 * 1024;
+            let mut computer = ComputerMachine::start_in_filesystem(
+                parent,
+                execution_profile.clone(),
+                &[],
+                &[],
+                filesystem,
+                owner,
+            )
+            .unwrap();
+            let before = computer.resource_snapshot();
+            assert_eq!(
+                Some(ComputerValue::I32(
+                    ProcessFailureReason::LimitExceeded.status()
+                )),
+                halt(&mut computer),
+            );
+            let after = computer.resource_snapshot();
+            assert_eq!(1, computer.sessions.len());
+            assert_eq!(before.heap_capacity_bytes, after.heap_capacity_bytes);
+            assert_eq!(
+                before.mutable_execution_resident_bytes,
+                after.mutable_execution_resident_bytes
+            );
+            let diagnostic =
+                String::from_utf16(&computer.take_process_diagnostic(TaskId::ROOT).unwrap())
+                    .unwrap();
+            assert!(
+                diagnostic.starts_with("/home/oom: OutOfMemory\n"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("Heap limit: 256 KiB"), "{diagnostic}");
+            assert!(diagnostic.contains("Allocation: "), "{diagnostic}");
+            assert!(diagnostic.contains("(array)"), "{diagnostic}");
+            if with_debug {
+                assert!(
+                    diagnostic.contains("at src/main.kt (UTF-16 offset 42)"),
+                    "{diagnostic}"
+                );
+            } else {
+                assert!(
+                    diagnostic.contains("module 0, block 1, instruction 0"),
+                    "{diagnostic}"
+                );
+            }
+            assert_eq!(None, computer.take_process_diagnostic(TaskId::ROOT));
+        }
     }
 
     #[test]

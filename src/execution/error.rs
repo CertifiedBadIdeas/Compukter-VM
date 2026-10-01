@@ -134,6 +134,16 @@ pub enum AllocationRequestKind {
     String,
 }
 
+impl AllocationRequestKind {
+    pub(crate) fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Array => "array",
+            Self::String => "string",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AllocationSource {
     pub module: u32,
