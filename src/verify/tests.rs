@@ -46,6 +46,74 @@ fn exception_contract_rejects_legacy_and_non_throwable_operands_and_handlers() {
 }
 
 #[test]
+fn runtime_exception_roles_require_unique_zero_state_throwable_subclasses_and_abi_1_9() {
+    use crate::artifact::{NominalType, TypeId};
+    let source = crate::execution::fixtures::throwable_root_artifact();
+    let mut artifact = decoded(source.decoded().bytes.to_vec());
+    artifact.header.runtime_minor = 9;
+    for tag in 1..=8 {
+        artifact.modules[1].types.push(NominalType::Class {
+            flags: tag << 3,
+            generic_arity: 0,
+            name: 0,
+            super_type: TypeId(2),
+            interfaces: Vec::new(),
+            field_start: 0,
+            field_count: 0,
+            method_start: 0,
+            method_count: 0,
+            initializer: None,
+        });
+    }
+    artifact.modules[1].declared_types = 11;
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    super::verify_artifact(Arc::from(bytes.clone()), ArtifactLimits::default()).unwrap();
+    for case in 0..11 {
+        let mut artifact = decoded(bytes.clone());
+        if case == 0 {
+            artifact.header.runtime_minor = 8;
+        } else if let NominalType::Class {
+            flags,
+            generic_arity,
+            super_type,
+            interfaces,
+            field_count,
+            method_count,
+            initializer,
+            ..
+        } = &mut artifact.modules[1].types[3]
+        {
+            match case {
+                1 => *flags |= 1,
+                2 => *flags |= 4,
+                3 => *generic_arity = 1,
+                4 => *field_count = 1,
+                5 => *method_count = 1,
+                6 => *initializer = Some(crate::artifact::FunctionId(0)),
+                7 => *super_type = TypeId(1),
+                8 => *super_type = TypeId(3),
+                9 => *flags = 2 << 3,
+                10 => interfaces.push(TypeId(2)),
+                _ => unreachable!(),
+            }
+        }
+        let errors = super::exceptions::verify_exceptions(&artifact, &ArtifactLimits::default())
+            .unwrap_err();
+        assert_eq!(
+            Code::BadException,
+            errors.first().unwrap().code,
+            "case {case}"
+        );
+    }
+    let mut artifact = decoded(bytes);
+    if let NominalType::Class { flags, .. } = &mut artifact.modules[1].types[3] {
+        *flags = 9 << 3;
+    }
+    let invalid = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    assert!(super::verify_artifact(Arc::from(invalid), ArtifactLimits::default()).is_err());
+}
+
+#[test]
 fn throwable_root_requires_runtime_abi_and_a_checked_reference_payload() {
     use crate::artifact::{NominalType, TypeId};
     let source = crate::execution::fixtures::throwable_root_artifact();

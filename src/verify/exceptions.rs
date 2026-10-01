@@ -111,6 +111,81 @@ pub(crate) struct Handler {
     pub exception_register: u16,
 }
 
+/// Roles are resolved from validated metadata, never exception class names.
+pub(crate) fn verify_runtime_exception_types(
+    artifact: &DecodedArtifact,
+    limits: &ArtifactLimits,
+    root: Option<(usize, usize)>,
+) -> Result<[Option<(usize, usize)>; 8], DiagnosticSet> {
+    let mut roles = [None; 8];
+    for (module_id, module) in artifact.modules.iter().enumerate() {
+        for (type_id, nominal) in module.types.iter().enumerate() {
+            let NominalType::Class { flags, .. } = nominal else {
+                continue;
+            };
+            let tag = flags >> 3;
+            if tag == 0 {
+                continue;
+            }
+            if tag > 8 || (artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 9) {
+                return Err(failure(
+                    limits,
+                    module_id,
+                    0,
+                    "runtime exception role requires Runtime ABI 1.9",
+                ));
+            }
+            if roles[tag as usize - 1]
+                .replace((module_id, type_id))
+                .is_some()
+            {
+                return Err(failure(
+                    limits,
+                    module_id,
+                    0,
+                    "duplicate runtime exception role",
+                ));
+            }
+            let mut current = Some((module_id, type_id));
+            let mut remaining = artifact
+                .modules
+                .iter()
+                .map(|module| module.types.len())
+                .sum::<usize>();
+            while current != root && remaining != 0 {
+                let Some((owner, id)) = current else { break };
+                let NominalType::Class {
+                    flags,
+                    generic_arity: 0,
+                    super_type,
+                    interfaces,
+                    field_count: 0,
+                    method_count: 0,
+                    initializer: None,
+                    ..
+                } = &artifact.modules[owner].types[id]
+                else {
+                    break;
+                };
+                if flags & 5 != 0 || !interfaces.is_empty() {
+                    break;
+                }
+                current = modules::resolved_type(artifact, owner, *super_type);
+                remaining -= 1;
+            }
+            if root.is_none() || current != root || Some((module_id, type_id)) == root {
+                return Err(failure(
+                    limits,
+                    module_id,
+                    0,
+                    "runtime exception role requires a zero-state Throwable subclass",
+                ));
+            }
+        }
+    }
+    Ok(roles)
+}
+
 #[derive(Debug)]
 pub(crate) struct ExceptionModel {
     pub functions: Vec<Vec<Vec<Handler>>>,
@@ -121,6 +196,7 @@ pub(crate) fn verify_exceptions(
     limits: &ArtifactLimits,
 ) -> Result<ExceptionModel, DiagnosticSet> {
     let root = verify_throwable_root(artifact, limits)?;
+    verify_runtime_exception_types(artifact, limits, root)?;
     let uses_exceptions = artifact.modules.iter().any(|module| {
         !module.exceptions.is_empty()
             || module.code.iter().any(|code| {
