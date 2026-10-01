@@ -136,6 +136,7 @@ pub(super) struct Machine {
     pending_allocation: Option<PendingAllocation>,
     pending_array_copy: Option<PendingArrayCopy>,
     pending_exception: Option<PendingException>,
+    pending_raise: Option<PendingRaise>,
     pending_text: Option<text::PendingText>,
     pending_concat: Option<text::PendingConcat>,
     pending_concat_source: Option<AllocationSource>,
@@ -196,13 +197,14 @@ pub(crate) struct MachineResourceSnapshot {
 #[derive(Clone, Copy, Debug)]
 enum AllocationShape {
     Object,
+    Exception,
     Array { length: u32 },
 }
 
 impl AllocationShape {
     const fn request_kind(self) -> AllocationRequestKind {
         match self {
-            Self::Object => AllocationRequestKind::Object,
+            Self::Object | Self::Exception => AllocationRequestKind::Object,
             Self::Array { .. } => AllocationRequestKind::Array,
         }
     }
@@ -221,6 +223,18 @@ struct AllocationRetry {
 enum StringCollectionTarget {
     Concat,
     HostResponse,
+    ExceptionMessage,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRaise {
+    ty: TypeKey,
+    units: [u16; super::host::MAXIMUM_HOST_FAILURE_DETAIL_BYTES],
+    length: usize,
+    text: text::PendingHostString,
+    message: Option<Ref32>,
+    exception: Option<Ref32>,
+    stack: FailureStack,
 }
 
 fn task_fault(error: TaskError) -> VmFault {
@@ -247,7 +261,11 @@ fn channel_failure(error: ChannelError) -> InstructionFailure {
 }
 
 impl AllocationRetry {
-    fn reserve(self, heap: &mut Heap) -> Result<Option<PendingAllocation>, VmFault> {
+    fn reserve(
+        self,
+        heap: &mut Heap,
+        collection_attempted: bool,
+    ) -> Result<Option<PendingAllocation>, VmFault> {
         let reservation = heap.reserve(self.request)?;
         let Some(reservation) = reservation else {
             return Ok(None);
@@ -259,10 +277,11 @@ impl AllocationRetry {
             logical_bytes: self.logical_bytes,
             initialized_bytes: 0,
             fixed_cost_paid: true,
-            collection_attempted: true,
+            collection_attempted,
         };
         Ok(Some(match self.shape {
             AllocationShape::Object => PendingAllocation::Object(state),
+            AllocationShape::Exception => PendingAllocation::Exception(state),
             AllocationShape::Array { length } => PendingAllocation::Array { state, length },
         }))
     }
@@ -277,6 +296,7 @@ impl Machine {
         (core::mem::size_of::<Option<AllocationRetry>>()
             + core::mem::size_of::<Option<PendingArrayCopy>>()
             + core::mem::size_of::<Option<PendingException>>()
+            + core::mem::size_of::<Option<PendingRaise>>()
             + core::mem::size_of::<Option<PendingAllocation>>()
             + core::mem::size_of::<Option<text::PendingText>>()
             + core::mem::size_of::<Option<text::PendingConcat>>()
@@ -374,6 +394,7 @@ impl Machine {
             pending_allocation: None,
             pending_array_copy: None,
             pending_exception: None,
+            pending_raise: None,
             pending_text: None,
             pending_concat: None,
             pending_concat_source: None,
@@ -568,7 +589,10 @@ impl Machine {
     }
 
     pub(super) fn minimum_run_budget(&self) -> u32 {
-        if self.pending_allocation.is_some() || self.pending_exception.is_some() {
+        if self.pending_allocation.is_some()
+            || self.pending_exception.is_some()
+            || self.pending_raise.is_some()
+        {
             1
         } else {
             self.image.minimum_slice_cost()
@@ -857,6 +881,7 @@ impl Machine {
 
     fn has_pending_guest_instruction(&self) -> bool {
         self.pending_allocation.is_some()
+            || self.pending_raise.is_some()
             || self.pending_exception.is_some()
             || self.pending_array_copy.is_some()
             || self.pending_text.is_some()
@@ -879,7 +904,10 @@ impl Machine {
             Lifecycle::Pristine => return Err(RunError::NotStarted),
             Lifecycle::Runnable => {}
         }
-        let minimum = if self.pending_allocation.is_some() || self.pending_exception.is_some() {
+        let minimum = if self.pending_allocation.is_some()
+            || self.pending_exception.is_some()
+            || self.pending_raise.is_some()
+        {
             1
         } else {
             self.image.minimum_slice_cost()
@@ -912,6 +940,11 @@ impl Machine {
             .saturating_sub(u64::from(self.has_pending_guest_instruction()));
         let mut remaining = guest_budget;
         'run: loop {
+            if self.pending_raise.is_some() {
+                if let Some(outcome) = self.resume_runtime_exception(&mut remaining) {
+                    return Ok(outcome);
+                }
+            }
             if self.pending_exception.is_some() {
                 match self.resume_exception(&mut remaining) {
                     Ok(Some(outcome)) => return Ok(outcome),
@@ -2291,6 +2324,12 @@ impl Machine {
                             &self.heap,
                         ) {
                             Ok(()) => self.frames[frame_index].instruction += 1,
+                            Err(InstructionFailure::Trap(GuestTrap::DivisionByZero)) => {
+                                if let Err(fault) = self.begin_runtime_exception(1, "/ by zero") {
+                                    return Ok(self.fault(fault));
+                                }
+                                return Ok(Outcome::SliceExhausted);
+                            }
                             Err(InstructionFailure::Trap(trap)) => {
                                 let outcome = Outcome::Crashed(trap);
                                 self.lifecycle = Lifecycle::Terminal(outcome);
@@ -2320,6 +2359,169 @@ impl Machine {
             next_handler: 0,
         });
         Ok(())
+    }
+
+    fn begin_runtime_exception(&mut self, tag: u8, detail: &str) -> Result<(), VmFault> {
+        if self.pending_raise.is_some()
+            || self.pending_exception.is_some()
+            || detail.len() > super::host::MAXIMUM_HOST_FAILURE_DETAIL_BYTES
+        {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        let ty = self
+            .image
+            .runtime_exception_type(tag)
+            .ok_or(VmFault::InvalidResolvedId)?;
+        let mut units = [0; super::host::MAXIMUM_HOST_FAILURE_DETAIL_BYTES];
+        let mut length = 0;
+        for unit in detail.encode_utf16() {
+            units[length] = unit;
+            length += 1;
+        }
+        self.pending_raise = Some(PendingRaise {
+            ty,
+            units,
+            length,
+            text: text::PendingHostString::new(u16::MAX),
+            message: None,
+            exception: None,
+            stack: self.failure_stack(),
+        });
+        Ok(())
+    }
+
+    fn resume_runtime_exception(&mut self, remaining: &mut u32) -> Option<Outcome> {
+        let mut pending = self.pending_raise.take()?;
+        if pending.message.is_none() {
+            let result = pending.text.resume(
+                &self.image,
+                &mut self.heap,
+                &pending.units[..pending.length],
+                *remaining,
+            );
+            let (used, value) = match result {
+                Ok(result) => result,
+                Err(text::TextError::Exhausted {
+                    used,
+                    block_bytes,
+                    requested,
+                    collection_attempted,
+                }) => {
+                    let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used))
+                    else {
+                        let _ = pending.text.abort(&mut self.heap);
+                        return Some(self.fault(VmFault::AccountingOverflow));
+                    };
+                    self.consumed_dynamic_cost = consumed;
+                    *remaining -= used;
+                    if collection_attempted
+                        || u64::from(block_bytes) > self.image.storage_plan().heap_arena_bytes
+                    {
+                        let _ = pending.text.abort(&mut self.heap);
+                        return Some(self.allocation_exhausted(
+                            AllocationRequestKind::String,
+                            requested,
+                            collection_attempted,
+                            pending.stack.frames[0],
+                        ));
+                    }
+                    self.pending_raise = Some(pending);
+                    self.string_collection_pending = Some(StringCollectionTarget::ExceptionMessage);
+                    self.collector.start();
+                    return Some(Outcome::SliceExhausted);
+                }
+                Err(text::TextError::Fault(fault)) => {
+                    let _ = pending.text.abort(&mut self.heap);
+                    return Some(self.fault(fault));
+                }
+                Err(text::TextError::Trap(_)) => {
+                    let _ = pending.text.abort(&mut self.heap);
+                    return Some(self.fault(VmFault::CorruptLifecycle));
+                }
+            };
+            let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used)) else {
+                let _ = pending.text.abort(&mut self.heap);
+                return Some(self.fault(VmFault::AccountingOverflow));
+            };
+            self.consumed_dynamic_cost = consumed;
+            *remaining -= used;
+            match value {
+                Some((_, RuntimeValue::Reference(reference))) => pending.message = Some(reference),
+                Some(_) => return Some(self.fault(VmFault::InvalidValueType)),
+                None => {
+                    self.pending_raise = Some(pending);
+                    return Some(Outcome::SliceExhausted);
+                }
+            }
+        }
+        if pending.exception.is_none() {
+            if self.pending_allocation.is_none() {
+                let Some(RuntimeTypeLayout::Object(layout)) = self.image.type_layout(pending.ty)
+                else {
+                    return Some(self.fault(VmFault::InvalidStoragePlan));
+                };
+                let Some(type_id) = self.image.type_id(pending.ty) else {
+                    return Some(self.fault(VmFault::InvalidResolvedId));
+                };
+                let retry = AllocationRetry {
+                    request: AllocationRequest {
+                        block_bytes: layout.block_bytes,
+                        type_id,
+                    },
+                    destination: u16::MAX,
+                    logical_bytes: layout.payload_bytes,
+                    shape: AllocationShape::Exception,
+                    source: pending.stack.frames[0],
+                };
+                match retry.reserve(&mut self.heap, false) {
+                    Ok(Some(allocation)) => self.pending_allocation = Some(allocation),
+                    Ok(None) => {
+                        self.pending_raise = Some(pending);
+                        self.allocation_retry = Some(retry);
+                        self.collector.start();
+                        return Some(Outcome::SliceExhausted);
+                    }
+                    Err(fault) => return Some(self.fault(fault)),
+                }
+            }
+            self.pending_raise = Some(pending);
+            let frame = self.frame_depth.checked_sub(1)?;
+            if let Some(outcome) = self.resume_pending_allocation(frame, remaining) {
+                return Some(outcome);
+            }
+            pending = self.pending_raise.take()?;
+        }
+        if *remaining == 0 {
+            self.pending_raise = Some(pending);
+            return Some(Outcome::SliceExhausted);
+        }
+        *remaining -= 1;
+        let Some(consumed) = self.consumed_dynamic_cost.checked_add(1) else {
+            return Some(self.fault(VmFault::AccountingOverflow));
+        };
+        self.consumed_dynamic_cost = consumed;
+        let Some(exception) = pending.exception else {
+            return Some(self.fault(VmFault::CorruptLifecycle));
+        };
+        let Some(message) = pending.message else {
+            return Some(self.fault(VmFault::CorruptLifecycle));
+        };
+        if let Err(fault) = store_value(
+            &mut self.heap,
+            exception,
+            0,
+            ValueWidth::Ref,
+            RuntimeValue::Reference(message),
+        ) {
+            return Some(self.fault(fault));
+        }
+        if let Err(fault) = self.begin_exception(TaskFailure {
+            exception,
+            stack: pending.stack,
+        }) {
+            return Some(self.fault(fault));
+        }
+        None
     }
 
     pub(crate) fn exception_diagnostic(
@@ -2588,6 +2790,9 @@ impl Machine {
         self.cancel_pending_allocation();
         self.cancel_pending_concat();
         self.cancel_pending_host_string();
+        if let Some(pending) = self.pending_raise.take() {
+            let _ = pending.text.abort(&mut self.heap);
+        }
         for state in &mut self.type_initialization {
             if *state == TypeInitializationState::Initializing {
                 *state = TypeInitializationState::Failed;
@@ -2691,7 +2896,7 @@ impl Machine {
             };
             remaining -= 1;
             self.consumed_maintenance_cost = consumed;
-            let mut runtime_roots = [None; 7];
+            let mut runtime_roots = [None; 9];
             let mut runtime_root_count = 0_usize;
             self.visit_runtime_roots(|reference| {
                 if let Some(slot) = runtime_roots.get_mut(runtime_root_count) {
@@ -2736,13 +2941,19 @@ impl Machine {
                         };
                         pending.mark_collection_attempted();
                     }
+                    StringCollectionTarget::ExceptionMessage => {
+                        let Some(pending) = self.pending_raise.as_mut() else {
+                            return Ok(self.fault(VmFault::CorruptLifecycle));
+                        };
+                        pending.text.mark_collection_attempted();
+                    }
                 }
                 return Ok(Outcome::SliceExhausted);
             }
             let Some(retry) = self.allocation_retry.take() else {
                 return Ok(self.fault(VmFault::CorruptLifecycle));
             };
-            match retry.reserve(&mut self.heap) {
+            match retry.reserve(&mut self.heap, true) {
                 Ok(Some(pending)) => self.pending_allocation = Some(pending),
                 Ok(None) => {
                     return Ok(self.allocation_exhausted(
@@ -2764,6 +2975,7 @@ impl Machine {
         remaining: &mut u32,
     ) -> Option<Outcome> {
         let mut pending = self.pending_allocation.take()?;
+        let is_exception = matches!(pending, PendingAllocation::Exception(_));
         let destination = pending.state().destination;
         let expected_units = pending.units_for_budget(*remaining);
         let Some(consumed_dynamic_cost) = self
@@ -2788,6 +3000,13 @@ impl Machine {
             self.pending_allocation = Some(pending);
             return Some(Outcome::SliceExhausted);
         };
+        if is_exception {
+            let Some(raise) = self.pending_raise.as_mut() else {
+                return Some(self.fault(VmFault::CorruptLifecycle));
+            };
+            raise.exception = Some(reference);
+            return None;
+        }
         if let Err(fault) =
             self.write_register(frame_index, destination, RuntimeValue::Reference(reference))
         {
@@ -3006,6 +3225,14 @@ impl Machine {
     }
 
     fn visit_runtime_roots(&self, mut visit: impl FnMut(Ref32)) {
+        if let Some(pending) = &self.pending_raise {
+            if let Some(message) = pending.message {
+                visit(message);
+            }
+            if let Some(exception) = pending.exception {
+                visit(exception);
+            }
+        }
         if let Some(pending) = self.pending_exception {
             visit(pending.failure.exception);
         }
@@ -3600,7 +3827,7 @@ impl Machine {
 
     #[cfg(test)]
     pub(super) fn test_collect_exception_roots(&mut self) -> Result<(), VmFault> {
-        let mut runtime_roots = [None; 7];
+        let mut runtime_roots = [None; 9];
         let mut count = 0;
         self.visit_runtime_roots(|reference| {
             runtime_roots[count] = Some(reference);
@@ -3629,6 +3856,12 @@ impl Machine {
     #[cfg(test)]
     pub(super) fn test_has_exception_work(&self) -> bool {
         self.pending_exception.is_some() || self.task_failures.iter().any(Option::is_some)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_factory_payload_published(&self) -> bool {
+        self.pending_raise
+            .is_some_and(|pending| pending.exception.is_some())
     }
 
     #[cfg(test)]

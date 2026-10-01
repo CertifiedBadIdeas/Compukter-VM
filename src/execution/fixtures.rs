@@ -1978,10 +1978,10 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
             artifact: trap_after_write_artifact(7),
             args: Box::new([]),
             budget: 7,
-            outcome: super::error::Outcome::Crashed(super::error::GuestTrap::DivisionByZero),
+            outcome: super::error::Outcome::SliceExhausted,
             digest: [
-                52, 214, 180, 35, 126, 102, 33, 17, 93, 32, 64, 129, 128, 82, 111, 107, 253, 0, 67,
-                38, 188, 80, 201, 234, 229, 233, 79, 24, 23, 239, 164, 246,
+                135, 1, 26, 15, 191, 213, 180, 116, 133, 73, 44, 203, 193, 198, 124, 67, 161, 255,
+                243, 176, 124, 87, 69, 58, 57, 70, 124, 138, 253, 53, 50, 170,
             ],
             fixed_cost: 7,
         },
@@ -6572,8 +6572,58 @@ fn verified_mutated(
     )
     .unwrap();
     change(&mut decoded);
+    if decoded.modules.iter().any(|module| {
+        module.code.iter().any(|code| {
+            code.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::Div { form: 1 | 2, .. } | Instruction::Rem { form: 1 | 2, .. }
+                )
+            })
+        })
+    }) {
+        install_arithmetic_exception_runtime(&mut decoded);
+    }
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+fn install_arithmetic_exception_runtime(artifact: &mut crate::artifact::DecodedArtifact) {
+    // Scalar execution fixtures explicitly include the same verified factory dependency as the compiler.
+    let runtime = throwable_root_artifact();
+    let mut library = crate::decode::records::decode_artifact(
+        runtime.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let mut module = library.modules.remove(1);
+    let offset = artifact.bytes.len();
+    let mut bytes = artifact.bytes.to_vec();
+    bytes.extend_from_slice(&library.bytes);
+    artifact.bytes = Arc::from(bytes);
+    for name in &mut module.strings {
+        name.start += offset;
+        name.end += offset;
+    }
+    for literal in &mut module.utf16_literals {
+        literal.start += offset;
+        literal.end += offset;
+    }
+    module.types.push(NominalType::Class {
+        flags: 1 << 3,
+        generic_arity: 0,
+        name: 0,
+        super_type: TypeId(2),
+        interfaces: Vec::new(),
+        field_start: 0,
+        field_count: 0,
+        method_start: 0,
+        method_count: 0,
+        initializer: None,
+    });
+    module.declared_types = module.types.len() as u32;
+    artifact.modules.push(module);
+    artifact.header.runtime_minor = 9;
 }
 
 fn verified_program(

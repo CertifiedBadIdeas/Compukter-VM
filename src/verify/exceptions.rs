@@ -196,7 +196,28 @@ pub(crate) fn verify_exceptions(
     limits: &ArtifactLimits,
 ) -> Result<ExceptionModel, DiagnosticSet> {
     let root = verify_throwable_root(artifact, limits)?;
-    verify_runtime_exception_types(artifact, limits, root)?;
+    let roles = verify_runtime_exception_types(artifact, limits, root)?;
+    let uses_arithmetic_errors = artifact.modules.iter().any(|module| {
+        module.code.iter().any(|code| {
+            code.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::Div { form: 1 | 2, .. } | Instruction::Rem { form: 1 | 2, .. }
+                )
+            })
+        })
+    });
+    if uses_arithmetic_errors
+        && ((artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 9)
+            || roles[0].is_none())
+    {
+        return Err(failure(
+            limits,
+            0,
+            0,
+            "arithmetic error artifact: rebuild with exception roles for Runtime ABI 1.9",
+        ));
+    }
     let uses_exceptions = artifact.modules.iter().any(|module| {
         !module.exceptions.is_empty()
             || module.code.iter().any(|code| {

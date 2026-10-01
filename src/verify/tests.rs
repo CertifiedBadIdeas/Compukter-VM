@@ -9,6 +9,28 @@ fn decoded(bytes: Vec<u8>) -> crate::artifact::DecodedArtifact {
 }
 
 #[test]
+fn integer_division_and_remainder_reject_legacy_or_missing_factory_metadata() {
+    let source = crate::execution::fixtures::trap_after_write_artifact(7);
+    for case in 0..2 {
+        let mut artifact = decoded(source.decoded().bytes.to_vec());
+        if case == 0 {
+            artifact.header.runtime_minor = 8;
+        } else if let crate::artifact::NominalType::Class { flags, .. } =
+            &mut artifact.modules[1].types[3]
+        {
+            *flags = 0;
+        }
+        let errors = super::exceptions::verify_exceptions(&artifact, &ArtifactLimits::default())
+            .unwrap_err();
+        assert_eq!(Code::BadException, errors.first().unwrap().code);
+        assert!(
+            errors.first().unwrap().detail.contains("rebuild")
+                || errors.first().unwrap().detail.contains("1.9")
+        );
+    }
+}
+
+#[test]
 fn exception_contract_rejects_legacy_and_non_throwable_operands_and_handlers() {
     let source = crate::execution::fixtures::exception_artifact(false, true, false);
     for case in 0..5 {

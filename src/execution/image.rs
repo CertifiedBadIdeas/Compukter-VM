@@ -474,6 +474,7 @@ struct ExecutionImageInner {
     literals: Box<[ResolvedLiteral]>,
     literal_ids: Box<[usize]>,
     string_type: Option<TypeKey>,
+    runtime_exception_types: [Option<TypeKey>; 8],
     storage_plan: StoragePlan,
     registers_per_frame: usize,
     maximum_call_depth: usize,
@@ -585,6 +586,20 @@ impl ExecutionImage {
         let static_layout = FrameLayout::derive_scalars(&static_atoms)
             .map_err(|_| AdmissionError::StoragePlanOverflow)?;
         let string_type = resolve_standard_string_type(decoded)?;
+        let mut runtime_exception_types = [None; 8];
+        for (module_id, module) in decoded.modules.iter().enumerate() {
+            for (type_id, nominal) in module.types.iter().enumerate() {
+                if let NominalType::Class { flags, .. } = nominal {
+                    let tag = flags >> 3;
+                    if tag != 0 {
+                        runtime_exception_types[tag as usize - 1] = Some(TypeKey {
+                            module: module_id as u32,
+                            ty: type_id as u32,
+                        });
+                    }
+                }
+            }
+        }
         let (mut literals, literal_ids) = resolve_literals(decoded, &literal_offsets)?;
         if string_type.is_some() && !literals.iter().any(|literal| literal.code_units == 0) {
             let mut with_empty = literals.into_vec();
@@ -896,6 +911,7 @@ impl ExecutionImage {
             literal_ids,
             string_type,
             storage_plan,
+            runtime_exception_types,
             registers_per_frame,
             maximum_call_depth: decoded.manifest.maximum_call_depth as usize,
             maximum_coroutines: decoded.manifest.maximum_coroutines as usize,
@@ -1135,6 +1151,14 @@ impl ExecutionImage {
 
     pub(super) fn string_type(&self) -> Option<TypeKey> {
         self.0.string_type
+    }
+
+    pub(super) fn runtime_exception_type(&self, tag: u8) -> Option<TypeKey> {
+        self.0
+            .runtime_exception_types
+            .get(tag.checked_sub(1)? as usize)
+            .copied()
+            .flatten()
     }
 
     pub(super) fn empty_string(&self) -> Option<RuntimeValue> {
