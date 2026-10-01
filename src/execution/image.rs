@@ -2685,7 +2685,16 @@ fn assignable_types(
                     }
                 }
             }
-            NominalType::Array { .. } | NominalType::Function { .. } => {}
+            NominalType::Array { super_type, .. } => {
+                if let Some(parent) = super_type
+                    .and_then(|parent| resolve_type(artifact, current.module as usize, parent))
+                {
+                    if !result.contains(&parent) && !pending.contains(&parent) {
+                        pending.push(parent);
+                    }
+                }
+            }
+            NominalType::Function { .. } => {}
         }
     }
     Ok(result.into_boxed_slice())

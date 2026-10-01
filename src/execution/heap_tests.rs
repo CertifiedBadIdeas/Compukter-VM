@@ -19,6 +19,34 @@ use super::{
 use crate::artifact::ByteRange;
 
 #[test]
+fn array_root_casts_preserve_identity_and_dynamic_type() {
+    for wrong_type in [false, true] {
+        for type_test in [false, true] {
+            for nullable_root in [false, true] {
+                let mut machine = fixtures::started(
+                    fixtures::array_root_cast_artifact(wrong_type, type_test, nullable_root),
+                    &[],
+                );
+                loop {
+                    match machine.run_slice(32, 8).unwrap() {
+                        Outcome::SliceExhausted => {}
+                        outcome => {
+                            let expected = if wrong_type && !type_test {
+                                Outcome::Crashed(GuestTrap::ClassCast)
+                            } else {
+                                Outcome::Halted(Some(RuntimeValue::Bool(!wrong_type)))
+                            };
+                            assert_eq!(expected, outcome);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn reference_identity_compares_typed_arrays_and_null_without_casts() {
     for same_type in [false, true] {
         for right_is_null in [false, true] {

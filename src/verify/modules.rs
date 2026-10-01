@@ -278,7 +278,39 @@ fn verify_nominal_types(
                         limits,
                     )?;
                 }
-                NominalType::Array { .. } | NominalType::Function { .. } => {}
+                NominalType::Array {
+                    super_type: Some(parent),
+                    ..
+                } => {
+                    if artifact.header.runtime_major < 1
+                        || (artifact.header.runtime_major == 1 && artifact.header.runtime_minor < 7)
+                    {
+                        return Err(type_failure(
+                            limits,
+                            module_id,
+                            "array superclass requires Runtime ABI 1.7",
+                        ));
+                    }
+                    let target = resolved_type(artifact, module_id, *parent).ok_or_else(|| {
+                        type_failure(limits, module_id, "array superclass does not resolve")
+                    })?;
+                    if !matches!(&artifact.modules[target.0].types[target.1],
+                        NominalType::Class { flags: 0, generic_arity: 0, super_type, interfaces,
+                            field_count: 0, method_count: 0, initializer: None, .. }
+                            if super_type.0 == u32::MAX && interfaces.is_empty()
+                    ) {
+                        return Err(type_failure(
+                            limits,
+                            module_id,
+                            "array superclass must be a stateless root class",
+                        ));
+                    }
+                    neighbors.push(global_type(&prefixes, target));
+                }
+                NominalType::Array {
+                    super_type: None, ..
+                }
+                | NominalType::Function { .. } => {}
             }
             edges.push(neighbors);
         }

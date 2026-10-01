@@ -2311,6 +2311,7 @@ fn entry_string_array_artifact(code_unit: Option<(i32, i32)>) -> VerifiedArtifac
         };
         module.types.push(NominalType::Array {
             name: 0,
+            super_type: None,
             element: string,
         });
         module.declared_types = 2;
@@ -2797,6 +2798,7 @@ pub(super) fn char_array_string_artifact(start: i32, end: i32) -> VerifiedArtifa
         |artifact| {
             artifact.modules[0].types.push(NominalType::Array {
                 name: 0,
+                super_type: None,
                 element: character,
             });
             artifact.modules[0].declared_types = 2;
@@ -4523,6 +4525,7 @@ pub(super) fn portable_layout_artifact() -> VerifiedArtifact {
             },
             NominalType::Array {
                 name: 0,
+                super_type: None,
                 element: primitive(6),
             },
         ]);
@@ -4694,6 +4697,7 @@ pub(super) fn gc_array_retry_artifact(length: i32) -> VerifiedArtifact {
         };
         artifact.modules[0].types.push(NominalType::Array {
             name: 0,
+            super_type: None,
             element: primitive(1),
         });
         artifact.modules[0].declared_types = 2;
@@ -4855,6 +4859,7 @@ pub(crate) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
         };
         artifact.modules[0].types.push(NominalType::Array {
             name: 0,
+            super_type: None,
             element: primitive(5),
         });
         artifact.modules[0].declared_types = 2;
@@ -4930,6 +4935,7 @@ pub(crate) fn reference_identity_artifact(
     };
     module.types.push(NominalType::Array {
         name,
+        super_type: None,
         element: primitive(6),
     });
     module.declared_types = module.types.len() as u32;
@@ -4995,6 +5001,100 @@ pub(crate) fn reference_identity_artifact(
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default())
         .expect("reference comparison fixture verifies")
+}
+
+pub(crate) fn array_root_cast_artifact(
+    wrong_type: bool,
+    type_test: bool,
+    nullable_root: bool,
+) -> VerifiedArtifact {
+    let base = reference_identity_artifact(true, false, false);
+    let mut artifact = crate::decode::records::decode_artifact(
+        base.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    artifact.header.runtime_minor = 7;
+    let module = &mut artifact.modules[0];
+    module.types.push(plain_class(TypeId(u32::MAX), 0, 0));
+    module.declared_types = module.types.len() as u32;
+    for nominal in &mut module.types[1..3] {
+        if let NominalType::Array { super_type, .. } = nominal {
+            *super_type = Some(TypeId(3));
+        }
+    }
+    let array = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(if wrong_type { 2 } else { 1 }),
+    };
+    let root = ValueType {
+        kind: 7,
+        flags: u8::from(nullable_root),
+        nominal_type: TypeId(3),
+    };
+    let function = &mut module.functions[0];
+    function.register_count = 5;
+    function.values = crate::artifact::scalar_values(vec![
+        primitive(1),
+        ValueType {
+            nominal_type: TypeId(1),
+            ..array
+        },
+        array,
+        primitive(5),
+        root,
+    ]);
+    let target = if wrong_type { 2 } else { 1 };
+    let mut tail = vec![Instruction::CheckedCast {
+        dst: 4,
+        value: 1,
+        type_ref: 3,
+    }];
+    if type_test {
+        tail.push(Instruction::IsType {
+            dst: 3,
+            value: 4,
+            type_ref: target,
+        });
+    } else {
+        tail.push(Instruction::CheckedCast {
+            dst: 2,
+            value: 4,
+            type_ref: target,
+        });
+        tail.push(Instruction::RefEqual {
+            dst: 3,
+            lhs: 1,
+            rhs: 2,
+        });
+    }
+    tail.push(Instruction::Return { value: 3 });
+    install_entry_blocks(
+        &mut artifact,
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![
+                Instruction::NewArray {
+                    dst: 1,
+                    type_ref: 1,
+                    length: 0,
+                },
+                Instruction::Jump { target: 2 },
+            ],
+            tail,
+        ],
+    );
+    configure_stack(&mut artifact, 5, 1);
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default())
+        .expect("array root fixture verifies")
 }
 
 pub(crate) fn array_copy_artifact() -> VerifiedArtifact {
@@ -5304,9 +5404,11 @@ fn primitive_array_roundtrip_artifact(
             result: element,
             parameters: Vec::new(),
         };
-        artifact.modules[0]
-            .types
-            .push(NominalType::Array { name: 0, element });
+        artifact.modules[0].types.push(NominalType::Array {
+            name: 0,
+            element,
+            super_type: None,
+        });
         artifact.modules[0].declared_types = 2;
         artifact.modules[0].constants = vec![Constant::I32(0), Constant::I32(1), constant];
         let function = &mut artifact.modules[0].functions[0];
@@ -5391,6 +5493,7 @@ pub(super) fn reference_array_roundtrip_artifact() -> VerifiedArtifact {
             plain_class(TypeId(1), 0, 0),
             NominalType::Array {
                 name: 0,
+                super_type: None,
                 element: base,
             },
         ]);
@@ -5460,6 +5563,7 @@ pub(super) fn array_bounds_artifact() -> VerifiedArtifact {
         };
         artifact.modules[0].types.push(NominalType::Array {
             name: 0,
+            super_type: None,
             element: primitive(1),
         });
         artifact.modules[0].declared_types = 2;
@@ -5711,6 +5815,7 @@ pub(super) fn failed_array_store_artifact() -> VerifiedArtifact {
         };
         artifact.modules[0].types.push(NominalType::Array {
             name: 0,
+            super_type: None,
             element: primitive(1),
         });
         artifact.modules[0].declared_types = 2;

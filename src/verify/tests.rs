@@ -9,6 +9,49 @@ fn decoded(bytes: Vec<u8>) -> crate::artifact::DecodedArtifact {
 }
 
 #[test]
+fn array_roots_require_abi_1_7_and_a_stateless_root_class() {
+    use crate::artifact::{NominalType, TypeId};
+    let source = crate::execution::fixtures::array_root_cast_artifact(false, false, false);
+    for failure in 0..10 {
+        let mut artifact = decoded(source.decoded().bytes.to_vec());
+        if failure == 0 {
+            artifact.header.runtime_minor = 6;
+        } else if failure == 1 {
+            if let NominalType::Array { super_type, .. } = &mut artifact.modules[0].types[1] {
+                *super_type = Some(TypeId(0));
+            }
+        } else if let NominalType::Class {
+            flags,
+            generic_arity,
+            super_type,
+            interfaces,
+            field_count,
+            method_count,
+            initializer,
+            ..
+        } = &mut artifact.modules[0].types[3]
+        {
+            match failure {
+                2 => *flags = 1,
+                3 => *flags = 2,
+                4 => *generic_arity = 1,
+                5 => *super_type = TypeId(3),
+                6 => interfaces.push(TypeId(3)),
+                7 => *field_count = 1,
+                8 => *method_count = 1,
+                9 => *initializer = Some(crate::artifact::FunctionId(0)),
+                _ => unreachable!(),
+            }
+        }
+        let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+        assert!(
+            super::verify_artifact(Arc::from(bytes), ArtifactLimits::default()).is_err(),
+            "case {failure}"
+        );
+    }
+}
+
+#[test]
 fn array_copy_requires_runtime_feature_and_typed_operands() {
     let source = crate::execution::fixtures::array_copy_artifact();
     for failure in 0..4 {
@@ -120,6 +163,7 @@ fn module_accepts_structurally_equivalent_array_signature_across_modules() {
         });
         module.types.push(crate::artifact::NominalType::Array {
             name: 0,
+            super_type: None,
             element: crate::artifact::ValueType {
                 kind: 1,
                 flags: 0,
@@ -561,6 +605,7 @@ fn cfg_rejects_string_materialization_from_non_char_array() {
         .types
         .push(crate::artifact::NominalType::Array {
             name: 0,
+            super_type: None,
             element: primitive(1),
         });
 
@@ -867,6 +912,7 @@ fn cfg_accepts_dedicated_object_and_array_allocation_blocks() {
         .types
         .push(crate::artifact::NominalType::Array {
             name: 0,
+            super_type: None,
             element: primitive(1),
         });
     configure_entry(
@@ -974,6 +1020,7 @@ fn cfg_accepts_structurally_equivalent_imported_array_argument() {
         parameters.push(reference(1, false));
         module.types.push(crate::artifact::NominalType::Array {
             name: 0,
+            super_type: None,
             element: primitive(1),
         });
     }
