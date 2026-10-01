@@ -79,6 +79,13 @@ dynamic Guest unit. Exception references remain rooted during suspended unwindin
 An unjoined failed child does not crash the process; every join throws its original exception at the join site.
 Root-task failure terminates the process. OOM, quotas, VM faults and forced shutdown remain noncatchable.
 
+Runtime ABI 1.9 additionally encodes factory type roles in class flags bits 3..7 (0 ordinary;
+1 arithmetic, 2 bounds, 3 negative size, 4 null pointer, 5 cast, 6 argument, 7 state, 8 I/O).
+Unknown tags are rejected. Roles are unique across the artifact and identify non-abstract, non-generic
+zero-state Throwable subclasses; their intermediate ancestors cannot add fields, methods, interfaces
+or initializers. Only the verified Throwable root supplies the message/cause payload. This metadata
+extension does not change C ABI 18; operation and host factories are integrated in a separate stage.
+
 ## Strings and ownership
 
 The boundary carries borrowed UTF-16 code units because Kotlin `Char` and
