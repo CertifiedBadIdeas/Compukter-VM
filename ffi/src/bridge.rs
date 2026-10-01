@@ -82,11 +82,11 @@ pub(crate) enum OwnedOutcome {
     SliceExhausted,
     WaitingForHostQuota,
     HostRequestBatch(Vec<OwnedRequest>),
-    AllocationExhausted(ManagedAllocationFailure),
+    AllocationExhausted(ManagedAllocationFailure, String),
     QuotaExhausted(QuotaExhaustion),
     Halted(Option<OwnedValue>),
-    Crashed(GuestTrap),
-    Faulted(VmFault),
+    Crashed(GuestTrap, String),
+    Faulted(VmFault, String),
     HostFailed(OwnedHostFailure),
     WaitingForTerminalEvent,
     CompilationRequested { token: u64 },
@@ -343,7 +343,9 @@ pub(crate) fn advance(
                 session.compilation = Some(request);
                 Ok(OwnedOutcome::CompilationRequested { token })
             } else {
-                Ok(copy_outcome(outcome))
+                let mut owned = copy_outcome(outcome);
+                attach_failure_trace(&mut owned, &session.computer);
+                Ok(owned)
             }
         })
         .map_err(BridgeError::Handle)?
@@ -378,7 +380,9 @@ pub(crate) fn advance_with_retirement_limit(
                 session.compilation = Some(request);
                 Ok((OwnedOutcome::CompilationRequested { token }, retired))
             } else {
-                Ok((copy_outcome(outcome), retired))
+                let mut owned = copy_outcome(outcome);
+                attach_failure_trace(&mut owned, &session.computer);
+                Ok((owned, retired))
             }
         })
         .map_err(BridgeError::Handle)?
@@ -797,6 +801,21 @@ fn deployment_candidates() -> &'static HandleTable<Box<DeploymentCandidate>> {
     DEPLOYMENT_CANDIDATES.get_or_init(HandleTable::default)
 }
 
+fn attach_failure_trace(outcome: &mut OwnedOutcome, computer: &ComputerMachine) {
+    match outcome {
+        OwnedOutcome::AllocationExhausted(_, trace) | OwnedOutcome::Crashed(_, trace) => {
+            *trace = computer.failure_stacktrace();
+        }
+        OwnedOutcome::Faulted(_, trace) => {
+            *trace = format!(
+                "Detected while executing:\n{}",
+                computer.failure_stacktrace()
+            );
+        }
+        _ => {}
+    }
+}
+
 fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
     match outcome {
         ComputerAdvanceOutcome::SliceExhausted => OwnedOutcome::SliceExhausted,
@@ -841,12 +860,12 @@ fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
                 .collect(),
         ),
         ComputerAdvanceOutcome::AllocationExhausted(value) => {
-            OwnedOutcome::AllocationExhausted(value)
+            OwnedOutcome::AllocationExhausted(value, String::new())
         }
         ComputerAdvanceOutcome::QuotaExhausted(value) => OwnedOutcome::QuotaExhausted(value),
         ComputerAdvanceOutcome::Halted(value) => OwnedOutcome::Halted(value.map(copy_value)),
-        ComputerAdvanceOutcome::Crashed(value) => OwnedOutcome::Crashed(value),
-        ComputerAdvanceOutcome::Faulted(value) => OwnedOutcome::Faulted(value),
+        ComputerAdvanceOutcome::Crashed(value) => OwnedOutcome::Crashed(value, String::new()),
+        ComputerAdvanceOutcome::Faulted(value) => OwnedOutcome::Faulted(value, String::new()),
         ComputerAdvanceOutcome::HostFailed(value) => OwnedOutcome::HostFailed(value),
         ComputerAdvanceOutcome::CompilationRequested(_) => {
             unreachable!("compilation requests are retained by the bridge session")

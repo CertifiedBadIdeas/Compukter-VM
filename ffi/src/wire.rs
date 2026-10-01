@@ -381,9 +381,10 @@ pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
             }
             encoder
         }
-        OwnedOutcome::AllocationExhausted(value) => {
+        OwnedOutcome::AllocationExhausted(value, trace) => {
             let mut encoder = Encoder::new(2);
             encoder.u8(u8::from(value.collection_attempted));
+            encoder.bytes(trace.as_bytes());
             encoder
         }
         OwnedOutcome::QuotaExhausted(value) => {
@@ -408,14 +409,16 @@ pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
             }
             encoder
         }
-        OwnedOutcome::Crashed(value) => {
+        OwnedOutcome::Crashed(value, trace) => {
             let mut encoder = Encoder::new(5);
             encoder.u8(value as u8);
+            encoder.bytes(trace.as_bytes());
             encoder
         }
-        OwnedOutcome::Faulted(value) => {
+        OwnedOutcome::Faulted(value, trace) => {
             let mut encoder = Encoder::new(6);
             encoder.u8(value as u8);
+            encoder.bytes(trace.as_bytes());
             encoder
         }
         OwnedOutcome::HostFailed(value) => {
@@ -1177,16 +1180,25 @@ mod tests {
     #[test]
     fn terminal_failure_variants_have_stable_scalar_wire_forms() {
         assert_eq!(
-            vec![5, 0],
-            encode_outcome(OwnedOutcome::Crashed(GuestTrap::DivisionByZero))
+            vec![5, 0, 0, 0, 0, 0],
+            encode_outcome(OwnedOutcome::Crashed(
+                GuestTrap::DivisionByZero,
+                String::new()
+            ))
         );
         assert_eq!(
-            vec![5, 7],
-            encode_outcome(OwnedOutcome::Crashed(GuestTrap::InvalidArgument))
+            vec![5, 7, 0, 0, 0, 0],
+            encode_outcome(OwnedOutcome::Crashed(
+                GuestTrap::InvalidArgument,
+                String::new()
+            ))
         );
         assert_eq!(
-            vec![6, 7],
-            encode_outcome(OwnedOutcome::Faulted(VmFault::HandleExhausted))
+            vec![6, 7, 0, 0, 0, 0],
+            encode_outcome(OwnedOutcome::Faulted(
+                VmFault::HandleExhausted,
+                String::new()
+            ))
         );
         assert_eq!(
             vec![

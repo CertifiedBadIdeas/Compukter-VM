@@ -233,7 +233,7 @@ pub(crate) fn decode_artifact(
             &mut total_utf16_literal_code_units,
             limits,
         )?;
-        let debug = match optional(&container, scope, format::DEBUG) {
+        let mut debug = match optional(&container, scope, format::DEBUG) {
             Some(entry) => {
                 let section = IndexedSection::decode(&container, entry, limits)
                     .map_err(|error| single(limits, error))?;
@@ -248,6 +248,38 @@ pub(crate) fn decode_artifact(
             }
             None => Vec::new(),
         };
+        if let Some(entry) = optional(&container, scope, format::DEBUG_SOURCE_POSITIONS) {
+            let section = IndexedSection::decode(&container, entry, limits)
+                .map_err(|error| single(limits, error))?;
+            add_to_limit(
+                &mut total_debug_bytes,
+                section.record_bytes_len(),
+                limits.debug_bytes,
+                limits,
+                "total debug byte limit exceeded",
+            )?;
+            let mut previous = None;
+            for id in 0..section.len() {
+                let record = section.record(id as u32).map_err(single_raw)?;
+                let mut cursor = Cursor::new(record);
+                let index = ru32(&mut cursor)?;
+                let line = ru32(&mut cursor)?;
+                let column = ru32(&mut cursor)?;
+                finish(
+                    &cursor,
+                    record,
+                    line > 0 && column > 0 && previous.is_none_or(|value| index > value),
+                )?;
+                let value = debug.get_mut(index as usize).ok_or_else(|| {
+                    raw(
+                        Code::BadRecord,
+                        "debug source position index is outside DEBUG",
+                    )
+                })?;
+                value.source_position = Some((line, column));
+                previous = Some(index);
+            }
+        }
         modules.push(DecodedModule {
             name_string,
             flags,
@@ -759,6 +791,7 @@ fn parse_debug(
                 start: record_range.start + path_start,
                 end: record_range.start + path_start + path_length,
             },
+            source_position: None,
         });
     }
     if values.windows(2).any(|pair| {

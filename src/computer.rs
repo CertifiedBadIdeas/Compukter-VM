@@ -318,6 +318,7 @@ impl From<FileSystemError> for ComputerFileReadError {
 
 #[derive(Debug)]
 pub struct ComputerMachine {
+    root_artifact: VerifiedArtifact,
     machine_identity: Arc<()>,
     sessions: Vec<ProcessFrame>,
     terminal: TerminalDevice,
@@ -474,7 +475,7 @@ impl ComputerMachine {
                 ProcessFailureReason::LimitExceeded,
             ));
         }
-        let mut session = admit_session(artifact, profile.clone(), &owned_addon_bindings)
+        let mut session = admit_session(artifact.clone(), profile.clone(), &owned_addon_bindings)
             .map_err(ComputerStartError::Admission)?;
         session
             .start(arguments)
@@ -484,6 +485,7 @@ impl ComputerMachine {
             FileRights::INSPECT | FileRights::LIST | FileRights::READ,
         );
         Ok(Self {
+            root_artifact: artifact,
             machine_identity: Arc::new(()),
             sessions: vec![ProcessFrame {
                 session,
@@ -521,6 +523,17 @@ impl ComputerMachine {
 
     pub const fn terminal(&self) -> &TerminalDevice {
         &self.terminal
+    }
+
+    /// Detection-site trace, independent of the managed guest heap.
+    pub fn failure_stacktrace(&self) -> String {
+        let frame = self.active_frame();
+        let artifact = frame
+            .executable
+            .as_ref()
+            .map(|(_, artifact)| artifact)
+            .unwrap_or(&self.root_artifact);
+        format_failure_stack(artifact, frame.session.failure_stack())
     }
 
     pub fn submit_redstone_input(&mut self, packet: u32) -> Result<(), ComputerError> {
@@ -1091,7 +1104,7 @@ impl ComputerMachine {
                     if self.sessions.len() > 1 {
                         return self.finish_child(self.process_failure(
                             ProcessFailureReason::Trapped,
-                            &format!("guest trapped: {value:?}"),
+                            &format!("guest trapped: {value:?}\n{}", self.failure_stacktrace()),
                         ));
                     }
                     return Ok(ComputerAdvanceOutcome::Crashed(value));
@@ -1100,7 +1113,10 @@ impl ComputerMachine {
                     if self.sessions.len() > 1 {
                         return self.finish_child(self.process_failure(
                             ProcessFailureReason::VmFault,
-                            &format!("VM fault: {value:?}"),
+                            &format!(
+                                "VM fault: {value:?}\nDetected while executing:\n{}",
+                                self.failure_stacktrace()
+                            ),
                         ));
                     }
                     return Ok(ComputerAdvanceOutcome::Faulted(value));
@@ -2071,7 +2087,7 @@ impl ComputerMachine {
 
     fn child_allocation_diagnostic(&self, failure: ManagedAllocationFailure) -> String {
         let frame = self.active_frame();
-        let Some((path, artifact)) = &frame.executable else {
+        let Some((path, _)) = &frame.executable else {
             return "OutOfMemory".to_owned();
         };
         let diagnostic = failure.diagnostic;
@@ -2091,53 +2107,8 @@ impl ComputerMachine {
             "{path}: OutOfMemory\nHeap limit: {heap_limit}\nUsed: {} bytes; free: {} bytes\nAllocation: {} bytes ({kind})\nLargest free block: {} bytes\nGC: {gc}",
             diagnostic.live, diagnostic.total_free, diagnostic.requested, diagnostic.largest_free_block,
         );
-        let decoded = artifact.decoded();
-        let source = diagnostic.source;
-        if let Some(module) = decoded.modules.get(source.module as usize) {
-            // AllocationSource uses execution-image block IDs; DEBUG uses module-local IDs.
-            let first_block: usize = decoded.modules[..source.module as usize]
-                .iter()
-                .map(|module| module.blocks.len())
-                .sum();
-            if let Some(block) = (source.block as usize).checked_sub(first_block) {
-                let entry = module.debug.iter().rev().find(|entry| {
-                    entry.function.0 == source.function
-                        && entry.block.0 as usize == block
-                        && entry.instruction <= source.instruction
-                });
-                if let Some(entry) = entry {
-                    let path = std::str::from_utf8(entry.source_path.slice(&decoded.bytes))
-                        .expect("verified debug paths are UTF-8");
-                    // A verified artifact may still contain control characters in debug paths.
-                    let path: String = path
-                        .chars()
-                        .map(|ch| if ch.is_control() { '?' } else { ch })
-                        .collect();
-                    message.push_str(&format!(
-                        "\nat {path} (UTF-16 offset {})",
-                        entry.start_utf16
-                    ));
-                    return message;
-                }
-                let function = module
-                    .functions
-                    .get(source.function as usize)
-                    .and_then(|function| module.strings.get(function.name as usize))
-                    .map(|name| {
-                        std::str::from_utf8(name.slice(&decoded.bytes))
-                            .expect("verified function names are UTF-8")
-                    })
-                    .unwrap_or("bytecode");
-                let function: String = function
-                    .chars()
-                    .map(|ch| if ch.is_control() { '?' } else { ch })
-                    .collect();
-                message.push_str(&format!(
-                    "\nat {function} (module {}, block {block}, instruction {})",
-                    source.module, source.instruction,
-                ));
-            }
-        }
+        message.push('\n');
+        message.push_str(&self.failure_stacktrace());
         message
     }
 
@@ -2684,6 +2655,94 @@ fn copy_compiler_request(request: HostRequestView<'_>) -> Result<TerminalRequest
         id: request.id(),
         operation,
     })
+}
+
+fn format_failure_stack(
+    artifact: &VerifiedArtifact,
+    stack: crate::execution::FailureStack,
+) -> String {
+    let decoded = artifact.decoded();
+    let mut message = String::new();
+    let mut shown = 0;
+    for source in &stack.frames[..stack.length] {
+        let mut line = format!(
+            "at bytecode (module {}, block {}, instruction {})",
+            source.module, source.block, source.instruction
+        );
+        if let Some(module) = decoded.modules.get(source.module as usize) {
+            let first_block: usize = decoded.modules[..source.module as usize]
+                .iter()
+                .map(|module| module.blocks.len())
+                .sum();
+            let block = (source.block as usize).checked_sub(first_block);
+            let function = module
+                .functions
+                .get(source.function as usize)
+                .and_then(|function| module.strings.get(function.name as usize))
+                .map(|name| diagnostic_component(name.slice(&decoded.bytes)))
+                .unwrap_or_else(|| "bytecode".to_owned());
+            let entry = block.and_then(|block| {
+                let end = module.debug.partition_point(|entry| {
+                    (entry.function.0, entry.block.0 as usize, entry.instruction)
+                        <= (source.function, block, source.instruction)
+                });
+                end.checked_sub(1)
+                    .and_then(|index| module.debug.get(index))
+                    .filter(|entry| {
+                        entry.function.0 == source.function && entry.block.0 as usize == block
+                    })
+            });
+            line = if let Some(entry) = entry {
+                let path = diagnostic_component(entry.source_path.slice(&decoded.bytes));
+                if let Some((line, column)) = entry.source_position {
+                    format!("at {function} ({path}:{line}:{column})")
+                } else {
+                    format!(
+                        "at {function} ({path}, UTF-16 offset {})",
+                        entry.start_utf16
+                    )
+                }
+            } else {
+                format!(
+                    "at {function} (module {}, block {}, instruction {})",
+                    source.module,
+                    block.unwrap_or(source.block as usize),
+                    source.instruction
+                )
+            };
+        }
+        // Reserve room for an explicit truncation marker; wire and host storage remain bounded.
+        if message.len() + line.len() > 3500 {
+            break;
+        }
+        if !message.is_empty() {
+            message.push('\n');
+        }
+        message.push_str(&line);
+        shown += 1;
+    }
+    let omitted = stack.omitted + stack.length - shown;
+    if omitted > 0 {
+        message.push_str(&format!("\n... {omitted} frames omitted"));
+    }
+    if stack.length == 0 {
+        message.push_str("Stack trace unavailable");
+    }
+    message
+}
+
+fn diagnostic_component(bytes: &[u8]) -> String {
+    let value = std::str::from_utf8(bytes).unwrap_or("?");
+    let mut chars = value.chars();
+    let mut result: String = chars
+        .by_ref()
+        .take(192)
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    result
 }
 
 fn bounded_utf16(value: &str, maximum_code_units: usize) -> Box<[u16]> {
@@ -3769,6 +3828,7 @@ mod tests {
                         start,
                         end: bytes.len(),
                     },
+                    source_position: None,
                 });
                 decoded.bytes = bytes.into();
             }
@@ -3824,7 +3884,7 @@ mod tests {
             assert!(diagnostic.contains("(array)"), "{diagnostic}");
             if with_debug {
                 assert!(
-                    diagnostic.contains("at src/main.kt (UTF-16 offset 42)"),
+                    diagnostic.contains("at entry (src/main.kt, UTF-16 offset 42)"),
                     "{diagnostic}"
                 );
             } else {
@@ -5244,5 +5304,26 @@ mod tests {
                 maximum_total_code_units: 16_384,
             },
         }
+    }
+
+    #[test]
+    fn root_vm_fault_keeps_the_detection_frame_and_all_callers_with_bytecode_fallback() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::nested_fault_artifact(),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            computer.advance(64, 64, 8).unwrap(),
+            ComputerAdvanceOutcome::Faulted(VmFault::ReachedUnreachable)
+        ));
+        let trace = computer.failure_stacktrace();
+        let frames = trace.lines().collect::<Vec<_>>();
+        assert_eq!(3, frames.len(), "{trace}");
+        assert!(frames[0].contains("block 2, instruction 0"), "{trace}");
+        assert!(frames[1].contains("block 1, instruction 1"), "{trace}");
+        assert!(frames[2].contains("block 0, instruction 1"), "{trace}");
     }
 }

@@ -141,6 +141,7 @@ pub(super) struct Machine {
     task_string_response: Option<(TaskId, RequestId, Option<TaskId>)>,
     emergency_oom: Option<super::value::Ref32>,
     frame_depth: usize,
+    failure_stack: Option<FailureStack>,
     consumed_fixed_cost: u64,
     consumed_dynamic_cost: u64,
     consumed_maintenance_cost: u64,
@@ -150,6 +151,16 @@ pub(super) struct Machine {
     maximum_observed_frame_depth: usize,
     trace: Sha256,
     trace_enabled: bool,
+}
+
+pub(crate) const MAXIMUM_FAILURE_FRAMES: usize = 32;
+
+/// A host-owned, allocation-free snapshot; never reads possibly damaged guest storage.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FailureStack {
+    pub frames: [AllocationSource; MAXIMUM_FAILURE_FRAMES],
+    pub length: usize,
+    pub omitted: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -341,6 +352,7 @@ impl Machine {
             task_string_response: None,
             emergency_oom: Some(super::value::Ref32::reserved(0).unwrap()),
             frame_depth: 0,
+            failure_stack: None,
             consumed_fixed_cost: 0,
             consumed_dynamic_cost: 0,
             consumed_maintenance_cost: 0,
@@ -791,6 +803,12 @@ impl Machine {
         let attempts_before = self.executed_instructions;
         let pending_before = u64::from(self.has_pending_guest_instruction());
         let outcome = self.run_slice_inner(guest_budget, maintenance_budget, retirement_limit)?;
+        if matches!(
+            outcome,
+            Outcome::AllocationExhausted(_) | Outcome::Crashed(_) | Outcome::Faulted(_)
+        ) {
+            self.capture_failure_stack();
+        }
         let attempts = self.executed_instructions - attempts_before;
         let pending_after = u64::from(self.has_pending_guest_instruction());
         let completed = attempts + pending_before - pending_after;
@@ -2098,6 +2116,7 @@ impl Machine {
                     }
                     ResolvedInstruction::Throw { trap } => {
                         let outcome = Outcome::Crashed(*trap);
+                        self.capture_failure_stack();
                         self.lifecycle = Lifecycle::Terminal(outcome);
                         self.frame_depth = 0;
                         return Ok(outcome);
@@ -2251,6 +2270,7 @@ impl Machine {
     }
 
     fn fault(&mut self, fault: VmFault) -> Outcome {
+        self.capture_failure_stack();
         self.cancel_pending_allocation();
         self.cancel_pending_concat();
         self.cancel_pending_host_string();
@@ -2271,6 +2291,13 @@ impl Machine {
         collection_attempted: bool,
         source: AllocationSource,
     ) -> Outcome {
+        self.capture_failure_stack();
+        // Deferred allocation work retains the precise original instruction.
+        if let Some(stack) = &mut self.failure_stack {
+            if stack.length > 0 {
+                stack.frames[0] = source;
+            }
+        }
         let Some(exception) = self.emergency_oom else {
             return self.fault(VmFault::InvalidStoragePlan);
         };
@@ -2295,6 +2322,35 @@ impl Machine {
         });
         self.lifecycle = Lifecycle::Terminal(outcome);
         outcome
+    }
+
+    fn capture_failure_stack(&mut self) {
+        if self.failure_stack.is_none() {
+            self.failure_stack = Some(self.failure_stack());
+        }
+    }
+
+    pub(crate) fn failure_stack(&self) -> FailureStack {
+        if let Some(stack) = self.failure_stack {
+            return stack;
+        }
+        let empty = AllocationSource {
+            module: u32::MAX,
+            function: u32::MAX,
+            block: u32::MAX,
+            instruction: u32::MAX,
+        };
+        let depth = self.frame_depth.min(self.frames.len());
+        let length = depth.min(MAXIMUM_FAILURE_FRAMES);
+        let mut stack = FailureStack {
+            frames: [empty; MAXIMUM_FAILURE_FRAMES],
+            length,
+            omitted: self.frame_depth.saturating_sub(length),
+        };
+        for (index, target) in stack.frames[..length].iter_mut().enumerate() {
+            *target = self.allocation_source(depth - index - 1);
+        }
+        stack
     }
 
     fn start_collection(

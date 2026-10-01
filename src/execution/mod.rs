@@ -29,6 +29,7 @@ pub use host::{
     OperationSchema, OwnedHostFailure, QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
     MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
 };
+pub(crate) use machine::FailureStack;
 pub use session::Session;
 
 #[cfg(test)]

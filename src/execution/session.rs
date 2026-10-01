@@ -84,6 +84,10 @@ impl core::fmt::Debug for Session {
 }
 
 impl Session {
+    pub(crate) fn failure_stack(&self) -> super::machine::FailureStack {
+        self.machine.failure_stack()
+    }
+
     pub fn admit(
         artifact: VerifiedArtifact,
         profile: ExecutionProfile,

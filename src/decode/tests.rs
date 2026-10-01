@@ -911,6 +911,50 @@ fn records_decode_debug_golden_inline_ancestry() {
 }
 
 #[test]
+fn source_positions_roundtrip_without_changing_semantic_hashes() {
+    let mut artifact = decoded_fixture("debug.cpkt");
+    let hash = artifact.modules[0].semantic_hash;
+    artifact.modules[0].debug[0].source_position = Some((3, 8));
+    let bytes = crate::test_encode::encode_artifact(&artifact).unwrap();
+    let decoded =
+        super::records::decode_artifact(bytes.into(), &ArtifactLimits::default()).unwrap();
+    assert_eq!(Some((3, 8)), decoded.modules[0].debug[0].source_position);
+    assert_eq!(None, decoded.modules[0].debug[1].source_position);
+    assert_eq!(hash, decoded.modules[0].semantic_hash);
+    for position in [(0, 8), (3, 0)] {
+        artifact.modules[0].debug[0].source_position = Some(position);
+        let bytes = crate::test_encode::encode_artifact(&artifact).unwrap();
+        assert!(super::records::decode_artifact(bytes.into(), &ArtifactLimits::default()).is_err());
+    }
+}
+
+#[test]
+fn source_positions_reject_duplicate_and_out_of_range_debug_indices() {
+    let mut artifact = decoded_fixture("debug.cpkt");
+    for entry in &mut artifact.modules[0].debug {
+        entry.source_position = Some((3, 8));
+    }
+    let original = crate::test_encode::encode_artifact(&artifact).unwrap();
+    let container =
+        super::container::decode_container(&original, &ArtifactLimits::default()).unwrap();
+    let entry = container
+        .directory
+        .iter()
+        .find(|entry| entry.kind == crate::artifact::format::DEBUG_SOURCE_POSITIONS)
+        .unwrap();
+    let section =
+        super::indexed::IndexedSection::decode(&container, entry, &ArtifactLimits::default())
+            .unwrap();
+    let record = section.record_range(1).unwrap().start;
+    for index in [0, 2] {
+        let mut bytes = original.clone();
+        support::write_u32(&mut bytes, record, index);
+        support::rehash(&mut bytes);
+        assert!(super::records::decode_artifact(bytes.into(), &ArtifactLimits::default()).is_err());
+    }
+}
+
+#[test]
 fn instruction_decodes_host_runtime_golden() {
     let bytes = std::fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host-runtime.code"),

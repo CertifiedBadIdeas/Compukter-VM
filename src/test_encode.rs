@@ -74,6 +74,29 @@ pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, Enc
                 .collect::<Result<Vec<_>, _>>()?;
             let count = to_u32(records.len(), "debug count exceeds u32")?;
             sections.push((format::DEBUG, scope, indexed(records)?, count));
+            let positions = decoded
+                .debug
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    entry.source_position.map(|(line, column)| {
+                        let mut bytes = Vec::new();
+                        u32le(&mut bytes, index as u32);
+                        u32le(&mut bytes, line);
+                        u32le(&mut bytes, column);
+                        bytes
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !positions.is_empty() {
+                let count = positions.len() as u32;
+                sections.push((
+                    format::DEBUG_SOURCE_POSITIONS,
+                    scope,
+                    indexed(positions)?,
+                    count,
+                ));
+            }
         }
     }
     assemble(
@@ -1174,7 +1197,7 @@ fn assemble(
         u16le(&mut bytes, *kind);
         u16le(
             &mut bytes,
-            if *kind == format::DEBUG {
+            if matches!(*kind, format::DEBUG | format::DEBUG_SOURCE_POSITIONS) {
                 0
             } else {
                 format::KNOWN_FLAGS
@@ -1392,6 +1415,7 @@ mod tests {
             end_utf16: 5,
             inline_parent: u32::MAX,
             source_path: ByteRange { start: 0, end: 0 },
+            source_position: None,
         };
 
         assert_eq!(encode_capability(&capability).len(), 24);

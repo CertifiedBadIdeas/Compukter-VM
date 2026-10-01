@@ -48,6 +48,27 @@ most 256 bytes and become stable `HostFailed` outcomes rather than guest traps
 or VM faults. The detail uses a fixed session-resident buffer reserved during
 admission, so accepting a failure allocates nothing.
 
+## Terminal failure stacks
+
+The machine captures at most 32 active frames innermost first before terminal
+failure teardown. Snapshot storage is reserved in fixed machine state and reads
+only host-owned frame and execution-image metadata, not Guest heap contents.
+Each frame retains its module-local function and execution-image instruction
+position; active callers remain at their call instruction. Excess depth is
+recorded as an explicit omitted count. Other tasks are not fabricated as callers.
+
+`ComputerMachine::failure_stacktrace` formats this snapshot using immutable
+verified artifact metadata. The formatted trace is byte-bounded, sanitizes
+control characters and reports omitted frames. Optional nonsemantic module
+section `0x8001` supplements existing DEBUG records with one-based line/column:
+indexed records are three little-endian u32 fields (DEBUG index, line, column),
+with strictly increasing valid indices and positive coordinates. Older artifacts
+retain UTF-16-offset or bytecode fallback. Neither section changes semantic hashes.
+
+C ABI 17 appends a length-prefixed UTF-8 trace after the scalar payload of
+outcome tags 2, 5 and 6. Both native transports use that same wire contract.
+VM fault traces describe the detection site, not necessarily the corruption cause.
+
 ## Strings and ownership
 
 The boundary carries borrowed UTF-16 code units because Kotlin `Char` and

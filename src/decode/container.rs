@@ -447,7 +447,8 @@ fn validate_entry(
         ));
     }
     if known {
-        let expected_flags = if entry.kind == format::DEBUG {
+        let expected_flags = if matches!(entry.kind, format::DEBUG | format::DEBUG_SOURCE_POSITIONS)
+        {
             0
         } else {
             format::KNOWN_FLAGS
