@@ -20,7 +20,8 @@ mod text;
 mod value;
 
 pub use error::{
-    AdmissionError, EntryArgumentLimit, GuestTrap, ResidentStorageComponent, RunError, VmFault,
+    AdmissionError, DiagnosticError, EntryArgumentLimit, GuestTrap, ResidentStorageComponent,
+    RunError, VmFault,
 };
 pub use host::{
     AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,

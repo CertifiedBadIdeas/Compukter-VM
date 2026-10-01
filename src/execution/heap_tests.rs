@@ -741,7 +741,11 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
     );
     assert_eq!(
         TaskScheduler::resident_bytes(image.maximum_coroutines() as u64).unwrap()
-            + Machine::task_failure_bytes(image.maximum_coroutines() as u64).unwrap(),
+            + Machine::task_failure_bytes(
+                image.maximum_coroutines() as u64,
+                image.runtime_exception_type(8).is_some()
+            )
+            .unwrap(),
         plan.task_scheduler_bytes,
     );
     assert_eq!(0, plan.channel_bytes);

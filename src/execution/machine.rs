@@ -20,6 +20,7 @@ use super::{
     value::{EntryArgument, Ref32, ReferenceDomain, RuntimeValue},
     TypeKey,
 };
+use crate::VerifiedArtifact;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -124,6 +125,7 @@ pub(super) struct Machine {
     task_frames: Box<[Frame]>,
     task_frame_depths: Box<[usize]>,
     task_failures: Box<[Option<TaskFailure>]>,
+    task_host_failures: Box<[Option<PendingHostFailure>]>,
     tasks: TaskScheduler,
     channels: ChannelArena,
     frame_arena: FrameArena,
@@ -179,6 +181,14 @@ struct PendingException {
     failure: TaskFailure,
     actual_type: TypeKey,
     next_handler: usize,
+    retires_instruction: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingHostFailure {
+    role: u8,
+    length: usize,
+    bytes: [u8; super::host::MAXIMUM_HOST_FAILURE_DETAIL_BYTES],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -235,6 +245,7 @@ struct PendingRaise {
     message: Option<Ref32>,
     exception: Option<Ref32>,
     stack: FailureStack,
+    retires_instruction: bool,
 }
 
 fn task_fault(error: TaskError) -> VmFault {
@@ -289,8 +300,14 @@ impl AllocationRetry {
 }
 
 impl Machine {
-    pub(super) const fn task_failure_bytes(capacity: u64) -> Option<u64> {
-        (core::mem::size_of::<Option<TaskFailure>>() as u64).checked_mul(capacity)
+    pub(super) const fn task_failure_bytes(capacity: u64, host_failures: bool) -> Option<u64> {
+        let per_task = core::mem::size_of::<Option<TaskFailure>>()
+            + if host_failures {
+                core::mem::size_of::<Option<PendingHostFailure>>()
+            } else {
+                0
+            };
+        (per_task as u64).checked_mul(capacity)
     }
 
     pub(super) const fn pending_state_bytes() -> u64 {
@@ -355,6 +372,16 @@ impl Machine {
             .try_reserve_exact(task_count)
             .map_err(|_| AdmissionError::AllocationFailed)?;
         task_failures.resize(task_count, None);
+        let host_failure_count = if image.runtime_exception_type(8).is_some() {
+            task_count
+        } else {
+            0
+        };
+        let mut task_host_failures = Vec::new();
+        task_host_failures
+            .try_reserve_exact(host_failure_count)
+            .map_err(|_| AdmissionError::AllocationFailed)?;
+        task_host_failures.resize(host_failure_count, None);
         let tasks = TaskScheduler::new(task_count).map_err(|_| AdmissionError::AllocationFailed)?;
         let channels = ChannelArena::new(
             image.maximum_channels(),
@@ -383,6 +410,7 @@ impl Machine {
             task_frames: task_frames.into_boxed_slice(),
             task_frame_depths: task_frame_depths.into_boxed_slice(),
             task_failures: task_failures.into_boxed_slice(),
+            task_host_failures: task_host_failures.into_boxed_slice(),
             tasks,
             channels,
             frame_arena,
@@ -578,7 +606,56 @@ impl Machine {
             return Ok(false);
         };
         self.restore_task(task)?;
+        let slot = self.tasks.slot_of(task).ok_or(VmFault::CorruptLifecycle)?;
+        if let Some(failure) = self.task_host_failures.get_mut(slot).and_then(Option::take) {
+            let detail = core::str::from_utf8(&failure.bytes[..failure.length])
+                .map_err(|_| VmFault::CorruptLifecycle)?;
+            self.begin_runtime_exception(failure.role, detail)?;
+            self.pending_raise
+                .as_mut()
+                .ok_or(VmFault::CorruptLifecycle)?
+                .retires_instruction = false;
+        }
         Ok(true)
+    }
+
+    pub(super) fn complete_task_host_failure(
+        &mut self,
+        task: TaskId,
+        request: RequestId,
+        role: u8,
+        detail: &str,
+    ) -> Result<(), VmFault> {
+        if detail.len() > super::host::MAXIMUM_HOST_FAILURE_DETAIL_BYTES
+            || self.tasks.state(task)
+                != Some(super::task::TaskState::Waiting(
+                    super::task::TaskWait::Host(request),
+                ))
+        {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        let slot = self.tasks.slot_of(task).ok_or(VmFault::CorruptLifecycle)?;
+        let target = self
+            .task_host_failures
+            .get_mut(slot)
+            .ok_or(VmFault::InvalidStoragePlan)?;
+        if target.is_some() {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        let mut bytes = [0; super::host::MAXIMUM_HOST_FAILURE_DETAIL_BYTES];
+        bytes[..detail.len()].copy_from_slice(detail.as_bytes());
+        *target = Some(PendingHostFailure {
+            role,
+            length: detail.len(),
+            bytes,
+        });
+        self.tasks
+            .complete_host(task, request)
+            .map_err(task_fault)?;
+        if self.tasks.current().is_err() && self.task_string_response.is_none() {
+            self.activate_next_task()?;
+        }
+        Ok(())
     }
 
     pub(super) fn current_task(&self) -> Result<TaskId, VmFault> {
@@ -881,9 +958,13 @@ impl Machine {
     }
 
     fn has_pending_guest_instruction(&self) -> bool {
+        if let Some(pending) = self.pending_raise {
+            return pending.retires_instruction;
+        }
+        if let Some(pending) = self.pending_exception {
+            return pending.retires_instruction;
+        }
         self.pending_allocation.is_some()
-            || self.pending_raise.is_some()
-            || self.pending_exception.is_some()
             || self.pending_array_copy.is_some()
             || self.pending_text.is_some()
             || self.pending_concat.is_some()
@@ -2313,6 +2394,7 @@ impl Machine {
             failure,
             actual_type,
             next_handler: 0,
+            retires_instruction: true,
         });
         Ok(())
     }
@@ -2342,6 +2424,7 @@ impl Machine {
             message: None,
             exception: None,
             stack: self.failure_stack(),
+            retires_instruction: true,
         });
         Ok(())
     }
@@ -2477,6 +2560,7 @@ impl Machine {
         }) {
             return Some(self.fault(fault));
         }
+        self.pending_exception.as_mut()?.retires_instruction = pending.retires_instruction;
         None
     }
 
@@ -2544,6 +2628,10 @@ impl Machine {
             }
         }
         result
+    }
+
+    pub(super) fn owns_artifact(&self, artifact: &VerifiedArtifact) -> bool {
+        self.image.content_hash() == artifact.content_hash()
     }
 
     fn resume_exception(&mut self, remaining: &mut u32) -> Result<Option<Outcome>, VmFault> {
@@ -3865,6 +3953,7 @@ impl Machine {
             + self.task_frames.len() * core::mem::size_of::<Frame>()
             + self.task_frame_depths.len() * core::mem::size_of::<usize>()
             + self.task_failures.len() * core::mem::size_of::<Option<TaskFailure>>()
+            + self.task_host_failures.len() * core::mem::size_of::<Option<PendingHostFailure>>()
             + self.tasks.reserved_bytes()
             + self.channels.reserved_bytes()
             + self.frame_arena.reserved_bytes()

@@ -92,6 +92,19 @@ impl Session {
         self.machine.exception_diagnostic(artifact.decoded())
     }
 
+    /// Reads the bounded class/message/cause diagnostic using the admitted artifact's metadata.
+    /// Returns an empty string when no exception is pending, and rejects a different artifact.
+    /// This read does not advance execution or expose a managed reference.
+    pub fn uncaught_exception_diagnostic(
+        &self,
+        artifact: &VerifiedArtifact,
+    ) -> Result<String, super::error::DiagnosticError> {
+        if !self.machine.owns_artifact(artifact) {
+            return Err(super::error::DiagnosticError::ArtifactMismatch);
+        }
+        Ok(self.exception_diagnostic(artifact))
+    }
+
     pub fn admit(
         artifact: VerifiedArtifact,
         profile: ExecutionProfile,
@@ -480,12 +493,28 @@ impl Session {
             if failure.detail().len() > self.failure_detail.len() {
                 return Err(ResumeError::ResponseTooLarge);
             }
-            self.failure_detail[..failure.detail().len()]
-                .copy_from_slice(failure.detail().as_bytes());
-            self.failure_detail_length = failure.detail().len();
+            if failure.kind() == HostFailureKind::Cancelled {
+                self.failure_detail[..failure.detail().len()]
+                    .copy_from_slice(failure.detail().as_bytes());
+                self.failure_detail_length = failure.detail().len();
+                self.terminal = Some(SessionTerminal::HostFailed(failure.kind()));
+            } else {
+                let role = match failure.kind() {
+                    HostFailureKind::EndOfFile | HostFailureKind::InputOutput => 8,
+                    HostFailureKind::Unavailable | HostFailureKind::Other => 7,
+                    HostFailureKind::Cancelled => unreachable!(),
+                };
+                if let Err(fault) = self.machine.complete_task_host_failure(
+                    task,
+                    request_id,
+                    role,
+                    failure.detail(),
+                ) {
+                    self.terminal = Some(SessionTerminal::Faulted(fault));
+                }
+            }
             self.accept_response(request_id, response);
             let _ = self.pending_requests.take(identity);
-            self.terminal = Some(SessionTerminal::HostFailed(failure.kind()));
             return Ok(());
         }
         let HostResponse::Success(input) = response else {

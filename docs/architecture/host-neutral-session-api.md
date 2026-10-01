@@ -45,9 +45,13 @@ oversized strings, and empty or oversized failure details are correctable
 `ResumeError` values: the original request and accounting stay unchanged. A
 valid response is accepted exactly once. Explicit host failures carry one of
 the shared failure kinds plus a non-empty human-readable UTF-8 detail of at
-most 256 bytes and become stable `HostFailed` outcomes rather than guest traps
-or VM faults. The detail uses a fixed session-resident buffer reserved during
-admission, so accepting a failure allocates nothing.
+most 256 bytes. EOF/I/O failures raise managed IOException; unavailable/other
+failures raise IllegalStateException. Cancellation remains a stable `HostFailed`
+outcome. Ordinary failure details are copied into admission-reserved per-task
+storage, so accepting a failure allocates nothing. Materialization waits until
+the failed task's frames are restored and raises at the original host-call PC;
+multiple responses before the next advance cannot overwrite one another.
+The call was already retired at publication and is not retired again by the factory.
 
 ## Terminal failure stacks
 
@@ -79,17 +83,22 @@ dynamic Guest unit. Exception references remain rooted during suspended unwindin
 An unjoined failed child does not crash the process; every join throws its original exception at the join site.
 Root-task failure terminates the process. OOM, quotas, VM faults and forced shutdown remain noncatchable.
 
+`Session::uncaught_exception_diagnostic` reads bounded class/message/cause text
+without advancing execution or exporting a managed reference. It requires the
+admitted artifact's content hash and returns `DiagnosticError::ArtifactMismatch`
+for foreign metadata; it returns an empty string when no exception is pending.
+
 Runtime ABI 1.9 additionally encodes factory type roles in class flags bits 3..7 (0 ordinary;
 1 arithmetic, 2 bounds, 3 negative size, 4 null pointer, 5 cast, 6 argument, 7 state, 8 I/O).
 Unknown tags are rejected. Roles are unique across the artifact and identify non-abstract, non-generic
 zero-state Throwable subclasses; their intermediate ancestors cannot add fields, methods, interfaces
 or initializers. Only the verified Throwable root supplies the message/cause payload. This metadata
 extension does not change C ABI 18. Fallible integer arithmetic, arrays, string ranges, reference access/casts
-and channels require their factory roles and ABI 1.9, including without a handler; legacy artifacts containing
+channels and host capability calls require their factory roles and ABI 1.9, including without a handler; legacy artifacts containing
 these operations require rebuilding. Their bounded message and ordinary managed
 exception are built through budgeted allocation and collection; pending references are GC roots.
 Factory OOM stays noncatchable. Floating division is nonthrowing. Stack overflow and channel-storage exhaustion
-remain noncatchable resource failures. Host factories are being integrated separately.
+remain noncatchable resource failures.
 
 ## Strings and ownership
 

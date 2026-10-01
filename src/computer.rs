@@ -4121,15 +4121,11 @@ mod tests {
         let failure = loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
-                ComputerAdvanceOutcome::HostFailed(failure) => break failure,
+                ComputerAdvanceOutcome::UncaughtException(diagnostic) => break diagnostic,
                 other => panic!("unexpected conflicting stdio outcome: {other:?}"),
             }
         };
-        assert_eq!(HostFailureKind::Unavailable, failure.kind());
-        assert_eq!(
-            "Terminal input is already owned by another process",
-            failure.detail()
-        );
+        assert!(failure.contains("Terminal input is already owned by another process"));
         assert_eq!(
             Some(ComputerTerminalEventKind::Text),
             computer.terminal_await_event().unwrap()
@@ -4682,7 +4678,7 @@ mod tests {
             process_v2_result_with_addons(&child_bytes, &[], None),
         );
         assert_eq!(
-            ProcessFailureReason::HostFailure.status(),
+            ProcessFailureReason::Trapped.status(),
             process_v2_result_with_addons(
                 &child_bytes,
                 &[addon],
@@ -5115,9 +5111,8 @@ mod tests {
         loop {
             match computer.advance(128, 128, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted => {}
-                ComputerAdvanceOutcome::HostFailed(failure) => {
-                    assert_eq!(HostFailureKind::InputOutput, failure.kind());
-                    assert_eq!("Filesystem quota was exceeded", failure.detail());
+                ComputerAdvanceOutcome::UncaughtException(diagnostic) => {
+                    assert!(diagnostic.contains("Filesystem quota was exceeded"));
                     break;
                 }
                 other => panic!("unexpected bounded filesystem outcome: {other:?}"),

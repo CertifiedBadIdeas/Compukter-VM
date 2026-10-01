@@ -1,6 +1,11 @@
 use super::value::{Ref32, RuntimeValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticError {
+    ArtifactMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidentStorageComponent {
     HeapArena,
     HeapAllocator,

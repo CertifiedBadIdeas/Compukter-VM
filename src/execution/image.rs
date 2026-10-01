@@ -790,7 +790,13 @@ impl ExecutionImage {
                 component: ResidentStorageComponent::FrameRecords,
             })?;
         let task_scheduler_bytes = TaskScheduler::resident_bytes(maximum_coroutines)
-            .and_then(|bytes| Machine::task_failure_bytes(maximum_coroutines)?.checked_add(bytes))
+            .and_then(|bytes| {
+                Machine::task_failure_bytes(
+                    maximum_coroutines,
+                    runtime_exception_types[7].is_some(),
+                )?
+                .checked_add(bytes)
+            })
             .ok_or(AdmissionError::ResidentStorageOverflow {
                 component: ResidentStorageComponent::TaskScheduler,
             })?;
