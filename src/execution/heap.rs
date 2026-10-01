@@ -65,6 +65,11 @@ pub(super) struct Heap {
     class_heads: Box<[u32]>,
     first_bitmap: u32,
     second_bitmaps: [u8; 32],
+    // A valid free block, not necessarily the current maximum after removal.
+    // Insertions keep the larger candidate; removal invalidates it. Sweep
+    // observes every surviving free block, restoring an exact maximum before
+    // the post-collection allocation retry, without an unbudgeted list scan.
+    largest_free_hint: u32,
     total_free: u32,
     live_objects: u32,
 }
@@ -104,6 +109,7 @@ impl Heap {
             class_heads: class_heads.into_boxed_slice(),
             first_bitmap: 0,
             second_bitmaps: [0; 32],
+            largest_free_hint: NULL_OFFSET,
             total_free: heap_bytes,
             live_objects: 0,
         };
@@ -502,6 +508,7 @@ impl Heap {
         // The forward sweep knows the effective predecessor size even after merging.
         self.write_previous_or_gray(block, previous_size)?;
         if !self.block_allocated(block)? {
+            self.observe_free_block(block)?;
             return Ok((offset.checked_add(size).ok_or(VmFault::CorruptHeap)?, size));
         }
         let flags = self.read_flags(block)?;
@@ -578,6 +585,15 @@ impl Heap {
         let Some(class) = request_size_class(size) else {
             return Ok(None);
         };
+        // The rounded-up bitmap search excludes the request's partial bucket.
+        // Its head may already fit; inspect it in constant time, preserving LIFO.
+        let lower = free_size_class(size).ok_or(VmFault::CorruptHeap)?;
+        if lower != class {
+            let head = self.class_heads[class_index(lower)];
+            if head != NULL_OFFSET && self.block_size(BlockOffset(head))? >= size {
+                return Ok(Some(BlockOffset(head)));
+            }
+        }
         let first = class.first as usize;
         let second_mask = self.second_bitmaps[first] & (u8::MAX << class.second);
         let selected = if second_mask != 0 {
@@ -592,7 +608,16 @@ impl Heap {
                 self.first_bitmap & (u32::MAX << (u32::from(class.first) + 1))
             };
             if higher_first == 0 {
-                return Ok(None);
+                // A fitting block can be hidden behind a smaller bucket head.
+                // After a full sweep the hint is the largest actual free block,
+                // so a failed retry now means no contiguous block can fit.
+                return if self.largest_free_hint != NULL_OFFSET
+                    && self.block_size(BlockOffset(self.largest_free_hint))? >= size
+                {
+                    Ok(Some(BlockOffset(self.largest_free_hint)))
+                } else {
+                    Ok(None)
+                };
             }
             let selected_first = higher_first.trailing_zeros() as u8;
             let selected_second = self.second_bitmaps[selected_first as usize];
@@ -626,10 +651,23 @@ impl Heap {
         self.class_heads[index] = block.0;
         self.second_bitmaps[class.first as usize] |= 1 << class.second;
         self.first_bitmap |= 1 << class.first;
+        self.observe_free_block(block)?;
+        Ok(())
+    }
+
+    fn observe_free_block(&mut self, block: BlockOffset) -> Result<(), VmFault> {
+        if self.largest_free_hint == NULL_OFFSET
+            || self.block_size(block)? > self.block_size(BlockOffset(self.largest_free_hint))?
+        {
+            self.largest_free_hint = block.0;
+        }
         Ok(())
     }
 
     fn remove_free(&mut self, block: BlockOffset) -> Result<(), VmFault> {
+        if self.largest_free_hint == block.0 {
+            self.largest_free_hint = NULL_OFFSET;
+        }
         let class = free_size_class(self.block_size(block)?).ok_or(VmFault::CorruptHeap)?;
         let index = class_index(class);
         let next = self.read_word(block, NEXT_FREE)?;

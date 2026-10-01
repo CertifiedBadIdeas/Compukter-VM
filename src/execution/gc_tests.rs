@@ -702,6 +702,59 @@ fn oom_fragmentation_survives_full_collection_with_sufficient_total_free() {
 }
 
 #[test]
+fn collector_recovers_a_fitting_block_after_the_largest_hint_is_consumed() {
+    let image = ExecutionImage::admit(
+        fixtures::reference_field_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    for format in [HeaderFormat::Legacy, HeaderFormat::select(1168, 2)] {
+        let mut heap = Heap::new(
+            &image
+                .storage_plan()
+                .with_heap_arena_bytes(1168)
+                .with_header_format(format),
+        )
+        .unwrap();
+        let ty = TypeKey { module: 0, ty: 1 };
+        let references = [272, 32, 256, 32, 512, 64].map(|size| allocate(&mut heap, ty, size));
+        heap.free(references[0]).unwrap();
+        heap.free(references[2]).unwrap();
+        heap.free(references[4]).unwrap();
+        let retained = allocate(&mut heap, ty, 512);
+        let mut roots = ExternalRootTable::new(4).unwrap();
+        for reference in [references[1], references[3], retained, references[5]] {
+            roots.retain(reference).unwrap();
+        }
+        let actions = collect_with_external_roots(
+            &mut Collector::new(),
+            &mut heap,
+            &image,
+            &[],
+            &[],
+            &[],
+            &roots,
+        );
+        assert_eq!(
+            6,
+            actions
+                .iter()
+                .filter(|action| matches!(action, CollectorAction::Sweep(_)))
+                .count()
+        );
+        assert_eq!(528, heap.diagnostic().total_free);
+        assert_eq!(272, heap.diagnostic().largest_free_block);
+        assert!(heap
+            .reserve(AllocationRequest {
+                block_bytes: 264,
+                type_id: ty.ty
+            })
+            .unwrap()
+            .is_some());
+    }
+}
+
+#[test]
 fn collector_handles_cycles_diamonds_duplicate_roots_statics_and_multiple_frames_fifo() {
     let image = ExecutionImage::admit(fixtures::gc_graph_artifact(), fixtures::profile()).unwrap();
     let mut heap = Heap::new(&image.storage_plan()).unwrap();

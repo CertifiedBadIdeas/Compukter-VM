@@ -101,12 +101,12 @@ fn allocator_absorbs_only_tails_below_16_bytes() -> Result<(), AdmissionError> {
 }
 
 #[test]
-fn allocator_uses_conservative_upward_search_and_lifo_free_lists() -> Result<(), AdmissionError> {
+fn allocator_uses_exact_fit_and_lifo_free_lists() -> Result<(), AdmissionError> {
     let mut fragmented = Heap::new(&allocator_plan(272))?;
-    assert!(fragmented
-        .reserve(allocator_request(272))
-        .unwrap()
-        .is_none());
+    let exact = fragmented.reserve(allocator_request(272)).unwrap().unwrap();
+    assert_eq!(BlockOffset(0), exact.block);
+    assert_eq!(0, fragmented.diagnostic().total_free);
+    fragmented.abort(exact).unwrap();
     assert_eq!(
         BlockOffset(0),
         fragmented
@@ -129,6 +129,49 @@ fn allocator_uses_conservative_upward_search_and_lifo_free_lists() -> Result<(),
         heap.reserve(allocator_request(32)).unwrap().unwrap().block
     );
     Ok(())
+}
+
+#[test]
+fn allocator_accepts_fitting_requests_inside_size_class_boundaries() {
+    for arena_bytes in (256..=512).step_by(16) {
+        for request_bytes in (256..=arena_bytes).step_by(8) {
+            let mut heap = Heap::new(&allocator_plan(arena_bytes)).unwrap();
+            assert!(
+                heap.reserve(allocator_request(request_bytes))
+                    .unwrap()
+                    .is_some(),
+                "request {request_bytes}, arena {arena_bytes}"
+            );
+        }
+    }
+}
+
+#[test]
+fn allocator_accepts_the_reported_array_list_growth_request() {
+    let format = HeaderFormat::select(256 * 1024, 2);
+    let mut heap = Heap::new(&allocator_plan(256 * 1024).with_header_format(format)).unwrap();
+    heap.reserve(allocator_request(104_688)).unwrap().unwrap();
+    assert_eq!(157_456, heap.diagnostic().largest_free_block);
+    let grown = heap.reserve(allocator_request(156_912)).unwrap().unwrap();
+    assert_eq!(BlockOffset(104_688), grown.block);
+    assert_eq!(544, heap.diagnostic().total_free);
+}
+
+#[test]
+fn allocator_finds_a_fitting_block_behind_a_smaller_free_list_head() {
+    let mut heap = Heap::new(&allocator_plan(1024)).unwrap();
+    let mut references = Vec::new();
+    for size in [272, 16, 256, 16, 464] {
+        let reservation = heap.reserve(allocator_request(size)).unwrap().unwrap();
+        references.push(heap.commit(reservation).unwrap());
+    }
+    heap.free(references[0]).unwrap();
+    heap.free(references[2]).unwrap();
+    assert_eq!(
+        BlockOffset(0),
+        heap.reserve(allocator_request(264)).unwrap().unwrap().block
+    );
+    assert!(heap.reserve(allocator_request(264)).unwrap().is_none());
 }
 
 #[test]
