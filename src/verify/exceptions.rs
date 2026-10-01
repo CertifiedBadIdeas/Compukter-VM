@@ -221,6 +221,7 @@ pub(crate) fn verify_semantic_features(
     let mut uses_channels = false;
     let mut uses_i64_string_conversion = false;
     let mut uses_f32_string_conversion = false;
+    let mut uses_array_copy = false;
     for module in &artifact.modules {
         if !module.exceptions.is_empty()
             || module
@@ -276,6 +277,14 @@ pub(crate) fn verify_semantic_features(
                         | Instruction::ChannelReceive { .. }
                 )
             });
+        uses_array_copy |= module
+            .code
+            .iter()
+            .flat_map(|code| code.instructions.iter())
+            .any(|instruction| matches!(instruction, Instruction::ArrayCopy { .. }));
+        if uses_array_copy {
+            expected |= 1 << 5;
+        }
         uses_i64_string_conversion |= module
             .code
             .iter()
@@ -307,6 +316,18 @@ pub(crate) fn verify_semantic_features(
         if uses_channels {
             expected |= 1 << 4;
         }
+    }
+    if uses_array_copy && (artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 5) {
+        let mut diagnostic = Diagnostic::at_offset(
+            Family::Module,
+            Code::BadModule,
+            6,
+            "array copying requires minimum runtime ABI 1.5",
+        );
+        diagnostic.location.section = None;
+        let mut errors = DiagnosticSet::new(limits.diagnostics);
+        errors.push(diagnostic);
+        return Err(errors);
     }
     if uses_tasks && (artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 1) {
         let mut diagnostic = Diagnostic::at_offset(

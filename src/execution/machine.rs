@@ -1,4 +1,5 @@
 use super::{
+    array_copy::PendingArrayCopy,
     channel::{ChannelArena, ChannelError, ReceiveResult, SendResult},
     error::{
         AdmissionError, AllocationDiagnostic, AllocationExhaustion, AllocationRequestKind,
@@ -132,6 +133,7 @@ pub(super) struct Machine {
     collector: Collector,
     allocation_retry: Option<AllocationRetry>,
     pending_allocation: Option<PendingAllocation>,
+    pending_array_copy: Option<PendingArrayCopy>,
     pending_text: Option<text::PendingText>,
     pending_concat: Option<text::PendingConcat>,
     pending_concat_source: Option<AllocationSource>,
@@ -254,6 +256,7 @@ impl AllocationRetry {
 impl Machine {
     pub(super) const fn pending_state_bytes() -> u64 {
         (core::mem::size_of::<Option<AllocationRetry>>()
+            + core::mem::size_of::<Option<PendingArrayCopy>>()
             + core::mem::size_of::<Option<PendingAllocation>>()
             + core::mem::size_of::<Option<text::PendingText>>()
             + core::mem::size_of::<Option<text::PendingConcat>>()
@@ -343,6 +346,7 @@ impl Machine {
             collector: Collector::new(),
             allocation_retry: None,
             pending_allocation: None,
+            pending_array_copy: None,
             pending_text: None,
             pending_concat: None,
             pending_concat_source: None,
@@ -826,6 +830,7 @@ impl Machine {
 
     fn has_pending_guest_instruction(&self) -> bool {
         self.pending_allocation.is_some()
+            || self.pending_array_copy.is_some()
             || self.pending_text.is_some()
             || self.pending_concat.is_some()
             || self.allocation_retry.is_some()
@@ -885,6 +890,11 @@ impl Machine {
                 .ok_or(RunError::NotRunnable)?;
             if self.pending_allocation.is_some() {
                 if let Some(outcome) = self.resume_pending_allocation(frame_index, &mut remaining) {
+                    return Ok(outcome);
+                }
+            }
+            if self.pending_array_copy.is_some() {
+                if let Some(outcome) = self.resume_pending_array_copy(frame_index, &mut remaining) {
                     return Ok(outcome);
                 }
             }
@@ -1722,6 +1732,80 @@ impl Machine {
                         }
                         self.frames[frame_index].instruction += 1;
                     }
+                    ResolvedInstruction::ArrayCopy {
+                        source,
+                        destination,
+                        source_start,
+                        destination_start,
+                        length,
+                    } => {
+                        let setup = (|| -> Result<PendingArrayCopy, InstructionFailure> {
+                            let source = self
+                                .read_register(frame_index, *source)
+                                .map_err(InstructionFailure::Fault)?;
+                            let destination = self
+                                .read_register(frame_index, *destination)
+                                .map_err(InstructionFailure::Fault)?;
+                            let (source, source_ty, width, source_length) =
+                                self.resolve_array(source)?;
+                            let (
+                                destination,
+                                destination_ty,
+                                destination_width,
+                                destination_length,
+                            ) = self.resolve_array(destination)?;
+                            let source_element = self
+                                .image
+                                .array_element_type(source_ty)
+                                .ok_or(InstructionFailure::Fault(VmFault::InvalidResolvedId))?;
+                            let destination_element = self
+                                .image
+                                .array_element_type(destination_ty)
+                                .ok_or(InstructionFailure::Fault(VmFault::InvalidResolvedId))?;
+                            let assignable = source_element.kind == destination_element.kind
+                                && (!source_element.nullable || destination_element.nullable)
+                                && match (source_element.nominal, destination_element.nominal) {
+                                    (Some(actual), Some(target)) => {
+                                        self.image.is_assignable(actual, target)
+                                    }
+                                    (None, None) => true,
+                                    _ => false,
+                                };
+                            if width != destination_width || !assignable {
+                                return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
+                            }
+                            let integer = |register| match self
+                                .read_register(frame_index, register)
+                                .map_err(InstructionFailure::Fault)?
+                            {
+                                RuntimeValue::I32(value) => Ok(value),
+                                _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+                            };
+                            PendingArrayCopy::new(
+                                (source, source_length),
+                                (destination, destination_length),
+                                integer(*source_start)?,
+                                integer(*destination_start)?,
+                                integer(*length)?,
+                                width.bytes(),
+                            )
+                            .map_err(InstructionFailure::Trap)
+                        })();
+                        self.pending_array_copy = Some(match setup {
+                            Ok(pending) => pending,
+                            Err(InstructionFailure::Trap(trap)) => {
+                                let outcome = Outcome::Crashed(trap);
+                                self.lifecycle = Lifecycle::Terminal(outcome);
+                                return Ok(outcome);
+                            }
+                            Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
+                        });
+                        if let Some(outcome) =
+                            self.resume_pending_array_copy(frame_index, &mut remaining)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
                     ResolvedInstruction::ArrayLength { dst, array } => {
                         let array = match self.read_register(frame_index, *array) {
                             Ok(value) => value,
@@ -2377,7 +2461,7 @@ impl Machine {
             };
             remaining -= 1;
             self.consumed_maintenance_cost = consumed;
-            let mut runtime_roots = [None; 4];
+            let mut runtime_roots = [None; 6];
             let mut runtime_root_count = 0_usize;
             self.visit_runtime_roots(|reference| {
                 if let Some(slot) = runtime_roots.get_mut(runtime_root_count) {
@@ -2477,6 +2561,29 @@ impl Machine {
             self.write_register(frame_index, destination, RuntimeValue::Reference(reference))
         {
             return Some(self.fault(fault));
+        }
+        self.frames[frame_index].instruction += 1;
+        None
+    }
+
+    fn resume_pending_array_copy(
+        &mut self,
+        frame_index: usize,
+        remaining: &mut u32,
+    ) -> Option<Outcome> {
+        let mut pending = self.pending_array_copy.take()?;
+        let (used, done) = match pending.advance(&mut self.heap, *remaining) {
+            Ok(result) => result,
+            Err(fault) => return Some(self.fault(fault)),
+        };
+        let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used)) else {
+            return Some(self.fault(VmFault::AccountingOverflow));
+        };
+        self.consumed_dynamic_cost = consumed;
+        *remaining -= used;
+        if !done {
+            self.pending_array_copy = Some(pending);
+            return Some(Outcome::SliceExhausted);
         }
         self.frames[frame_index].instruction += 1;
         None
@@ -2668,6 +2775,10 @@ impl Machine {
     }
 
     fn visit_runtime_roots(&self, mut visit: impl FnMut(Ref32)) {
+        if let Some(pending) = self.pending_array_copy {
+            visit(pending.source);
+            visit(pending.destination);
+        }
         if let Some(pending) = self.pending_text {
             pending.visit_roots(&mut visit);
         }

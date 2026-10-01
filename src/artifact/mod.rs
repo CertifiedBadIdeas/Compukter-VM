@@ -512,6 +512,13 @@ pub(crate) enum Instruction {
         index: u16,
         value: u16,
     },
+    ArrayCopy {
+        source: u16,
+        destination: u16,
+        source_start: u16,
+        destination_start: u16,
+        length: u16,
+    },
     FieldGet {
         dst: u16,
         receiver: u16,

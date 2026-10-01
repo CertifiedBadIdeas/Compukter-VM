@@ -761,6 +761,25 @@ fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeEr
             regs(&mut operands, &[*array, *index, *value]);
             (0x34, 0)
         }
+        Instruction::ArrayCopy {
+            source,
+            destination,
+            source_start,
+            destination_start,
+            length,
+        } => {
+            regs(
+                &mut operands,
+                &[
+                    *source,
+                    *destination,
+                    *source_start,
+                    *destination_start,
+                    *length,
+                ],
+            );
+            (0x3b, 0)
+        }
         Instruction::FieldGet {
             dst,
             receiver,

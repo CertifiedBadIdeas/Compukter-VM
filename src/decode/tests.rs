@@ -93,7 +93,7 @@ fn container_rejects_non_zero_alignment_gap() {
 #[test]
 fn container_rejects_unknown_feature_bit() {
     let mut bytes = support::minimal_vector();
-    support::write_u32(&mut bytes, 20, 1 << 5);
+    support::write_u32(&mut bytes, 20, 1 << 6);
     support::rehash(&mut bytes);
     assert_eq!(error_code(bytes), Code::UnsupportedVersion);
 }
@@ -748,6 +748,7 @@ fn for_each_v1_opcode_case(mut check: impl FnMut(u8, u8, &[u8], bool)) {
         (0x32, 0, r2, false),
         (0x33, 0, r3, false),
         (0x34, 0, r3, false),
+        (0x3b, 0, &[0, 0, 1, 0, 2, 0, 3, 0, 4, 0], false),
         (0x35, 0, &[0, 0, 1, 0, 0], false),
         (0x36, 0, &[0, 0, 0, 1, 0], false),
         (0x37, 0, &[0, 0, 0], false),

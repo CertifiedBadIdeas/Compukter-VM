@@ -149,6 +149,13 @@ fn decode_instruction(
             type_ref: id(&mut cursor, offset)?,
             length: reg(&mut cursor, offset)?,
         },
+        0x3b => Instruction::ArrayCopy {
+            source: reg(&mut cursor, offset)?,
+            destination: reg(&mut cursor, offset)?,
+            source_start: reg(&mut cursor, offset)?,
+            destination_start: reg(&mut cursor, offset)?,
+            length: reg(&mut cursor, offset)?,
+        },
         0x32 => Instruction::ArrayLength {
             dst: reg(&mut cursor, offset)?,
             array: reg(&mut cursor, offset)?,
@@ -698,6 +705,7 @@ impl Instruction {
             | Self::ArrayLength { .. }
             | Self::ArrayLoad { .. }
             | Self::ArrayStore { .. }
+            | Self::ArrayCopy { .. }
             | Self::FieldGet { .. }
             | Self::FieldSet { .. }
             | Self::StaticGet { .. }
