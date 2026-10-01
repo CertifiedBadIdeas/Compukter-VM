@@ -380,6 +380,54 @@ impl Heap {
         Ok(())
     }
 
+    pub(super) fn copy_payload_range(
+        &mut self,
+        source: Ref32,
+        source_offset: u32,
+        destination: Ref32,
+        destination_offset: u32,
+        length: u32,
+    ) -> Result<(), VmFault> {
+        let span = |reference, offset: u32| -> Result<usize, VmFault> {
+            let block = self.live_block(reference)?;
+            let capacity = self
+                .block_size(block)?
+                .checked_sub(self.payload_offset())
+                .ok_or(VmFault::CorruptHeap)?;
+            if offset.checked_add(length).is_none_or(|end| end > capacity) {
+                return Err(VmFault::CorruptHeap);
+            }
+            let start = block
+                .0
+                .checked_add(self.payload_offset())
+                .and_then(|base| base.checked_add(offset))
+                .ok_or(VmFault::CorruptHeap)?;
+            if start
+                .checked_add(length)
+                .is_none_or(|end| end > self.arena_bytes)
+            {
+                return Err(VmFault::CorruptHeap);
+            }
+            Ok(start as usize)
+        };
+        let source_start = span(source, source_offset)?;
+        let destination_start = span(destination, destination_offset)?;
+        // SAFETY: ArenaUnit is repr(C), exactly 16 initialized bytes with no
+        // padding. This exclusive byte view covers the same owned allocation;
+        // both payload spans were validated against live managed block bounds.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                self.arena.as_mut_ptr().cast::<u8>(),
+                self.arena.len() * 16,
+            )
+        };
+        bytes.copy_within(
+            source_start..source_start + length as usize,
+            destination_start,
+        );
+        Ok(())
+    }
+
     fn live_block(&self, reference: Ref32) -> Result<BlockOffset, VmFault> {
         if reference.domain() != ReferenceDomain::Managed
             || reference.payload() < OBJECT_TYPE_ID

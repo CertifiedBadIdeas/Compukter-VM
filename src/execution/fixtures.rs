@@ -4908,6 +4908,110 @@ pub(crate) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
     })
 }
 
+pub(crate) fn array_copy_artifact() -> VerifiedArtifact {
+    let artifact = array_allocation_artifact(700);
+    let mut decoded = crate::decode::records::decode_artifact(
+        artifact.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    decoded.header.runtime_minor = 5;
+    decoded.header.semantic_features = 1 << 5;
+    let module = &mut decoded.modules[0];
+    if let NominalType::Function { result, .. } = &mut module.types[0] {
+        *result = primitive(1);
+    }
+    if let NominalType::Array { element, .. } = &mut module.types[1] {
+        *element = primitive(1);
+    }
+    module.constants = [0, 1, 42, 699, 700]
+        .into_iter()
+        .map(Constant::I32)
+        .collect();
+    let array = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    module.functions[0].register_count = 7;
+    module.functions[0].values = crate::artifact::scalar_values(vec![
+        primitive(1),
+        array,
+        primitive(1),
+        primitive(1),
+        primitive(1),
+        primitive(1),
+        primitive(1),
+    ]);
+    let programs = [
+        vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 4,
+            },
+            Instruction::Const {
+                dst: 2,
+                constant: 0,
+            },
+            Instruction::Const {
+                dst: 3,
+                constant: 1,
+            },
+            Instruction::Const {
+                dst: 4,
+                constant: 3,
+            },
+            Instruction::Const {
+                dst: 5,
+                constant: 2,
+            },
+            Instruction::Jump { target: 1 },
+        ],
+        vec![
+            Instruction::NewArray {
+                dst: 1,
+                type_ref: 1,
+                length: 0,
+            },
+            Instruction::ArrayStore {
+                array: 1,
+                index: 2,
+                value: 5,
+            },
+            Instruction::ArrayCopy {
+                source: 1,
+                destination: 1,
+                source_start: 2,
+                destination_start: 3,
+                length: 4,
+            },
+            Instruction::ArrayLoad {
+                dst: 6,
+                array: 1,
+                index: 3,
+            },
+            Instruction::Return { value: 6 },
+        ],
+    ];
+    let mut maximum = 0;
+    for (index, instructions) in programs.into_iter().enumerate() {
+        let cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        maximum = maximum.max(cost);
+        module.blocks[index].instruction_count = instructions.len() as u32;
+        module.blocks[index].declared_fixed_cost = cost;
+        module.code[index].fixed_cost = cost;
+        module.code[index].instructions = instructions.into_boxed_slice();
+    }
+    decoded.manifest.maximum_block_cost = maximum;
+    decoded.manifest.minimum_slice_cost = maximum;
+    configure_stack(&mut decoded, 7, 1);
+    let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
 pub(super) fn static_roundtrip_artifact() -> VerifiedArtifact {
     verified_mutated(|artifact| {
         artifact.modules[0].types[0] = NominalType::Function {

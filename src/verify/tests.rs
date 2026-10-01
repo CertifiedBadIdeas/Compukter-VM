@@ -9,6 +9,39 @@ fn decoded(bytes: Vec<u8>) -> crate::artifact::DecodedArtifact {
 }
 
 #[test]
+fn array_copy_requires_runtime_feature_and_typed_operands() {
+    let source = crate::execution::fixtures::array_copy_artifact();
+    for failure in 0..4 {
+        let mut artifact = crate::decode::records::decode_artifact(
+            source.decoded().bytes.clone(),
+            &ArtifactLimits::default(),
+        )
+        .unwrap();
+        match failure {
+            0 => artifact.header.runtime_minor = 4,
+            1 => artifact.header.semantic_features = 0,
+            2 | 3 => {
+                if let crate::artifact::Instruction::ArrayCopy { source, length, .. } =
+                    &mut artifact.modules[0].code[1].instructions[2]
+                {
+                    if failure == 2 {
+                        *source = 0;
+                    } else {
+                        *length = 1;
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+        assert!(
+            super::verify_artifact(Arc::from(bytes), ArtifactLimits::default()).is_err(),
+            "case {failure}"
+        );
+    }
+}
+
+#[test]
 fn module_accepts_vector_a_identity() {
     super::modules::verify_modules(
         &decoded(support::minimal_vector()),

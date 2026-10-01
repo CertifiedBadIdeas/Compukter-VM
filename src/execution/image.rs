@@ -316,6 +316,13 @@ pub(super) enum ResolvedInstruction {
         index: u16,
         value: u16,
     },
+    ArrayCopy {
+        source: u16,
+        destination: u16,
+        source_start: u16,
+        destination_start: u16,
+        length: u16,
+    },
     CheckedCast {
         dst: u16,
         value: u16,
@@ -2083,6 +2090,19 @@ fn resolve_instruction(
             value: *value,
             ty: resolve_type(artifact, module, TypeId(*type_ref))
                 .ok_or(AdmissionError::InvalidEntry)?,
+        },
+        Instruction::ArrayCopy {
+            source,
+            destination,
+            source_start,
+            destination_start,
+            length,
+        } => ResolvedInstruction::ArrayCopy {
+            source: *source,
+            destination: *destination,
+            source_start: *source_start,
+            destination_start: *destination_start,
+            length: *length,
         },
         Instruction::ArrayLength { dst, array } => ResolvedInstruction::ArrayLength {
             dst: *dst,

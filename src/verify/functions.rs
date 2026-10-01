@@ -396,6 +396,7 @@ fn may_throw(instruction: &Instruction) -> bool {
             | Instruction::ArrayLength { .. }
             | Instruction::ArrayLoad { .. }
             | Instruction::ArrayStore { .. }
+            | Instruction::ArrayCopy { .. }
             | Instruction::FieldGet { .. }
             | Instruction::FieldSet { .. }
             | Instruction::StaticGet { .. }
@@ -771,6 +772,50 @@ fn verify_instruction(
                     module_id,
                     function_id,
                     "array store value has the wrong type",
+                ));
+            }
+        }
+        Instruction::ArrayCopy {
+            source,
+            destination,
+            source_start,
+            destination_start,
+            length,
+        } => {
+            let (source_module, source_element) = array_element(
+                artifact,
+                module_id,
+                function_id,
+                function,
+                state,
+                *source,
+                limits,
+            )?;
+            let (destination_module, destination_element) = array_element(
+                artifact,
+                module_id,
+                function_id,
+                function,
+                state,
+                *destination,
+                limits,
+            )?;
+            for register in [source_start, destination_start, length] {
+                read(function, state, *register, module_id, function_id, limits)?;
+                require_kind(function, *register, 1, module_id, function_id, limits)?;
+            }
+            if !value_assignable(
+                artifact,
+                source_module,
+                source_element,
+                destination_module,
+                destination_element,
+            ) {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "array copy elements are incompatible",
                 ));
             }
         }

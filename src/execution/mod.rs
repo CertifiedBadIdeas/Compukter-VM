@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod array_copy;
 mod channel;
 mod error;
 mod external_roots;
