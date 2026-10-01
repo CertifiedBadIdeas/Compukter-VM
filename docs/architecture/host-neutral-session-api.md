@@ -84,11 +84,12 @@ Runtime ABI 1.9 additionally encodes factory type roles in class flags bits 3..7
 Unknown tags are rejected. Roles are unique across the artifact and identify non-abstract, non-generic
 zero-state Throwable subclasses; their intermediate ancestors cannot add fields, methods, interfaces
 or initializers. Only the verified Throwable root supplies the message/cause payload. This metadata
-extension does not change C ABI 18. Integer Div/Rem require role 1 and ABI 1.9, including without a
-handler; legacy arithmetic artifacts require rebuilding. Their `/ by zero` message and ordinary managed
+extension does not change C ABI 18. Fallible integer arithmetic, arrays, string ranges, reference access/casts
+and channels require their factory roles and ABI 1.9, including without a handler; legacy artifacts containing
+these operations require rebuilding. Their bounded message and ordinary managed
 exception are built through budgeted allocation and collection; pending references are GC roots.
-Factory OOM stays noncatchable. Floating division is nonthrowing. Other operation and host factories
-are being integrated separately.
+Factory OOM stays noncatchable. Floating division is nonthrowing. Stack overflow and channel-storage exhaustion
+remain noncatchable resource failures. Host factories are being integrated separately.
 
 ## Strings and ownership
 

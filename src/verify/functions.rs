@@ -410,6 +410,14 @@ fn may_throw(instruction: &Instruction) -> bool {
             | Instruction::Throw { .. }
             | Instruction::CallSuspend { .. }
             | Instruction::StringValueOf { .. }
+            | Instruction::StringLength { .. }
+            | Instruction::StringGet { .. }
+            | Instruction::StringEquals { .. }
+            | Instruction::StringCompare { .. }
+            | Instruction::StringHash { .. }
+            | Instruction::StringConcat { .. }
+            | Instruction::StringSubstring { .. }
+            | Instruction::StringFromCharArray { .. }
             | Instruction::Sleep { .. }
             | Instruction::CoroutineJoin { .. }
             | Instruction::ChannelCreate { .. }

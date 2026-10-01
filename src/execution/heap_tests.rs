@@ -1,5 +1,5 @@
 use super::{
-    error::{AdmissionError, AllocationExhaustion, GuestTrap, Outcome, VmFault},
+    error::{AdmissionError, AllocationExhaustion, Outcome, VmFault},
     external_roots::ExternalRootTable,
     fixtures,
     heap::{free_size_class, request_size_class, AllocationRequest, BlockOffset, Heap, SizeClass},
@@ -32,7 +32,7 @@ fn array_root_casts_preserve_identity_and_dynamic_type() {
                         Outcome::SliceExhausted => {}
                         outcome => {
                             let expected = if wrong_type && !type_test {
-                                Outcome::Crashed(GuestTrap::ClassCast)
+                                Outcome::UncaughtException
                             } else {
                                 Outcome::Halted(Some(RuntimeValue::Bool(!wrong_type)))
                             };
@@ -897,18 +897,16 @@ fn allocation_resumes_without_recharging_or_publishing_a_prefix() {
 #[test]
 fn allocation_negative_array_length_traps_before_heap_mutation() {
     let mut profile = fixtures::profile();
-    profile.heap_bytes = 64;
+    profile.heap_bytes = 128;
     let image = ExecutionImage::admit(fixtures::array_allocation_artifact(-1), profile).unwrap();
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
 
     assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
-    assert_eq!(
-        Outcome::Crashed(GuestTrap::NegativeArraySize),
-        machine.run_slice(5, 0).unwrap()
-    );
-    assert_eq!(64, machine.test_heap_diagnostic().total_free);
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(5, 0).unwrap());
+    assert_eq!(128, machine.test_heap_diagnostic().total_free);
     assert_eq!(0, machine.test_heap_diagnostic().live_handles);
+    fixtures::finish_exception(&mut machine, "Negative array size");
 }
 
 #[test]
@@ -1066,11 +1064,9 @@ fn heap_instructions_bounds_fail_before_destination_publication() {
         machine
             .start(&[EntryArgument::unowned(RuntimeValue::I32(index))])
             .unwrap();
-        assert_eq!(
-            Outcome::Crashed(GuestTrap::IndexOutOfBounds),
-            machine.run_slice(64, 0).unwrap()
-        );
+        assert_eq!(Outcome::SliceExhausted, machine.run_slice(64, 0).unwrap());
         assert_eq!(Some(RuntimeValue::I32(99)), machine.test_register(2));
+        fixtures::finish_exception(&mut machine, "Index out of bounds");
     }
 }
 
@@ -1080,11 +1076,9 @@ fn heap_instructions_nonnull_zero_reference_traps_without_publication() {
         .unwrap();
     let mut machine = Machine::new(image).unwrap();
     machine.start(&[]).unwrap();
-    assert_eq!(
-        Outcome::Crashed(GuestTrap::NullReference),
-        machine.run_slice(64, 0).unwrap()
-    );
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(64, 0).unwrap());
     assert_eq!(None, machine.test_register(1));
+    fixtures::finish_exception(&mut machine, "Null reference");
 }
 
 #[test]
@@ -1107,21 +1101,17 @@ fn heap_instructions_checked_cast_handles_nullability_and_incompatibility() {
     machine
         .start(&[EntryArgument::unowned(RuntimeValue::Null)])
         .unwrap();
-    assert_eq!(
-        Outcome::Crashed(GuestTrap::NullReference),
-        machine.run_slice(32, 0).unwrap()
-    );
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(32, 0).unwrap());
     assert_eq!(None, machine.test_register(1));
+    fixtures::finish_exception(&mut machine, "Null reference");
 
     let incompatible =
         ExecutionImage::admit(fixtures::incompatible_cast_artifact(), fixtures::profile()).unwrap();
     let mut machine = Machine::new(incompatible).unwrap();
     machine.start(&[]).unwrap();
-    assert_eq!(
-        Outcome::Crashed(GuestTrap::ClassCast),
-        machine.run_slice(32, 0).unwrap()
-    );
+    assert_eq!(Outcome::SliceExhausted, machine.run_slice(32, 0).unwrap());
     assert_eq!(None, machine.test_register(1));
+    fixtures::finish_exception(&mut machine, "Invalid cast");
 }
 
 #[test]
@@ -1153,15 +1143,13 @@ fn heap_instructions_failed_array_store_is_atomic() {
         machine
             .start(&[EntryArgument::unowned(RuntimeValue::I32(index))])
             .unwrap();
-        assert_eq!(
-            Outcome::Crashed(GuestTrap::IndexOutOfBounds),
-            machine.run_slice(64, 0).unwrap()
-        );
+        assert_eq!(Outcome::SliceExhausted, machine.run_slice(64, 0).unwrap());
         let RuntimeValue::Reference(array) = machine.test_register(2).unwrap() else {
             unreachable!()
         };
         let payload = machine.test_managed_payload(array).unwrap();
         assert_eq!([0, 0, 0, 0], payload[8..12]);
+        fixtures::finish_exception(&mut machine, "Index out of bounds");
     }
 }
 

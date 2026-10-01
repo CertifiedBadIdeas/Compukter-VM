@@ -191,33 +191,80 @@ pub(crate) struct ExceptionModel {
     pub functions: Vec<Vec<Vec<Handler>>>,
 }
 
+pub(crate) fn required_runtime_exception_roles(instruction: &Instruction) -> u8 {
+    match instruction {
+        Instruction::Div { form: 1 | 2, .. } | Instruction::Rem { form: 1 | 2, .. } => 1,
+        Instruction::NewArray { .. } => 1 << 2,
+        Instruction::ArrayLoad { .. }
+        | Instruction::ArrayStore { .. }
+        | Instruction::ArrayCopy { .. }
+        | Instruction::StringGet { .. }
+        | Instruction::StringSubstring { .. }
+        | Instruction::StringFromCharArray { .. } => (1 << 1) | (1 << 3),
+        Instruction::CheckedCast { .. } => (1 << 4) | (1 << 3),
+        Instruction::ArrayLength { .. }
+        | Instruction::FieldGet { .. }
+        | Instruction::FieldSet { .. }
+        | Instruction::StaticGet { .. }
+        | Instruction::StaticSet { .. }
+        | Instruction::CallVirtual { .. }
+        | Instruction::CallInterface { .. }
+        | Instruction::StringLength { .. }
+        | Instruction::StringEquals { .. }
+        | Instruction::StringCompare { .. }
+        | Instruction::StringHash { .. }
+        | Instruction::StringConcat { .. } => 1 << 3,
+        Instruction::ChannelCreate { .. }
+        | Instruction::ChannelSend { .. }
+        | Instruction::ChannelReceive { .. } => 1 << 5,
+        _ => 0,
+    }
+}
+
 pub(crate) fn verify_exceptions(
     artifact: &DecodedArtifact,
     limits: &ArtifactLimits,
 ) -> Result<ExceptionModel, DiagnosticSet> {
     let root = verify_throwable_root(artifact, limits)?;
     let roles = verify_runtime_exception_types(artifact, limits, root)?;
-    let uses_arithmetic_errors = artifact.modules.iter().any(|module| {
-        module.code.iter().any(|code| {
-            code.instructions.iter().any(|instruction| {
-                matches!(
-                    instruction,
-                    Instruction::Div { form: 1 | 2, .. } | Instruction::Rem { form: 1 | 2, .. }
-                )
-            })
-        })
-    });
-    if uses_arithmetic_errors
+    let required = artifact
+        .modules
+        .iter()
+        .flat_map(|module| &module.code)
+        .flat_map(|code| code.instructions.iter())
+        .fold(0, |mask, instruction| {
+            mask | required_runtime_exception_roles(instruction)
+        });
+    if required != 0
         && ((artifact.header.runtime_major, artifact.header.runtime_minor) < (1, 9)
-            || roles[0].is_none())
+            || roles
+                .iter()
+                .enumerate()
+                .any(|(index, role)| required & (1 << index) != 0 && role.is_none()))
     {
         return Err(failure(
             limits,
             0,
             0,
-            "arithmetic error artifact: rebuild with exception roles for Runtime ABI 1.9",
+            "operation error artifact: rebuild with exception roles for Runtime ABI 1.9",
         ));
     }
+    handler_tables(artifact, limits, root)
+}
+
+#[cfg(test)]
+pub(crate) fn verify_handler_tables(
+    artifact: &DecodedArtifact,
+    limits: &ArtifactLimits,
+) -> Result<ExceptionModel, DiagnosticSet> {
+    handler_tables(artifact, limits, verify_throwable_root(artifact, limits)?)
+}
+
+fn handler_tables(
+    artifact: &DecodedArtifact,
+    limits: &ArtifactLimits,
+    root: Option<(usize, usize)>,
+) -> Result<ExceptionModel, DiagnosticSet> {
     let uses_exceptions = artifact.modules.iter().any(|module| {
         !module.exceptions.is_empty()
             || module.code.iter().any(|code| {
