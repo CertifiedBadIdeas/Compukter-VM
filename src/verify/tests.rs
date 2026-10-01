@@ -9,6 +9,43 @@ fn decoded(bytes: Vec<u8>) -> crate::artifact::DecodedArtifact {
 }
 
 #[test]
+fn exception_contract_rejects_legacy_and_non_throwable_operands_and_handlers() {
+    let source = crate::execution::fixtures::exception_artifact(false, true, false);
+    for case in 0..5 {
+        let mut artifact = decoded(source.decoded().bytes.to_vec());
+        match case {
+            0 => artifact.header.runtime_minor = 7,
+            1 => {
+                if let crate::artifact::NominalType::Class { flags, .. } =
+                    &mut artifact.modules[1].types[2]
+                {
+                    *flags = 0;
+                }
+            }
+            2 => {
+                artifact.modules[0].functions[0].values[0].semantic_type =
+                    reference(0x8000_0001, false)
+            }
+            3 => {
+                artifact.modules[0].exceptions[0].catch_type = crate::artifact::TypeId(0x8000_0001)
+            }
+            4 => {
+                artifact.modules[0].exceptions[0].catch_type = crate::artifact::TypeId(u32::MAX);
+                artifact.modules[0].exceptions[0].exception_register = 0;
+            }
+            _ => unreachable!(),
+        }
+        let errors = super::exceptions::verify_exceptions(&artifact, &ArtifactLimits::default())
+            .unwrap_err();
+        assert_eq!(
+            Code::BadException,
+            errors.first().unwrap().code,
+            "case {case}"
+        );
+    }
+}
+
+#[test]
 fn throwable_root_requires_runtime_abi_and_a_checked_reference_payload() {
     use crate::artifact::{NominalType, TypeId};
     let source = crate::execution::fixtures::throwable_root_artifact();
@@ -1286,6 +1323,43 @@ fn add_exception_register(
     artifact.modules[0].functions[0].exception_count = 1;
 }
 
+fn mark_test_throwable_root(artifact: &mut crate::artifact::DecodedArtifact, root: usize) {
+    use crate::artifact::{ByteRange, Field, NominalType};
+    artifact.header.runtime_minor = 8;
+    let mut bytes = artifact.bytes.to_vec();
+    let start = bytes.len();
+    bytes.extend_from_slice(b"kotlin.String");
+    let end = bytes.len();
+    artifact.bytes = Arc::from(bytes);
+    let module = &mut artifact.modules[0];
+    let name = module.strings.len() as u32;
+    module.strings.push(ByteRange { start, end });
+    let string = module.types.len() as u32;
+    module.types.push(class(name, 2, u32::MAX));
+    if let NominalType::Class {
+        flags,
+        field_start,
+        field_count,
+        ..
+    } = &mut module.types[root]
+    {
+        *flags = 4;
+        *field_start = module.fields.len() as u32;
+        *field_count = 2;
+    }
+    for (name, value_type) in [
+        (0, reference(string, true)),
+        (1, reference(root as u32, true)),
+    ] {
+        module.fields.push(Field {
+            owner: crate::artifact::TypeId(root as u32),
+            name,
+            value_type,
+            flags: 0,
+        });
+    }
+}
+
 #[test]
 fn exception_rejects_empty_protected_range() {
     let mut artifact = decoded(support::minimal_vector());
@@ -1352,6 +1426,7 @@ fn exception_register_must_accept_the_catch_type_not_only_its_subtype() {
         *super_type = TypeId(parent);
     }
     artifact.modules[0].types.push(child_type);
+    mark_test_throwable_root(&mut artifact, parent as usize);
     add_exception_register(&mut artifact, reference(child, false));
     artifact.modules[0].exceptions.push(ExceptionEntry {
         owner_function: FunctionId(0),
@@ -1699,6 +1774,7 @@ fn exception_handler_artifact(reads_uninitialized_local: bool) -> crate::artifac
     let mut artifact = decoded(support::minimal_vector());
     artifact.header.semantic_features = 1;
     artifact.modules[0].types.push(class(0, 0, u32::MAX));
+    mark_test_throwable_root(&mut artifact, 1);
     artifact.modules[0].functions[0].register_count = 2;
     artifact.modules[0].functions[0].values =
         crate::artifact::scalar_values(vec![reference(1, false), primitive(1)]);

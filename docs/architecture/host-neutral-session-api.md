@@ -30,6 +30,7 @@ maintenance_budget)`. An advance returns one of:
 - one borrowed `HostRequest`, which suspends guest execution;
 - stable `Halted`, `Crashed`, `Faulted`, `HostFailed`, or `QuotaExhausted`;
 - stable managed `AllocationExhausted` with bounded diagnostics.
+- stable `UncaughtException` for an unhandled root-task Guest exception.
 
 Only one request can be outstanding. Calling `advance` while it is outstanding
 returns the same request ID and values without consuming a budget, changing
@@ -68,6 +69,15 @@ retain UTF-16-offset or bytecode fallback. Neither section changes semantic hash
 C ABI 17 appends a length-prefixed UTF-8 trace after the scalar payload of
 outcome tags 2, 5 and 6. Both native transports use that same wire contract.
 VM fault traces describe the detection site, not necessarily the corruption cause.
+
+C ABI 18 adds outcome tag 12: a little-endian u32 UTF-8 byte length followed by the bounded uncaught-exception
+diagnostic (class, message, at most four causes and the source stack). No managed reference leaves the VM.
+Both transports require ABI 18. Explicit Throw/handler artifacts require Runtime ABI 1.8 and one verified
+Throwable root; older exception artifacts are rejected with a rebuild requirement, never converted to traps.
+Admission resolves handlers in innermost/source order. Every handler inspection and unwound frame costs one
+dynamic Guest unit. Exception references remain rooted during suspended unwinding and after child-task failure.
+An unjoined failed child does not crash the process; every join throws its original exception at the join site.
+Root-task failure terminates the process. OOM, quotas, VM faults and forced shutdown remain noncatchable.
 
 ## Strings and ownership
 

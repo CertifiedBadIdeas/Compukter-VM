@@ -28,7 +28,7 @@ pub(super) enum StringBacking {
 }
 
 impl StringBacking {
-    fn length(self) -> u32 {
+    pub(super) fn length(self) -> u32 {
         match self {
             Self::Inline { length, .. } => u32::from(length),
             Self::Literal(literal) => literal.code_units,
@@ -1026,7 +1026,7 @@ pub(super) fn encoding(
     })
 }
 
-fn backing(
+pub(super) fn backing(
     image: &ExecutionImage,
     heap: &Heap,
     value: RuntimeValue,
@@ -1065,7 +1065,7 @@ fn backing(
     })
 }
 
-fn code_unit(
+pub(super) fn code_unit(
     image: &ExecutionImage,
     heap: &Heap,
     value: StringBacking,

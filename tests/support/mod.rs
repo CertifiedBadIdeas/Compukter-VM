@@ -94,12 +94,12 @@ pub(crate) fn executable_minimal_vector() -> Vec<u8> {
 
 #[allow(dead_code)]
 pub(crate) fn bounded_vector() -> Vec<u8> {
-    let strings = indexed(&[b"app", b"entry"]);
+    let strings = indexed(&[b"app", b"entry", b"kotlin.String"]);
     let empty = indexed(&[]);
 
-    let mut class_type = vec![0, 0];
+    let mut class_type = vec![0, 4];
     push_u16(&mut class_type, 0);
-    for value in [0, u32::MAX, 0, 0, 0, 0, 0] {
+    for value in [0, u32::MAX, 0, 0, 2, 0, 0] {
         push_u32(&mut class_type, value);
     }
     let mut function_type = vec![3, 0];
@@ -108,7 +108,23 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
     push_u16(&mut function_type, 0);
     push_u16(&mut function_type, 0);
     function_type.extend(value_type(0, 0, u32::MAX));
-    let types = indexed(&[&class_type, &function_type]);
+    let mut string_type = vec![0, 2];
+    push_u16(&mut string_type, 0);
+    for value in [2, u32::MAX, 0, 0, 0, 0, 0] {
+        push_u32(&mut string_type, value);
+    }
+    let types = indexed(&[&class_type, &function_type, &string_type]);
+    let mut fields = Vec::new();
+    for target in [2, 0] {
+        let mut field = Vec::new();
+        push_u32(&mut field, 0);
+        push_u32(&mut field, 0);
+        field.extend(value_type(7, 1, target));
+        push_u32(&mut field, 0);
+        push_u32(&mut field, 0);
+        fields.push(field);
+    }
+    let fields = indexed(&fields.iter().map(Vec::as_slice).collect::<Vec<_>>());
 
     let mut function = Vec::new();
     for value in [u32::MAX, 1, 1, 2] {
@@ -147,12 +163,12 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
     let exceptions = indexed(&[&exception]);
 
     let semantic_sections = vec![
-        (0x0100_u16, strings, 2),
-        (0x0101, types, 2),
+        (0x0100_u16, strings, 3),
+        (0x0101, types, 3),
         (0x0102, empty.clone(), 0),
         (0x0103, empty.clone(), 0),
         (0x0104, empty.clone(), 0),
-        (0x0105, empty.clone(), 0),
+        (0x0105, fields, 2),
         (0x0106, functions, 1),
         (0x0107, blocks, 2),
         (0x0108, code, 2),
@@ -176,7 +192,7 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
     manifest[24..28].copy_from_slice(&6_u32.to_le_bytes());
     manifest[28..32].copy_from_slice(&6_u32.to_le_bytes());
     manifest[32..36].copy_from_slice(&1_u32.to_le_bytes());
-    let module = module_record_with_counts(module_hash, 2, 1, 0, 0);
+    let module = module_record_with_counts(module_hash, 3, 1, 0, 0);
     let modules = indexed(&[&module]);
     let mut sections = vec![
         (0x0001_u16, 0_u32, manifest, 1),
@@ -196,17 +212,20 @@ pub(crate) fn bounded_vector() -> Vec<u8> {
     debug.extend_from_slice(b"src/a.kt");
     sections.push((0x0110, 1, indexed(&[&debug]), 1));
 
-    assemble(sections, (1 << 0) | (1 << 2))
+    let mut bytes = assemble(sections, (1 << 0) | (1 << 2));
+    bytes[10..12].copy_from_slice(&8_u16.to_le_bytes());
+    rehash(&mut bytes);
+    bytes
 }
 
 #[allow(dead_code)]
 pub(crate) fn language_runtime_vector() -> Vec<u8> {
-    let strings = indexed(&[b"Box", b"app", b"array", b"entry"]);
+    let strings = indexed(&[b"Box", b"app", b"array", b"entry", b"kotlin.String"]);
     let empty = indexed(&[]);
 
-    let mut class_type = vec![0, 0];
+    let mut class_type = vec![0, 4];
     push_u16(&mut class_type, 0);
-    for value in [0, u32::MAX, 0, 0, 0, 0, 0] {
+    for value in [0, u32::MAX, 0, 0, 2, 0, 0] {
         push_u32(&mut class_type, value);
     }
     let mut array_type = vec![2, 0];
@@ -219,7 +238,25 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
     push_u16(&mut function_type, 0);
     push_u16(&mut function_type, 0);
     function_type.extend(value_type(0, 0, u32::MAX));
-    let types = indexed(&[&class_type, &array_type, &function_type]);
+    let mut string_type = vec![0, 2];
+    push_u16(&mut string_type, 0);
+    for value in [4, u32::MAX, 0, 0, 0, 0, 0] {
+        push_u32(&mut string_type, value);
+    }
+    let types = indexed(&[&class_type, &array_type, &function_type, &string_type]);
+    let mut message = Vec::new();
+    push_u32(&mut message, 0);
+    push_u32(&mut message, 0);
+    message.extend(value_type(7, 1, 3));
+    push_u32(&mut message, 0);
+    push_u32(&mut message, 0);
+    let mut cause = Vec::new();
+    push_u32(&mut cause, 0);
+    push_u32(&mut cause, 2);
+    cause.extend(value_type(7, 1, 0));
+    push_u32(&mut cause, 0);
+    push_u32(&mut cause, 0);
+    let fields = indexed(&[&message, &cause]);
 
     let zero = [0, 0, 0, 0, 0];
     let one = [0, 1, 0, 0, 0];
@@ -310,12 +347,12 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
     let exceptions = indexed(&[&exception]);
 
     let semantic_sections = vec![
-        (0x0100_u16, strings, 4),
-        (0x0101, types, 3),
+        (0x0100_u16, strings, 5),
+        (0x0101, types, 4),
         (0x0102, constants, 2),
         (0x0103, empty.clone(), 0),
         (0x0104, empty.clone(), 0),
-        (0x0105, empty.clone(), 0),
+        (0x0105, fields, 2),
         (0x0106, functions, 1),
         (0x0107, blocks, 5),
         (0x0108, code, 5),
@@ -342,7 +379,10 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
             14,
         ),
     ];
-    single_module_artifact(semantic_sections, None, 1 << 0, 1, 3, 10)
+    let mut bytes = single_module_artifact(semantic_sections, None, 1 << 0, 1, 4, 10);
+    bytes[10..12].copy_from_slice(&8_u16.to_le_bytes());
+    rehash(&mut bytes);
+    bytes
 }
 
 #[allow(dead_code)]

@@ -2402,6 +2402,311 @@ pub(crate) fn throwable_root_artifact() -> VerifiedArtifact {
         .expect("Throwable root fixture verifies")
 }
 
+pub(crate) fn exception_artifact(cross_call: bool, caught: bool, task: bool) -> VerifiedArtifact {
+    let source = throwable_root_artifact();
+    let mut artifact = crate::decode::records::decode_artifact(
+        source.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    artifact.header.semantic_features = 1 | 8 | if task { 2 } else { 0 };
+    artifact.modules[1].exports.insert(
+        0,
+        Export {
+            kind: 0,
+            visibility: 1,
+            name: 0,
+            local_symbol: 2,
+            signature: TypeId(2),
+        },
+    );
+    artifact.modules[1].declared_exports += 1;
+    let root_name = artifact.modules[1].strings[0];
+    let module = &mut artifact.modules[0];
+    let root_name_id = module.strings.len() as u32;
+    module.strings.push(root_name);
+    module.imports.insert(
+        0,
+        Import {
+            kind: 0,
+            target_module: ModuleId(1),
+            target_name: root_name_id,
+            expected_signature: TypeId(0x8000_0000),
+            target_hash: [0; 32],
+        },
+    );
+    module.imports[1].expected_signature = TypeId(0x8000_0001);
+    module.declared_imports += 1;
+    let root = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    module.types[0] = NominalType::Function {
+        name: 1,
+        flags: 0,
+        result: primitive(5),
+        parameters: Vec::new(),
+    };
+    module.types.push(NominalType::Class {
+        flags: 2,
+        generic_arity: 0,
+        name: 0,
+        super_type: root.nominal_type,
+        interfaces: Vec::new(),
+        field_start: 0,
+        field_count: 0,
+        method_start: 0,
+        method_count: 0,
+        initializer: None,
+    });
+    let child = ValueType {
+        nominal_type: TypeId(1),
+        ..root
+    };
+    module.types.push(NominalType::Function {
+        name: 1,
+        flags: 0,
+        result: primitive(0),
+        parameters: vec![child],
+    });
+    module.declared_types = 3;
+    module.functions[0].values =
+        crate::artifact::scalar_values(vec![child, root, primitive(5), primitive(1), root]);
+    module.functions[0].register_count = 5;
+    module.constants = vec![Constant::Bool(false)];
+    let new = Instruction::NewObject {
+        dst: 0,
+        type_ref: 1,
+    };
+    let call = Instruction::CallDirect {
+        dst: u16::MAX,
+        function_ref: 1,
+        args: vec![0].into_boxed_slice(),
+    };
+    let compare = Instruction::RefEqual {
+        dst: 2,
+        lhs: 0,
+        rhs: 1,
+    };
+    let programs = if task {
+        vec![
+            vec![
+                new,
+                Instruction::CoroutineSpawn {
+                    dst: 3,
+                    function_ref: 1,
+                    args: vec![0].into_boxed_slice(),
+                },
+                Instruction::Jump { target: 1 },
+            ],
+            vec![Instruction::CoroutineJoin {
+                dst: u16::MAX,
+                coroutine: 3,
+                resume_block: 2,
+            }],
+            vec![
+                Instruction::Const {
+                    dst: 2,
+                    constant: 0,
+                },
+                Instruction::Return { value: 2 },
+            ],
+            vec![Instruction::CoroutineJoin {
+                dst: u16::MAX,
+                coroutine: 3,
+                resume_block: 2,
+            }],
+            vec![
+                Instruction::RefEqual {
+                    dst: 2,
+                    lhs: 1,
+                    rhs: 4,
+                },
+                Instruction::Return { value: 2 },
+            ],
+        ]
+    } else if cross_call {
+        vec![
+            vec![new, Instruction::Jump { target: 1 }],
+            vec![call, Instruction::Jump { target: 2 }],
+            vec![
+                Instruction::Const {
+                    dst: 2,
+                    constant: 0,
+                },
+                Instruction::Return { value: 2 },
+            ],
+            vec![compare, Instruction::Return { value: 2 }],
+        ]
+    } else if caught {
+        vec![
+            vec![new, Instruction::Jump { target: 1 }],
+            vec![Instruction::Throw { exception: 0 }],
+            vec![compare, Instruction::Return { value: 2 }],
+        ]
+    } else {
+        vec![vec![new, Instruction::Throw { exception: 0 }]]
+    };
+    install_entry_blocks(&mut artifact, programs);
+    let module = &mut artifact.modules[0];
+    if caught {
+        if task {
+            module.blocks[2].flags = 1;
+        }
+        module.exceptions.push(crate::artifact::ExceptionEntry {
+            owner_function: FunctionId(0),
+            first_protected_block: BlockId(1),
+            protected_block_count: 1,
+            catch_type: root.nominal_type,
+            handler_block: BlockId(if cross_call || task { 3 } else { 2 }),
+            exception_register: 1,
+        });
+        if task {
+            module.exceptions.push(crate::artifact::ExceptionEntry {
+                owner_function: FunctionId(0),
+                first_protected_block: BlockId(3),
+                protected_block_count: 1,
+                catch_type: root.nominal_type,
+                handler_block: BlockId(4),
+                exception_register: 4,
+            });
+        }
+        module.functions[0].exception_count = module.exceptions.len() as u32;
+    }
+    if cross_call || task {
+        let instructions = if task {
+            vec![
+                Instruction::NewObject {
+                    dst: 0,
+                    type_ref: 1,
+                },
+                Instruction::Throw { exception: 0 },
+            ]
+        } else {
+            vec![Instruction::Throw { exception: 0 }]
+        };
+        let cost = if task { 6 } else { 2 };
+        let block = module.blocks.len() as u32;
+        module.functions.push(crate::artifact::Function {
+            owner: TypeId(u32::MAX),
+            name: 1,
+            signature: TypeId(2),
+            flags: 2,
+            register_count: 1,
+            parameter_count: 1,
+            first_block: BlockId(block),
+            block_count: 1,
+            first_exception: module.exceptions.len() as u32,
+            exception_count: 0,
+            values: crate::artifact::scalar_values(vec![child]),
+        });
+        module.blocks.push(Block {
+            owner_function: FunctionId(1),
+            code_record: BlockId(block),
+            instruction_count: instructions.len() as u32,
+            declared_fixed_cost: cost,
+            flags: 0,
+        });
+        module.code.push(DecodedCode {
+            bytes: ByteRange { start: 0, end: 0 },
+            instructions: instructions.into_boxed_slice(),
+            fixed_cost: cost,
+        });
+        module.declared_functions += 1;
+    }
+    artifact.manifest.maximum_coroutines = if task { 2 } else { 1 };
+    configure_stack(&mut artifact, 5, 4);
+    if task {
+        artifact.manifest.required_stack_bytes *= 2;
+    }
+    canonicalize_module_strings(&mut artifact, 0);
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+pub(super) fn nested_exception_artifact(rethrow: bool) -> VerifiedArtifact {
+    let source = exception_artifact(true, true, false);
+    let mut artifact = crate::decode::records::decode_artifact(
+        source.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let module = &mut artifact.modules[0];
+    let helper_block = module.blocks.pop().unwrap();
+    let helper_code = module.code.pop().unwrap();
+    if rethrow {
+        module.code[3].instructions = vec![Instruction::Throw { exception: 1 }].into_boxed_slice();
+        module.code[3].fixed_cost = 2;
+        module.blocks[3].instruction_count = 1;
+        module.blocks[3].declared_fixed_cost = 2;
+    }
+    for (id, instructions) in [
+        (
+            4,
+            vec![
+                Instruction::Const {
+                    dst: 2,
+                    constant: 0,
+                },
+                Instruction::Return { value: 2 },
+            ],
+        ),
+        (
+            5,
+            vec![
+                Instruction::RefEqual {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Instruction::Return { value: 2 },
+            ],
+        ),
+    ] {
+        module.blocks.push(Block {
+            owner_function: FunctionId(0),
+            code_record: BlockId(id),
+            instruction_count: instructions.len() as u32,
+            declared_fixed_cost: 2,
+            flags: 0,
+        });
+        module.code.push(DecodedCode {
+            bytes: ByteRange { start: 0, end: 0 },
+            instructions: instructions.into_boxed_slice(),
+            fixed_cost: 2,
+        });
+    }
+    module.blocks.push(Block {
+        code_record: BlockId(6),
+        ..helper_block
+    });
+    module.code.push(helper_code);
+    module.functions[0].block_count = 6;
+    module.functions[0].exception_count = 3;
+    module.functions[1].first_block = BlockId(6);
+    module.functions[1].first_exception = 3;
+    let inner = module.exceptions.remove(0);
+    module.exceptions = vec![
+        crate::artifact::ExceptionEntry {
+            first_protected_block: BlockId(1),
+            protected_block_count: 3,
+            handler_block: BlockId(5),
+            ..inner
+        },
+        crate::artifact::ExceptionEntry {
+            catch_type: TypeId(1),
+            ..inner
+        },
+        crate::artifact::ExceptionEntry {
+            handler_block: BlockId(4),
+            ..inner
+        },
+    ];
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
 pub(super) fn literal_string_length_artifact() -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,

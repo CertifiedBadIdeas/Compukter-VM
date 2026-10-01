@@ -88,6 +88,10 @@ impl Session {
         self.machine.failure_stack()
     }
 
+    pub(crate) fn exception_diagnostic(&self, artifact: &VerifiedArtifact) -> String {
+        self.machine.exception_diagnostic(artifact.decoded())
+    }
+
     pub fn admit(
         artifact: VerifiedArtifact,
         profile: ExecutionProfile,
@@ -407,6 +411,10 @@ impl Session {
                 },
             },
             super::error::Outcome::Crashed(trap) => Ok(AdvanceOutcome::Crashed(trap)),
+            super::error::Outcome::UncaughtException => {
+                self.pending_requests.clear();
+                Ok(AdvanceOutcome::UncaughtException)
+            }
             super::error::Outcome::Faulted(fault) => Ok(AdvanceOutcome::Faulted(fault)),
         }
     }

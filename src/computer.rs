@@ -163,6 +163,7 @@ pub enum ComputerAdvanceOutcome {
     QuotaExhausted(QuotaExhaustion),
     Halted(Option<ComputerValue>),
     Crashed(GuestTrap),
+    UncaughtException(String),
     Faulted(VmFault),
     HostFailed(OwnedHostFailure),
 }
@@ -1108,6 +1109,25 @@ impl ComputerMachine {
                         ));
                     }
                     return Ok(ComputerAdvanceOutcome::Crashed(value));
+                }
+                AdvanceOutcome::UncaughtException => {
+                    let frame = self.active_frame();
+                    let artifact = frame
+                        .executable
+                        .as_ref()
+                        .map(|(_, artifact)| artifact)
+                        .unwrap_or(&self.root_artifact);
+                    let diagnostic = format!(
+                        "{}\n{}",
+                        frame.session.exception_diagnostic(artifact),
+                        self.failure_stacktrace()
+                    );
+                    if self.sessions.len() > 1 {
+                        return self.finish_child(
+                            self.process_failure(ProcessFailureReason::Trapped, &diagnostic),
+                        );
+                    }
+                    return Ok(ComputerAdvanceOutcome::UncaughtException(diagnostic));
                 }
                 AdvanceOutcome::Faulted(value) => {
                     if self.sessions.len() > 1 {

@@ -427,6 +427,11 @@ pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
             encoder.bytes(value.detail().as_bytes());
             encoder
         }
+        OwnedOutcome::UncaughtException(diagnostic) => {
+            let mut encoder = Encoder::new(12);
+            encoder.bytes(diagnostic.as_bytes());
+            encoder
+        }
         OwnedOutcome::WaitingForTerminalEvent => Encoder::new(9),
         OwnedOutcome::CompilationRequested { token } => {
             let mut encoder = Encoder::new(10);
@@ -1179,6 +1184,10 @@ mod tests {
 
     #[test]
     fn terminal_failure_variants_have_stable_scalar_wire_forms() {
+        assert_eq!(
+            vec![12, 3, 0, 0, 0, b'E', b'r', b'r'],
+            encode_outcome(OwnedOutcome::UncaughtException("Err".to_owned()))
+        );
         assert_eq!(
             vec![5, 0, 0, 0, 0, 0],
             encode_outcome(OwnedOutcome::Crashed(
