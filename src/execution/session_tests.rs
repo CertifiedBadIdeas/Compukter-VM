@@ -672,7 +672,7 @@ fn string_request_id_overflow_faults_before_copying_or_dynamic_charge() {
 }
 
 #[test]
-fn explicit_host_failure_is_a_stable_terminal_outcome() {
+fn cancelled_host_failure_is_a_stable_terminal_outcome() {
     let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
     let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
     let mut session = Session::admit(
@@ -685,7 +685,7 @@ fn explicit_host_failure_is_a_stable_terminal_outcome() {
     let request = only_request(session.advance(64, 0).unwrap());
     assert_eq!(TaskId::ROOT, request.task_id());
     let id = request.id();
-    let failure = HostFailure::new(HostFailureKind::Unavailable, "Peripheral is unavailable");
+    let failure = HostFailure::new(HostFailureKind::Cancelled, "Request was cancelled");
     session
         .resume_for(TaskId::ROOT, id, HostResponse::Failure(failure))
         .unwrap();
@@ -703,6 +703,76 @@ fn explicit_host_failure_is_a_stable_terminal_outcome() {
             .resume_for(TaskId::ROOT, id, HostResponse::Failure(failure))
             .unwrap_err(),
     );
+}
+
+#[test]
+fn ordinary_host_failures_raise_at_the_original_call_without_double_retirement() {
+    for kind in [
+        HostFailureKind::EndOfFile,
+        HostFailureKind::InputOutput,
+        HostFailureKind::Unavailable,
+        HostFailureKind::Other,
+    ] {
+        let artifact = fixtures::capability_artifact(true, true, 1, 0);
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+        let mut session = Session::admit(artifact.clone(), profile(), &[binding]).unwrap();
+        session.start(&[]).unwrap();
+        let id = only_request(session.advance(64, 0).unwrap()).id();
+        let retired = session.accounting().retired_instructions;
+        session
+            .resume(
+                id,
+                HostResponse::Failure(HostFailure::new(kind, "host failure")),
+            )
+            .unwrap();
+        for attempt in 0..1000 {
+            let outcome = session.advance_with_retirement_limit(1, 1, 1).unwrap();
+            if outcome == AdvanceOutcome::UncaughtException {
+                assert_eq!(retired, session.accounting().retired_instructions);
+                let diagnostic = session.uncaught_exception_diagnostic(&artifact).unwrap();
+                assert!(diagnostic.contains("host failure"), "{diagnostic}");
+                let foreign = fixtures::capability_artifact(true, true, 2, 0);
+                assert_eq!(
+                    Err(crate::DiagnosticError::ArtifactMismatch),
+                    session.uncaught_exception_diagnostic(&foreign)
+                );
+                assert_eq!(0, session.failure_stack().frames[0].instruction);
+                break;
+            }
+            assert_eq!(AdvanceOutcome::SliceExhausted, outcome);
+            assert_eq!(retired, session.accounting().retired_instructions);
+            assert!(attempt < 999, "factory did not finish");
+        }
+    }
+}
+
+#[test]
+fn host_exception_factory_oom_remains_noncatchable() {
+    let artifact = fixtures::capability_artifact(true, true, 1, 0);
+    let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
+    let mut constrained = profile();
+    constrained.heap_bytes = 32;
+    let mut session = Session::admit(artifact, constrained, &[binding]).unwrap();
+    session.start(&[]).unwrap();
+    let id = only_request(session.advance(64, 0).unwrap()).id();
+    session
+        .resume(
+            id,
+            HostResponse::Failure(HostFailure::new(
+                HostFailureKind::InputOutput,
+                "message does not fit in heap",
+            )),
+        )
+        .unwrap();
+    for attempt in 0..1000 {
+        match session.advance(1, 1).unwrap() {
+            AdvanceOutcome::SliceExhausted => assert!(attempt < 999),
+            AdvanceOutcome::AllocationExhausted(_) => return,
+            outcome => panic!("unexpected host factory outcome: {outcome:?}"),
+        }
+    }
 }
 
 #[test]
@@ -1194,8 +1264,8 @@ fn terminal_vertical_conformance() {
     assert_eq!(3, accounting.accepted_responses);
     assert_eq!(
         [
-            252, 127, 89, 159, 137, 245, 91, 215, 207, 30, 225, 157, 242, 168, 161, 174, 54, 190,
-            201, 70, 198, 224, 20, 191, 191, 194, 243, 124, 177, 199, 11, 186,
+            99, 109, 11, 239, 223, 207, 143, 41, 220, 195, 247, 164, 39, 46, 230, 24, 170, 226, 30,
+            220, 125, 232, 134, 202, 93, 106, 43, 235, 72, 174, 121, 226,
         ],
         accounting.trace_digest
     );

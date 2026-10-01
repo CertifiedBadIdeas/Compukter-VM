@@ -70,13 +70,13 @@ pub use computer::{
 pub use deployment::{DeploymentCandidate, DeploymentFailure, HostDeployError, HostVerifyError};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};
 pub use execution::{
-    AccountingSnapshot, AdmissionError, AdvanceOutcome, CapabilityBinding, EntryArgumentLimit,
-    EntryArgumentLimits, EntryValue, ExecutionProfile, GuestTrap, HostArguments, HostFailure,
-    HostFailureKind, HostMergeEntry, HostMergeEntrySource, HostMergeGroup, HostMergeSchema,
-    HostRequestBatchView, HostRequestView, HostResponse, HostValueInput, HostValueType,
-    HostValueView, ManagedAllocationFailure, OperationSchema, OwnedHostFailure, QuotaExhaustion,
-    QuotaKind, RequestId, ResidentStorageComponent, ResumeError, RunError, Session, TaskId,
-    VmFault, MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
+    AccountingSnapshot, AdmissionError, AdvanceOutcome, CapabilityBinding, DiagnosticError,
+    EntryArgumentLimit, EntryArgumentLimits, EntryValue, ExecutionProfile, GuestTrap,
+    HostArguments, HostFailure, HostFailureKind, HostMergeEntry, HostMergeEntrySource,
+    HostMergeGroup, HostMergeSchema, HostRequestBatchView, HostRequestView, HostResponse,
+    HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema,
+    OwnedHostFailure, QuotaExhaustion, QuotaKind, RequestId, ResidentStorageComponent, ResumeError,
+    RunError, Session, TaskId, VmFault, MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
 };
 pub use filesystem::{
     recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, ExecutableRevision,
