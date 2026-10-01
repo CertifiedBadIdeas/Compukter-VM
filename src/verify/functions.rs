@@ -354,7 +354,7 @@ fn verify_dataflow(
             Code::BadControlFlow,
             module_id,
             function_id,
-            "exception handler has no potentially throwing predecessor",
+            "function contains an unreachable block or handler without a throwing predecessor",
         ));
     }
     Ok(())

@@ -1843,6 +1843,23 @@ fn exception_accepts_handler_initialized_from_throwing_paths() {
 }
 
 #[test]
+fn exception_accepts_continuation_reachable_only_through_handler() {
+    let mut artifact = exception_handler_artifact(false);
+    artifact.modules[0].functions[0].block_count = 3;
+    artifact.modules[0].code[1].instructions =
+        vec![crate::artifact::Instruction::Jump { target: 2 }].into_boxed_slice();
+    artifact.modules[0].blocks.push(crate::artifact::Block {
+        owner_function: crate::artifact::FunctionId(0),
+        code_record: crate::artifact::BlockId(2),
+        instruction_count: 1,
+        declared_fixed_cost: 1,
+        flags: 0,
+    });
+    artifact.modules[0].code.push(unit_return());
+    verify_cfg(&artifact).unwrap();
+}
+
+#[test]
 fn exception_rejects_handler_read_not_initialized_on_throwing_paths() {
     let error = verify_cfg(&exception_handler_artifact(true)).unwrap_err();
     assert_eq!(error.first().unwrap().code, Code::UninitializedRegister);

@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use crate::{
     artifact::{DecodedModule, Instruction},
     diagnostic::{Code, Diagnostic, DiagnosticSet, Family},
@@ -105,30 +103,8 @@ pub(super) fn verify_control_flow(
         successors.push(local);
     }
 
-    let mut reachable = vec![false; successors.len()];
-    let mut queue = VecDeque::new();
-    reachable[0] = true;
-    queue.push_back(0);
-    while let Some(block) = queue.pop_front() {
-        for target in &successors[block] {
-            if !reachable[*target] {
-                reachable[*target] = true;
-                queue.push_back(*target);
-            }
-        }
-    }
-    if reachable
-        .iter()
-        .enumerate()
-        .any(|(local, value)| !value && !handler_blocks.contains(&(start + local)))
-    {
-        return Err(failure(
-            limits,
-            module_id,
-            function_id,
-            "function contains an unreachable block",
-        ));
-    }
+    // Reachability belongs to dataflow: it traverses both ordinary and exceptional edges.
+    // An entry-only walk incorrectly rejects continuations reachable solely through a catch.
     Ok(ControlFlow { successors })
 }
 
