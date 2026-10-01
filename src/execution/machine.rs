@@ -253,9 +253,10 @@ fn task_fault(error: TaskError) -> VmFault {
 
 fn channel_failure(error: ChannelError) -> InstructionFailure {
     match error {
-        ChannelError::InvalidCapacity | ChannelError::InvalidHandle | ChannelError::NoCapacity => {
+        ChannelError::InvalidCapacity | ChannelError::InvalidHandle => {
             InstructionFailure::Trap(GuestTrap::InvalidArgument)
         }
+        ChannelError::NoCapacity => InstructionFailure::Fault(VmFault::HandleExhausted),
         ChannelError::CorruptQueue => InstructionFailure::Fault(VmFault::CorruptLifecycle),
     }
 }
@@ -1163,10 +1164,9 @@ impl Machine {
                                             match self.read_register(frame_index, receiver) {
                                                 Ok(RuntimeValue::Reference(reference)) => reference,
                                                 Ok(RuntimeValue::Null) => {
-                                                    let outcome =
-                                                        Outcome::Crashed(GuestTrap::NullReference);
-                                                    self.lifecycle = Lifecycle::Terminal(outcome);
-                                                    return Ok(outcome);
+                                                    return Ok(
+                                                        self.guest_trap(GuestTrap::NullReference)
+                                                    );
                                                 }
                                                 Ok(_) => {
                                                     return Ok(self.fault(VmFault::InvalidValueType))
@@ -1404,9 +1404,7 @@ impl Machine {
                             Err(fault) => return Ok(self.fault(fault)),
                         };
                         if length < 0 {
-                            let outcome = Outcome::Crashed(GuestTrap::NegativeArraySize);
-                            self.lifecycle = Lifecycle::Terminal(outcome);
-                            return Ok(outcome);
+                            return Ok(self.guest_trap(GuestTrap::NegativeArraySize));
                         }
                         let RuntimeTypeLayout::Array { element } =
                             self.image.type_layout(*ty).ok_or(RunError::NotRunnable)?
@@ -1592,9 +1590,7 @@ impl Machine {
                         let (reference, _, element, length) = match self.resolve_array(array) {
                             Ok(array) => array,
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
                         };
@@ -1624,9 +1620,7 @@ impl Machine {
                             Err(fault) => return Ok(self.fault(fault)),
                         };
                         if value == RuntimeValue::Null && !field.value_type.nullable {
-                            let outcome = Outcome::Crashed(GuestTrap::NullReference);
-                            self.lifecycle = Lifecycle::Terminal(outcome);
-                            return Ok(outcome);
+                            return Ok(self.guest_trap(GuestTrap::NullReference));
                         }
                         if let Err(fault) = self.write_register(frame_index, *dst, value) {
                             return Ok(self.fault(fault));
@@ -1656,9 +1650,7 @@ impl Machine {
                     } => {
                         let receiver = match self.read_register(frame_index, *receiver) {
                             Ok(RuntimeValue::Null) => {
-                                let outcome = Outcome::Crashed(GuestTrap::NullReference);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(GuestTrap::NullReference));
                             }
                             Ok(RuntimeValue::Reference(reference)) => reference,
                             Ok(_) => return Ok(self.fault(VmFault::InvalidValueType)),
@@ -1685,9 +1677,7 @@ impl Machine {
                             Err(fault) => return Ok(self.fault(fault)),
                         };
                         if value == RuntimeValue::Null && !field.value_type.nullable {
-                            let outcome = Outcome::Crashed(GuestTrap::NullReference);
-                            self.lifecycle = Lifecycle::Terminal(outcome);
-                            return Ok(outcome);
+                            return Ok(self.guest_trap(GuestTrap::NullReference));
                         }
                         if let Err(fault) = self.write_register(frame_index, *dst, value) {
                             return Ok(self.fault(fault));
@@ -1709,9 +1699,7 @@ impl Machine {
                         };
                         let receiver = match receiver_value {
                             RuntimeValue::Null => {
-                                let outcome = Outcome::Crashed(GuestTrap::NullReference);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(GuestTrap::NullReference));
                             }
                             RuntimeValue::Reference(reference) => reference,
                             _ => return Ok(self.fault(VmFault::InvalidValueType)),
@@ -1777,9 +1765,7 @@ impl Machine {
                             .ok_or(RunError::NotRunnable)?;
                         match value {
                             RuntimeValue::Null if !destination_type.nullable => {
-                                let outcome = Outcome::Crashed(GuestTrap::NullReference);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(GuestTrap::NullReference));
                             }
                             RuntimeValue::Null => {}
                             RuntimeValue::Reference(reference) => {
@@ -1788,9 +1774,7 @@ impl Machine {
                                     Err(fault) => return Ok(self.fault(fault)),
                                 };
                                 if !self.image.is_assignable(actual, *ty) {
-                                    let outcome = Outcome::Crashed(GuestTrap::ClassCast);
-                                    self.lifecycle = Lifecycle::Terminal(outcome);
-                                    return Ok(outcome);
+                                    return Ok(self.guest_trap(GuestTrap::ClassCast));
                                 }
                             }
                             _ => return Ok(self.fault(VmFault::InvalidValueType)),
@@ -1862,9 +1846,7 @@ impl Machine {
                         self.pending_array_copy = Some(match setup {
                             Ok(pending) => pending,
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
                         });
@@ -1882,9 +1864,7 @@ impl Machine {
                         let (_, _, _, length) = match self.resolve_array(array) {
                             Ok(array) => array,
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
                         };
@@ -1908,18 +1888,14 @@ impl Machine {
                         let (reference, _, element, length) = match self.resolve_array(array) {
                             Ok(array) => array,
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
                         };
                         let offset = match array_element_offset(index_value, length, element) {
                             Ok(offset) => offset,
                             Err(trap) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                         };
                         let value = match load_value(&self.heap, reference, offset, element) {
@@ -1933,9 +1909,7 @@ impl Machine {
                             .copied()
                             .ok_or(RunError::NotRunnable)?;
                         if value == RuntimeValue::Null && !destination_type.nullable {
-                            let outcome = Outcome::Crashed(GuestTrap::NullReference);
-                            self.lifecycle = Lifecycle::Terminal(outcome);
-                            return Ok(outcome);
+                            return Ok(self.guest_trap(GuestTrap::NullReference));
                         }
                         if let Err(fault) = self.write_register(frame_index, *dst, value) {
                             return Ok(self.fault(fault));
@@ -1965,9 +1939,7 @@ impl Machine {
                         {
                             Ok(array) => array,
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
                         };
@@ -1981,9 +1953,7 @@ impl Machine {
                         let offset = match array_element_offset(index_value, length, element) {
                             Ok(offset) => offset,
                             Err(trap) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                         };
                         if let Err(fault) =
@@ -2125,9 +2095,7 @@ impl Machine {
                         let handle = match self.channels.create(capacity).map_err(channel_failure) {
                             Ok(handle) => handle,
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => {
                                 return Ok(self.fault(fault));
@@ -2172,9 +2140,7 @@ impl Machine {
                         {
                             Ok(result) => result,
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => {
                                 return Ok(self.fault(fault));
@@ -2241,9 +2207,7 @@ impl Machine {
                         {
                             Ok(result) => result,
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => {
                                 return Ok(self.fault(fault));
@@ -2324,16 +2288,8 @@ impl Machine {
                             &self.heap,
                         ) {
                             Ok(()) => self.frames[frame_index].instruction += 1,
-                            Err(InstructionFailure::Trap(GuestTrap::DivisionByZero)) => {
-                                if let Err(fault) = self.begin_runtime_exception(1, "/ by zero") {
-                                    return Ok(self.fault(fault));
-                                }
-                                return Ok(Outcome::SliceExhausted);
-                            }
                             Err(InstructionFailure::Trap(trap)) => {
-                                let outcome = Outcome::Crashed(trap);
-                                self.lifecycle = Lifecycle::Terminal(outcome);
-                                return Ok(outcome);
+                                return Ok(self.guest_trap(trap));
                             }
                             Err(InstructionFailure::Fault(fault)) => {
                                 return Ok(self.fault(fault));
@@ -3146,12 +3102,31 @@ impl Machine {
         match error {
             text::TextError::Trap(trap) => {
                 self.cancel_pending_concat();
-                let outcome = Outcome::Crashed(trap);
-                self.lifecycle = Lifecycle::Terminal(outcome);
-                outcome
+                self.guest_trap(trap)
             }
             text::TextError::Fault(fault) => self.fault(fault),
             text::TextError::Exhausted { .. } => self.fault(VmFault::CorruptLifecycle),
+        }
+    }
+
+    fn guest_trap(&mut self, trap: GuestTrap) -> Outcome {
+        let (role, message) = match trap {
+            GuestTrap::DivisionByZero => (1, "/ by zero"),
+            GuestTrap::IndexOutOfBounds => (2, "Index out of bounds"),
+            GuestTrap::NegativeArraySize => (3, "Negative array size"),
+            GuestTrap::NullReference => (4, "Null reference"),
+            GuestTrap::ClassCast => (5, "Invalid cast"),
+            GuestTrap::InvalidArgument => (6, "Invalid argument"),
+            GuestTrap::InvalidExitCode => (6, "Invalid exit code"),
+            GuestTrap::StackOverflow => {
+                let outcome = Outcome::Crashed(trap);
+                self.lifecycle = Lifecycle::Terminal(outcome);
+                return outcome;
+            }
+        };
+        match self.begin_runtime_exception(role, message) {
+            Ok(()) => Outcome::SliceExhausted,
+            Err(fault) => self.fault(fault),
         }
     }
 
@@ -3805,6 +3780,20 @@ impl Machine {
     #[cfg(test)]
     pub(super) fn test_heap_diagnostic(&self) -> super::heap::HeapDiagnostic {
         self.heap.diagnostic()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_exception_message(&self) -> String {
+        let reference = self.pending_exception.unwrap().failure.exception;
+        let RuntimeValue::Reference(message) =
+            load_value(&self.heap, reference, 0, ValueWidth::Ref).unwrap()
+        else {
+            panic!("factory message is missing");
+        };
+        let units: Vec<u16> = (0..self.string_length(message))
+            .map(|index| self.string_get(message, index))
+            .collect();
+        String::from_utf16(&units).unwrap()
     }
 
     #[cfg(test)]

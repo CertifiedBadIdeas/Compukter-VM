@@ -243,7 +243,26 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
     for value in [4, u32::MAX, 0, 0, 0, 0, 0] {
         push_u32(&mut string_type, value);
     }
-    let types = indexed(&[&class_type, &array_type, &function_type, &string_type]);
+    let roles: Vec<Vec<u8>> = [2, 3, 4]
+        .into_iter()
+        .map(|tag| {
+            let mut role = vec![0, tag << 3];
+            push_u16(&mut role, 0);
+            for value in [0, 0, 0, 0, 0, 0, 0] {
+                push_u32(&mut role, value);
+            }
+            role
+        })
+        .collect();
+    let types = indexed(&[
+        &class_type,
+        &array_type,
+        &function_type,
+        &string_type,
+        &roles[0],
+        &roles[1],
+        &roles[2],
+    ]);
     let mut message = Vec::new();
     push_u32(&mut message, 0);
     push_u32(&mut message, 0);
@@ -348,7 +367,7 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
 
     let semantic_sections = vec![
         (0x0100_u16, strings, 5),
-        (0x0101, types, 4),
+        (0x0101, types, 7),
         (0x0102, constants, 2),
         (0x0103, empty.clone(), 0),
         (0x0104, empty.clone(), 0),
@@ -379,8 +398,8 @@ pub(crate) fn language_runtime_vector() -> Vec<u8> {
             14,
         ),
     ];
-    let mut bytes = single_module_artifact(semantic_sections, None, 1 << 0, 1, 4, 10);
-    bytes[10..12].copy_from_slice(&8_u16.to_le_bytes());
+    let mut bytes = single_module_artifact(semantic_sections, None, 1 << 0, 1, 7, 10);
+    bytes[10..12].copy_from_slice(&9_u16.to_le_bytes());
     rehash(&mut bytes);
     bytes
 }

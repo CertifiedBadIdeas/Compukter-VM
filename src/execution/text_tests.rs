@@ -1,5 +1,5 @@
 use super::{
-    error::{GuestTrap, Outcome},
+    error::Outcome,
     fixtures,
     image::deduplicate_literal_ranges,
     text::PendingConcat,
@@ -54,10 +54,8 @@ fn string_get_returns_a_utf16_code_unit() {
 fn string_get_traps_outside_utf16_bounds() {
     for index in [-1, 2] {
         let mut machine = fixtures::started_zero_arg(fixtures::literal_string_get_artifact(index));
-        assert_eq!(
-            Outcome::Crashed(GuestTrap::IndexOutOfBounds),
-            machine.run_slice(16, 0).unwrap()
-        );
+        assert_eq!(Outcome::SliceExhausted, machine.run_slice(16, 0).unwrap());
+        fixtures::finish_exception(&mut machine, "Index out of bounds");
     }
 }
 
@@ -363,10 +361,8 @@ fn string_substring_checks_order_and_utf16_bounds_before_allocation() {
         let mut machine =
             fixtures::started_zero_arg(fixtures::literal_string_substring_artifact(start, end));
         assert_eq!(Outcome::SliceExhausted, machine.run_slice(4, 0).unwrap());
-        assert_eq!(
-            Outcome::Crashed(GuestTrap::IndexOutOfBounds),
-            machine.run_slice(8, 0).unwrap()
-        );
+        assert_eq!(Outcome::SliceExhausted, machine.run_slice(8, 0).unwrap());
+        fixtures::finish_exception(&mut machine, "Index out of bounds");
     }
 }
 
@@ -404,7 +400,10 @@ fn string_from_char_array_checks_ranges_before_allocation() {
         loop {
             match machine.run_slice(64, 0).unwrap() {
                 Outcome::SliceExhausted => {}
-                Outcome::Crashed(GuestTrap::IndexOutOfBounds) => break,
+                Outcome::UncaughtException => {
+                    assert_eq!("Index out of bounds", machine.test_exception_message());
+                    break;
+                }
                 outcome => panic!("unexpected char-array range outcome: {outcome:?}"),
             }
         }

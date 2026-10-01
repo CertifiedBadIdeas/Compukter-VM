@@ -10,6 +10,7 @@ use crate::{
 };
 
 use super::{
+    error::Outcome,
     image::{AdmittedReference, ExecutionImage, ExecutionProfile},
     machine::Machine,
     value::{EntryArgument, Ref32, RuntimeValue},
@@ -891,6 +892,7 @@ fn internal_wait_and_external_request_artifact(
     decoded.manifest.minimum_slice_cost = maximum_block_cost;
     decoded.manifest.maximum_call_depth = 1;
     decoded.manifest.required_stack_bytes = 16;
+    install_runtime_exception_dependencies(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -1166,6 +1168,7 @@ pub(crate) fn redstone_i32_artifact(
         first.push(Instruction::Return { value: destination });
         install_entry_blocks(&mut decoded, vec![first]);
     }
+    install_runtime_exception_dependencies(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -1230,6 +1233,7 @@ pub(crate) fn redstone_unit_artifact(operation: u32, arguments: &[i32]) -> Verif
         &mut decoded,
         vec![first, vec![Instruction::Return { value: u16::MAX }]],
     );
+    install_runtime_exception_dependencies(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -1303,6 +1307,7 @@ pub(crate) fn sound_bool_artifact(arguments: &[i32]) -> VerifiedArtifact {
         &mut decoded,
         vec![first, vec![Instruction::Return { value: destination }]],
     );
+    install_runtime_exception_dependencies(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -1361,6 +1366,7 @@ pub(crate) fn timer_unit_artifact(duration: i32) -> VerifiedArtifact {
             vec![Instruction::Return { value: u16::MAX }],
         ],
     );
+    install_runtime_exception_dependencies(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -2325,6 +2331,7 @@ fn entry_string_array_artifact(code_unit: Option<(i32, i32)>) -> VerifiedArtifac
         let registers = artifact.modules[0].functions[0].register_count as u64;
         configure_stack(&mut artifact, registers, 1);
     }
+    install_runtime_exception_dependencies(&mut artifact);
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -2397,6 +2404,7 @@ pub(crate) fn throwable_root_artifact() -> VerifiedArtifact {
         },
     ];
     module.declared_types = 3;
+    install_runtime_exception_dependencies(&mut artifact);
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default())
         .expect("Throwable root fixture verifies")
@@ -2621,6 +2629,7 @@ pub(crate) fn exception_artifact(cross_call: bool, caught: bool, task: bool) -> 
         artifact.manifest.required_stack_bytes *= 2;
     }
     canonicalize_module_strings(&mut artifact, 0);
+    install_runtime_exception_dependencies(&mut artifact);
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -2703,6 +2712,7 @@ pub(super) fn nested_exception_artifact(rethrow: bool) -> VerifiedArtifact {
             ..inner
         },
     ];
+    install_runtime_exception_dependencies(&mut artifact);
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -3458,6 +3468,7 @@ fn literal_string_program_blocks_configured(
     configure(&mut decoded);
     canonicalize_module_strings(&mut decoded, 0);
 
+    install_runtime_exception_dependencies(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     verify_artifact(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -5352,6 +5363,7 @@ pub(crate) fn reference_identity_artifact(
         ],
     );
     configure_stack(&mut artifact, 4, 1);
+    install_runtime_exception_dependencies(&mut artifact);
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default())
         .expect("reference comparison fixture verifies")
@@ -5446,6 +5458,7 @@ pub(crate) fn array_root_cast_artifact(
         ],
     );
     configure_stack(&mut artifact, 5, 1);
+    install_runtime_exception_dependencies(&mut artifact);
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default())
         .expect("array root fixture verifies")
@@ -5551,6 +5564,7 @@ pub(crate) fn array_copy_artifact() -> VerifiedArtifact {
     decoded.manifest.maximum_block_cost = maximum;
     decoded.manifest.minimum_slice_cost = maximum;
     configure_stack(&mut decoded, 7, 1);
+    install_runtime_exception_dependencies(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
@@ -6572,58 +6586,154 @@ fn verified_mutated(
     )
     .unwrap();
     change(&mut decoded);
-    if decoded.modules.iter().any(|module| {
-        module.code.iter().any(|code| {
-            code.instructions.iter().any(|instruction| {
-                matches!(
-                    instruction,
-                    Instruction::Div { form: 1 | 2, .. } | Instruction::Rem { form: 1 | 2, .. }
-                )
-            })
-        })
-    }) {
-        install_arithmetic_exception_runtime(&mut decoded);
-    }
+    install_runtime_exception_dependencies(&mut decoded);
     let bytes = crate::test_encode::encode_artifact_rehashed(decoded).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
 
-fn install_arithmetic_exception_runtime(artifact: &mut crate::artifact::DecodedArtifact) {
-    // Scalar execution fixtures explicitly include the same verified factory dependency as the compiler.
-    let runtime = throwable_root_artifact();
-    let mut library = crate::decode::records::decode_artifact(
-        runtime.decoded().bytes.clone(),
-        &ArtifactLimits::default(),
-    )
-    .unwrap();
-    let mut module = library.modules.remove(1);
-    let offset = artifact.bytes.len();
-    let mut bytes = artifact.bytes.to_vec();
-    bytes.extend_from_slice(&library.bytes);
-    artifact.bytes = Arc::from(bytes);
-    for name in &mut module.strings {
-        name.start += offset;
-        name.end += offset;
+fn install_runtime_exception_dependencies(artifact: &mut crate::artifact::DecodedArtifact) {
+    // Test artifact producers retain implicit dependencies just as the compiler linker does.
+    // Admission itself never repairs legacy or incomplete artifacts.
+    let required = artifact
+        .modules
+        .iter()
+        .flat_map(|module| &module.code)
+        .flat_map(|code| &code.instructions)
+        .fold(0, |mask, instruction| {
+            mask | crate::verify::exceptions::required_runtime_exception_roles(instruction)
+        });
+    if required == 0 {
+        return;
     }
-    for literal in &mut module.utf16_literals {
-        literal.start += offset;
-        literal.end += offset;
-    }
-    module.types.push(NominalType::Class {
-        flags: 1 << 3,
-        generic_arity: 0,
-        name: 0,
-        super_type: TypeId(2),
-        interfaces: Vec::new(),
-        field_start: 0,
-        field_count: 0,
-        method_start: 0,
-        method_count: 0,
-        initializer: None,
+    let root = artifact
+        .modules
+        .iter()
+        .enumerate()
+        .find_map(|(owner, module)| {
+            module
+                .types
+                .iter()
+                .position(|ty| matches!(ty, NominalType::Class { flags, .. } if flags & 4 != 0))
+                .map(|index| (owner, index))
+        });
+    let (owner, root) = root.unwrap_or_else(|| {
+        let string = artifact
+            .modules
+            .iter()
+            .enumerate()
+            .find_map(|(owner, module)| {
+                module
+                    .types
+                    .iter()
+                    .position(|ty| {
+                        matches!(ty, NominalType::Class { name, .. }
+                if module.strings[*name as usize].slice(&artifact.bytes) == b"kotlin.String")
+                    })
+                    .map(|index| (owner, index))
+            });
+        if let Some((owner, string)) = string {
+            let module = &mut artifact.modules[owner];
+            let root = module.types.len();
+            module.types.push(NominalType::Class {
+                flags: 4,
+                generic_arity: 0,
+                name: 0,
+                super_type: TypeId(u32::MAX),
+                interfaces: Vec::new(),
+                field_start: module.fields.len() as u32,
+                field_count: 2,
+                method_start: 0,
+                method_count: 0,
+                initializer: None,
+            });
+            for (name, nominal_type) in [string, root].into_iter().enumerate() {
+                module.fields.push(Field {
+                    owner: TypeId(root as u32),
+                    name: name as u32,
+                    value_type: ValueType {
+                        kind: 7,
+                        flags: 1,
+                        nominal_type: TypeId(nominal_type as u32),
+                    },
+                    flags: 0,
+                });
+            }
+            (owner, root)
+        } else {
+            let runtime = throwable_root_artifact();
+            let mut library = crate::decode::records::decode_artifact(
+                runtime.decoded().bytes.clone(),
+                &ArtifactLimits::default(),
+            )
+            .unwrap();
+            let mut module = library.modules.remove(1);
+            let offset = artifact.bytes.len();
+            let mut bytes = artifact.bytes.to_vec();
+            bytes.extend_from_slice(&library.bytes);
+            artifact.bytes = Arc::from(bytes);
+            for name in &mut module.strings {
+                name.start += offset;
+                name.end += offset;
+            }
+            for literal in &mut module.utf16_literals {
+                literal.start += offset;
+                literal.end += offset;
+            }
+            let owner = artifact.modules.len();
+            artifact.modules.push(module);
+            (owner, 2)
+        }
     });
-    module.declared_types = module.types.len() as u32;
-    artifact.modules.push(module);
+    for tag in 1..=8 {
+        if required & (1 << (tag - 1)) == 0
+            || artifact.modules.iter().any(|module| {
+                module
+                    .types
+                    .iter()
+                    .any(|ty| matches!(ty, NominalType::Class { flags, .. } if flags >> 3 == tag))
+            })
+        {
+            continue;
+        }
+        artifact.modules[owner].types.push(NominalType::Class {
+            flags: tag << 3,
+            generic_arity: 0,
+            name: 0,
+            super_type: TypeId(root as u32),
+            interfaces: Vec::new(),
+            field_start: 0,
+            field_count: 0,
+            method_start: 0,
+            method_count: 0,
+            initializer: None,
+        });
+    }
+    artifact.modules[owner].declared_types = artifact.modules[owner].types.len() as u32;
     artifact.header.runtime_minor = 9;
+}
+
+pub(crate) fn fallible_operation_artifacts() -> [VerifiedArtifact; 5] {
+    [
+        array_allocation_artifact(-1),
+        array_bounds_artifact(),
+        nonnull_zero_field_artifact(),
+        nullable_cast_artifact(false),
+        channel_handoff_artifact(),
+    ]
+}
+
+pub(super) fn finish_exception(machine: &mut Machine, message: &str) {
+    for _ in 0..1024 {
+        match machine.run_slice(64, 64).unwrap() {
+            Outcome::SliceExhausted => {}
+            Outcome::UncaughtException => {
+                assert_eq!(message, machine.test_exception_message());
+                return;
+            }
+            outcome => panic!("expected managed exception, got {outcome:?}"),
+        }
+    }
+    panic!("exception factory did not finish");
 }
 
 fn verified_program(

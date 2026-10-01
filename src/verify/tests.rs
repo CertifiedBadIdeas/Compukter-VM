@@ -31,6 +31,45 @@ fn integer_division_and_remainder_reject_legacy_or_missing_factory_metadata() {
 }
 
 #[test]
+fn fallible_operations_reject_each_missing_factory_and_legacy_abi() {
+    use crate::execution::fixtures;
+    for source in fixtures::fallible_operation_artifacts() {
+        let artifact = source.decoded();
+        let required = artifact
+            .modules
+            .iter()
+            .flat_map(|module| &module.code)
+            .flat_map(|code| &code.instructions)
+            .fold(0, |mask, instruction| {
+                mask | super::exceptions::required_runtime_exception_roles(instruction)
+            });
+        assert_ne!(0, required);
+        for tag in 1..=8 {
+            if required & (1 << (tag - 1)) == 0 {
+                continue;
+            }
+            let mut missing = decoded(artifact.bytes.to_vec());
+            for module in &mut missing.modules {
+                for ty in &mut module.types {
+                    if let crate::artifact::NominalType::Class { flags, .. } = ty {
+                        if *flags >> 3 == tag {
+                            *flags &= 7;
+                        }
+                    }
+                }
+            }
+            let errors = super::exceptions::verify_exceptions(&missing, &ArtifactLimits::default())
+                .unwrap_err();
+            assert_eq!(Code::BadException, errors.first().unwrap().code);
+            assert!(errors.first().unwrap().detail.contains("rebuild"));
+        }
+        let mut legacy = decoded(artifact.bytes.to_vec());
+        legacy.header.runtime_minor = 8;
+        assert!(super::exceptions::verify_exceptions(&legacy, &ArtifactLimits::default()).is_err());
+    }
+}
+
+#[test]
 fn exception_contract_rejects_legacy_and_non_throwable_operands_and_handlers() {
     let source = crate::execution::fixtures::exception_artifact(false, true, false);
     for case in 0..5 {
@@ -509,7 +548,9 @@ fn module_rejects_field_owned_by_function_type() {
 
 fn verify_cfg(artifact: &crate::artifact::DecodedArtifact) -> Result<(), crate::DiagnosticSet> {
     let limits = ArtifactLimits::default();
-    let exceptions = super::exceptions::verify_exceptions(artifact, &limits)?;
+    // These isolated CFG tests are not artifact-admission tests. Their exception tables
+    // are checked without imposing implicit factory dependencies on synthetic type layouts.
+    let exceptions = super::exceptions::verify_handler_tables(artifact, &limits)?;
     super::functions::verify_functions(artifact, &exceptions, &limits)
 }
 
