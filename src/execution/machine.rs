@@ -1580,7 +1580,17 @@ impl Machine {
                             Ok(value) => value,
                             Err(fault) => return Ok(self.fault(fault)),
                         };
-                        let pending = match text::PendingConcat::scalar(value, *form, *dst) {
+                        let conversion = if *form == 7 {
+                            text::PendingConcat::reference_default(
+                                &self.image,
+                                &self.heap,
+                                value,
+                                *dst,
+                            )
+                        } else {
+                            text::PendingConcat::scalar(value, *form, *dst)
+                        };
+                        let pending = match conversion {
                             Ok(pending) => pending,
                             Err(error) => return Ok(self.text_outcome(error)),
                         };

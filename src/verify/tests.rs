@@ -1047,6 +1047,31 @@ fn cfg_rejects_string_allocation_after_another_instruction() {
 }
 
 #[test]
+fn reference_string_conversion_requires_abi_1_10_and_a_reference_operand() {
+    for (minor, source, valid) in [
+        (9, reference(1, true), false),
+        (10, reference(1, true), true),
+        (10, primitive(1), false),
+    ] {
+        let mut artifact = string_artifact(
+            vec![source, reference(1, false)],
+            1,
+            vec![
+                crate::artifact::Instruction::StringValueOf {
+                    form: 7,
+                    dst: 1,
+                    source: 0,
+                },
+                crate::artifact::Instruction::Return { value: u16::MAX },
+            ],
+        );
+        artifact.header.runtime_minor = minor;
+        let result = verify_cfg(&artifact);
+        assert_eq!(valid, result.is_ok(), "minor {minor}: {result:?}");
+    }
+}
+
+#[test]
 fn cfg_rejects_scalar_string_conversion_type_mismatches() {
     for (registers, instruction) in [
         (

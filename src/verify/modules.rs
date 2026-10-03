@@ -296,8 +296,9 @@ fn verify_nominal_types(
                     })?;
                     if !matches!(&artifact.modules[target.0].types[target.1],
                         NominalType::Class { flags: 0, generic_arity: 0, super_type, interfaces,
-                            field_count: 0, method_count: 0, initializer: None, .. }
+                            field_count: 0, method_count, initializer: None, .. }
                             if super_type.0 == u32::MAX && interfaces.is_empty()
+                                && (*method_count == 0 || artifact.header.runtime_minor >= 10)
                     ) {
                         return Err(type_failure(
                             limits,

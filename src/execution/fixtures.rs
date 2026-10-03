@@ -2871,6 +2871,72 @@ pub(super) fn literal_string_concat_artifact() -> VerifiedArtifact {
     literal_string_concat_units_artifact(&[0x48, 0x69])
 }
 
+pub(super) fn reference_default_string_artifact(null: bool) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    let object = ValueType {
+        kind: 7,
+        flags: u8::from(null),
+        nominal_type: TypeId(1),
+    };
+    let first = if null {
+        Instruction::Const {
+            dst: 0,
+            constant: 1,
+        }
+    } else {
+        Instruction::NewObject {
+            dst: 0,
+            type_ref: 1,
+        }
+    };
+    literal_string_program_blocks_configured(
+        string,
+        vec![object, string],
+        vec![Constant::Null],
+        &[],
+        vec![
+            vec![first, Instruction::Jump { target: 1 }],
+            vec![
+                Instruction::StringValueOf {
+                    form: 7,
+                    dst: 1,
+                    source: 0,
+                },
+                Instruction::Return { value: 1 },
+            ],
+        ],
+        |artifact| {
+            artifact.header.runtime_minor = 10;
+            artifact.modules[0].constants.swap(0, 1);
+            let mut bytes = artifact.bytes.to_vec();
+            let start = bytes.len();
+            bytes.extend_from_slice("demo.Класс".as_bytes());
+            let end = bytes.len();
+            artifact.bytes = Arc::from(bytes);
+            let module = &mut artifact.modules[0];
+            let name = module.strings.len() as u32;
+            module.strings.push(ByteRange { start, end });
+            module.types.push(NominalType::Class {
+                flags: 2,
+                generic_arity: 0,
+                name,
+                super_type: TypeId(u32::MAX),
+                interfaces: vec![],
+                field_start: 0,
+                field_count: 0,
+                method_start: 0,
+                method_count: 0,
+                initializer: None,
+            });
+            module.declared_types = module.types.len() as u32;
+        },
+    )
+}
+
 pub(super) fn scalar_string_value_artifact(form: u8, value: Constant) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
