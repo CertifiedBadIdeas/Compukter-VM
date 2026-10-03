@@ -270,6 +270,41 @@ fn scalar_string_conversion_matches_kotlin_representations() {
 }
 
 #[test]
+fn reference_default_string_conversion_handles_null_unicode_and_tiny_slices() {
+    for null in [false, true] {
+        let mut machine =
+            fixtures::started_zero_arg(fixtures::reference_default_string_artifact(null));
+        let mut slices = 0;
+        let outcome = loop {
+            let outcome = machine.run_slice(5, 0).unwrap();
+            if outcome != Outcome::SliceExhausted {
+                break outcome;
+            }
+            slices += 1;
+            assert!(slices < 1000);
+        };
+        let Outcome::Halted(Some(RuntimeValue::Reference(reference))) = outcome else {
+            panic!("{outcome:?}");
+        };
+        let text = String::from_utf16(
+            &(0..machine.string_length(reference))
+                .map(|index| machine.string_get(reference, index))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(slices > 0);
+        if null {
+            assert_eq!("null", text);
+        } else {
+            let suffix = text
+                .strip_prefix("demo.Класс@")
+                .expect("qualified Unicode type name");
+            assert!(!suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+}
+
+#[test]
 fn scalar_string_conversion_resumes_without_publishing_a_partial_value() {
     let mut machine = fixtures::started_zero_arg(fixtures::scalar_string_value_artifact(
         1,

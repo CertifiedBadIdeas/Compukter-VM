@@ -1249,12 +1249,20 @@ fn verify_instruction(
             write(state, *dst, function, module_id, function_id, limits)?;
         }
         Instruction::StringValueOf { form, dst, source } => {
-            if !matches!(form, 1 | 2 | 3 | 5 | 6) {
+            if !matches!(form, 1 | 2 | 3 | 5 | 6 | 7) {
                 return Err(type_failure(
                     limits,
                     module_id,
                     function_id,
                     "unsupported string conversion form",
+                ));
+            }
+            if *form == 7 && artifact.header.runtime_minor < 10 {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "reference string conversion requires Runtime ABI 1.10",
                 ));
             }
             read(function, state, *source, module_id, function_id, limits)?;

@@ -16,6 +16,10 @@ pub(super) enum StringBacking {
         length: u8,
     },
     Literal(ResolvedLiteral),
+    TypeName {
+        index: usize,
+        length: u32,
+    },
     Managed {
         reference: Ref32,
         length: u32,
@@ -32,6 +36,7 @@ impl StringBacking {
         match self {
             Self::Inline { length, .. } => u32::from(length),
             Self::Literal(literal) => literal.code_units,
+            Self::TypeName { length, .. } => length,
             Self::Managed { length, .. } => length,
             Self::CharArray { length, .. } => length,
         }
@@ -40,7 +45,7 @@ impl StringBacking {
     fn visit_root(self, visit: &mut impl FnMut(Ref32)) {
         match self {
             Self::Managed { reference, .. } | Self::CharArray { reference, .. } => visit(reference),
-            Self::Inline { .. } | Self::Literal(_) => {}
+            Self::Inline { .. } | Self::Literal(_) | Self::TypeName { .. } => {}
         }
     }
 }
@@ -259,6 +264,90 @@ impl PendingConcat {
             },
             rhs_start: 0,
             rhs_length: 0,
+            destination,
+            scan: 0,
+            latin1: true,
+            reservation: None,
+            layout: None,
+            written: 0,
+            collection_attempted: false,
+        })
+    }
+
+    pub(super) fn reference_default(
+        image: &ExecutionImage,
+        heap: &Heap,
+        value: RuntimeValue,
+        destination: u16,
+    ) -> Result<Self, TextError> {
+        let mut units = [0; INLINE_SCALAR_UNITS];
+        let (lhs, rhs) = match value {
+            RuntimeValue::Null => {
+                units[..4].copy_from_slice(&[110, 117, 108, 108]);
+                (
+                    StringBacking::Inline {
+                        units,
+                        start: 0,
+                        length: 4,
+                    },
+                    StringBacking::Inline {
+                        units: [0; INLINE_SCALAR_UNITS],
+                        start: 0,
+                        length: 0,
+                    },
+                )
+            }
+            RuntimeValue::Reference(reference) => {
+                let index = if let Some(ty) = image.reference_type(reference) {
+                    image
+                        .type_index(ty)
+                        .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?
+                } else {
+                    heap.runtime_type(reference)
+                        .ok_or(TextError::Fault(VmFault::InvalidReference))?
+                        as usize
+                };
+                let length = u32::try_from(
+                    image
+                        .type_name(index)
+                        .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?
+                        .len(),
+                )
+                .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?;
+                let identity = reference.to_bits();
+                let mut start = INLINE_SCALAR_UNITS;
+                let mut rest = identity;
+                loop {
+                    start -= 1;
+                    units[start] = b"0123456789abcdef"[(rest & 15) as usize] as u16;
+                    rest >>= 4;
+                    if rest == 0 {
+                        break;
+                    }
+                }
+                start -= 1;
+                units[start] = b'@' as u16;
+                (
+                    StringBacking::TypeName { index, length },
+                    StringBacking::Inline {
+                        units,
+                        start: start as u8,
+                        length: (INLINE_SCALAR_UNITS - start) as u8,
+                    },
+                )
+            }
+            _ => return Err(TextError::Fault(VmFault::InvalidValueType)),
+        };
+        lhs.length()
+            .checked_add(rhs.length())
+            .ok_or(TextError::Fault(VmFault::AccountingOverflow))?;
+        Ok(Self {
+            lhs,
+            lhs_start: 0,
+            lhs_length: lhs.length(),
+            rhs,
+            rhs_start: 0,
+            rhs_length: rhs.length(),
             destination,
             scan: 0,
             latin1: true,
@@ -1018,7 +1107,7 @@ pub(super) fn encoding(
         StringBacking::Inline { .. } => {
             return Err(TextError::Fault(VmFault::InvalidReference));
         }
-        StringBacking::Literal(_) => None,
+        StringBacking::Literal(_) | StringBacking::TypeName { .. } => None,
         StringBacking::Managed { encoding, .. } => Some(encoding),
         StringBacking::CharArray { .. } => {
             return Err(TextError::Fault(VmFault::InvalidReference));
@@ -1075,6 +1164,11 @@ pub(super) fn code_unit(
         StringBacking::Inline { units, start, .. } => {
             Ok(units[usize::from(start) + index as usize])
         }
+        StringBacking::TypeName { index: ty, .. } => image
+            .type_name(ty)
+            .and_then(|units| units.get(index as usize))
+            .copied()
+            .ok_or(TextError::Fault(VmFault::InvalidResolvedId)),
         StringBacking::Literal(literal) => {
             let offset = index as usize * 2;
             let bytes = image.literal_bytes(literal);

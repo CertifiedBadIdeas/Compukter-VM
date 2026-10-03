@@ -79,8 +79,9 @@ pub(crate) fn verify_throwable_root(
             });
             let valid_parent = super_type.0 == u32::MAX || modules::resolved_type(artifact, module_id, *super_type).is_some_and(|identity| {
                 matches!(&artifact.modules[identity.0].types[identity.1], NominalType::Class {
-                    flags: 0, generic_arity: 0, super_type, interfaces, field_count: 0, method_count: 0, initializer: None, ..
-                } if super_type.0 == u32::MAX && interfaces.is_empty())
+                    flags: 0, generic_arity: 0, super_type, interfaces, field_count: 0, method_count, initializer: None, ..
+                } if super_type.0 == u32::MAX && interfaces.is_empty()
+                    && (*method_count == 0 || artifact.header.runtime_minor >= 10))
             });
             if *flags != 4
                 || *generic_arity != 0

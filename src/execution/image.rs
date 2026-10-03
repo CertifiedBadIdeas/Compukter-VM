@@ -464,6 +464,8 @@ struct ExecutionImageInner {
     host_references: Box<[ResolvedHostReference]>,
     type_offsets: Box<[usize]>,
     type_layouts: Box<[RuntimeTypeLayout]>,
+    type_name_indices: Box<[usize]>,
+    type_names: Box<[Box<[u16]>]>,
     type_initializers: Box<[Option<usize>]>,
     type_superclasses: Box<[Option<TypeKey>]>,
     class_types: Box<[bool]>,
@@ -889,6 +891,43 @@ impl ExecutionImage {
             });
         }
 
+        // Deduplicate by the verified metadata identity, so repeated type names do not amplify storage.
+        // The shared UTF-16 pool is bounded by twice the source metadata bytes plus one index per type.
+        let mut name_ids = std::collections::HashMap::new();
+        name_ids
+            .try_reserve(type_layouts.len())
+            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+        let mut type_names = reserved(type_layouts.len())?;
+        let mut type_name_indices = reserved(type_layouts.len())?;
+        for (module_id, module) in decoded.modules.iter().enumerate() {
+            for ty in &module.types {
+                let name = match ty {
+                    NominalType::Class { name, .. }
+                    | NominalType::Interface { name, .. }
+                    | NominalType::Array { name, .. }
+                    | NominalType::Function { name, .. } => *name,
+                };
+                let index = if let Some(index) = name_ids.get(&(module_id, name)) {
+                    *index
+                } else {
+                    let bytes = module
+                        .strings
+                        .get(name as usize)
+                        .ok_or(AdmissionError::InvalidEntry)?
+                        .slice(&decoded.bytes);
+                    let text =
+                        std::str::from_utf8(bytes).map_err(|_| AdmissionError::InvalidEntry)?;
+                    let index = type_names.len();
+                    let mut units = reserved(text.encode_utf16().count())?;
+                    units.extend(text.encode_utf16());
+                    type_names.push(units.into_boxed_slice());
+                    name_ids.insert((module_id, name), index);
+                    index
+                };
+                type_name_indices.push(index);
+            }
+        }
+
         let entry_key = artifact.entry();
         let entry = function_offsets
             .get(entry_key.module as usize)
@@ -906,6 +945,8 @@ impl ExecutionImage {
             host_references: host_references.into_boxed_slice(),
             type_offsets,
             type_layouts,
+            type_name_indices: type_name_indices.into_boxed_slice(),
+            type_names: type_names.into_boxed_slice(),
             type_initializers: type_initializers.into_boxed_slice(),
             type_superclasses: type_superclasses.into_boxed_slice(),
             class_types: class_types.into_boxed_slice(),
@@ -1066,6 +1107,11 @@ impl ExecutionImage {
 
     pub(super) fn storage_plan(&self) -> StoragePlan {
         self.0.storage_plan
+    }
+
+    pub(super) fn type_name(&self, index: usize) -> Option<&[u16]> {
+        let name = *self.0.type_name_indices.get(index)?;
+        self.0.type_names.get(name).map(|units| units.as_ref())
     }
 
     pub(super) fn type_layout(&self, key: TypeKey) -> Option<&RuntimeTypeLayout> {
@@ -2521,8 +2567,10 @@ fn resolve_dispatch_entries(
     let mut entries = reserved(capacity)?;
     for (module_id, module) in artifact.modules.iter().enumerate() {
         for (local_type, nominal) in module.types.iter().enumerate() {
-            let NominalType::Class { flags, .. } = nominal else {
-                continue;
+            let flags = match nominal {
+                NominalType::Class { flags, .. } => *flags,
+                NominalType::Array { .. } => 0,
+                _ => continue,
             };
             let actual = TypeKey {
                 module: checked_u32(module_id)?,
@@ -2568,6 +2616,10 @@ fn find_method_implementation(
     let mut current = Some(actual);
     while let Some(owner) = current {
         let module = &artifact.modules[owner.module as usize];
+        if let NominalType::Array { super_type, .. } = &module.types[owner.ty as usize] {
+            current = super_type.and_then(|ty| resolve_type(artifact, owner.module as usize, ty));
+            continue;
+        }
         let NominalType::Class {
             super_type,
             method_start,

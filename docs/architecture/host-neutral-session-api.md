@@ -100,6 +100,22 @@ exception are built through budgeted allocation and collection; pending referenc
 Factory OOM stays noncatchable. Floating division is nonthrowing. Stack overflow and channel-storage exhaustion
 remain noncatchable resource failures.
 
+Runtime ABI 1.10 adds reference-default `string_value_of` form 7. It accepts a reference
+(including null) and produces a non-null standard String. Null becomes `null`; a live reference
+becomes its qualified runtime type name, `@`, and the lowercase hexadecimal VM Ref32 identity.
+This identity is stable while the object is live and contains no host pointer. The instruction
+provides the concrete root `Any.toString` implementation; virtual overrides retain ordinary
+method dispatch, including inherited methods on arrays. ABI 1.10 allows methods on the
+stateless root parent of arrays and Throwable; older artifacts retain their no-method restriction. String and scalar-box overrides are
+compiler-owned library methods rather than special cases of this default instruction.
+
+Admission deduplicates verified type names by module/string identity into an immutable shared
+UTF-16 pool, bounded by twice the source metadata bytes plus per-type indices and pool records.
+Conversion snapshots the name and identity before any collection, then uses the existing
+sliceable string scan/allocation/copy machinery. All Guest work and allocation remain charged;
+no partial destination is published. Older forms remain compatible, while form 7 requires 1.10.
+The artifact container format and C ABI 18 are unchanged.
+
 ## Strings and ownership
 
 The boundary carries borrowed UTF-16 code units because Kotlin `Char` and
