@@ -640,3 +640,36 @@ fn equal_dynamic_strings_are_fresh_but_content_equal() {
         assert_eq!(Outcome::Halted(Some(RuntimeValue::Bool(true))), outcome);
     }
 }
+
+#[test]
+fn value_hash_executes_scalar_semantics_with_fixed_slices() {
+    for (form, value, expected) in [
+        (1, crate::artifact::Constant::I32(-7), -7),
+        (
+            2,
+            crate::artifact::Constant::I64(0x12345678abcdef01),
+            0xb9f9b979u32 as i32,
+        ),
+        (2, crate::artifact::Constant::I64(-1), 0),
+        (3, crate::artifact::Constant::F32(0x80000000), i32::MIN),
+        (3, crate::artifact::Constant::F32(0x7fa12345), 0x7fc00000),
+        (3, crate::artifact::Constant::F32(0xffc00001), 0x7fc00000),
+        (5, crate::artifact::Constant::Bool(true), 1231),
+        (5, crate::artifact::Constant::Bool(false), 1237),
+        (6, crate::artifact::Constant::Char(0xd800), 0xd800),
+    ] {
+        let mut machine = fixtures::started_zero_arg(fixtures::scalar_hash_artifact(form, value));
+        assert_eq!(
+            Outcome::Halted(Some(RuntimeValue::I32(expected))),
+            machine.run_slice(3, 0).unwrap()
+        );
+        assert_eq!(0, machine.consumed_dynamic_cost());
+    }
+    let reference = Ref32::managed(16).unwrap();
+    assert_eq!(
+        Some(reference.to_bits() as i32),
+        RuntimeValue::Reference(reference).hash_code(7)
+    );
+    assert_eq!(Some(0), RuntimeValue::Null.hash_code(7));
+    assert_eq!(None, RuntimeValue::I32(1).hash_code(7));
+}

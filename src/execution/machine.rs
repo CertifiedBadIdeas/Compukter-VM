@@ -1575,6 +1575,21 @@ impl Machine {
                             return Ok(outcome);
                         }
                     }
+                    ResolvedInstruction::ValueHash { form, dst, source } => {
+                        let value = match self.read_register(frame_index, *source) {
+                            Ok(value) => value,
+                            Err(fault) => return Ok(self.fault(fault)),
+                        };
+                        let Some(hash) = value.hash_code(*form) else {
+                            return Ok(self.fault(VmFault::InvalidValueType));
+                        };
+                        if let Err(fault) =
+                            self.write_register(frame_index, *dst, RuntimeValue::I32(hash))
+                        {
+                            return Ok(self.fault(fault));
+                        }
+                        self.frames[frame_index].instruction += 1;
+                    }
                     ResolvedInstruction::StringValueOf { form, dst, source } => {
                         let value = match self.read_register(frame_index, *source) {
                             Ok(value) => value,

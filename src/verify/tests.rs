@@ -2205,3 +2205,35 @@ fn cfg_accepts_while_true_at_loop_header_safepoint() {
         vec![crate::artifact::Instruction::Jump { target: 0 }].into_boxed_slice();
     verify_cfg(&artifact).unwrap();
 }
+
+#[test]
+fn value_hash_requires_abi_1_11_matching_operand_and_i32_result() {
+    for (minor, form, source, result, valid) in [
+        (10, 1, primitive(1), primitive(1), false),
+        (11, 1, primitive(1), primitive(1), true),
+        (11, 2, primitive(1), primitive(1), false),
+        (11, 7, reference(1, true), primitive(1), true),
+        (11, 7, primitive(1), primitive(1), false),
+        (11, 1, primitive(1), primitive(2), false),
+        (11, 4, primitive(4), primitive(1), false),
+    ] {
+        let mut artifact = string_artifact(
+            vec![source, result],
+            1,
+            vec![
+                crate::artifact::Instruction::ValueHash {
+                    form,
+                    dst: 1,
+                    source: 0,
+                },
+                crate::artifact::Instruction::Return { value: u16::MAX },
+            ],
+        );
+        artifact.header.runtime_minor = minor;
+        assert_eq!(
+            valid,
+            verify_cfg(&artifact).is_ok(),
+            "minor={minor}, form={form}"
+        );
+    }
+}

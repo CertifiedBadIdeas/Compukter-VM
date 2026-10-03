@@ -7031,3 +7031,27 @@ fn section_offset(bytes: &[u8], kind: u16, scope: u32) -> usize {
 pub(super) fn reference_type(module: u32, ty: u32) -> TypeKey {
     TypeKey { module, ty }
 }
+
+pub(super) fn scalar_hash_artifact(form: u8, value: Constant) -> VerifiedArtifact {
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![primitive(form), primitive(1)],
+        vec![value],
+        &[],
+        vec![vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::ValueHash {
+                form,
+                dst: 1,
+                source: 0,
+            },
+            Instruction::Return { value: 1 },
+        ]],
+        |artifact| {
+            artifact.header.runtime_minor = 11;
+        },
+    )
+}

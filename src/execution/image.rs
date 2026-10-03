@@ -263,6 +263,11 @@ pub(super) enum ResolvedInstruction {
         lhs: u16,
         rhs: u16,
     },
+    ValueHash {
+        form: u8,
+        dst: u16,
+        source: u16,
+    },
     StringValueOf {
         form: u8,
         dst: u16,
@@ -2101,6 +2106,11 @@ fn resolve_instruction(
             dst: *dst,
             lhs: *lhs,
             rhs: *rhs,
+        },
+        Instruction::ValueHash { form, dst, source } => ResolvedInstruction::ValueHash {
+            form: *form,
+            dst: *dst,
+            source: *source,
         },
         Instruction::StringValueOf { form, dst, source } => ResolvedInstruction::StringValueOf {
             form: *form,

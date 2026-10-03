@@ -81,6 +81,31 @@ pub(super) enum RuntimeValue {
 }
 
 impl RuntimeValue {
+    pub(super) fn hash_code(self, form: u8) -> Option<i32> {
+        Some(match (form, self) {
+            (1, Self::I32(value)) => value,
+            (2, Self::I64(value)) => (value as u64 ^ ((value as u64) >> 32)) as i32,
+            (3, Self::F32(bits)) => {
+                if f32::from_bits(bits).is_nan() {
+                    0x7fc0_0000
+                } else {
+                    bits as i32
+                }
+            }
+            (5, Self::Bool(value)) => {
+                if value {
+                    1231
+                } else {
+                    1237
+                }
+            }
+            (6, Self::Char(value)) => i32::from(value),
+            (7, Self::Null) => 0,
+            (7, Self::Reference(value)) => value.to_bits() as i32,
+            _ => return None,
+        })
+    }
+
     pub(super) fn trace_bits_u64(self) -> u64 {
         match self {
             Self::I32(value) => value as u32 as u64,
