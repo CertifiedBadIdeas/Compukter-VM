@@ -1248,6 +1248,20 @@ fn verify_instruction(
             require_string(artifact, function, *dst, module_id, function_id, limits)?;
             write(state, *dst, function, module_id, function_id, limits)?;
         }
+        Instruction::ValueHash { form, dst, source } => {
+            if artifact.header.runtime_minor < 11 || !matches!(form, 1 | 2 | 3 | 5 | 6 | 7) {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "value hash requires Runtime ABI 1.11 and a supported form",
+                ));
+            }
+            read(function, state, *source, module_id, function_id, limits)?;
+            require_kind(function, *source, *form, module_id, function_id, limits)?;
+            require_kind(function, *dst, 1, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
         Instruction::StringValueOf { form, dst, source } => {
             if !matches!(form, 1 | 2 | 3 | 5 | 6 | 7) {
                 return Err(type_failure(

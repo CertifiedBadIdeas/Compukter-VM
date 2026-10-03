@@ -901,6 +901,10 @@ fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeEr
             regs(&mut operands, &[*dst, *lhs, *rhs]);
             (0x65, 0)
         }
+        Instruction::ValueHash { form, dst, source } => {
+            regs(&mut operands, &[*dst, *source]);
+            (0x69, *form)
+        }
         Instruction::StringValueOf { form, dst, source } => {
             regs(&mut operands, &[*dst, *source]);
             (0x68, *form)

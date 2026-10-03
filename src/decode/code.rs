@@ -274,6 +274,11 @@ fn decode_instruction(
             let (dst, lhs, rhs) = regs3(&mut cursor, offset)?;
             Instruction::StringConcat { dst, lhs, rhs }
         }
+        0x69 => Instruction::ValueHash {
+            form,
+            dst: reg(&mut cursor, offset)?,
+            source: reg(&mut cursor, offset)?,
+        },
         0x68 => Instruction::StringValueOf {
             form,
             dst: reg(&mut cursor, offset)?,

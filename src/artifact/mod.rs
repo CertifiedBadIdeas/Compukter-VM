@@ -602,6 +602,11 @@ pub(crate) enum Instruction {
         lhs: u16,
         rhs: u16,
     },
+    ValueHash {
+        form: u8,
+        dst: u16,
+        source: u16,
+    },
     StringValueOf {
         form: u8,
         dst: u16,

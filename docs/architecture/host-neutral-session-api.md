@@ -177,3 +177,7 @@ The VM intentionally does not spawn threads, perform I/O, interpret wall-clock
 time, or decide how multiple computers run in parallel. A host scheduler can
 drive many individually single-task sessions concurrently while preserving the
 same per-session semantics.
+
+## Value hashing
+
+Runtime ABI 1.11 adds `value_hash` (0x69), a fixed-cost, allocation-free operation producing I32. Forms 1/2/3/5/6 accept I32/I64/F32/Bool/Char; form 7 accepts nullable references. Integers use Int identity or Long folded high/low bits; Float canonicalizes every NaN to 0x7fc00000 and preserves signed zero, Boolean uses 1231/1237, and Char uses its UTF-16 code unit. Reference null hashes to zero and live references use opaque VM identity bits, never host pointers. Hash collisions are permitted. The non-moving collector preserves live identity; future relocation must preserve observable hashes rather than recomputing them from a moved address. String content hashing retains its existing sliced, rooted `string_hash` path. Artifact format and C ABI 18 are unchanged.
