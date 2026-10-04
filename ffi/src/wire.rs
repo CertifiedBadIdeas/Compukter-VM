@@ -564,6 +564,16 @@ impl<'a> LimitsDecoder<'a> {
 pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
     let encoder = match outcome {
         OwnedOutcome::SliceExhausted => Encoder::new(0),
+        OwnedOutcome::ProcessEntered(id) => {
+            let mut encoder = Encoder::new(13);
+            encoder.u64(id);
+            encoder
+        }
+        OwnedOutcome::ProcessExited(id) => {
+            let mut encoder = Encoder::new(14);
+            encoder.u64(id);
+            encoder
+        }
         OwnedOutcome::WaitingForHostQuota => Encoder::new(11),
         OwnedOutcome::HostRequestBatch(requests) => {
             let mut encoder = Encoder::new(1);
@@ -1425,6 +1435,19 @@ mod tests {
         assert_eq!(
             vec![9],
             encode_outcome(OwnedOutcome::WaitingForTerminalEvent)
+        );
+    }
+
+    #[test]
+    fn process_lifecycle_has_distinct_tags_and_little_endian_identity() {
+        let id = 0x0102_0304_0506_0708;
+        assert_eq!(
+            vec![13, 8, 7, 6, 5, 4, 3, 2, 1],
+            encode_outcome(OwnedOutcome::ProcessEntered(id))
+        );
+        assert_eq!(
+            vec![14, 8, 7, 6, 5, 4, 3, 2, 1],
+            encode_outcome(OwnedOutcome::ProcessExited(id))
         );
     }
 

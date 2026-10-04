@@ -84,6 +84,7 @@ pub enum ComputerError {
     Run(RunError),
     Resume(ResumeError),
     InvalidRequestId,
+    ExternalRequestLimit,
     InvalidTerminalRequest,
     InvalidStdioRequest,
     InvalidFileSystemRequest,
@@ -155,6 +156,8 @@ pub struct ComputerHostRequestBatch {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComputerAdvanceOutcome {
     SliceExhausted,
+    ProcessEntered(u64),
+    ProcessExited(u64),
     WaitingForHostQuota,
     WaitingForTerminalEvent,
     HostRequestBatch(ComputerHostRequestBatch),
@@ -340,10 +343,13 @@ pub struct ComputerMachine {
     maximum_text_code_units: usize,
     pending_compilation: Option<CompilationTransaction>,
     next_compilation_token: u64,
+    next_external_request: u64,
+    external_requests: Vec<ExternalRequestRoute>,
 }
 
 #[derive(Debug)]
 struct ProcessFrame {
+    scope_id: u64,
     session: Session,
     executable: Option<(VirtualPath, VerifiedArtifact)>,
     process_diagnostics: Vec<(TaskId, Box<[u16]>)>,
@@ -351,6 +357,14 @@ struct ProcessFrame {
     pending_terminal_event: Option<(TaskId, RequestId)>,
     pending_stdio_read: Option<(TaskId, RequestId)>,
     pending_process: Option<(TaskId, RequestId)>,
+}
+
+#[derive(Debug)]
+struct ExternalRequestRoute {
+    scope_id: u64,
+    task_id: u32,
+    internal_id: u64,
+    external_id: u64,
 }
 
 #[derive(Debug)]
@@ -489,6 +503,7 @@ impl ComputerMachine {
             root_artifact: artifact,
             machine_identity: Arc::new(()),
             sessions: vec![ProcessFrame {
+                scope_id: 0,
                 session,
                 executable: None,
                 process_diagnostics: Vec::new(),
@@ -519,6 +534,8 @@ impl ComputerMachine {
             maximum_text_code_units,
             pending_compilation: None,
             next_compilation_token: 1,
+            next_external_request: 1,
+            external_requests: Vec::new(),
         })
     }
 
@@ -579,6 +596,12 @@ impl ComputerMachine {
             counters_saturated: self.retired_execution.saturated,
             ..ComputerResourceSnapshot::default()
         };
+        add_counter(
+            &mut snapshot.mutable_execution_resident_bytes,
+            (self.external_requests.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<ExternalRequestRoute>() as u64),
+            &mut snapshot.counters_saturated,
+        );
         for frame in &self.sessions {
             let resource = frame.session.resource_snapshot();
             add_counter(
@@ -999,7 +1022,7 @@ impl ComputerMachine {
         let pending_terminal_event = self.active_frame().pending_terminal_event;
         let compilation_pending = self.pending_compilation.is_some();
         let redstone = &self.redstone;
-        let (internal, external) = {
+        let (internal, mut external) = {
             let outcome = self
                 .sessions
                 .last_mut()
@@ -1154,6 +1177,9 @@ impl ComputerMachine {
             }
         };
         if !external.is_empty() {
+            for request in &mut external {
+                self.route_external_request(request)?;
+            }
             return Ok(ComputerAdvanceOutcome::HostRequestBatch(
                 ComputerHostRequestBatch {
                     requests: external.into_boxed_slice(),
@@ -1705,11 +1731,61 @@ impl ComputerMachine {
         request_id: u64,
         response: HostResponse<'_>,
     ) -> Result<(), ComputerError> {
+        let route_index = self
+            .external_requests
+            .iter()
+            .position(|route| route.task_id == task_id && route.external_id == request_id)
+            .ok_or(ComputerError::InvalidRequestId)?;
+        let route = &self.external_requests[route_index];
         let task = TaskId::new(task_id).ok_or(ComputerError::InvalidRequestId)?;
-        let request_id = RequestId::new(request_id).ok_or(ComputerError::InvalidRequestId)?;
-        self.active_session_mut()
-            .resume_for(task, request_id, response)
-            .map_err(ComputerError::Resume)
+        let internal_id =
+            RequestId::new(route.internal_id).ok_or(ComputerError::InvalidRequestId)?;
+        let frame = self
+            .sessions
+            .iter_mut()
+            .find(|frame| frame.scope_id == route.scope_id)
+            .ok_or(ComputerError::InvalidRequestId)?;
+        frame
+            .session
+            .resume_for(task, internal_id, response)
+            .map_err(ComputerError::Resume)?;
+        self.external_requests.swap_remove(route_index);
+        Ok(())
+    }
+
+    fn route_external_request(
+        &mut self,
+        request: &mut ComputerHostRequest,
+    ) -> Result<(), ComputerError> {
+        let scope_id = self.active_frame().scope_id;
+        if let Some(route) = self.external_requests.iter().find(|route| {
+            route.scope_id == scope_id
+                && route.task_id == request.task_id
+                && route.internal_id == request.id
+        }) {
+            request.id = route.external_id;
+            return Ok(());
+        }
+        let maximum = (self.profile.maximum_host_requests as usize)
+            .checked_mul(self.process_limits.maximum_depth as usize)
+            .ok_or(ComputerError::ExternalRequestLimit)?;
+        if self.external_requests.len() >= maximum || self.next_external_request >= i64::MAX as u64
+        {
+            return Err(ComputerError::ExternalRequestLimit);
+        }
+        self.external_requests
+            .try_reserve(1)
+            .map_err(|_| ComputerError::ExternalRequestLimit)?;
+        let external_id = self.next_external_request;
+        self.next_external_request += 1;
+        self.external_requests.push(ExternalRequestRoute {
+            scope_id,
+            task_id: request.task_id,
+            internal_id: request.id,
+            external_id,
+        });
+        request.id = external_id;
+        Ok(())
     }
 
     fn handle_process_request(
@@ -1803,7 +1879,9 @@ impl ComputerMachine {
                 "process depth limit exceeded",
             );
         }
-        if self.process_starts >= self.process_limits.maximum_starts {
+        if self.process_starts >= self.process_limits.maximum_starts
+            || self.process_starts >= i64::MAX as u64
+        {
             return self.resume_process_failure(
                 task,
                 id,
@@ -1885,10 +1963,12 @@ impl ComputerMachine {
             return self.resume_process_failure(task, id, reason, diagnostic);
         }
         self.active_frame_mut().pending_process = Some((task, id));
+        let scope_id = self.process_starts;
         self.process_starts += 1;
         self.reserved_heap_bytes = reserved_heap_bytes;
         self.reserved_frame_storage_bytes = reserved_frame_storage_bytes;
         self.sessions.push(ProcessFrame {
+            scope_id,
             session: child,
             executable: Some((path, artifact)),
             process_diagnostics: Vec::new(),
@@ -1897,7 +1977,7 @@ impl ComputerMachine {
             pending_stdio_read: None,
             pending_process: None,
         });
-        Ok(ComputerAdvanceOutcome::SliceExhausted)
+        Ok(ComputerAdvanceOutcome::ProcessEntered(scope_id))
     }
 
     fn handle_compiler_request(
@@ -2138,6 +2218,8 @@ impl ComputerMachine {
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
         let child_depth = self.sessions.len();
         let child = self.sessions.pop().expect("a child session is active");
+        self.external_requests
+            .retain(|request| request.scope_id != child.scope_id);
         self.retired_execution.add(child.session.accounting());
         self.reserved_heap_bytes -= u64::from(self.profile.heap_bytes);
         self.reserved_frame_storage_bytes -= self.profile.frame_storage_bytes;
@@ -2164,7 +2246,7 @@ impl ComputerMachine {
         if let ProcessCompletion::Failed { diagnostic, .. } = completion {
             self.store_process_diagnostic(task, diagnostic);
         }
-        Ok(ComputerAdvanceOutcome::SliceExhausted)
+        Ok(ComputerAdvanceOutcome::ProcessExited(child.scope_id))
     }
 
     fn resume_process_failure(
@@ -3307,10 +3389,12 @@ mod tests {
         )
         .unwrap();
         while computer.sessions.len() == 1 {
-            assert_eq!(
-                ComputerAdvanceOutcome::SliceExhausted,
+            assert!(matches!(
                 computer.advance(64, 64, u32::MAX).unwrap(),
-            );
+                ComputerAdvanceOutcome::SliceExhausted
+                    | ComputerAdvanceOutcome::ProcessEntered(_)
+                    | ComputerAdvanceOutcome::ProcessExited(_)
+            ));
         }
         let with_child = computer.resource_snapshot();
         assert_eq!(
@@ -3325,12 +3409,12 @@ mod tests {
 
         while computer.sessions.len() == 2 {
             let before = computer.resource_snapshot();
-            assert_eq!(
-                ComputerAdvanceOutcome::SliceExhausted,
+            assert!(matches!(
                 computer
                     .advance_with_retirement_limit(64, 64, u32::MAX, 1)
                     .unwrap(),
-            );
+                ComputerAdvanceOutcome::SliceExhausted | ComputerAdvanceOutcome::ProcessExited(_)
+            ));
             let after = computer.resource_snapshot();
             assert!(after.executed_instructions >= before.executed_instructions);
             assert!(after.retired_instructions - before.retired_instructions <= 1);
@@ -3396,15 +3480,19 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(
-            ComputerAdvanceOutcome::SliceExhausted,
+        assert!(matches!(
             computer.advance(64, 64, u32::MAX).unwrap(),
-        );
+            ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_)
+        ));
         computer.submit_redstone_input(2 | (3 << 10)).unwrap();
-        assert_eq!(
-            ComputerAdvanceOutcome::SliceExhausted,
+        assert!(matches!(
             computer.advance(64, 64, u32::MAX).unwrap(),
-        );
+            ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_)
+        ));
         computer
             .submit_redstone_input(1 | (9 << 6) | (3 << 10))
             .unwrap();
@@ -3424,10 +3512,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            ComputerAdvanceOutcome::SliceExhausted,
+        assert!(matches!(
             computer.advance(64, 64, u32::MAX).unwrap(),
-        );
+            ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_)
+        ));
         let request = match computer.advance(64, 64, u32::MAX).unwrap() {
             ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
             other => panic!("parked redstone wait hid external work: {other:?}"),
@@ -3458,10 +3548,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            ComputerAdvanceOutcome::SliceExhausted,
+        assert!(matches!(
             computer.advance(64, 64, u32::MAX).unwrap(),
-        );
+            ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_)
+        ));
         computer.submit_redstone_input(1 | (13 << 6)).unwrap();
         let request = match computer.advance(64, 64, u32::MAX).unwrap() {
             ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
@@ -3505,10 +3597,12 @@ mod tests {
             )
             .unwrap();
         computer.terminal_mut().push_text("x").unwrap();
-        assert_eq!(
-            ComputerAdvanceOutcome::SliceExhausted,
+        assert!(matches!(
             computer.advance(64, 64, u32::MAX).unwrap(),
-        );
+            ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_)
+        ));
         assert_eq!(None, halt(&mut computer));
     }
 
@@ -3966,7 +4060,9 @@ mod tests {
             .unwrap();
         let halted = loop {
             match computer.advance(64, 64, 0).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected raw terminal outcome: {other:?}"),
             }
@@ -4121,7 +4217,9 @@ mod tests {
 
         let failure = loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::UncaughtException(diagnostic) => break diagnostic,
                 other => panic!("unexpected conflicting stdio outcome: {other:?}"),
             }
@@ -4172,19 +4270,23 @@ mod tests {
             ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
                 .unwrap();
         while computer.sessions.len() == 1 {
-            assert_eq!(
-                ComputerAdvanceOutcome::SliceExhausted,
+            assert!(matches!(
                 computer.advance(64, 64, u32::MAX).unwrap(),
-            );
+                ComputerAdvanceOutcome::SliceExhausted
+                    | ComputerAdvanceOutcome::ProcessEntered(_)
+                    | ComputerAdvanceOutcome::ProcessExited(_)
+            ));
         }
 
         let child_owner = InputOwner::new(2, TaskId::ROOT);
         computer.standard_streams.begin_read(child_owner).unwrap();
         while computer.sessions.len() == 2 {
-            assert_eq!(
-                ComputerAdvanceOutcome::SliceExhausted,
+            assert!(matches!(
                 computer.advance(64, 64, u32::MAX).unwrap(),
-            );
+                ComputerAdvanceOutcome::SliceExhausted
+                    | ComputerAdvanceOutcome::ProcessEntered(_)
+                    | ComputerAdvanceOutcome::ProcessExited(_)
+            ));
         }
 
         let root_owner = InputOwner::new(1, TaskId::ROOT);
@@ -4208,7 +4310,9 @@ mod tests {
 
         loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(None) => break,
                 other => panic!("unexpected positional terminal outcome: {other:?}"),
             }
@@ -4257,15 +4361,19 @@ mod tests {
 
         assert_eq!(1, computer.sessions.len());
         while computer.sessions.len() == 1 {
-            assert_eq!(
-                ComputerAdvanceOutcome::SliceExhausted,
-                computer.advance(64, 64, u32::MAX).unwrap()
-            );
+            assert!(matches!(
+                computer.advance(64, 64, u32::MAX).unwrap(),
+                ComputerAdvanceOutcome::SliceExhausted
+                    | ComputerAdvanceOutcome::ProcessEntered(_)
+                    | ComputerAdvanceOutcome::ProcessExited(_)
+            ));
         }
         assert_eq!(2, computer.sessions.len());
         let halted = loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected process outcome: {other:?}"),
             }
@@ -4565,10 +4673,12 @@ mod tests {
     fn compiler_failure_diagnostics_are_bounded_and_resume_once() {
         let (mut computer, _, _, _) = compiler_computer(b"fun main() = 42\n", None);
         let request = next_compilation_request(&mut computer);
-        assert_eq!(
-            ComputerAdvanceOutcome::SliceExhausted,
-            computer.advance(64, 64, u32::MAX).unwrap()
-        );
+        assert!(matches!(
+            computer.advance(64, 64, u32::MAX).unwrap(),
+            ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_)
+        ));
         let oversized = "λ".repeat(computer.maximum_text_code_units + 1);
 
         computer
@@ -4609,7 +4719,9 @@ mod tests {
 
         let halted = loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected ROM installer outcome: {other:?}"),
             }
@@ -4716,7 +4828,9 @@ mod tests {
                 .unwrap();
         loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::HostRequestBatch(batch) => {
                     assert_eq!(1, batch.requests.len());
                     let request = &batch.requests[0];
@@ -4764,7 +4878,9 @@ mod tests {
                 .unwrap();
         let status = loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(status))) => break status,
                 other => panic!("unexpected process-v2 exit outcome: {other:?}"),
             }
@@ -4789,7 +4905,9 @@ mod tests {
         .unwrap();
         let result = loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(result))) => break result,
                 other => panic!("unexpected filesystem text outcome: {other:?}"),
             }
@@ -5066,7 +5184,9 @@ mod tests {
 
         let result = loop {
             match computer.advance(128, 128, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(value))) => break value,
                 other => panic!("unexpected filesystem conformance outcome: {other:?}"),
             }
@@ -5111,7 +5231,9 @@ mod tests {
 
         loop {
             match computer.advance(128, 128, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::UncaughtException(diagnostic) => {
                     assert!(diagnostic.contains("Filesystem quota was exceeded"));
                     break;
@@ -5270,7 +5392,9 @@ mod tests {
     fn next_compilation_request(computer: &mut ComputerMachine) -> CompilationRequest {
         loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::CompilationRequested(request) => return request,
                 other => panic!("unexpected compiler outcome: {other:?}"),
             }
@@ -5280,9 +5404,118 @@ mod tests {
     fn advance_to_canonical_read(computer: &mut ComputerMachine) {
         loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::WaitingForTerminalEvent => return,
                 other => panic!("unexpected canonical input outcome: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn process_lifetime_events_bracket_the_real_child_execution() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        let child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        filesystem
+            .write_file(&owner, &path("/home/child", &limits), &bytes, true)
+            .unwrap();
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let mut computer =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        let mut events = Vec::new();
+        loop {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::ProcessEntered(id) => {
+                    assert_eq!(2, computer.sessions.len());
+                    events.push((true, id));
+                }
+                ComputerAdvanceOutcome::ProcessExited(id) => {
+                    assert_eq!(1, computer.sessions.len());
+                    events.push((false, id));
+                }
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(0))) => break,
+                other => panic!("unexpected process lifetime outcome: {other:?}"),
+            }
+        }
+        assert_eq!(vec![(true, 1), (false, 1)], events);
+    }
+
+    #[test]
+    fn external_replies_route_to_their_own_live_process_and_never_rebind() {
+        let artifact = crate::execution::fixtures::capability_artifact(true, true, 1, 0);
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let bindings = [CapabilityBinding::new("app", "entry", 1, 2, &operations)];
+        let mut computer =
+            ComputerMachine::start(artifact.clone(), profile(), &bindings, &[]).unwrap();
+        let parent = external_request(&mut computer);
+        // Suspend a parent that already owns a pending request, as a nested process does.
+        let mut child = ComputerMachine::start(artifact, profile(), &bindings, &[]).unwrap();
+        let mut frame = child.sessions.pop().unwrap();
+        frame.scope_id = 1;
+        computer.sessions.push(frame);
+        let child_request = external_request(&mut computer);
+        assert_eq!(parent.task_id, child_request.task_id);
+        assert_ne!(parent.id, child_request.id);
+        computer
+            .resume_host_request_for(
+                parent.task_id,
+                parent.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        assert_eq!(
+            ComputerError::InvalidRequestId,
+            computer
+                .resume_host_request_for(
+                    parent.task_id,
+                    parent.id,
+                    HostResponse::Success(HostValueInput::Unit)
+                )
+                .unwrap_err()
+        );
+        computer
+            .resume_host_request_for(
+                child_request.task_id,
+                child_request.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        computer.sessions.pop().unwrap();
+        computer
+            .external_requests
+            .retain(|request| request.scope_id != 1);
+        assert_eq!(
+            ComputerError::InvalidRequestId,
+            computer
+                .resume_host_request_for(
+                    child_request.task_id,
+                    child_request.id,
+                    HostResponse::Success(HostValueInput::Unit)
+                )
+                .unwrap_err()
+        );
+        assert_eq!(None, halt(&mut computer));
+        assert!(computer.external_requests.is_empty());
+    }
+
+    fn external_request(computer: &mut ComputerMachine) -> super::ComputerHostRequest {
+        loop {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::HostRequestBatch(batch) => {
+                    assert_eq!(1, batch.requests.len());
+                    return batch.requests[0].clone();
+                }
+                other => panic!("unexpected external request outcome: {other:?}"),
             }
         }
     }
@@ -5290,7 +5523,9 @@ mod tests {
     fn halt(computer: &mut ComputerMachine) -> Option<ComputerValue> {
         loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(value) => return value,
                 other => panic!("unexpected compiler completion outcome: {other:?}"),
             }

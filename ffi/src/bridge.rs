@@ -80,6 +80,8 @@ pub(crate) enum OwnedMerge {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedOutcome {
     SliceExhausted,
+    ProcessEntered(u64),
+    ProcessExited(u64),
     WaitingForHostQuota,
     HostRequestBatch(Vec<OwnedRequest>),
     AllocationExhausted(ManagedAllocationFailure, String),
@@ -837,6 +839,8 @@ fn attach_failure_trace(outcome: &mut OwnedOutcome, computer: &ComputerMachine) 
 fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
     match outcome {
         ComputerAdvanceOutcome::SliceExhausted => OwnedOutcome::SliceExhausted,
+        ComputerAdvanceOutcome::ProcessEntered(id) => OwnedOutcome::ProcessEntered(id),
+        ComputerAdvanceOutcome::ProcessExited(id) => OwnedOutcome::ProcessExited(id),
         ComputerAdvanceOutcome::WaitingForHostQuota => OwnedOutcome::WaitingForHostQuota,
         ComputerAdvanceOutcome::WaitingForTerminalEvent => OwnedOutcome::WaitingForTerminalEvent,
         ComputerAdvanceOutcome::HostRequestBatch(batch) => OwnedOutcome::HostRequestBatch(
@@ -909,7 +913,8 @@ fn copy_error(error: ComputerError) -> BridgeError {
         ComputerError::Run(error) => BridgeError::Run(error),
         ComputerError::Resume(error) => BridgeError::Resume(error),
         ComputerError::InvalidRequestId => BridgeError::InvalidRequestId,
-        ComputerError::InvalidTerminalRequest
+        ComputerError::ExternalRequestLimit
+        | ComputerError::InvalidTerminalRequest
         | ComputerError::InvalidStdioRequest
         | ComputerError::InvalidFileSystemRequest
         | ComputerError::InvalidProcessRequest
