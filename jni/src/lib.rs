@@ -26,7 +26,7 @@ use compukter_ffi::{
     compukter_max_outcome_bytes, compukter_redstone_confirm_output,
     compukter_redstone_submit_input, compukter_resource_snapshot, compukter_resume_bool,
     compukter_resume_f32_bits, compukter_resume_failure, compukter_resume_i32,
-    compukter_resume_string, compukter_resume_unit, compukter_store_close,
+    compukter_resume_string, compukter_resume_unit, compukter_resume_value, compukter_store_close,
     compukter_store_durable_generation, compukter_store_flush, compukter_store_health,
     compukter_store_open, compukter_store_recover, compukter_store_tombstone,
     compukter_submit_canonical_line, compukter_terminal_changes_since, compukter_terminal_commit,
@@ -724,6 +724,29 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resu
                 request_id as u64,
                 value.as_ptr(),
                 value.len(),
+            )
+        } as jint)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resumeValue<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    task_id: jint,
+    request_id: jlong,
+    payload: JByteArray<'caller>,
+) -> jint {
+    status(&mut env, |env| {
+        let payload = bytes(env, &payload)?;
+        Ok(unsafe {
+            compukter_resume_value(
+                handle as u64,
+                task_id as u32,
+                request_id as u64,
+                payload.as_ptr(),
+                payload.len(),
             )
         } as jint)
     })
