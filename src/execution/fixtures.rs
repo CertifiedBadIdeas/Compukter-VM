@@ -2968,6 +2968,7 @@ pub(super) fn scalar_string_value_artifact(form: u8, value: Constant) -> Verifie
         |artifact| match form {
             2 => artifact.header.runtime_minor = 3,
             3 => artifact.header.runtime_minor = 4,
+            4 => artifact.header.runtime_minor = 12,
             _ => {}
         },
     )
@@ -7051,7 +7052,7 @@ pub(super) fn scalar_hash_artifact(form: u8, value: Constant) -> VerifiedArtifac
             Instruction::Return { value: 1 },
         ]],
         |artifact| {
-            artifact.header.runtime_minor = 11;
+            artifact.header.runtime_minor = if form == 4 { 12 } else { 11 };
         },
     )
 }

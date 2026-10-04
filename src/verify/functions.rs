@@ -1249,7 +1249,15 @@ fn verify_instruction(
             write(state, *dst, function, module_id, function_id, limits)?;
         }
         Instruction::ValueHash { form, dst, source } => {
-            if artifact.header.runtime_minor < 11 || !matches!(form, 1 | 2 | 3 | 5 | 6 | 7) {
+            if *form == 4 && artifact.header.runtime_minor < 12 {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "Double text and hashing require Runtime ABI 1.12",
+                ));
+            }
+            if artifact.header.runtime_minor < 11 || !matches!(form, 1..=7) {
                 return Err(type_failure(
                     limits,
                     module_id,
@@ -1263,7 +1271,15 @@ fn verify_instruction(
             write(state, *dst, function, module_id, function_id, limits)?;
         }
         Instruction::StringValueOf { form, dst, source } => {
-            if !matches!(form, 1 | 2 | 3 | 5 | 6 | 7) {
+            if *form == 4 && artifact.header.runtime_minor < 12 {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "Double text and hashing require Runtime ABI 1.12",
+                ));
+            }
+            if !matches!(form, 1..=7) {
                 return Err(type_failure(
                     limits,
                     module_id,
