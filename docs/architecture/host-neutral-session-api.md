@@ -193,10 +193,29 @@ Artifact format and C ABI 18 are unchanged.
 ## Encoded host responses (C ABI 19)
 
 `compukter_resume_value` accepts a caller-owned byte payload, validates it completely before request lookup, and retains
-no pointer after return. Version byte 1 precedes a scalar HostValueType tag (0..7). Numeric values use little-endian
+no pointer after return. Version byte 1 precedes a HostValueType tag (0..8). Numeric values use little-endian
 widths matching their register kind, including exact F32/F64 bits. Bool is 0 or 1; Char is a u16 UTF-16 code unit;
 String has a u16 count followed by that many u16 code units (including isolated surrogates). Unit has no payload.
 The payload limit is 65536 bytes, and strings are limited to 4096 code units. Wrong versions, tags, widths, Boolean
 values, lengths and trailing data return InvalidArgument without consuming a pending response. HostValueInput still
 checks the admitted operation result type. Existing resume exports are retained; this addition enables all existing
 scalar result kinds through the JVM adapters without changing Runtime ABI 1.12 or artifact encoding.
+
+
+## Structured host responses (Runtime ABI 1.13)
+
+Tag 8 returns a bounded tree of records with non-null scalar or nested-record fields. Capability schema wire version 2
+includes each record's qualified nominal name and ordered field names/types; scalar-only schemas retain version 1.
+A record body encodes its qualified ASCII name as u16 length plus bytes, then a u8 field count. Each member carries a
+u8-length ASCII field name, a value tag and its scalar bytes or nested record body. The entire response remains wire
+version 1. Limits are 8 nesting levels, 32 record/String nodes, 64 expanded fields, 4096 total UTF-16 code units and
+64 KiB. Record arguments, nullable fields, arrays and cyclic schemas are unsupported.
+
+Admission requires Runtime ABI 1.13, an asynchronous operation and an exact nominal instance layout matching its host
+schema. Pure immutable DTO authoring is checked by the SDK; native admission verifies layout and storage types.
+Resume validates and owns the complete response before consuming a request. It executes no Guest constructor or
+managed allocation. Advance materializes nodes in postorder, charging allocation, initialization, String copying and
+field stores against the existing sliced budgets. Partial objects and completed child nodes remain GC roots; the
+result register is published only after the complete tree is ready. OOM remains terminal, and another task's reply
+cannot overwrite an unfinished reference response. Pending owned replies and materialization plans count towards
+execution-resident resource accounting. The C ABI remains 19 with the existing resume-value export.

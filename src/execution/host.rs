@@ -1,3 +1,6 @@
+pub use super::record::{
+    HostRecordField, HostRecordMember, HostRecordScalar, HostRecordSchema, HostRecordValue,
+};
 pub use super::requests::{HostMergeEntry, HostMergeGroup};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,6 +13,7 @@ pub enum HostValueType {
     Bool,
     Char,
     String,
+    Record,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +37,7 @@ pub struct OperationSchema<'a> {
     pub result: HostValueType,
     pub asynchronous: bool,
     pub merge: HostMergeSchema,
+    pub result_record: Option<&'a HostRecordSchema>,
 }
 
 impl<'a> OperationSchema<'a> {
@@ -42,6 +47,7 @@ impl<'a> OperationSchema<'a> {
             result,
             asynchronous: false,
             merge: HostMergeSchema::Ordinary,
+            result_record: None,
         }
     }
 
@@ -51,6 +57,20 @@ impl<'a> OperationSchema<'a> {
             result,
             asynchronous: true,
             merge: HostMergeSchema::Ordinary,
+            result_record: None,
+        }
+    }
+
+    pub const fn asynchronous_record(
+        arguments: &'a [HostValueType],
+        record: &'a HostRecordSchema,
+    ) -> Self {
+        Self {
+            arguments,
+            result: HostValueType::Record,
+            asynchronous: true,
+            merge: HostMergeSchema::Ordinary,
+            result_record: Some(record),
         }
     }
 
@@ -65,6 +85,7 @@ impl<'a> OperationSchema<'a> {
             result,
             asynchronous: true,
             merge: HostMergeSchema::LastWriteWins { group, source },
+            result_record: None,
         }
     }
 }
@@ -160,6 +181,7 @@ pub(super) struct ResolvedOperation {
     pub result: HostValueType,
     pub asynchronous: bool,
     pub merge: HostMergeSchema,
+    pub result_record: Option<HostRecordSchema>,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +239,7 @@ pub enum HostValueInput<'a> {
     Bool(bool),
     Char(u16),
     String(&'a [u16]),
+    Record(&'a HostRecordValue),
 }
 
 impl HostValueInput<'_> {
@@ -230,6 +253,7 @@ impl HostValueInput<'_> {
             Self::Bool(_) => HostValueType::Bool,
             Self::Char(_) => HostValueType::Char,
             Self::String(_) => HostValueType::String,
+            Self::Record(_) => HostValueType::Record,
         }
     }
 }

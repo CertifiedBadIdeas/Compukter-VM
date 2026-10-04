@@ -24,11 +24,16 @@ pub(crate) struct DecodedOperationSchema {
     pub arguments: Vec<HostValueType>,
     pub result: HostValueType,
     pub asynchronous: bool,
+    pub result_record: Option<compukter_vm::HostRecordSchema>,
 }
 
 pub(crate) fn decode_capability_schemas(bytes: &[u8]) -> Option<Vec<DecodedCapabilitySchema>> {
     let mut decoder = CapabilitySchemaDecoder::new(bytes);
-    if decoder.u8()? != 1 {
+    if bytes.len() > 65_536 {
+        return None;
+    }
+    let version = decoder.u8()?;
+    if !matches!(version, 1 | 2) {
         return None;
     }
     let count = usize::from(decoder.u8()?);
@@ -65,12 +70,29 @@ pub(crate) fn decode_capability_schemas(bytes: &[u8]) -> Option<Vec<DecodedCapab
             }
             let mut arguments = Vec::with_capacity(argument_count);
             for _ in 0..argument_count {
-                arguments.push(decoder.value_type()?);
+                let argument = decoder.value_type()?;
+                if argument == HostValueType::Record {
+                    return None;
+                }
+                arguments.push(argument);
             }
+            let result_record = if result == HostValueType::Record {
+                if version != 2 || !asynchronous {
+                    return None;
+                }
+                let record = decoder.record(1, &mut 0, &mut 0)?;
+                if !record.validate() {
+                    return None;
+                }
+                Some(record)
+            } else {
+                None
+            };
             operations.push(DecodedOperationSchema {
                 arguments,
                 result,
                 asynchronous,
+                result_record,
             });
         }
         schemas.push(DecodedCapabilitySchema {
@@ -81,7 +103,13 @@ pub(crate) fn decode_capability_schemas(bytes: &[u8]) -> Option<Vec<DecodedCapab
             operations,
         });
     }
-    decoder.end().then_some(schemas)
+    let has_record = schemas.iter().any(|schema| {
+        schema
+            .operations
+            .iter()
+            .any(|operation| operation.result_record.is_some())
+    });
+    (decoder.end() && (version == 2) == has_record).then_some(schemas)
 }
 
 struct CapabilitySchemaDecoder<'a> {
@@ -136,7 +164,171 @@ impl<'a> CapabilitySchemaDecoder<'a> {
             5 => HostValueType::Bool,
             6 => HostValueType::Char,
             7 => HostValueType::String,
+            8 => HostValueType::Record,
             _ => return None,
+        })
+    }
+
+    fn name(&mut self, qualified: bool) -> Option<String> {
+        let length = if qualified {
+            usize::from(self.u16()?)
+        } else {
+            usize::from(self.u8()?)
+        };
+        if length == 0 || length > if qualified { 256 } else { 64 } {
+            return None;
+        }
+        let end = self.offset.checked_add(length)?;
+        let bytes = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        let value = std::str::from_utf8(bytes).ok()?;
+        fn identifier(value: &str) -> bool {
+            let first = value.as_bytes().first().copied().unwrap_or(0);
+            (first.is_ascii_alphabetic() || first == b'_')
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        }
+        if qualified {
+            if !value.contains('.') || !value.split('.').all(identifier) {
+                return None;
+            }
+        } else if !identifier(value) {
+            return None;
+        }
+        Some(value.into())
+    }
+
+    fn record(
+        &mut self,
+        depth: usize,
+        nodes: &mut usize,
+        fields: &mut usize,
+    ) -> Option<compukter_vm::HostRecordSchema> {
+        use compukter_vm::{HostRecordField, HostRecordSchema};
+        if depth > 8 {
+            return None;
+        }
+        *nodes += 1;
+        if *nodes > 32 {
+            return None;
+        }
+        let type_name = self.name(true)?;
+        let count = usize::from(self.u8()?);
+        *fields += count;
+        if count == 0 || *fields > 64 {
+            return None;
+        }
+        let mut members = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = self.name(false)?;
+            let value_type = self.value_type()?;
+            if value_type == HostValueType::Unit {
+                return None;
+            }
+            let record = if value_type == HostValueType::Record {
+                Some(Box::new(self.record(depth + 1, nodes, fields)?))
+            } else {
+                None
+            };
+            if value_type == HostValueType::String {
+                *nodes += 1;
+                if *nodes > 32 {
+                    return None;
+                }
+            }
+            if members
+                .iter()
+                .any(|field: &HostRecordField| field.name == name)
+            {
+                return None;
+            }
+            members.push(HostRecordField {
+                name,
+                value_type,
+                record,
+            });
+        }
+        Some(HostRecordSchema {
+            type_name,
+            fields: members,
+        })
+    }
+
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let end = self.offset.checked_add(N)?;
+        let value = self.bytes.get(self.offset..end)?.try_into().ok()?;
+        self.offset = end;
+        Some(value)
+    }
+
+    fn record_value(
+        &mut self,
+        depth: usize,
+        nodes: &mut usize,
+        fields: &mut usize,
+        units: &mut usize,
+    ) -> Option<compukter_vm::HostRecordValue> {
+        use compukter_vm::{HostRecordMember, HostRecordScalar as Value, HostRecordValue};
+        if depth > 8 {
+            return None;
+        }
+        *nodes += 1;
+        if *nodes > 32 {
+            return None;
+        }
+        let type_name = self.name(true)?;
+        let count = usize::from(self.u8()?);
+        *fields += count;
+        if count == 0 || *fields > 64 {
+            return None;
+        }
+        let mut members = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = self.name(false)?;
+            let value = match self.u8()? {
+                1 => Value::I32(i32::from_le_bytes(self.take()?)),
+                2 => Value::I64(i64::from_le_bytes(self.take()?)),
+                3 => Value::F32(u32::from_le_bytes(self.take()?)),
+                4 => Value::F64(u64::from_le_bytes(self.take()?)),
+                5 => match self.u8()? {
+                    0 => Value::Bool(false),
+                    1 => Value::Bool(true),
+                    _ => return None,
+                },
+                6 => Value::Char(self.u16()?),
+                7 => {
+                    let count = usize::from(self.u16()?);
+                    *units += count;
+                    *nodes += 1;
+                    if *units > 4096 || *nodes > 32 {
+                        return None;
+                    }
+                    let mut text = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        text.push(self.u16()?);
+                    }
+                    Value::String(text)
+                }
+                8 => Value::Record(Box::new(self.record_value(
+                    depth + 1,
+                    nodes,
+                    fields,
+                    units,
+                )?)),
+                _ => return None,
+            };
+            if members
+                .iter()
+                .any(|field: &HostRecordMember| field.name == name)
+            {
+                return None;
+            }
+            members.push(HostRecordMember { name, value });
+        }
+        Some(HostRecordValue {
+            type_name,
+            fields: members,
         })
     }
 
@@ -979,6 +1171,7 @@ mod tests {
                     arguments: vec![HostValueType::I32, HostValueType::F32],
                     result: HostValueType::F32,
                     asynchronous: true,
+                    result_record: None,
                 }],
             }]),
             decode_capability_schemas(&bytes),
@@ -1315,6 +1508,11 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Option<crate::bridge::OwnedRespon
     if bytes.len() < 2 || bytes.len() > 65_536 || bytes[0] != 1 {
         return None;
     }
+    if bytes[1] == 8 {
+        let mut decoder = CapabilitySchemaDecoder::new(&bytes[2..]);
+        let value = decoder.record_value(1, &mut 0, &mut 0, &mut 0)?;
+        return decoder.end().then_some(OwnedResponse::SuccessRecord(value));
+    }
     let value = &bytes[2..];
     Some(match bytes[1] {
         0 if value.is_empty() => OwnedResponse::SuccessUnit,
@@ -1378,5 +1576,85 @@ mod response_tests {
         let mut oversized = vec![1, 7, 1, 16];
         oversized.resize(2 + 2 + 2 * 4097, 0);
         assert_eq!(None, decode_response(&oversized));
+    }
+}
+
+#[cfg(test)]
+mod record_wire_tests {
+    use super::*;
+    use compukter_vm::{HostRecordMember, HostRecordScalar, HostRecordValue};
+
+    fn record_name(bytes: &mut Vec<u8>, name: &str) {
+        bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+    }
+
+    #[test]
+    fn record_schema_requires_version_two_and_checked_field_identity() {
+        let mut bytes = vec![2, 1, 1, b'a', 1, b'b', 1, 0, 0, 0, 1, 0, 1, 8, 0];
+        record_name(&mut bytes, "fixture.Vector");
+        bytes.extend_from_slice(&[1, 1, b'x', 4]);
+        let schema = decode_capability_schemas(&bytes).unwrap();
+        assert_eq!(HostValueType::Record, schema[0].operations[0].result);
+        assert_eq!(
+            "fixture.Vector",
+            schema[0].operations[0]
+                .result_record
+                .as_ref()
+                .unwrap()
+                .type_name
+        );
+        let mut legacy = bytes.clone();
+        legacy[0] = 1;
+        assert_eq!(None, decode_capability_schemas(&legacy));
+        for end in 0..bytes.len() {
+            assert_eq!(None, decode_capability_schemas(&bytes[..end]));
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(None, decode_capability_schemas(&trailing));
+        let mut wrong_type = bytes.clone();
+        *wrong_type.last_mut().unwrap() = 0;
+        assert_eq!(None, decode_capability_schemas(&wrong_type));
+    }
+
+    #[test]
+    fn record_response_is_bounded_copied_and_preserves_raw_ieee_bits() {
+        let mut bytes = vec![1, 8];
+        record_name(&mut bytes, "fixture.Vector");
+        bytes.extend_from_slice(&[1, 1, b'x', 4]);
+        bytes.extend_from_slice(&0x7ff0000000000042u64.to_le_bytes());
+        let decoded = decode_response(&bytes);
+        assert_eq!(
+            Some(crate::bridge::OwnedResponse::SuccessRecord(
+                HostRecordValue {
+                    type_name: "fixture.Vector".into(),
+                    fields: vec![HostRecordMember {
+                        name: "x".into(),
+                        value: HostRecordScalar::F64(0x7ff0000000000042)
+                    }],
+                }
+            )),
+            decoded
+        );
+        for end in 0..bytes.len() {
+            assert_eq!(None, decode_response(&bytes[..end]));
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(None, decode_response(&trailing));
+        let mut duplicate = vec![1, 8];
+        record_name(&mut duplicate, "fixture.Vector");
+        duplicate.push(2);
+        for _ in 0..2 {
+            duplicate.extend_from_slice(&[1, b'x', 1, 0, 0, 0, 0]);
+        }
+        assert_eq!(None, decode_response(&duplicate));
+        let mut deep = vec![1, 8];
+        for _ in 0..9 {
+            record_name(&mut deep, "fixture.Vector");
+            deep.extend_from_slice(&[1, 1, b'x', 8]);
+        }
+        assert_eq!(None, decode_response(&deep));
     }
 }

@@ -149,6 +149,7 @@ pub(crate) enum OwnedResponse {
     SuccessF32(u32),
     SuccessBool(bool),
     SuccessString(Vec<u16>),
+    SuccessRecord(compukter_vm::HostRecordValue),
     Failure {
         kind: HostFailureKind,
         detail: String,
@@ -309,6 +310,7 @@ fn with_capability_bindings<T>(
                     arguments: &operation.arguments,
                     result: operation.result,
                     asynchronous: operation.asynchronous,
+                    result_record: operation.result_record.as_ref(),
                     merge: HostMergeSchema::Ordinary,
                 })
                 .collect()
@@ -444,6 +446,9 @@ pub(crate) fn resume(
                 }
                 OwnedResponse::SuccessString(units) => {
                     HostResponse::Success(HostValueInput::String(units))
+                }
+                OwnedResponse::SuccessRecord(value) => {
+                    HostResponse::Success(HostValueInput::Record(value))
                 }
                 OwnedResponse::Failure { kind, detail } => {
                     HostResponse::Failure(HostFailure::new(*kind, detail))

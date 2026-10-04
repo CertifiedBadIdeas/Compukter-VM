@@ -1396,3 +1396,250 @@ fn object_collection_active_frame_measurement() {
     assert_eq!(14, count);
     fs::write(report, output).unwrap();
 }
+
+fn record_schema() -> super::host::HostRecordSchema {
+    use super::host::{HostRecordField, HostRecordSchema};
+    HostRecordSchema {
+        type_name: "fixture.Snapshot".into(),
+        fields: vec![
+            HostRecordField {
+                name: "tick".into(),
+                value_type: HostValueType::I64,
+                record: None,
+            },
+            HostRecordField {
+                name: "position".into(),
+                value_type: HostValueType::Record,
+                record: Some(Box::new(HostRecordSchema {
+                    type_name: "fixture.Vector".into(),
+                    fields: vec![HostRecordField {
+                        name: "x".into(),
+                        value_type: HostValueType::F64,
+                        record: None,
+                    }],
+                })),
+            },
+            HostRecordField {
+                name: "label".into(),
+                value_type: HostValueType::String,
+                record: None,
+            },
+        ],
+    }
+}
+
+fn record_value(bits: u64, units: usize) -> super::host::HostRecordValue {
+    use super::host::{HostRecordMember, HostRecordScalar as Value, HostRecordValue};
+    HostRecordValue {
+        type_name: "fixture.Snapshot".into(),
+        fields: vec![
+            HostRecordMember {
+                name: "tick".into(),
+                value: Value::I64(i64::MIN),
+            },
+            HostRecordMember {
+                name: "position".into(),
+                value: Value::Record(Box::new(HostRecordValue {
+                    type_name: "fixture.Vector".into(),
+                    fields: vec![HostRecordMember {
+                        name: "x".into(),
+                        value: Value::F64(bits),
+                    }],
+                })),
+            },
+            HostRecordMember {
+                name: "label".into(),
+                value: Value::String(vec![0xd800; units]),
+            },
+        ],
+    }
+}
+
+#[test]
+fn records_copy_validate_and_publish_only_after_budgeted_materialization() {
+    let schema = record_schema();
+    let operations = [OperationSchema::asynchronous_record(&[], &schema)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::record_response_artifact(13, true),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = only_request(session.advance(64, 0).unwrap()).id();
+    let bits = 0x7ff0000000000042;
+    let mut wrong = record_value(bits, 17);
+    wrong.fields[0].name = "spoof".into();
+    assert_eq!(
+        Err(ResumeError::WrongResponseType),
+        session.resume(id, HostResponse::Success(HostValueInput::Record(&wrong)))
+    );
+    let mut value = record_value(bits, 128);
+    let before = session.accounting();
+    session
+        .resume(id, HostResponse::Success(HostValueInput::Record(&value)))
+        .unwrap();
+    value.fields.clear();
+    assert_eq!(
+        before.dynamic_guest_units,
+        session.accounting().dynamic_guest_units
+    );
+    assert_eq!(
+        before.executed_instructions,
+        session.accounting().executed_instructions
+    );
+    assert_eq!(
+        Err(ResumeError::NoPendingRequest),
+        session.resume(id, HostResponse::Success(HostValueInput::Record(&value)))
+    );
+    let mut slices = 0;
+    let mut collections = 0;
+    loop {
+        let dynamic = session.accounting().dynamic_guest_units;
+        let outcome = session.advance(6, 6).unwrap();
+        match outcome {
+            AdvanceOutcome::SliceExhausted => slices += 1,
+            AdvanceOutcome::Halted(Some(HostValueView::F64(actual))) => {
+                assert_eq!(bits, actual);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(session.accounting().dynamic_guest_units - dynamic <= 6);
+        collections += usize::from(session.test_collect_runtime_roots());
+        assert!(slices < 200);
+    }
+    assert!(slices > 3);
+    assert!(collections > 0);
+    assert_eq!(1, session.accounting().accepted_responses);
+}
+
+#[test]
+fn record_admission_requires_runtime_and_exact_nested_layout() {
+    let schema = record_schema();
+    let operations = [OperationSchema::asynchronous_record(&[], &schema)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    assert!(matches!(
+        Session::admit(
+            fixtures::record_response_artifact(12, false),
+            profile(),
+            &[binding]
+        ),
+        Err(AdmissionError::CapabilitySchema { .. })
+    ));
+    let mut wrong = record_schema();
+    wrong.fields[0].value_type = HostValueType::F64;
+    let operations = [OperationSchema::asynchronous_record(&[], &wrong)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    assert!(matches!(
+        Session::admit(
+            fixtures::record_response_artifact(13, false),
+            profile(),
+            &[binding]
+        ),
+        Err(AdmissionError::CapabilitySchema { .. })
+    ));
+}
+
+#[test]
+fn record_allocation_failure_is_budgeted_bounded_and_releases_unpublished_storage() {
+    let schema = record_schema();
+    let operations = [OperationSchema::asynchronous_record(&[], &schema)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut limits = profile();
+    limits.heap_bytes = 1024;
+    let mut session = Session::admit(
+        fixtures::record_response_artifact(13, false),
+        limits,
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = only_request(session.advance(64, 0).unwrap()).id();
+    let value = record_value(1f64.to_bits(), 500);
+    let resident = session.resource_snapshot().machine.mutable_resident_bytes;
+    session
+        .resume(id, HostResponse::Success(HostValueInput::Record(&value)))
+        .unwrap();
+    assert!(session.resource_snapshot().machine.mutable_resident_bytes > resident);
+    for attempt in 0..2000 {
+        match session.advance(6, 6).unwrap() {
+            AdvanceOutcome::SliceExhausted => assert!(attempt < 1999),
+            AdvanceOutcome::AllocationExhausted(failure) => {
+                assert!(failure.collection_attempted);
+                assert!(session.accounting().maintenance_units > 0);
+                assert!(matches!(
+                    session.advance(6, 6).unwrap(),
+                    AdvanceOutcome::AllocationExhausted(_)
+                ));
+                return;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("record allocation did not reach a terminal outcome");
+}
+
+#[test]
+fn other_task_responses_do_not_replace_an_incomplete_record_frame() {
+    for resume_during_materialization in [false, true] {
+        let schema = record_schema();
+        let operations = [
+            OperationSchema::asynchronous_record(&[], &schema),
+            OperationSchema::asynchronous(&[], HostValueType::I32),
+        ];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut session = Session::admit(
+            fixtures::record_and_scalar_tasks_artifact(),
+            profile(),
+            &[binding],
+        )
+        .unwrap();
+        session.start(&[]).unwrap();
+        let AdvanceOutcome::HostRequestBatch(batch) = session.advance(64, 0).unwrap() else {
+            panic!("no task requests");
+        };
+        assert_eq!(2, batch.len());
+        let record = batch.get(0).unwrap();
+        let scalar = batch.get(1).unwrap();
+        let record = (record.task_id(), record.id());
+        let scalar = (scalar.task_id(), scalar.id());
+        session
+            .resume_for(
+                record.0,
+                record.1,
+                HostResponse::Success(HostValueInput::Record(&record_value(
+                    (-0.0f64).to_bits(),
+                    128,
+                ))),
+            )
+            .unwrap();
+        if resume_during_materialization {
+            assert!(matches!(
+                session.advance(6, 0).unwrap(),
+                AdvanceOutcome::HostRequestBatch(_)
+            ));
+        }
+        session
+            .resume_for(
+                scalar.0,
+                scalar.1,
+                HostResponse::Success(HostValueInput::I32(42)),
+            )
+            .unwrap();
+        let mut halted = false;
+        for _ in 0..100 {
+            match session.advance(64, 64).unwrap() {
+                AdvanceOutcome::SliceExhausted => {}
+                AdvanceOutcome::Halted(None) => {
+                    halted = true;
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(halted);
+        assert_eq!(2, session.accounting().accepted_responses);
+    }
+}

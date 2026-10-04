@@ -143,6 +143,8 @@ pub(super) struct Machine {
     pending_concat: Option<text::PendingConcat>,
     pending_concat_source: Option<AllocationSource>,
     pending_host_string: Option<text::PendingHostString>,
+    pending_record: Option<super::record::PendingRecord>,
+    pending_record_source: Option<AllocationSource>,
     pending_host_string_source: Option<AllocationSource>,
     string_collection_pending: Option<StringCollectionTarget>,
     task_string_response: Option<(TaskId, RequestId, Option<TaskId>)>,
@@ -233,6 +235,7 @@ struct AllocationRetry {
 enum StringCollectionTarget {
     Concat,
     HostResponse,
+    RecordResponse,
     ExceptionMessage,
 }
 
@@ -319,6 +322,8 @@ impl Machine {
             + core::mem::size_of::<Option<text::PendingText>>()
             + core::mem::size_of::<Option<text::PendingConcat>>()
             + core::mem::size_of::<Option<AllocationSource>>() * 2
+            + core::mem::size_of::<Option<super::record::PendingRecord>>()
+            + core::mem::size_of::<Option<AllocationSource>>()
             + core::mem::size_of::<Option<text::PendingHostString>>()
             + core::mem::size_of::<Option<StringCollectionTarget>>()) as u64
             + core::mem::size_of::<Option<(TaskId, RequestId, Option<TaskId>)>>() as u64
@@ -431,6 +436,8 @@ impl Machine {
             pending_host_string_source: None,
             string_collection_pending: None,
             task_string_response: None,
+            pending_record: None,
+            pending_record_source: None,
             emergency_oom: Some(super::value::Ref32::reserved(0).unwrap()),
             frame_depth: 0,
             failure_stack: None,
@@ -662,6 +669,13 @@ impl Machine {
         self.tasks.current().map_err(task_fault)
     }
 
+    pub(super) fn terminal_outcome(&self) -> Option<Outcome> {
+        match self.lifecycle {
+            Lifecycle::Terminal(outcome) => Some(outcome),
+            _ => None,
+        }
+    }
+
     pub(super) fn has_active_task(&self) -> bool {
         self.tasks.current().is_ok()
     }
@@ -712,6 +726,140 @@ impl Machine {
             self.activate_next_task()?;
         }
         Ok(())
+    }
+
+    pub(super) fn begin_task_record_response(
+        &mut self,
+        task: TaskId,
+        request: RequestId,
+        value: super::host::HostRecordValue,
+    ) -> Result<(), VmFault> {
+        if self.task_string_response.is_some() || self.pending_record.is_some() {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        let active = self.tasks.current().ok();
+        if let Some(active) = active {
+            self.save_task(active)?;
+        }
+        self.restore_task(task)?;
+        let frame_index = self
+            .frame_depth
+            .checked_sub(1)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let frame = self
+            .frames
+            .get(frame_index)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let destination = match self
+            .image
+            .block(frame.block)
+            .and_then(|block| block.instructions.get(frame.instruction))
+        {
+            Some(ResolvedInstruction::CapabilityCallAsync { dst, .. }) if *dst != u16::MAX => *dst,
+            _ => return Err(VmFault::CorruptLifecycle),
+        };
+        let ty = self
+            .image
+            .function(frame.function)
+            .and_then(|function| function.registers.get(destination as usize))
+            .and_then(|value| value.nominal)
+            .ok_or(VmFault::InvalidValueType)?;
+        let layout = self
+            .image
+            .record_layout(ty)
+            .ok_or(VmFault::InvalidResolvedId)?;
+        self.pending_record = Some(super::record::PendingRecord::new(layout, value)?);
+        self.pending_record_source = Some(self.allocation_source(frame_index));
+        self.task_string_response = Some((task, request, active));
+        Ok(())
+    }
+
+    pub(super) fn record_response_pending(&self) -> bool {
+        self.pending_record.is_some()
+    }
+
+    pub(super) fn run_record_slice(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+    ) -> Result<Outcome, RunError> {
+        match self.lifecycle {
+            Lifecycle::Terminal(outcome) => return Ok(outcome),
+            Lifecycle::Pristine => return Err(RunError::NotStarted),
+            Lifecycle::Runnable => {}
+        }
+        if guest_budget == 0
+            || guest_budget > self.image.maximum_slice_budget()
+            || maintenance_budget > self.image.maximum_slice_budget()
+        {
+            return Err(RunError::InvalidSliceBudget {
+                minimum: 1,
+                maximum: self.image.maximum_slice_budget(),
+                supplied: guest_budget,
+            });
+        }
+        if self.collector.is_active() {
+            return self.run_maintenance(maintenance_budget);
+        }
+        let Some(mut pending) = self.pending_record.take() else {
+            return Ok(self.fault(VmFault::CorruptLifecycle));
+        };
+        let result = pending.resume(&self.image, &mut self.heap, guest_budget);
+        let used = match &result {
+            Ok((used, _)) | Err(text::TextError::Exhausted { used, .. }) => *used,
+            _ => 0,
+        };
+        let Some(consumed) = self.consumed_dynamic_cost.checked_add(u64::from(used)) else {
+            let _ = pending.abort(&mut self.heap);
+            return Ok(self.fault(VmFault::AccountingOverflow));
+        };
+        self.consumed_dynamic_cost = consumed;
+        match result {
+            Ok((_, Some(value))) => {
+                self.pending_record_source = None;
+                if let Err(fault) = self.complete_capability(Some(value)) {
+                    return Ok(self.fault(fault));
+                }
+            }
+            Ok((_, None)) => self.pending_record = Some(pending),
+            Err(text::TextError::Exhausted {
+                block_bytes,
+                requested,
+                collection_attempted,
+                ..
+            }) => {
+                let Some(source) = self.pending_record_source else {
+                    let _ = pending.abort(&mut self.heap);
+                    return Ok(self.fault(VmFault::CorruptLifecycle));
+                };
+                if u64::from(block_bytes) > self.image.storage_plan().heap_arena_bytes
+                    || collection_attempted
+                {
+                    let kind = pending.allocation_kind();
+                    let _ = pending.abort(&mut self.heap);
+                    self.pending_record_source = None;
+                    return Ok(self.allocation_exhausted(
+                        kind,
+                        requested,
+                        collection_attempted,
+                        source,
+                    ));
+                }
+                if self.allocation_retry.is_some() || self.string_collection_pending.is_some() {
+                    let _ = pending.abort(&mut self.heap);
+                    return Ok(self.fault(VmFault::CorruptLifecycle));
+                }
+                self.pending_record = Some(pending);
+                self.string_collection_pending = Some(StringCollectionTarget::RecordResponse);
+                self.collector.start();
+            }
+            Err(error) => {
+                let _ = pending.abort(&mut self.heap);
+                self.pending_record_source = None;
+                return Ok(self.text_outcome(error));
+            }
+        }
+        Ok(Outcome::SliceExhausted)
     }
 
     pub(super) fn begin_task_string_response(
@@ -2965,7 +3113,7 @@ impl Machine {
             };
             remaining -= 1;
             self.consumed_maintenance_cost = consumed;
-            let mut runtime_roots = [None; 9];
+            let mut runtime_roots = [None; 41];
             let mut runtime_root_count = 0_usize;
             self.visit_runtime_roots(|reference| {
                 if let Some(slot) = runtime_roots.get_mut(runtime_root_count) {
@@ -3006,6 +3154,12 @@ impl Machine {
                     }
                     StringCollectionTarget::HostResponse => {
                         let Some(pending) = self.pending_host_string.as_mut() else {
+                            return Ok(self.fault(VmFault::CorruptLifecycle));
+                        };
+                        pending.mark_collection_attempted();
+                    }
+                    StringCollectionTarget::RecordResponse => {
+                        let Some(pending) = self.pending_record.as_mut() else {
                             return Ok(self.fault(VmFault::CorruptLifecycle));
                         };
                         pending.mark_collection_attempted();
@@ -3313,6 +3467,9 @@ impl Machine {
     }
 
     fn visit_runtime_roots(&self, mut visit: impl FnMut(Ref32)) {
+        if let Some(pending) = &self.pending_record {
+            pending.visit_roots(&mut visit);
+        }
         if let Some(pending) = &self.pending_raise {
             if let Some(message) = pending.message {
                 visit(message);
@@ -3853,7 +4010,15 @@ impl Machine {
             heap_used_bytes: heap_capacity_bytes
                 .saturating_sub(u64::from(self.heap.total_free_bytes())),
             live_objects: u64::from(self.heap.live_objects()),
-            mutable_resident_bytes: self.image.storage_plan().mutable_resident_bytes(),
+            mutable_resident_bytes: self
+                .image
+                .storage_plan()
+                .mutable_resident_bytes()
+                .saturating_add(
+                    self.pending_record
+                        .as_ref()
+                        .map_or(0, |pending| pending.resident_bytes()),
+                ),
             task_capacity: tasks.capacity,
             live_tasks: tasks.live,
             runnable_tasks: tasks.runnable,
@@ -3928,8 +4093,15 @@ impl Machine {
     }
 
     #[cfg(test)]
+    pub(super) fn test_record_collection_safe(&self) -> bool {
+        self.pending_record
+            .as_ref()
+            .is_some_and(|record| record.test_collection_safe())
+    }
+
+    #[cfg(test)]
     pub(super) fn test_collect_exception_roots(&mut self) -> Result<(), VmFault> {
-        let mut runtime_roots = [None; 9];
+        let mut runtime_roots = [None; 41];
         let mut count = 0;
         self.visit_runtime_roots(|reference| {
             runtime_roots[count] = Some(reference);
