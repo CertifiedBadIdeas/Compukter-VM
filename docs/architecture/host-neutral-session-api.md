@@ -76,7 +76,7 @@ VM fault traces describe the detection site, not necessarily the corruption caus
 
 C ABI 18 adds outcome tag 12: a little-endian u32 UTF-8 byte length followed by the bounded uncaught-exception
 diagnostic (class, message, at most four causes and the source stack). No managed reference leaves the VM.
-Both transports require ABI 19. Explicit Throw/handler artifacts require Runtime ABI 1.8 and one verified
+Both transports require ABI 20. Explicit Throw/handler artifacts require Runtime ABI 1.8 and one verified
 Throwable root; older exception artifacts are rejected with a rebuild requirement, never converted to traps.
 Admission resolves handlers in innermost/source order. Every handler inspection and unwound frame costs one
 dynamic Guest unit. Exception references remain rooted during suspended unwinding and after child-task failure.
@@ -218,4 +218,16 @@ managed allocation. Advance materializes nodes in postorder, charging allocation
 field stores against the existing sliced budgets. Partial objects and completed child nodes remain GC roots; the
 result register is published only after the complete tree is ready. OOM remains terminal, and another task's reply
 cannot overwrite an unfinished reference response. Pending owned replies and materialization plans count towards
-execution-resident resource accounting. The C ABI remains 19 with the existing resume-value export.
+execution-resident resource accounting. Records use the resume-value export introduced in C ABI 19; active transports require C ABI 20.
+
+## Process lifecycle (C ABI 20)
+
+Computer advances publish tag 13 on successful child entry and tag 14 on child exit, each followed by a positive
+little-endian u64 process ID. The root process has ID 0. IDs are unique for the computer lifetime. Entry is returned
+before the child executes; exit is returned before the parent resumes execution. These nonterminal outcomes do not
+change the retirement allowance or artifact ABI. Both JNI and FFM require C ABI 20; the 44 exported functions remain.
+
+External requests use computer-wide opaque IDs routed to their live process, task, and internal request identity.
+Repeated pending requests retain the same external ID; successful resume removes its route. Child exit purges its
+routes, and late or duplicate completions cannot target another process. The bounded routing table supports responses
+to suspended parents and includes retained allocation capacity in mutable execution-resident resource accounting.
