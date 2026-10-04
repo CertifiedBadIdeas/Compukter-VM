@@ -92,6 +92,14 @@ impl RuntimeValue {
                     bits as i32
                 }
             }
+            (4, Self::F64(bits)) => {
+                let canonical = if f64::from_bits(bits).is_nan() {
+                    0x7ff8_0000_0000_0000
+                } else {
+                    bits
+                };
+                (canonical ^ (canonical >> 32)) as i32
+            }
             (5, Self::Bool(value)) => {
                 if value {
                     1231

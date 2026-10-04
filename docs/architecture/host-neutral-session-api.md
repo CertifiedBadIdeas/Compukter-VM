@@ -181,3 +181,11 @@ same per-session semantics.
 ## Value hashing
 
 Runtime ABI 1.11 adds `value_hash` (0x69), a fixed-cost, allocation-free operation producing I32. Forms 1/2/3/5/6 accept I32/I64/F32/Bool/Char; form 7 accepts nullable references. Integers use Int identity or Long folded high/low bits; Float canonicalizes every NaN to 0x7fc00000 and preserves signed zero, Boolean uses 1231/1237, and Char uses its UTF-16 code unit. Reference null hashes to zero and live references use opaque VM identity bits, never host pointers. Hash collisions are permitted. The non-moving collector preserves live identity; future relocation must preserve observable hashes rather than recomputing them from a moved address. String content hashing retains its existing sliced, rooted `string_hash` path. Artifact format and C ABI 18 are unchanged.
+
+Runtime ABI 1.12 adds F64 form 4 to `string_value_of` (0x68) and `value_hash` (0x69).
+Admission requires ABI 1.12 and F64 input. Text uses bounded shortest-round-trip decimal
+conversion, Kotlin notation, and a fixed 24-unit inline buffer; string allocation remains
+sliced and quota-accounted. Hashing canonicalizes NaN to 0x7ff8000000000000 and folds high
+xor low into I32, preserving the sign of zero. Hash collisions are permitted and must not
+be used alone as value equality. Existing numeric F64 instructions remain ABI 1.0.
+Artifact format and C ABI 18 are unchanged.

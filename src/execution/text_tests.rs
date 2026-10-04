@@ -232,6 +232,81 @@ fn scalar_string_conversion_matches_kotlin_representations() {
             "-1.4E-45".encode_utf16().collect::<Vec<_>>(),
         ),
         (
+            4,
+            Constant::F64((0.0_f64).to_bits()),
+            "0.0".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((-0.0_f64).to_bits()),
+            "-0.0".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((1.5_f64).to_bits()),
+            "1.5".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((16777217.0_f64).to_bits()),
+            "1.6777217E7".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((0.001_f64).to_bits()),
+            "0.001".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((0.0001_f64).to_bits()),
+            "1.0E-4".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((f64::MAX).to_bits()),
+            "1.7976931348623157E308".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((f64::MIN_POSITIVE).to_bits()),
+            "2.2250738585072014E-308".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((f64::from_bits(1)).to_bits()),
+            "4.9E-324".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((-f64::from_bits(1)).to_bits()),
+            "-4.9E-324".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64(f64::from_bits(2).to_bits()),
+            "9.9E-324".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64(f64::from_bits(10).to_bits()),
+            "4.9E-323".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((f64::INFINITY).to_bits()),
+            "Infinity".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((f64::NEG_INFINITY).to_bits()),
+            "-Infinity".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            4,
+            Constant::F64((f64::NAN).to_bits()),
+            "NaN".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
             5,
             Constant::Bool(false),
             "false".encode_utf16().collect::<Vec<_>>(),
@@ -652,6 +727,26 @@ fn value_hash_executes_scalar_semantics_with_fixed_slices() {
         ),
         (2, crate::artifact::Constant::I64(-1), 0),
         (3, crate::artifact::Constant::F32(0x80000000), i32::MIN),
+        (
+            4,
+            crate::artifact::Constant::F64(0x8000000000000000),
+            i32::MIN,
+        ),
+        (
+            4,
+            crate::artifact::Constant::F64(0x7ff0000000000001),
+            0x7ff80000,
+        ),
+        (
+            4,
+            crate::artifact::Constant::F64(0xfff8000000000001),
+            0x7ff80000,
+        ),
+        (
+            4,
+            crate::artifact::Constant::F64(1.5_f64.to_bits()),
+            1073217536,
+        ),
         (3, crate::artifact::Constant::F32(0x7fa12345), 0x7fc00000),
         (3, crate::artifact::Constant::F32(0xffc00001), 0x7fc00000),
         (5, crate::artifact::Constant::Bool(true), 1231),

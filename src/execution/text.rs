@@ -6,7 +6,8 @@ use super::{
     value::{Ref32, RuntimeValue},
 };
 
-const INLINE_SCALAR_UNITS: usize = 20;
+// Enough for a signed 17-digit Double mantissa and a three-digit exponent.
+const INLINE_SCALAR_UNITS: usize = 24;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum StringBacking {
@@ -1245,6 +1246,10 @@ fn scalar_units(
             let length = write_kotlin_f32(bits, &mut units)?;
             Ok((units, 0, length))
         }
+        (4, RuntimeValue::F64(bits)) => {
+            let length = write_kotlin_f64(bits, &mut units)?;
+            Ok((units, 0, length))
+        }
         (5, RuntimeValue::Bool(value)) => {
             let text: &[u8] = if value { b"true" } else { b"false" };
             for (destination, source) in units.iter_mut().zip(text.iter().copied()) {
@@ -1293,7 +1298,80 @@ fn write_kotlin_f32(bits: u32, units: &mut [u16; INLINE_SCALAR_UNITS]) -> Result
     }
 
     let mut buffer = ryu::Buffer::new();
+    write_kotlin_decimal(buffer.format_finite(value).as_bytes(), units)
+}
+
+fn write_kotlin_f64(bits: u64, units: &mut [u16; INLINE_SCALAR_UNITS]) -> Result<u8, TextError> {
+    let value = f64::from_bits(bits);
+    if value.is_nan() {
+        return write_ascii(units, b"NaN");
+    }
+    if value == f64::INFINITY {
+        return write_ascii(units, b"Infinity");
+    }
+    if value == f64::NEG_INFINITY {
+        return write_ascii(units, b"-Infinity");
+    }
+    if bits & 0x7fff_ffff_ffff_ffff == 0 {
+        return write_ascii(units, if bits >> 63 == 0 { b"0.0" } else { b"-0.0" });
+    }
+    let mut buffer = ryu::Buffer::new();
     let shortest = buffer.format_finite(value).as_bytes();
+    let mut digit_count = 0;
+    let mut trailing_zeroes = 0;
+    for byte in shortest
+        .iter()
+        .take_while(|byte| **byte != b'e' && **byte != b'E')
+    {
+        if byte.is_ascii_digit() && (*byte != b'0' || digit_count != 0) {
+            digit_count += 1;
+            trailing_zeroes = if *byte == b'0' {
+                trailing_zeroes + 1
+            } else {
+                0
+            };
+        }
+    }
+    if digit_count - trailing_zeroes == 1 {
+        // Java/Kotlin selects the nearest decimal of length one OR two when
+        // one digit is enough to round-trip. This matters for subnormals.
+        use core::fmt::Write;
+        let mut nearest = FixedAscii {
+            bytes: [0; INLINE_SCALAR_UNITS],
+            length: 0,
+        };
+        write!(&mut nearest, "{value:.1e}")
+            .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?;
+        return write_kotlin_decimal(&nearest.bytes[..nearest.length], units);
+    }
+    write_kotlin_decimal(shortest, units)
+}
+
+struct FixedAscii {
+    bytes: [u8; INLINE_SCALAR_UNITS],
+    length: usize,
+}
+
+impl core::fmt::Write for FixedAscii {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        let end = self
+            .length
+            .checked_add(value.len())
+            .ok_or(core::fmt::Error)?;
+        let target = self
+            .bytes
+            .get_mut(self.length..end)
+            .ok_or(core::fmt::Error)?;
+        target.copy_from_slice(value.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
+
+fn write_kotlin_decimal(
+    shortest: &[u8],
+    units: &mut [u16; INLINE_SCALAR_UNITS],
+) -> Result<u8, TextError> {
     let mut output = [0_u8; INLINE_SCALAR_UNITS];
     let mut output_length = 0_usize;
     let mut offset = 0_usize;
@@ -1382,11 +1460,18 @@ fn write_kotlin_f32(bits: u32, units: &mut [u16; INLINE_SCALAR_UNITS]) -> Result
             push_ascii(&mut output, &mut output_length, b'-')?;
         }
         let magnitude = scientific_exponent.unsigned_abs();
+        if magnitude >= 100 {
+            push_ascii(
+                &mut output,
+                &mut output_length,
+                b'0' + (magnitude / 100) as u8,
+            )?;
+        }
         if magnitude >= 10 {
             push_ascii(
                 &mut output,
                 &mut output_length,
-                b'0' + (magnitude / 10) as u8,
+                b'0' + ((magnitude / 10) % 10) as u8,
             )?;
         }
         push_ascii(
@@ -1419,4 +1504,29 @@ fn write_ascii(units: &mut [u16; INLINE_SCALAR_UNITS], ascii: &[u8]) -> Result<u
         *unit = u16::from(*byte);
     }
     Ok(ascii.len() as u8)
+}
+
+#[cfg(test)]
+mod double_format_tests {
+    use super::{write_kotlin_f64, INLINE_SCALAR_UNITS};
+
+    #[test]
+    fn double_decimal_round_trips_finite_values_in_a_fixed_buffer() {
+        let mut bits = 0x243f_6a88_85a3_08d3_u64;
+        for _ in 0..10000 {
+            bits = bits
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let value = f64::from_bits(bits);
+            if !value.is_finite() {
+                continue;
+            }
+            let mut units = [0; INLINE_SCALAR_UNITS];
+            let length = write_kotlin_f64(bits, &mut units)
+                .unwrap_or_else(|_| panic!("formatting failed for {bits:016x}"));
+            let text = String::from_utf16(&units[..usize::from(length)]).unwrap();
+            let parsed: f64 = text.parse().unwrap();
+            assert_eq!(bits, parsed.to_bits(), "{text}");
+        }
+    }
 }

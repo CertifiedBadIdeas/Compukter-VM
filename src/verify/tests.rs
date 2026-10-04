@@ -1072,6 +1072,30 @@ fn reference_string_conversion_requires_abi_1_10_and_a_reference_operand() {
 }
 
 #[test]
+fn f64_string_conversion_requires_abi_1_12_and_f64_operand() {
+    for (minor, source, valid) in [
+        (11, primitive(4), false),
+        (12, primitive(4), true),
+        (12, primitive(3), false),
+    ] {
+        let mut artifact = string_artifact(
+            vec![source, reference(1, false)],
+            1,
+            vec![
+                crate::artifact::Instruction::StringValueOf {
+                    form: 4,
+                    dst: 1,
+                    source: 0,
+                },
+                crate::artifact::Instruction::Return { value: u16::MAX },
+            ],
+        );
+        artifact.header.runtime_minor = minor;
+        assert_eq!(valid, verify_cfg(&artifact).is_ok(), "minor {minor}");
+    }
+}
+
+#[test]
 fn cfg_rejects_scalar_string_conversion_type_mismatches() {
     for (registers, instruction) in [
         (
@@ -2216,6 +2240,8 @@ fn value_hash_requires_abi_1_11_matching_operand_and_i32_result() {
         (11, 7, primitive(1), primitive(1), false),
         (11, 1, primitive(1), primitive(2), false),
         (11, 4, primitive(4), primitive(1), false),
+        (12, 4, primitive(4), primitive(1), true),
+        (12, 4, primitive(3), primitive(1), false),
     ] {
         let mut artifact = string_artifact(
             vec![source, result],
