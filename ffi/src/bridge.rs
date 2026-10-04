@@ -143,6 +143,9 @@ pub(crate) enum FileInspectionBridgeError {
 pub(crate) enum OwnedResponse {
     SuccessUnit,
     SuccessI32(i32),
+    SuccessI64(i64),
+    SuccessF64(u64),
+    SuccessChar(u16),
     SuccessF32(u32),
     SuccessBool(bool),
     SuccessString(Vec<u16>),
@@ -423,6 +426,15 @@ pub(crate) fn resume(
                 OwnedResponse::SuccessUnit => HostResponse::Success(HostValueInput::Unit),
                 OwnedResponse::SuccessI32(value) => {
                     HostResponse::Success(HostValueInput::I32(*value))
+                }
+                OwnedResponse::SuccessI64(value) => {
+                    HostResponse::Success(HostValueInput::I64(*value))
+                }
+                OwnedResponse::SuccessF64(bits) => {
+                    HostResponse::Success(HostValueInput::F64(*bits))
+                }
+                OwnedResponse::SuccessChar(value) => {
+                    HostResponse::Success(HostValueInput::Char(*value))
                 }
                 OwnedResponse::SuccessF32(bits) => {
                     HostResponse::Success(HostValueInput::F32(*bits))

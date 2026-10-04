@@ -76,7 +76,7 @@ VM fault traces describe the detection site, not necessarily the corruption caus
 
 C ABI 18 adds outcome tag 12: a little-endian u32 UTF-8 byte length followed by the bounded uncaught-exception
 diagnostic (class, message, at most four causes and the source stack). No managed reference leaves the VM.
-Both transports require ABI 18. Explicit Throw/handler artifacts require Runtime ABI 1.8 and one verified
+Both transports require ABI 19. Explicit Throw/handler artifacts require Runtime ABI 1.8 and one verified
 Throwable root; older exception artifacts are rejected with a rebuild requirement, never converted to traps.
 Admission resolves handlers in innermost/source order. Every handler inspection and unwound frame costs one
 dynamic Guest unit. Exception references remain rooted during suspended unwinding and after child-task failure.
@@ -189,3 +189,14 @@ sliced and quota-accounted. Hashing canonicalizes NaN to 0x7ff8000000000000 and 
 xor low into I32, preserving the sign of zero. Hash collisions are permitted and must not
 be used alone as value equality. Existing numeric F64 instructions remain ABI 1.0.
 Artifact format and C ABI 18 are unchanged.
+
+## Encoded host responses (C ABI 19)
+
+`compukter_resume_value` accepts a caller-owned byte payload, validates it completely before request lookup, and retains
+no pointer after return. Version byte 1 precedes a scalar HostValueType tag (0..7). Numeric values use little-endian
+widths matching their register kind, including exact F32/F64 bits. Bool is 0 or 1; Char is a u16 UTF-16 code unit;
+String has a u16 count followed by that many u16 code units (including isolated surrogates). Unit has no payload.
+The payload limit is 65536 bytes, and strings are limited to 4096 code units. Wrong versions, tags, widths, Boolean
+values, lengths and trailing data return InvalidArgument without consuming a pending response. HostValueInput still
+checks the admitted operation result type. Existing resume exports are retained; this addition enables all existing
+scalar result kinds through the JVM adapters without changing Runtime ABI 1.12 or artifact encoding.

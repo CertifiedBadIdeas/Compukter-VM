@@ -1308,3 +1308,75 @@ mod tests {
         );
     }
 }
+
+/// Decode completely before touching a pending request. Unknown versions/tags and trailing bytes are rejected.
+pub(crate) fn decode_response(bytes: &[u8]) -> Option<crate::bridge::OwnedResponse> {
+    use crate::bridge::OwnedResponse;
+    if bytes.len() < 2 || bytes.len() > 65_536 || bytes[0] != 1 {
+        return None;
+    }
+    let value = &bytes[2..];
+    Some(match bytes[1] {
+        0 if value.is_empty() => OwnedResponse::SuccessUnit,
+        1 => OwnedResponse::SuccessI32(i32::from_le_bytes(value.try_into().ok()?)),
+        2 => OwnedResponse::SuccessI64(i64::from_le_bytes(value.try_into().ok()?)),
+        3 => OwnedResponse::SuccessF32(u32::from_le_bytes(value.try_into().ok()?)),
+        4 => OwnedResponse::SuccessF64(u64::from_le_bytes(value.try_into().ok()?)),
+        5 if value.len() == 1 && value[0] <= 1 => OwnedResponse::SuccessBool(value[0] != 0),
+        6 => OwnedResponse::SuccessChar(u16::from_le_bytes(value.try_into().ok()?)),
+        7 if value.len() >= 2 => {
+            let length = usize::from(u16::from_le_bytes(value[..2].try_into().ok()?));
+            if length > 4096 || value.len() != 2 + 2 * length {
+                return None;
+            }
+            OwnedResponse::SuccessString(
+                value[2..]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect(),
+            )
+        }
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::decode_response;
+    use crate::bridge::OwnedResponse;
+
+    #[test]
+    fn scalar_response_wire_preserves_signed_values_ieee_payloads_and_utf16() {
+        for value in [i64::MIN, i64::MAX, -1, 0] {
+            let mut payload = vec![1, 2];
+            payload.extend_from_slice(&value.to_le_bytes());
+            assert_eq!(
+                Some(OwnedResponse::SuccessI64(value)),
+                decode_response(&payload)
+            );
+        }
+        for bits in [
+            (-0.0_f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            0x7ff0_0000_0000_0042,
+        ] {
+            let mut payload = vec![1, 4];
+            payload.extend_from_slice(&bits.to_le_bytes());
+            assert_eq!(
+                Some(OwnedResponse::SuccessF64(bits)),
+                decode_response(&payload)
+            );
+        }
+        assert_eq!(
+            Some(OwnedResponse::SuccessChar(0xd800)),
+            decode_response(&[1, 6, 0, 216])
+        );
+        assert_eq!(
+            Some(OwnedResponse::SuccessString(vec![0xd800, 65])),
+            decode_response(&[1, 7, 2, 0, 0, 216, 65, 0])
+        );
+        let mut oversized = vec![1, 7, 1, 16];
+        oversized.resize(2 + 2 + 2 * 4097, 0);
+        assert_eq!(None, decode_response(&oversized));
+    }
+}

@@ -1320,6 +1320,31 @@ pub unsafe extern "C" fn compukter_resume_string(
 }
 
 #[unsafe(no_mangle)]
+/// Resumes a request using a bounded versioned value encoding; no caller pointers are retained.
+///
+/// # Safety
+/// `payload` must name `payload_len` readable bytes when the length is nonzero.
+pub unsafe extern "C" fn compukter_resume_value(
+    handle: u64,
+    task_id: u32,
+    request_id: u64,
+    payload: *const u8,
+    payload_len: usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if task_id == 0 || payload_len < 2 || payload_len > 65_536 || payload.is_null() {
+            return FfiStatus::InvalidArgument;
+        }
+        // SAFETY: the caller provides the readable region required by the ABI.
+        let bytes = unsafe { core::slice::from_raw_parts(payload, payload_len) };
+        match crate::wire::decode_response(bytes) {
+            Some(response) => bridge_status(bridge::resume(handle, task_id, request_id, &response)),
+            None => FfiStatus::InvalidArgument,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Resumes a pending host request with a human-readable failure.
 ///
 /// # Safety
