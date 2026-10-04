@@ -477,6 +477,7 @@ struct ExecutionImageInner {
     assignable_types: Box<[Box<[TypeKey]>]>,
     array_element_types: Box<[Option<ResolvedValueType>]>,
     fields: Box<[ResolvedField]>,
+    record_layouts: std::collections::HashMap<TypeKey, super::record::RecordLayout>,
     static_layout: FrameLayout,
     literals: Box<[ResolvedLiteral]>,
     literal_ids: Box<[usize]>,
@@ -839,6 +840,7 @@ impl ExecutionImage {
         .with_header_format(header_format);
 
         let mut blocks = reserved(*block_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+        let record_layouts = std::cell::RefCell::new(std::collections::HashMap::new());
         let instruction_resolution = InstructionResolution {
             function_offsets: &function_offsets,
             block_offsets: &block_offsets,
@@ -848,6 +850,10 @@ impl ExecutionImage {
             functions: &functions,
             capabilities,
             string_type,
+            artifact: decoded,
+            type_offsets: &type_offsets,
+            type_layouts: &type_layouts,
+            record_layouts: &record_layouts,
         };
         for (module_id, module) in decoded.modules.iter().enumerate() {
             for (block_id, block) in module.blocks.iter().enumerate() {
@@ -958,6 +964,7 @@ impl ExecutionImage {
             assignable_types: assignable_type_sets.into_boxed_slice(),
             array_element_types: array_element_types.into_boxed_slice(),
             fields,
+            record_layouts: record_layouts.into_inner(),
             static_layout,
             literals,
             literal_ids,
@@ -1181,6 +1188,10 @@ impl ExecutionImage {
 
     pub(super) fn field(&self, index: usize) -> Option<&ResolvedField> {
         self.0.fields.get(index)
+    }
+
+    pub(super) fn record_layout(&self, ty: TypeKey) -> Option<&super::record::RecordLayout> {
+        self.0.record_layouts.get(&ty)
     }
 
     pub(super) fn fields(&self) -> &[ResolvedField] {
@@ -1921,6 +1932,11 @@ struct InstructionResolution<'a> {
     functions: &'a [ResolvedFunction],
     capabilities: &'a [Option<ResolvedCapability>],
     string_type: Option<TypeKey>,
+    artifact: &'a DecodedArtifact,
+    type_offsets: &'a [usize],
+    type_layouts: &'a [RuntimeTypeLayout],
+    record_layouts:
+        &'a std::cell::RefCell<std::collections::HashMap<TypeKey, super::record::RecordLayout>>,
 }
 
 fn resolve_instruction(
@@ -2507,6 +2523,55 @@ fn validate_capability_call(
             });
     let result_matches = match schema.result {
         HostValueType::Unit => destination == u16::MAX,
+        HostValueType::Record => {
+            let actual = resolved_function.registers.get(destination as usize);
+            match (actual, schema.result_record.as_ref()) {
+                (Some(actual), Some(record))
+                    if actual.kind == 7
+                        && !actual.nullable
+                        && resolution.artifact.header.runtime_minor >= 13 =>
+                {
+                    actual
+                        .nominal
+                        .and_then(|ty| {
+                            let layout = super::record::admit_record(
+                                resolution.artifact,
+                                ty,
+                                record,
+                                resolution.fields,
+                                resolution.field_offsets,
+                                resolution.string_type,
+                            )?;
+                            fn physical(
+                                layout: &super::record::RecordLayout,
+                                resolution: &InstructionResolution<'_>,
+                            ) -> Option<()> {
+                                let index =
+                                    checked_global_index(resolution.type_offsets, layout.ty)?;
+                                let RuntimeTypeLayout::Object(object) =
+                                    resolution.type_layouts.get(index)?
+                                else {
+                                    return None;
+                                };
+                                if object.fields.len() != layout.fields.len() {
+                                    return None;
+                                }
+                                for field in &layout.fields {
+                                    if let Some(child) = &field.record {
+                                        physical(child, resolution)?;
+                                    }
+                                }
+                                Some(())
+                            }
+                            physical(&layout, resolution)?;
+                            resolution.record_layouts.borrow_mut().insert(ty, layout);
+                            Some(())
+                        })
+                        .is_some()
+                }
+                _ => false,
+            }
+        }
         expected => {
             destination != u16::MAX
                 && resolved_function
@@ -2532,7 +2597,7 @@ fn host_type_matches(
     string_type: Option<TypeKey>,
 ) -> bool {
     match expected {
-        HostValueType::Unit => false,
+        HostValueType::Unit | HostValueType::Record => false,
         HostValueType::I32 => actual.kind == 1,
         HostValueType::I64 => actual.kind == 2,
         HostValueType::F32 => actual.kind == 3,

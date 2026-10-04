@@ -13,6 +13,7 @@ mod image;
 mod layout;
 mod machine;
 mod numeric;
+mod record;
 mod requests;
 mod session;
 mod task;
@@ -26,7 +27,8 @@ pub use error::{
 pub use host::{
     AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
     ExecutionProfile, HostArguments, HostFailure, HostFailureKind, HostMergeEntry,
-    HostMergeEntrySource, HostMergeGroup, HostMergeSchema, HostRequestBatchView, HostRequestView,
+    HostMergeEntrySource, HostMergeGroup, HostMergeSchema, HostRecordField, HostRecordMember,
+    HostRecordScalar, HostRecordSchema, HostRecordValue, HostRequestBatchView, HostRequestView,
     HostResponse, HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure,
     OperationSchema, OwnedHostFailure, QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
     MAXIMUM_HOST_FAILURE_DETAIL_BYTES,

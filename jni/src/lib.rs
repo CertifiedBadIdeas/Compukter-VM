@@ -739,6 +739,9 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_resu
     payload: JByteArray<'caller>,
 ) -> jint {
     status(&mut env, |env| {
+        if payload.len(env)? > 65_536 {
+            return Ok(INVALID_ARGUMENT);
+        }
         let payload = bytes(env, &payload)?;
         Ok(unsafe {
             compukter_resume_value(

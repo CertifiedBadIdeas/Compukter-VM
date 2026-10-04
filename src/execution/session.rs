@@ -35,6 +35,8 @@ pub struct Session {
     maximum_slice_budget: u32,
     inbound_length: usize,
     resuming_host_string: bool,
+    replies: std::collections::VecDeque<QueuedReply>,
+    maximum_replies: usize,
     published_requests: u64,
     accepted_responses: u64,
     entry_argument_limits: EntryArgumentLimits,
@@ -55,6 +57,18 @@ struct PreparingRequest {
     operation: u32,
     argument: usize,
     string_offset: u32,
+}
+
+struct QueuedReply {
+    task: TaskId,
+    request: RequestId,
+    value: CopiedReply,
+}
+enum CopiedReply {
+    Scalar(Option<RuntimeValue>),
+    String(Vec<u16>),
+    Record(super::host::HostRecordValue),
+    Failure(super::host::OwnedHostFailure),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -199,6 +213,8 @@ impl Session {
             maximum_slice_budget,
             inbound_length: 0,
             resuming_host_string: false,
+            replies: std::collections::VecDeque::new(),
+            maximum_replies: maximum_host_requests,
             published_requests: 0,
             accepted_responses: 0,
             entry_argument_limits,
@@ -272,6 +288,62 @@ impl Session {
                 }
             });
         }
+        if let Some(outcome) = self.machine.terminal_outcome() {
+            return self.map_machine_outcome(outcome, 0, 0, &mut remaining_retirements);
+        }
+        if !self.resuming_host_string && !self.machine.record_response_pending() {
+            while let Some(reply) = self.replies.pop_front() {
+                let result = match reply.value {
+                    CopiedReply::Scalar(value) => {
+                        self.machine
+                            .complete_task_capability(reply.task, reply.request, value)
+                    }
+                    CopiedReply::Failure(failure) => {
+                        let role = match failure.kind() {
+                            HostFailureKind::EndOfFile | HostFailureKind::InputOutput => 8,
+                            _ => 7,
+                        };
+                        self.machine.complete_task_host_failure(
+                            reply.task,
+                            reply.request,
+                            role,
+                            failure.detail(),
+                        )
+                    }
+                    CopiedReply::String(units) => {
+                        self.inbound_utf16[..units.len()].copy_from_slice(&units);
+                        self.inbound_length = units.len();
+                        self.machine
+                            .begin_task_string_response(reply.task, reply.request, units.is_empty())
+                            .map(|pending| self.resuming_host_string = pending)
+                    }
+                    CopiedReply::Record(value) => {
+                        self.machine
+                            .begin_task_record_response(reply.task, reply.request, value)
+                    }
+                };
+                if let Err(fault) = result {
+                    return self.establish_fault(fault);
+                }
+                if self.resuming_host_string || self.machine.record_response_pending() {
+                    break;
+                }
+            }
+        }
+        if self.machine.record_response_pending() {
+            let outcome = self
+                .machine
+                .run_record_slice(guest_budget, maintenance_budget)?;
+            if !self.machine.record_response_pending()
+                && matches!(outcome, super::error::Outcome::SliceExhausted)
+            {
+                if let Err(fault) = self.machine.finish_task_string_response() {
+                    return self.establish_fault(fault);
+                }
+            }
+            // A record is published atomically; Guest execution resumes in the following ordinary slice.
+            return self.map_machine_outcome(outcome, 0, 0, &mut remaining_retirements);
+        }
         if !self.machine.has_active_task()
             && !self.pending_requests.is_empty()
             && !self.resuming_host_string
@@ -291,7 +363,10 @@ impl Session {
                 maintenance_budget,
             )?;
             self.resuming_host_string = self.machine.capability_string_response_pending();
-            if !self.resuming_host_string && self.machine.has_task_string_response() {
+            if !self.resuming_host_string
+                && self.machine.has_task_string_response()
+                && matches!(outcome, super::error::Outcome::SliceExhausted)
+            {
                 if let Err(fault) = self.machine.finish_task_string_response() {
                     return self.establish_fault(fault);
                 }
@@ -446,7 +521,7 @@ impl Session {
         request_id: RequestId,
         response: HostResponse<'_>,
     ) -> Result<(), ResumeError> {
-        if self.terminal.is_some() {
+        if self.terminal.is_some() || self.machine.terminal_outcome().is_some() {
             return Err(ResumeError::NoPendingRequest);
         }
         let identity = HostRequestIdentity::new(task, request_id);
@@ -474,16 +549,24 @@ impl Session {
             .get(pending.capability() as usize)
             .and_then(Option::as_ref)
             .and_then(|capability| capability.operations.get(pending.operation() as usize))
-            .map(|operation| operation.result)
             .ok_or(ResumeError::NoPendingRequest)?;
         if let HostResponse::Success(input) = response {
-            if input.value_type() != expected {
+            if input.value_type() != expected.result {
                 return Err(ResumeError::WrongResponseType);
             }
             if let HostValueInput::String(units) = input {
                 if units.len() > self.inbound_utf16.len() {
                     return Err(ResumeError::ResponseTooLarge);
                 }
+            }
+        }
+        if let HostResponse::Success(HostValueInput::Record(record)) = response {
+            if !expected
+                .result_record
+                .as_ref()
+                .is_some_and(|schema| schema.accepts(record, self.inbound_utf16.len()))
+            {
+                return Err(ResumeError::WrongResponseType);
             }
         }
         if let HostResponse::Failure(failure) = response {
@@ -498,61 +581,69 @@ impl Session {
                     .copy_from_slice(failure.detail().as_bytes());
                 self.failure_detail_length = failure.detail().len();
                 self.terminal = Some(SessionTerminal::HostFailed(failure.kind()));
-            } else {
-                let role = match failure.kind() {
-                    HostFailureKind::EndOfFile | HostFailureKind::InputOutput => 8,
-                    HostFailureKind::Unavailable | HostFailureKind::Other => 7,
-                    HostFailureKind::Cancelled => unreachable!(),
-                };
-                if let Err(fault) = self.machine.complete_task_host_failure(
-                    task,
-                    request_id,
-                    role,
-                    failure.detail(),
-                ) {
-                    self.terminal = Some(SessionTerminal::Faulted(fault));
-                }
-            }
-            self.accept_response(request_id, response);
-            let _ = self.pending_requests.take(identity);
-            return Ok(());
-        }
-        let HostResponse::Success(input) = response else {
-            unreachable!();
-        };
-        let value = match input {
-            HostValueInput::Unit => None,
-            HostValueInput::I32(value) => Some(RuntimeValue::I32(value)),
-            HostValueInput::I64(value) => Some(RuntimeValue::I64(value)),
-            HostValueInput::F32(value) => Some(RuntimeValue::F32(value)),
-            HostValueInput::F64(value) => Some(RuntimeValue::F64(value)),
-            HostValueInput::Bool(value) => Some(RuntimeValue::Bool(value)),
-            HostValueInput::Char(value) => Some(RuntimeValue::Char(value)),
-            HostValueInput::String(units) => {
-                self.inbound_utf16[..units.len()].copy_from_slice(units);
-                let pending = match self.machine.begin_task_string_response(
-                    task,
-                    request_id,
-                    units.is_empty(),
-                ) {
-                    Ok(pending) => pending,
-                    Err(fault) => {
-                        self.accept_response(request_id, response);
-                        let _ = self.pending_requests.take(identity);
-                        self.terminal = Some(SessionTerminal::Faulted(fault));
-                        return Ok(());
-                    }
-                };
-                self.inbound_length = units.len();
-                self.resuming_host_string = pending;
                 self.accept_response(request_id, response);
                 let _ = self.pending_requests.take(identity);
                 return Ok(());
             }
+        }
+        if self.replies.is_empty()
+            && !self.resuming_host_string
+            && !self.machine.record_response_pending()
+        {
+            if let HostResponse::Success(HostValueInput::String(units)) = response {
+                self.inbound_utf16[..units.len()].copy_from_slice(units);
+                match self
+                    .machine
+                    .begin_task_string_response(task, request_id, units.is_empty())
+                {
+                    Ok(pending) => {
+                        self.inbound_length = units.len();
+                        self.resuming_host_string = pending;
+                    }
+                    Err(fault) => self.terminal = Some(SessionTerminal::Faulted(fault)),
+                }
+                self.accept_response(request_id, response);
+                let _ = self.pending_requests.take(identity);
+                return Ok(());
+            }
+        }
+        if self.replies.len() >= self.maximum_replies {
+            return Err(ResumeError::ResponseTooLarge);
+        }
+        let copied = match response {
+            HostResponse::Failure(failure) => {
+                CopiedReply::Failure(super::host::OwnedHostFailure::copy_from(failure))
+            }
+            HostResponse::Success(input) => match input {
+                HostValueInput::Unit => CopiedReply::Scalar(None),
+                HostValueInput::I32(value) => CopiedReply::Scalar(Some(RuntimeValue::I32(value))),
+                HostValueInput::I64(value) => CopiedReply::Scalar(Some(RuntimeValue::I64(value))),
+                HostValueInput::F32(value) => CopiedReply::Scalar(Some(RuntimeValue::F32(value))),
+                HostValueInput::F64(value) => CopiedReply::Scalar(Some(RuntimeValue::F64(value))),
+                HostValueInput::Bool(value) => CopiedReply::Scalar(Some(RuntimeValue::Bool(value))),
+                HostValueInput::Char(value) => CopiedReply::Scalar(Some(RuntimeValue::Char(value))),
+                HostValueInput::String(units) => CopiedReply::String(units.to_vec()),
+                HostValueInput::Record(value) => CopiedReply::Record(value.clone()),
+            },
         };
-        self.machine
-            .complete_task_capability(task, request_id, value)
-            .map_err(|_| ResumeError::WrongResponseType)?;
+        if self.replies.is_empty()
+            && !self.resuming_host_string
+            && !self.machine.record_response_pending()
+        {
+            if let CopiedReply::Scalar(value) = copied {
+                self.machine
+                    .complete_task_capability(task, request_id, value)
+                    .map_err(|_| ResumeError::WrongResponseType)?;
+                self.accept_response(request_id, response);
+                let _ = self.pending_requests.take(identity);
+                return Ok(());
+            }
+        }
+        self.replies.push_back(QueuedReply {
+            task,
+            request: request_id,
+            value: copied,
+        });
         self.accept_response(request_id, response);
         let _ = self.pending_requests.take(identity);
         Ok(())
@@ -603,10 +694,34 @@ impl Session {
         self.machine.test_peak_active_frame_bytes()
     }
 
+    #[cfg(test)]
+    pub(super) fn test_collect_runtime_roots(&mut self) -> bool {
+        if !self.machine.test_record_collection_safe() {
+            return false;
+        }
+        self.machine.test_collect_exception_roots().unwrap();
+        true
+    }
+
     pub(crate) fn resource_snapshot(&self) -> SessionResourceSnapshot {
+        let mut machine = self.machine.resource_snapshot();
+        let reply_bytes = self.replies.capacity() * core::mem::size_of::<QueuedReply>()
+            + self
+                .replies
+                .iter()
+                .map(|reply| match &reply.value {
+                    CopiedReply::Scalar(_) => 0,
+                    CopiedReply::String(units) => units.capacity() * 2,
+                    CopiedReply::Record(value) => value.resident_bytes(),
+                    CopiedReply::Failure(failure) => failure.detail().len(),
+                })
+                .sum::<usize>();
+        machine.mutable_resident_bytes = machine
+            .mutable_resident_bytes
+            .saturating_add(reply_bytes as u64);
         SessionResourceSnapshot {
             accounting: self.accounting(),
-            machine: self.machine.resource_snapshot(),
+            machine,
         }
     }
 
@@ -950,6 +1065,27 @@ fn trace_input(machine: &mut Machine, value: HostValueInput<'_>) {
         HostValueInput::Bool(value) => trace_scalar(machine, 5, &[u8::from(value)]),
         HostValueInput::Char(value) => trace_scalar(machine, 6, &value.to_le_bytes()),
         HostValueInput::String(units) => trace_utf16(machine, units),
+        HostValueInput::Record(value) => trace_record(machine, value),
+    }
+}
+
+fn trace_record(machine: &mut Machine, value: &super::host::HostRecordValue) {
+    use super::host::HostRecordScalar as Value;
+    trace_field(machine, &[8]);
+    trace_field(machine, value.type_name.as_bytes());
+    trace_field(machine, &(value.fields.len() as u32).to_le_bytes());
+    for field in &value.fields {
+        trace_field(machine, field.name.as_bytes());
+        match &field.value {
+            Value::I32(v) => trace_input(machine, HostValueInput::I32(*v)),
+            Value::I64(v) => trace_input(machine, HostValueInput::I64(*v)),
+            Value::F32(v) => trace_input(machine, HostValueInput::F32(*v)),
+            Value::F64(v) => trace_input(machine, HostValueInput::F64(*v)),
+            Value::Bool(v) => trace_input(machine, HostValueInput::Bool(*v)),
+            Value::Char(v) => trace_input(machine, HostValueInput::Char(*v)),
+            Value::String(v) => trace_input(machine, HostValueInput::String(v)),
+            Value::Record(v) => trace_record(machine, v),
+        }
     }
 }
 
@@ -1084,7 +1220,7 @@ fn resolve_capabilities(
             .try_reserve_exact(binding.operations().len())
             .map_err(|_| AdmissionError::AllocationFailed)?;
         for (operation_index, schema) in binding.operations().iter().enumerate() {
-            if !valid_merge_schema(schema) {
+            if !valid_merge_schema(schema) || !super::record::valid_operation(schema) {
                 return Err(AdmissionError::CapabilitySchema {
                     capability: u32::try_from(index)
                         .map_err(|_| AdmissionError::StoragePlanOverflow)?,
@@ -1102,6 +1238,7 @@ fn resolve_capabilities(
                 result: schema.result,
                 asynchronous: schema.asynchronous,
                 merge: schema.merge,
+                result_record: schema.result_record.cloned(),
             });
         }
         if index < u32::BITS as usize {

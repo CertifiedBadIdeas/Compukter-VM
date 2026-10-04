@@ -2454,6 +2454,7 @@ fn admit_session(
                     result: operation.result(),
                     asynchronous: operation.asynchronous(),
                     merge: operation.merge(),
+                    result_record: operation.result_record(),
                 })
                 .collect::<Box<[_]>>()
         })

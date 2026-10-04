@@ -35,6 +35,7 @@ pub(crate) struct OwnedOperationSchema {
     result: HostValueType,
     asynchronous: bool,
     merge: HostMergeSchema,
+    result_record: Option<crate::HostRecordSchema>,
 }
 
 impl OwnedCapabilityBinding {
@@ -52,6 +53,7 @@ impl OwnedCapabilityBinding {
                     result: operation.result,
                     asynchronous: operation.asynchronous,
                     merge: operation.merge,
+                    result_record: operation.result_record.cloned(),
                 })
                 .collect(),
         }
@@ -89,6 +91,10 @@ impl OwnedOperationSchema {
 
     pub(crate) const fn asynchronous(&self) -> bool {
         self.asynchronous
+    }
+
+    pub(crate) fn result_record(&self) -> Option<&crate::HostRecordSchema> {
+        self.result_record.as_ref()
     }
 
     pub(crate) const fn merge(&self) -> HostMergeSchema {

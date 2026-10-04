@@ -6776,7 +6776,7 @@ fn install_runtime_exception_dependencies(artifact: &mut crate::artifact::Decode
         });
     }
     artifact.modules[owner].declared_types = artifact.modules[owner].types.len() as u32;
-    artifact.header.runtime_minor = 9;
+    artifact.header.runtime_minor = artifact.header.runtime_minor.max(9);
 }
 
 pub(crate) fn fallible_operation_artifacts() -> [VerifiedArtifact; 5] {
@@ -7055,4 +7055,265 @@ pub(super) fn scalar_hash_artifact(form: u8, value: Constant) -> VerifiedArtifac
             artifact.header.runtime_minor = if form == 4 { 12 } else { 11 };
         },
     )
+}
+
+pub(super) fn record_response_artifact(runtime_minor: u16, mutable: bool) -> VerifiedArtifact {
+    literal_string_program_blocks_configured(
+        primitive(4),
+        vec![
+            ValueType {
+                kind: 7,
+                flags: 0,
+                nominal_type: TypeId(1),
+            },
+            ValueType {
+                kind: 7,
+                flags: 0,
+                nominal_type: TypeId(2),
+            },
+            primitive(4),
+        ],
+        Vec::new(),
+        &[],
+        vec![
+            vec![Instruction::CapabilityCallAsync {
+                dst: 0,
+                capability: 0,
+                operation: 0,
+                args: Box::new([]),
+                resume_block: 1,
+            }],
+            vec![
+                Instruction::FieldGet {
+                    dst: 1,
+                    receiver: 0,
+                    field_ref: 1,
+                },
+                Instruction::FieldGet {
+                    dst: 2,
+                    receiver: 1,
+                    field_ref: 3,
+                },
+                Instruction::Return { value: 2 },
+            ],
+        ],
+        |artifact| {
+            artifact.header.runtime_minor = runtime_minor;
+            artifact.header.semantic_features = 0b1110;
+            artifact.capabilities.push(Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 1,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+            let mut bytes = artifact.bytes.to_vec();
+            let module = &mut artifact.modules[0];
+            let mut name = |value: &[u8]| {
+                let id = module.strings.len() as u32;
+                let start = bytes.len();
+                bytes.extend_from_slice(value);
+                module.strings.push(ByteRange {
+                    start,
+                    end: bytes.len(),
+                });
+                id
+            };
+            let snapshot = name(b"fixture.Snapshot");
+            let vector = name(b"fixture.Vector");
+            let tick = name(b"tick");
+            let position = name(b"position");
+            let label = name(b"label");
+            let x = name(b"x");
+            artifact.bytes = Arc::from(bytes);
+            module.types.extend([
+                NominalType::Class {
+                    flags: 2,
+                    generic_arity: 0,
+                    name: snapshot,
+                    super_type: TypeId(u32::MAX),
+                    interfaces: Vec::new(),
+                    field_start: 0,
+                    field_count: 3,
+                    method_start: 0,
+                    method_count: 0,
+                    initializer: None,
+                },
+                NominalType::Class {
+                    flags: 2,
+                    generic_arity: 0,
+                    name: vector,
+                    super_type: TypeId(u32::MAX),
+                    interfaces: Vec::new(),
+                    field_start: 3,
+                    field_count: 1,
+                    method_start: 0,
+                    method_count: 0,
+                    initializer: None,
+                },
+            ]);
+            module.declared_types = module.types.len() as u32;
+            module.fields = vec![
+                Field {
+                    owner: TypeId(1),
+                    name: tick,
+                    value_type: primitive(2),
+                    flags: u32::from(mutable),
+                },
+                Field {
+                    owner: TypeId(1),
+                    name: position,
+                    value_type: ValueType {
+                        kind: 7,
+                        flags: 0,
+                        nominal_type: TypeId(2),
+                    },
+                    flags: 0,
+                },
+                Field {
+                    owner: TypeId(1),
+                    name: label,
+                    value_type: ValueType {
+                        kind: 7,
+                        flags: 0,
+                        nominal_type: TypeId(0x8000_0000),
+                    },
+                    flags: 0,
+                },
+                Field {
+                    owner: TypeId(2),
+                    name: x,
+                    value_type: primitive(4),
+                    flags: 0,
+                },
+            ];
+            if let NominalType::Function { flags, .. } = &mut module.types[0] {
+                *flags = 1;
+            }
+            module.functions[0].flags = 1;
+        },
+    )
+}
+
+pub(super) fn record_and_scalar_tasks_artifact() -> VerifiedArtifact {
+    let base = record_response_artifact(13, true);
+    let mut artifact = crate::decode::records::decode_artifact(
+        base.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let unit = primitive(0);
+    let i32_type = primitive(1);
+    let module = &mut artifact.modules[0];
+    let worker_values = std::mem::take(&mut module.functions[0].values);
+    let worker_program = std::mem::take(&mut module.code[1].instructions).into_vec();
+    module.types.push(NominalType::Function {
+        name: 1,
+        flags: 1,
+        result: unit,
+        parameters: Vec::new(),
+    });
+    module.declared_types = module.types.len() as u32;
+    let mut root = function(3, 0, vec![i32_type, i32_type], 0);
+    root.flags = 1;
+    root.block_count = 3;
+    let mut worker = function(3, 0, Vec::new(), 3);
+    worker.flags = 1;
+    worker.block_count = 2;
+    worker.register_count = worker_values.len() as u16;
+    worker.values = worker_values;
+    let mut scalar = function(3, 0, vec![i32_type], 5);
+    scalar.flags = 1;
+    scalar.block_count = 2;
+    module.functions = vec![root, worker, scalar];
+    module.declared_functions = 3;
+    let mut reader = worker_program;
+    *reader.last_mut().unwrap() = Instruction::Return { value: u16::MAX };
+    let programs = vec![
+        (
+            0,
+            vec![
+                Instruction::CoroutineSpawn {
+                    dst: 0,
+                    function_ref: 1,
+                    args: Box::new([]),
+                },
+                Instruction::CoroutineSpawn {
+                    dst: 1,
+                    function_ref: 2,
+                    args: Box::new([]),
+                },
+                Instruction::CoroutineJoin {
+                    dst: u16::MAX,
+                    coroutine: 0,
+                    resume_block: 1,
+                },
+            ],
+        ),
+        (
+            0,
+            vec![Instruction::CoroutineJoin {
+                dst: u16::MAX,
+                coroutine: 1,
+                resume_block: 2,
+            }],
+        ),
+        (0, vec![Instruction::Return { value: u16::MAX }]),
+        (
+            1,
+            vec![Instruction::CapabilityCallAsync {
+                dst: 0,
+                capability: 0,
+                operation: 0,
+                args: Box::new([]),
+                resume_block: 4,
+            }],
+        ),
+        (1, reader),
+        (
+            2,
+            vec![Instruction::CapabilityCallAsync {
+                dst: 0,
+                capability: 0,
+                operation: 1,
+                args: Box::new([]),
+                resume_block: 6,
+            }],
+        ),
+        (2, vec![Instruction::Return { value: u16::MAX }]),
+    ];
+    module.blocks.clear();
+    module.code.clear();
+    let mut maximum = 0;
+    for (index, (owner, instructions)) in programs.into_iter().enumerate() {
+        let cost = instructions
+            .iter()
+            .map(|instruction| instruction.fixed_cost().unwrap())
+            .sum();
+        maximum = maximum.max(cost);
+        module.blocks.push(Block {
+            owner_function: FunctionId(owner),
+            code_record: BlockId(index as u32),
+            instruction_count: instructions.len() as u32,
+            declared_fixed_cost: cost,
+            flags: 0,
+        });
+        module.code.push(DecodedCode {
+            bytes: ByteRange { start: 0, end: 0 },
+            instructions: instructions.into_boxed_slice(),
+            fixed_cost: cost,
+        });
+    }
+    artifact.capabilities[0].operation_count = 2;
+    artifact.manifest.maximum_host_requests = 2;
+    artifact.manifest.maximum_coroutines = 3;
+    artifact.manifest.maximum_call_depth = 1;
+    artifact.manifest.required_stack_bytes = 64;
+    artifact.manifest.maximum_block_cost = maximum;
+    artifact.manifest.minimum_slice_cost = maximum;
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
