@@ -468,6 +468,7 @@ struct ExecutionImageInner {
     constants: Box<[RuntimeValue]>,
     host_references: Box<[ResolvedHostReference]>,
     type_offsets: Box<[usize]>,
+    type_keys: Box<[TypeKey]>,
     type_layouts: Box<[RuntimeTypeLayout]>,
     type_name_indices: Box<[usize]>,
     type_names: Box<[Box<[u16]>]>,
@@ -514,6 +515,7 @@ impl ExecutionImage {
         let constant_offsets =
             offsets(decoded.modules.iter().map(|module| module.constants.len()))?;
         let type_offsets = offsets(decoded.modules.iter().map(|module| module.types.len()))?;
+        let type_keys = resolve_type_keys(&type_offsets)?;
         let header_format = HeaderFormat::select(
             profile.heap_bytes,
             *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?,
@@ -949,6 +951,7 @@ impl ExecutionImage {
             constants: constants.into_boxed_slice(),
             host_references: host_references.into_boxed_slice(),
             type_offsets,
+            type_keys,
             type_layouts,
             type_name_indices: type_name_indices.into_boxed_slice(),
             type_names: type_names.into_boxed_slice(),
@@ -1137,18 +1140,7 @@ impl ExecutionImage {
     }
 
     pub(super) fn type_key(&self, index: usize) -> Option<TypeKey> {
-        if index >= self.0.type_layouts.len() {
-            return None;
-        }
-        let module = self
-            .0
-            .type_offsets
-            .partition_point(|offset| *offset <= index)
-            .checked_sub(1)?;
-        Some(TypeKey {
-            module: u32::try_from(module).ok()?,
-            ty: u32::try_from(index.checked_sub(self.0.type_offsets[module])?).ok()?,
-        })
+        self.0.type_keys.get(index).copied()
     }
 
     pub(super) fn is_class(&self, key: TypeKey) -> bool {
@@ -1664,6 +1656,28 @@ where
     } else {
         Ok(())
     }
+}
+
+// Managed headers carry global type IDs. Resolve the reverse mapping once in
+// the shared immutable image instead of searching module offsets at each access.
+fn resolve_type_keys(type_offsets: &[usize]) -> Result<Box<[TypeKey]>, AdmissionError> {
+    if type_offsets.first() != Some(&0) {
+        return Err(AdmissionError::InvalidEntry);
+    }
+    let mut keys = reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+    for (module, offsets) in type_offsets.windows(2).enumerate() {
+        let count = offsets[1]
+            .checked_sub(offsets[0])
+            .ok_or(AdmissionError::InvalidEntry)?;
+        let module = checked_u32(module)?;
+        for ty in 0..count {
+            keys.push(TypeKey {
+                module,
+                ty: checked_u32(ty)?,
+            });
+        }
+    }
+    Ok(keys.into_boxed_slice())
 }
 
 fn offsets(lengths: impl Iterator<Item = usize>) -> Result<Box<[usize]>, AdmissionError> {
@@ -2816,6 +2830,47 @@ fn assignable_types(
 mod tests {
     use super::*;
     use crate::execution::{error::AdmissionError, fixtures, FunctionKey};
+
+    #[test]
+    fn global_type_ids_preserve_module_identity_across_empty_modules() {
+        let offsets = [0, 0, 2, 2, 3, 3];
+        let keys = resolve_type_keys(&offsets).unwrap();
+        assert_eq!(
+            &*keys,
+            &[
+                TypeKey { module: 1, ty: 0 },
+                TypeKey { module: 1, ty: 1 },
+                TypeKey { module: 3, ty: 0 },
+            ]
+        );
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(Some(index), checked_global_index(&offsets, *key));
+        }
+        assert_eq!(None, keys.get(3));
+        assert!(resolve_type_keys(&[0, 0, 0]).unwrap().is_empty());
+        assert!(matches!(
+            resolve_type_keys(&[1, 2]),
+            Err(AdmissionError::InvalidEntry)
+        ));
+        assert!(matches!(
+            resolve_type_keys(&[0, 2, 1]),
+            Err(AdmissionError::InvalidEntry)
+        ));
+    }
+
+    #[test]
+    fn admitted_type_ids_round_trip_and_reject_unknown_ids() {
+        let image = ExecutionImage::admit(
+            fixtures::reference_array_roundtrip_artifact(),
+            fixtures::profile(),
+        )
+        .unwrap();
+        for id in 0..image.0.type_layouts.len() {
+            assert_eq!(Some(id), image.type_index(image.type_key(id).unwrap()));
+        }
+        assert_eq!(None, image.type_key(image.0.type_layouts.len()));
+        assert_eq!(None, image.type_key(usize::MAX));
+    }
 
     #[test]
     fn interface_defaults_choose_most_specific_or_reject_conflicts() {
