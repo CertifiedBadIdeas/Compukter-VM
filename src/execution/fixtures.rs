@@ -1004,7 +1004,7 @@ pub(crate) fn two_block_artifact(first_cost: u32, second_cost: u32) -> VerifiedA
     )
 }
 
-pub(super) fn empty_loop_artifact(cost: u32) -> VerifiedArtifact {
+pub(crate) fn empty_loop_artifact(cost: u32) -> VerifiedArtifact {
     let mut instructions = (0..cost - 1).map(|_| Instruction::Nop).collect::<Vec<_>>();
     instructions.push(Instruction::Jump { target: 0 });
     verified_blocks(

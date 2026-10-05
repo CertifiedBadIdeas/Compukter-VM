@@ -404,6 +404,29 @@ impl TerminalDevice {
         self.replication.record_reset();
     }
 
+    /// Resume line-oriented output after a raw-terminal application without clearing its screen.
+    pub(crate) fn resume_console_output(&mut self) {
+        let last_content_row = (0..TERMINAL_HEIGHT).rev().find(|&y| {
+            (0..TERMINAL_WIDTH).any(|x| {
+                self.cells[self.physical_index(TerminalPosition { x, y })].code_point
+                    != u32::from(' ')
+            })
+        });
+        self.foreground = DEFAULT_FOREGROUND;
+        self.background = DEFAULT_BACKGROUND;
+        self.set_cursor_visible(true);
+        if let Some(y) = last_content_row.filter(|&y| y >= self.cursor.y) {
+            self.set_cursor(TerminalPosition { x: 0, y });
+            self.newline();
+            self.record_cursor();
+        } else {
+            self.set_cursor(TerminalPosition {
+                x: 0,
+                y: self.cursor.y,
+            });
+        }
+    }
+
     pub fn push_key(&mut self, event: TerminalKeyEvent) -> Result<(), TerminalInputError> {
         self.input.push_key(event)
     }

@@ -33,8 +33,9 @@ use crate::{
     HostRequestView, HostResponse, HostValueInput, HostValueType, HostValueView, HostVerifyError,
     ManagedAllocationFailure, NodeKind, OpenMode, OperationSchema, OwnedHostFailure,
     ProcessCompletion, ProcessFailureReason, ProcessLimits, QuotaExhaustion, RequestId,
-    ResumeError, RunError, Session, TaskId, TerminalDevice, TerminalInputEvent, TerminalKeyAction,
-    TerminalPosition, TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
+    ResumeError, RunError, Session, TaskId, TerminalDevice, TerminalInputError, TerminalInputEvent,
+    TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, TerminalPosition,
+    TerminalRectangle, VerifiedArtifact, VirtualPath, VmFault,
 };
 
 const TERMINAL_NAMESPACE: &str = "compukter";
@@ -342,6 +343,7 @@ pub struct ComputerMachine {
     reserved_frame_storage_bytes: u64,
     maximum_text_code_units: usize,
     pending_compilation: Option<CompilationTransaction>,
+    pending_termination: Option<u64>,
     next_compilation_token: u64,
     next_external_request: u64,
     external_requests: Vec<ExternalRequestRoute>,
@@ -533,6 +535,7 @@ impl ComputerMachine {
             reserved_frame_storage_bytes,
             maximum_text_code_units,
             pending_compilation: None,
+            pending_termination: None,
             next_compilation_token: 1,
             next_external_request: 1,
             external_requests: Vec::new(),
@@ -885,6 +888,34 @@ impl ComputerMachine {
             .map_err(|_| CanonicalLineSubmissionError::Resume)
     }
 
+    /// Ctrl+T is a host control, independent of Guest input polling and input queue capacity.
+    /// Only a PRESS starts termination; REPEAT is consumed without stopping another command.
+    pub fn submit_terminal_key(
+        &mut self,
+        event: TerminalKeyEvent,
+    ) -> Result<(), TerminalInputError> {
+        if event.key() == TerminalKey::T
+            && event.modifiers().bits() & TerminalModifiers::CONTROL != 0
+        {
+            if event.action() == TerminalKeyAction::Press && self.pending_termination.is_none() {
+                let shell = self.sessions.iter().rposition(|frame| {
+                    frame
+                        .executable
+                        .as_ref()
+                        .is_some_and(|(path, _)| path.to_string() == "/rom/shell")
+                });
+                let index = shell.map_or(1, |index| index + 1);
+                self.pending_termination = self.sessions.get(index).map(|frame| frame.scope_id);
+                if self.pending_termination.is_some() {
+                    // Input queued for the killed command must not be replayed into its parent shell.
+                    while self.terminal.poll_input().is_some() {}
+                }
+            }
+            return Ok(());
+        }
+        self.terminal.push_key(event)
+    }
+
     pub fn terminal_mut(&mut self) -> &mut TerminalDevice {
         &mut self.terminal
     }
@@ -1000,6 +1031,30 @@ impl ComputerMachine {
         host_request_budget: u32,
         retirement_limit: u32,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        if let Some(scope) = self.pending_termination {
+            if let Some(index) = self
+                .sessions
+                .iter()
+                .position(|frame| frame.scope_id == scope)
+            {
+                if self
+                    .pending_compilation
+                    .as_ref()
+                    .is_some_and(|pending| pending.owner_depth > index)
+                {
+                    self.pending_compilation = None;
+                }
+                let outcome = self.finish_child(ProcessCompletion::Exited(130))?;
+                if self.sessions.len() == index {
+                    self.pending_termination = None;
+                    // A raw-terminal child may leave its cursor inside an editor grid.
+                    // Resume below its visible output before the parent shell resumes.
+                    self.terminal.resume_console_output();
+                }
+                return Ok(outcome);
+            }
+            self.pending_termination = None;
+        }
         if self.active_frame().pending_stdio_read.is_some()
             && self.advance_pending_stdio()? != ComputerAdvanceOutcome::WaitingForTerminalEvent
         {
@@ -5411,6 +5466,173 @@ mod tests {
                 other => panic!("unexpected canonical input outcome: {other:?}"),
             }
         }
+    }
+
+    fn termination_fixture(child: VerifiedArtifact) -> ComputerMachine {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut fs = ComputerFileSystem::with_limits(limits);
+        for (name, artifact) in [
+            ("/home/child", child),
+            (
+                "/home/leaf",
+                crate::execution::fixtures::empty_loop_artifact(1),
+            ),
+        ] {
+            let bytes = crate::test_encode::encode_artifact(artifact.decoded()).unwrap();
+            fs.write_file(&owner, &path(name, &limits), &bytes, true)
+                .unwrap();
+        }
+        fs.write_file(
+            &owner,
+            &path("/home/source.kt", &limits),
+            b"fun main() {}",
+            true,
+        )
+        .unwrap();
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let mut computer =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], fs, owner).unwrap();
+        loop {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
+                ComputerAdvanceOutcome::ProcessEntered(_) => break,
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("unexpected entry: {other:?}"),
+            }
+        }
+        computer
+    }
+
+    fn terminate_key(action: TerminalKeyAction) -> TerminalKeyEvent {
+        TerminalKeyEvent::new(
+            TerminalKey::T,
+            action,
+            TerminalModifiers::new(TerminalModifiers::CONTROL).unwrap(),
+        )
+    }
+
+    #[test]
+    fn ctrl_t_terminates_a_busy_child_without_guest_input_and_preserves_files() {
+        let mut computer = termination_fixture(crate::execution::fixtures::empty_loop_artifact(1));
+        for _ in 0..3 {
+            assert_eq!(
+                ComputerAdvanceOutcome::SliceExhausted,
+                computer.advance(8, 8, 8).unwrap()
+            );
+        }
+        let generation = computer.filesystem_generation();
+        computer
+            .terminal_mut()
+            .write_utf16(&"preserved output".encode_utf16().collect::<Vec<_>>())
+            .unwrap();
+        while computer.terminal_mut().push_text("stale input").is_ok() {}
+        computer
+            .submit_terminal_key(terminate_key(TerminalKeyAction::Press))
+            .unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::ProcessExited(1),
+            computer.advance(0, 0, 0).unwrap()
+        );
+        assert_eq!(generation, computer.filesystem_generation());
+        let text: String = computer
+            .terminal()
+            .logical_cells()
+            .map(|cell| char::from_u32(cell.code_point()).unwrap())
+            .collect();
+        assert!(text.contains("preserved output"));
+        computer
+            .submit_terminal_key(terminate_key(TerminalKeyAction::Repeat))
+            .unwrap();
+        assert_eq!(None, computer.terminal_await_event().unwrap());
+        loop {
+            match computer.advance(64, 64, 64).unwrap() {
+                ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(130))) => break,
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("unexpected parent result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_t_unwinds_nested_children_in_lifecycle_order() {
+        let child = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/leaf".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let mut computer = termination_fixture(child);
+        loop {
+            match computer.advance(64, 64, 64).unwrap() {
+                ComputerAdvanceOutcome::ProcessEntered(2) => break,
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("unexpected nested entry: {other:?}"),
+            }
+        }
+        computer
+            .submit_terminal_key(terminate_key(TerminalKeyAction::Press))
+            .unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::ProcessExited(2),
+            computer.advance(0, 0, 0).unwrap()
+        );
+        computer
+            .submit_terminal_key(terminate_key(TerminalKeyAction::Repeat))
+            .unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::ProcessExited(1),
+            computer.advance(0, 0, 0).unwrap()
+        );
+        assert_eq!(1, computer.sessions.len());
+        assert_eq!(None, computer.pending_termination);
+    }
+
+    #[test]
+    fn ctrl_t_cancels_pending_compilation_before_resuming_parent() {
+        let child = crate::execution::fixtures::compiler_compile_artifact(
+            &"/home/source.kt".encode_utf16().collect::<Vec<_>>(),
+            &"/home/output".encode_utf16().collect::<Vec<_>>(),
+        );
+        let mut computer = termination_fixture(child);
+        loop {
+            match computer.advance(64, 64, 64).unwrap() {
+                ComputerAdvanceOutcome::CompilationRequested(_) => break,
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("unexpected compilation: {other:?}"),
+            }
+        }
+        computer
+            .submit_terminal_key(terminate_key(TerminalKeyAction::Press))
+            .unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::ProcessExited(1),
+            computer.advance(0, 0, 0).unwrap()
+        );
+        assert!(computer.pending_compilation.is_none());
+    }
+
+    #[test]
+    fn ctrl_t_does_not_terminate_an_idle_shell_and_plain_t_remains_input() {
+        let mut computer = termination_fixture(crate::execution::fixtures::empty_loop_artifact(1));
+        computer.sessions[1].executable.as_mut().unwrap().0 =
+            VirtualPath::parse_utf8("/rom/shell", &FileSystemLimits::testing()).unwrap();
+        computer
+            .submit_terminal_key(terminate_key(TerminalKeyAction::Press))
+            .unwrap();
+        assert_eq!(None, computer.pending_termination);
+        computer
+            .submit_terminal_key(TerminalKeyEvent::new(
+                TerminalKey::T,
+                TerminalKeyAction::Press,
+                TerminalModifiers::default(),
+            ))
+            .unwrap();
+        assert_eq!(
+            Some(ComputerTerminalEventKind::Key),
+            computer.terminal_await_event().unwrap()
+        );
+        assert_eq!(84, computer.terminal_event_key().unwrap());
     }
 
     #[test]
