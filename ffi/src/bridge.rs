@@ -665,8 +665,7 @@ pub(crate) fn terminal_key(
         .with(handle, |session| {
             session
                 .computer
-                .terminal_mut()
-                .push_key(TerminalKeyEvent::new(key, action, modifiers))
+                .submit_terminal_key(TerminalKeyEvent::new(key, action, modifiers))
         })
         .map_err(BridgeError::Handle)?
         .map_err(copy_input_error)
