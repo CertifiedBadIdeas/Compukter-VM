@@ -1332,7 +1332,7 @@ pub unsafe extern "C" fn compukter_resume_value(
     payload_len: usize,
 ) -> FfiStatus {
     ffi_status(|| {
-        if task_id == 0 || payload_len < 2 || payload_len > 65_536 || payload.is_null() {
+        if task_id == 0 || !(2..=65_536).contains(&payload_len) || payload.is_null() {
             return FfiStatus::InvalidArgument;
         }
         // SAFETY: the caller provides the readable region required by the ABI.

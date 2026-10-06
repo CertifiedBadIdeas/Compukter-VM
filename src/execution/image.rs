@@ -464,10 +464,12 @@ struct ExecutionImageInner {
     entry: usize,
     functions: Box<[ResolvedFunction]>,
     dispatch_entries: Box<[DispatchEntry]>,
+    dispatch_offsets: Box<[usize]>,
     blocks: Box<[ResolvedBlock]>,
     constants: Box<[RuntimeValue]>,
     host_references: Box<[ResolvedHostReference]>,
     type_offsets: Box<[usize]>,
+    type_keys: Box<[TypeKey]>,
     type_layouts: Box<[RuntimeTypeLayout]>,
     type_name_indices: Box<[usize]>,
     type_names: Box<[Box<[u16]>]>,
@@ -515,6 +517,7 @@ impl ExecutionImage {
         let constant_offsets =
             offsets(decoded.modules.iter().map(|module| module.constants.len()))?;
         let type_offsets = offsets(decoded.modules.iter().map(|module| module.types.len()))?;
+        let type_keys = resolve_type_keys(&type_offsets)?;
         let header_format = HeaderFormat::select(
             profile.heap_bytes,
             *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?,
@@ -788,6 +791,8 @@ impl ExecutionImage {
             &functions,
         )?;
 
+        let dispatch_offsets = resolve_dispatch_offsets(&dispatch_entries, type_keys.len())?;
+
         let maximum_call_depth = u64::from(decoded.manifest.maximum_call_depth);
         let frame_arena_bytes = u64::from(decoded.manifest.required_stack_bytes);
         let maximum_coroutines = u64::from(decoded.manifest.maximum_coroutines);
@@ -951,10 +956,12 @@ impl ExecutionImage {
             entry,
             functions: functions.into_boxed_slice(),
             dispatch_entries,
+            dispatch_offsets,
             blocks: blocks.into_boxed_slice(),
             constants: constants.into_boxed_slice(),
             host_references: host_references.into_boxed_slice(),
             type_offsets,
+            type_keys,
             type_layouts,
             type_name_indices: type_name_indices.into_boxed_slice(),
             type_names: type_names.into_boxed_slice(),
@@ -1004,13 +1011,13 @@ impl ExecutionImage {
 
     pub(super) fn dispatch_target(&self, actual: TypeKey, declaration: usize) -> Option<usize> {
         let actual_type = self.type_index(actual)?;
-        self.0
-            .dispatch_entries
-            .binary_search_by_key(&(actual_type, declaration), |entry| {
-                (entry.actual_type, entry.declaration)
-            })
+        let start = *self.0.dispatch_offsets.get(actual_type)?;
+        let end = *self.0.dispatch_offsets.get(actual_type + 1)?;
+        let entries = self.0.dispatch_entries.get(start..end)?;
+        entries
+            .binary_search_by_key(&declaration, |entry| entry.declaration)
             .ok()
-            .map(|index| self.0.dispatch_entries[index].implementation)
+            .map(|index| entries[index].implementation)
     }
 
     pub(super) fn block(&self, index: usize) -> Option<&ResolvedBlock> {
@@ -1144,18 +1151,7 @@ impl ExecutionImage {
     }
 
     pub(super) fn type_key(&self, index: usize) -> Option<TypeKey> {
-        if index >= self.0.type_layouts.len() {
-            return None;
-        }
-        let module = self
-            .0
-            .type_offsets
-            .partition_point(|offset| *offset <= index)
-            .checked_sub(1)?;
-        Some(TypeKey {
-            module: u32::try_from(module).ok()?,
-            ty: u32::try_from(index.checked_sub(self.0.type_offsets[module])?).ok()?,
-        })
+        self.0.type_keys.get(index).copied()
     }
 
     pub(super) fn is_class(&self, key: TypeKey) -> bool {
@@ -1675,6 +1671,28 @@ where
     } else {
         Ok(())
     }
+}
+
+// Managed headers carry global type IDs. Resolve the reverse mapping once in
+// the shared immutable image instead of searching module offsets at each access.
+fn resolve_type_keys(type_offsets: &[usize]) -> Result<Box<[TypeKey]>, AdmissionError> {
+    if type_offsets.first() != Some(&0) {
+        return Err(AdmissionError::InvalidEntry);
+    }
+    let mut keys = reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+    for (module, offsets) in type_offsets.windows(2).enumerate() {
+        let count = offsets[1]
+            .checked_sub(offsets[0])
+            .ok_or(AdmissionError::InvalidEntry)?;
+        let module = checked_u32(module)?;
+        for ty in 0..count {
+            keys.push(TypeKey {
+                module,
+                ty: checked_u32(ty)?,
+            });
+        }
+    }
+    Ok(keys.into_boxed_slice())
 }
 
 fn offsets(lengths: impl Iterator<Item = usize>) -> Result<Box<[usize]>, AdmissionError> {
@@ -2610,6 +2628,33 @@ fn host_type_matches(
     }
 }
 
+// Entries are emitted in global type order, then declaration order. Index the
+// immutable table once so calls search only methods applicable to their receiver.
+fn resolve_dispatch_offsets(
+    entries: &[DispatchEntry],
+    type_count: usize,
+) -> Result<Box<[usize]>, AdmissionError> {
+    let capacity = type_count
+        .checked_add(1)
+        .ok_or(AdmissionError::StoragePlanOverflow)?;
+    let mut offsets = reserved(capacity)?;
+    let mut cursor = 0;
+    for actual_type in 0..type_count {
+        offsets.push(cursor);
+        while entries
+            .get(cursor)
+            .is_some_and(|entry| entry.actual_type == actual_type)
+        {
+            cursor += 1;
+        }
+    }
+    if cursor != entries.len() {
+        return Err(AdmissionError::InvalidEntry);
+    }
+    offsets.push(cursor);
+    Ok(offsets.into_boxed_slice())
+}
+
 fn resolve_dispatch_entries(
     artifact: &DecodedArtifact,
     function_offsets: &[usize],
@@ -2881,6 +2926,125 @@ fn assignable_types(
 mod tests {
     use super::*;
     use crate::execution::{error::AdmissionError, fixtures, FunctionKey};
+
+    #[test]
+    fn global_type_ids_preserve_module_identity_across_empty_modules() {
+        let offsets = [0, 0, 2, 2, 3, 3];
+        let keys = resolve_type_keys(&offsets).unwrap();
+        assert_eq!(
+            &*keys,
+            &[
+                TypeKey { module: 1, ty: 0 },
+                TypeKey { module: 1, ty: 1 },
+                TypeKey { module: 3, ty: 0 },
+            ]
+        );
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(Some(index), checked_global_index(&offsets, *key));
+        }
+        assert_eq!(None, keys.get(3));
+        assert!(resolve_type_keys(&[0, 0, 0]).unwrap().is_empty());
+        assert!(matches!(
+            resolve_type_keys(&[1, 2]),
+            Err(AdmissionError::InvalidEntry)
+        ));
+        assert!(matches!(
+            resolve_type_keys(&[0, 2, 1]),
+            Err(AdmissionError::InvalidEntry)
+        ));
+    }
+
+    #[test]
+    fn admitted_type_ids_round_trip_and_reject_unknown_ids() {
+        let image = ExecutionImage::admit(
+            fixtures::reference_array_roundtrip_artifact(),
+            fixtures::profile(),
+        )
+        .unwrap();
+        for id in 0..image.0.type_layouts.len() {
+            assert_eq!(Some(id), image.type_index(image.type_key(id).unwrap()));
+        }
+        assert_eq!(None, image.type_key(image.0.type_layouts.len()));
+        assert_eq!(None, image.type_key(usize::MAX));
+    }
+
+    #[test]
+    fn dispatch_lookup_matches_all_admitted_methods_and_rejects_missing_targets() {
+        let image =
+            ExecutionImage::admit(fixtures::dynamic_dispatch_artifact(), fixtures::profile())
+                .unwrap();
+        assert!(!image.0.dispatch_entries.is_empty());
+        for actual_type in 0..image.type_count() {
+            let key = image.type_key(actual_type).unwrap();
+            for declaration in 0..image.functions().len() {
+                let expected = image
+                    .0
+                    .dispatch_entries
+                    .iter()
+                    .find(|entry| {
+                        entry.actual_type == actual_type && entry.declaration == declaration
+                    })
+                    .map(|entry| entry.implementation);
+                assert_eq!(expected, image.dispatch_target(key, declaration));
+            }
+            assert_eq!(None, image.dispatch_target(key, usize::MAX));
+        }
+        assert_eq!(
+            None,
+            image.dispatch_target(
+                TypeKey {
+                    module: u32::MAX,
+                    ty: 0
+                },
+                0
+            )
+        );
+        assert_eq!(
+            None,
+            image.dispatch_target(
+                TypeKey {
+                    module: 0,
+                    ty: u32::MAX
+                },
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn dispatch_ranges_preserve_empty_types_and_table_boundaries() {
+        let entries = [
+            DispatchEntry {
+                actual_type: 1,
+                declaration: 4,
+                implementation: 7,
+            },
+            DispatchEntry {
+                actual_type: 1,
+                declaration: 9,
+                implementation: 8,
+            },
+            DispatchEntry {
+                actual_type: 3,
+                declaration: 4,
+                implementation: 10,
+            },
+        ];
+        assert_eq!(
+            &*resolve_dispatch_offsets(&entries, 5).unwrap(),
+            &[0, 0, 2, 2, 3, 3]
+        );
+        assert_eq!(&*resolve_dispatch_offsets(&[], 0).unwrap(), &[0]);
+        assert_eq!(&*resolve_dispatch_offsets(&[], 2).unwrap(), &[0, 0, 0]);
+        assert!(matches!(
+            resolve_dispatch_offsets(&entries, 3),
+            Err(AdmissionError::InvalidEntry)
+        ));
+        assert!(matches!(
+            resolve_dispatch_offsets(&entries, usize::MAX),
+            Err(AdmissionError::StoragePlanOverflow)
+        ));
+    }
 
     #[test]
     fn interface_defaults_choose_most_specific_or_reject_conflicts() {
