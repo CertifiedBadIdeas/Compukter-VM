@@ -181,3 +181,41 @@ Computer terminal input reserves Ctrl+T (key 84, CONTROL) to forcibly terminate 
 Termination runs at the next advance, emits ordered ProcessExited events and returns status 130 to its parent.
 The shell/root is preserved when idle; repeat events do not terminate another command. Existing terminal-key
 FFI/JNI calls and C ABI layouts are unchanged.
+
+## Production-path Guest benchmark
+
+The opt-in `guest-benchmark` binary compiles the same private verifier and
+interpreter modules without unit-test instrumentation. It uses the existing
+untraced session path, checks a traced control for identical deterministic work,
+and validates the `ready` marker, checksum, termination and sample counters.
+It introduces no public runtime API and is not part of production Runtime bundles.
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release --locked --offline \
+  --features guest-benchmark --bin guest-benchmark
+./target/release/guest-benchmark ARTIFACT_DIR REPORT_DIR 7 16384 untraced
+```
+
+`ARTIFACT_DIR` must contain a generated TSV manifest with `id` and `checksum`
+columns plus verified `.cpkt` measurement artifacts that print `ready` before
+an operation and the checksum afterward. Use the parent Compukters benchmark
+artifact generators. Supply the requested Guest heap explicitly (for example,
+16384 for loops or 262144 for collection reuse). This benchmark does not lower
+artifact admission limits or silently fall back to another heap budget.
+An optional final comma-separated list of ID prefixes selects profile workloads.
+Use `traced` as the fifth argument for a diagnostic-trace timing control.
+Samples must be an odd number of at least three. The harness warms each case,
+reverses order on alternate rounds, excludes verification/admission/start from
+timers and records construction and operation separately in `samples.tsv` and
+`measurements.tsv`. Operation includes the final scan and output text copy.
+
+Profile separately from ordinary timing. With symbols enabled, for example:
+
+```sh
+perf record -e cycles:u -F 499 --call-graph dwarf -o profile.data -- \
+  ./target/release/guest-benchmark ARTIFACT_DIR REPORT_DIR 99 16384 untraced while-indexed
+perf report -i profile.data --stdio
+```
+
+Profiles also include warmup/control, setup and final termination; use sampling
+symbols to identify hot execution and keep profiled samples out of timing claims.

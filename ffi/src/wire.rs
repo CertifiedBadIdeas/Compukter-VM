@@ -1552,7 +1552,9 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Option<crate::bridge::OwnedRespon
             }
             OwnedResponse::SuccessString(
                 value[2..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                     .collect(),
             )

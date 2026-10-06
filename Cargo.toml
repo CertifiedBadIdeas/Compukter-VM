@@ -23,6 +23,7 @@ crate-type = ["rlib"]
 
 [features]
 persistence-crash-testing = []
+guest-benchmark = []
 
 [dependencies]
 ryu = { version = "1.0", default-features = false }
@@ -31,3 +32,10 @@ sha2 = { version = "0.10", default-features = false }
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+[[bin]]
+name = "guest-benchmark"
+path = "src/guest_benchmark.rs"
+required-features = ["guest-benchmark"]
+test = false
+bench = false
