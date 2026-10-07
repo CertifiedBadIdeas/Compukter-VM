@@ -18,7 +18,9 @@
 
 use compukter_ffi::{
     compukter_abi_version, compukter_advance, compukter_advance_with_retirement_limit,
-    compukter_close, compukter_compilation_complete, compukter_compilation_request_copy,
+    compukter_checkpoint_discard, compukter_checkpoint_host_copy, compukter_checkpoint_host_size,
+    compukter_checkpoint_restore, compukter_checkpoint_save, compukter_close,
+    compukter_compilation_complete, compukter_compilation_request_copy,
     compukter_compilation_request_size, compukter_create, compukter_create_boot_in_store,
     compukter_create_in_store, compukter_deploy, compukter_deployment_candidate_close,
     compukter_executable_revision, compukter_filesystem_generation, compukter_filesystem_list,
@@ -314,6 +316,130 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_crea
                 capacity,
                 count,
             )
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_checkpointSave<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    store_handle: jlong,
+    id: JByteArray<'caller>,
+    host: JByteArray<'caller>,
+) -> jint {
+    status(&mut env, |env| {
+        if id.len(env)? != 16 || host.len(env)? > 4 * 1024 * 1024 {
+            return Ok(INVALID_ARGUMENT);
+        }
+        let id = bytes(env, &id)?;
+        let host = bytes(env, &host)?;
+        Ok(unsafe {
+            compukter_checkpoint_save(
+                handle as u64,
+                store_handle as u64,
+                id.as_ptr(),
+                host.as_ptr(),
+                host.len(),
+            )
+        } as jint)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_checkpointRestore<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    store_handle: jlong,
+    boot: jint,
+    id: JByteArray<'caller>,
+    rom: JByteArray<'caller>,
+    schemas: JByteArray<'caller>,
+    output: JByteArray<'caller>,
+    written: JLongArray<'caller>,
+) -> jint {
+    status(&mut env, |env| {
+        if id.len(env)? != 16 || rom.len(env)? > 16 * 1024 * 1024 || schemas.len(env)? > 64 * 1024 {
+            return Ok(INVALID_ARGUMENT);
+        }
+        let id = bytes(env, &id)?;
+        let rom = bytes(env, &rom)?;
+        let schemas = bytes(env, &schemas)?;
+        output_call(env, &output, &written, |out, capacity, count| unsafe {
+            compukter_checkpoint_restore(
+                store_handle as u64,
+                boot as u32,
+                id.as_ptr(),
+                rom.as_ptr(),
+                rom.len(),
+                schemas.as_ptr(),
+                schemas.len(),
+                out,
+                capacity,
+                count,
+            )
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_checkpointDiscard<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    store_handle: jlong,
+    id: JByteArray<'caller>,
+) -> jint {
+    status(&mut env, |env| {
+        if id.len(env)? != 16 {
+            return Ok(INVALID_ARGUMENT);
+        }
+        let id = bytes(env, &id)?;
+        Ok(unsafe { compukter_checkpoint_discard(store_handle as u64, id.as_ptr()) } as jint)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_checkpointHostSize<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    size: JLongArray<'caller>,
+) -> jint {
+    status(&mut env, |env| {
+        if size.len(env)? != 1 {
+            return Ok(INVALID_ARGUMENT);
+        }
+        let mut value = 0_usize;
+        let result = unsafe { compukter_checkpoint_host_size(handle as u64, &mut value) };
+        if result == FfiStatus::Ok {
+            write_long(env, &size, value)?;
+        }
+        Ok(result as jint)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_checkpointHostCopy<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    output: JByteArray<'caller>,
+    written: JLongArray<'caller>,
+) -> jint {
+    status(&mut env, |env| {
+        output_call(env, &output, &written, |out, capacity, count| unsafe {
+            compukter_checkpoint_host_copy(handle as u64, out, capacity, count)
         })
     })
 }

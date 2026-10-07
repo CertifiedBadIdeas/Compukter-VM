@@ -21,11 +21,13 @@ mod ffi_api;
 mod handle_table;
 mod wire;
 
-pub const COMPUKTER_FFI_ABI_VERSION: u32 = 20;
+pub const COMPUKTER_FFI_ABI_VERSION: u32 = 21;
 
 pub use ffi_api::{
     compukter_abi_version, compukter_advance, compukter_advance_with_retirement_limit,
-    compukter_close, compukter_compilation_complete, compukter_compilation_request_copy,
+    compukter_checkpoint_discard, compukter_checkpoint_host_copy, compukter_checkpoint_host_size,
+    compukter_checkpoint_restore, compukter_checkpoint_save, compukter_close,
+    compukter_compilation_complete, compukter_compilation_request_copy,
     compukter_compilation_request_size, compukter_create, compukter_create_boot_in_store,
     compukter_create_in_store, compukter_deploy, compukter_deployment_candidate_close,
     compukter_executable_revision, compukter_filesystem_generation, compukter_filesystem_list,

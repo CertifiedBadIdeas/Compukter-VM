@@ -22,7 +22,9 @@ mod support;
 
 use compukter_ffi::{
     compukter_abi_version, compukter_advance, compukter_advance_with_retirement_limit,
-    compukter_close, compukter_compilation_complete, compukter_compilation_request_copy,
+    compukter_checkpoint_discard, compukter_checkpoint_host_copy, compukter_checkpoint_host_size,
+    compukter_checkpoint_restore, compukter_checkpoint_save, compukter_close,
+    compukter_compilation_complete, compukter_compilation_request_copy,
     compukter_compilation_request_size, compukter_create, compukter_create_boot_in_store,
     compukter_create_in_store, compukter_deploy, compukter_deployment_candidate_close,
     compukter_executable_revision, compukter_filesystem_generation, compukter_filesystem_list,
@@ -45,7 +47,7 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(20, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(21, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
@@ -1114,5 +1116,168 @@ fn encoded_responses_reject_malformed_payloads_before_handle_lookup() {
     });
     assert_eq!(FfiStatus::InvalidArgument, unsafe {
         compukter_resume_value(0, 1, 1, std::ptr::null(), 65_537)
+    });
+}
+
+#[test]
+fn checkpoint_survives_store_reopen_and_requires_explicit_consumption() {
+    let root = TestRoot::new();
+    let id = [71; 16];
+    let rom = rom_with_boot(&terminal_artifact(), true);
+    let store = open_store(root.path());
+    let original = create_boot_machine(store, id, &rom);
+    let host = b"portable host descriptors";
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_checkpoint_save(original, store, id.as_ptr(), host.as_ptr(), host.len())
+    });
+    assert_eq!(FfiStatus::CheckpointIncompatible, unsafe {
+        compukter_checkpoint_save(
+            original,
+            store,
+            [72; 16].as_ptr(),
+            host.as_ptr(),
+            host.len(),
+        )
+    });
+    assert_eq!(FfiStatus::Ok, compukter_close(original));
+    assert_eq!(FfiStatus::Ok, compukter_store_close(store));
+    let store = open_store(root.path());
+    let restore = |output: &mut [u8], written: &mut usize| unsafe {
+        compukter_checkpoint_restore(
+            store,
+            1,
+            id.as_ptr(),
+            rom.as_ptr(),
+            rom.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            written,
+        )
+    };
+    let mut written = 0;
+    assert_eq!(
+        FfiStatus::BufferTooSmall,
+        restore(&mut [0; 8], &mut written)
+    );
+    assert_eq!(9, written);
+    let mut wire = [0; 9];
+    assert_eq!(FfiStatus::Ok, restore(&mut wire, &mut written));
+    assert_eq!(9, written);
+    assert_eq!(0, wire[0]);
+    let restored = u64::from_le_bytes(wire[1..].try_into().unwrap());
+    assert_ne!(original, restored);
+    let mut size = 0;
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_checkpoint_host_size(restored, &mut size)
+    });
+    assert_eq!(host.len(), size);
+    let mut short = [99; 2];
+    assert_eq!(FfiStatus::BufferTooSmall, unsafe {
+        compukter_checkpoint_host_copy(restored, short.as_mut_ptr(), short.len(), &mut written)
+    });
+    assert_eq!([99; 2], short);
+    assert_eq!(host.len(), written);
+    let mut copied = vec![0; size];
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_checkpoint_host_copy(restored, copied.as_mut_ptr(), copied.len(), &mut written)
+    });
+    assert_eq!(host, copied.as_slice());
+    // Admission leaves the durable snapshot intact until the host binds resources.
+    assert_eq!(FfiStatus::Ok, restore(&mut wire, &mut written));
+    assert_eq!(
+        FfiStatus::Ok,
+        compukter_close(u64::from_le_bytes(wire[1..].try_into().unwrap()))
+    );
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_checkpoint_discard(store, id.as_ptr())
+    });
+    assert_eq!(
+        FfiStatus::CheckpointNotFound,
+        restore(&mut wire, &mut written)
+    );
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_checkpoint_discard(store, id.as_ptr())
+    });
+    assert_eq!(FfiStatus::Ok, compukter_close(restored));
+    assert_eq!(FfiStatus::Ok, compukter_store_close(store));
+}
+
+#[test]
+fn checkpoint_rejects_corruption_instead_of_booting_again() {
+    let root = TestRoot::new();
+    let id = [73; 16];
+    let rom = rom_with_boot(&terminal_artifact(), true);
+    let store = open_store(root.path());
+    let original = create_boot_machine(store, id, &rom);
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_checkpoint_save(original, store, id.as_ptr(), core::ptr::null(), 0)
+    });
+    assert_eq!(FfiStatus::Ok, compukter_close(original));
+    let path = root
+        .path()
+        .join("computers")
+        .join("49".repeat(16))
+        .join("execution");
+    let mut bytes = std::fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    let mut wire = [99; 9];
+    let mut written = 0;
+    assert_eq!(FfiStatus::CheckpointCorrupt, unsafe {
+        compukter_checkpoint_restore(
+            store,
+            1,
+            id.as_ptr(),
+            rom.as_ptr(),
+            rom.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
+            wire.as_mut_ptr(),
+            wire.len(),
+            &mut written,
+        )
+    });
+    assert_eq!([99; 9], wire);
+    assert_eq!(FfiStatus::Ok, compukter_store_close(store));
+}
+
+#[test]
+fn checkpoint_restore_rejects_invalid_mode_and_pointers_before_lookup() {
+    let mut output = [0; 9];
+    let mut written = 0;
+    let call = |boot, id, count| unsafe {
+        compukter_checkpoint_restore(
+            0,
+            boot,
+            id,
+            core::ptr::null(),
+            0,
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            count,
+        )
+    };
+    let mut call = call;
+    assert_eq!(
+        FfiStatus::InvalidArgument,
+        call(2, [0; 16].as_ptr(), &mut written)
+    );
+    assert_eq!(
+        FfiStatus::InvalidArgument,
+        call(1, core::ptr::null(), &mut written)
+    );
+    assert_eq!(
+        FfiStatus::InvalidArgument,
+        call(1, [0; 16].as_ptr(), core::ptr::null_mut())
+    );
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_checkpoint_save(0, 0, [0; 16].as_ptr(), core::ptr::null(), 1)
+    });
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_checkpoint_host_size(0, core::ptr::null_mut())
     });
 }
