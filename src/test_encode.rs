@@ -21,6 +21,19 @@ type Section = (u16, u32, Vec<u8>, u32);
 type ModuleSection = (u16, Vec<u8>, u32);
 
 pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, EncodeError> {
+    encode_artifact_debug(artifact, false)
+}
+
+pub(crate) fn encode_artifact_with_debug_paths(
+    artifact: &DecodedArtifact,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_artifact_debug(artifact, true)
+}
+
+fn encode_artifact_debug(
+    artifact: &DecodedArtifact,
+    compact: bool,
+) -> Result<Vec<u8>, EncodeError> {
     let mut encoded_modules = Vec::new();
     encoded_modules
         .try_reserve_exact(artifact.modules.len())
@@ -67,13 +80,32 @@ pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, Enc
                 .map(|(kind, payload, count)| (kind, scope, payload, count)),
         );
         if !decoded.debug.is_empty() {
+            let mut paths: Vec<Vec<u8>> = Vec::new();
             let records = decoded
                 .debug
                 .iter()
-                .map(|entry| encode_debug(artifact, entry))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|entry| {
+                    let mut record = encode_debug(artifact, entry)?;
+                    if compact {
+                        let path = entry.source_path.slice(&artifact.bytes);
+                        let id = if let Some(id) = paths.iter().position(|value| value == path) {
+                            id
+                        } else {
+                            paths.push(path.to_vec());
+                            paths.len() - 1
+                        };
+                        record.truncate(24);
+                        u32le(&mut record, id as u32);
+                    }
+                    Ok(record)
+                })
+                .collect::<Result<Vec<_>, EncodeError>>()?;
             let count = to_u32(records.len(), "debug count exceeds u32")?;
             sections.push((format::DEBUG, scope, indexed(records)?, count));
+            if compact {
+                let count = to_u32(paths.len(), "debug path count exceeds u32")?;
+                sections.push((format::DEBUG_PATHS, scope, indexed(paths)?, count));
+            }
             let positions = decoded
                 .debug
                 .iter()
@@ -1254,6 +1286,8 @@ fn assemble(
             &mut bytes,
             if matches!(*kind, format::DEBUG | format::DEBUG_SOURCE_POSITIONS) {
                 0
+            } else if *kind == format::DEBUG_PATHS {
+                format::CRITICAL
             } else {
                 format::KNOWN_FLAGS
             },

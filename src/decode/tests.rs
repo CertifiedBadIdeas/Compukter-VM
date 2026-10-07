@@ -1007,3 +1007,88 @@ fn instruction_decodes_host_runtime_golden() {
         crate::artifact::Instruction::CapabilityCallAsync { .. }
     ));
 }
+
+#[test]
+fn compact_debug_preserves_legacy_metadata_and_shares_path_bytes() {
+    let legacy = decoded_fixture("debug.cpkt");
+    let compact = super::records::decode_artifact(
+        support::compact_debug_vector().into(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy.modules[0].semantic_hash,
+        compact.modules[0].semantic_hash
+    );
+    for (old, new) in legacy.modules[0]
+        .debug
+        .iter()
+        .zip(&compact.modules[0].debug)
+    {
+        assert_eq!(
+            (
+                old.function,
+                old.block,
+                old.instruction,
+                old.start_utf16,
+                old.end_utf16,
+                old.inline_parent
+            ),
+            (
+                new.function,
+                new.block,
+                new.instruction,
+                new.start_utf16,
+                new.end_utf16,
+                new.inline_parent
+            )
+        );
+        assert_eq!(
+            old.source_path.slice(&legacy.bytes),
+            new.source_path.slice(&compact.bytes)
+        );
+    }
+    assert_eq!(
+        compact.modules[0].debug[0].source_path,
+        compact.modules[0].debug[1].source_path
+    );
+    let bytes = support::compact_debug_vector();
+    let limits = ArtifactLimits {
+        debug_bytes: 56,
+        ..ArtifactLimits::default()
+    };
+    assert!(super::records::decode_artifact(bytes.into(), &limits).is_err());
+}
+
+#[test]
+fn compact_debug_rejects_bad_paths_references_flags_scope_and_orphan_pool() {
+    let orphan = super::records::decode_artifact(
+        support::compact_debug_vector_without_debug().into(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap_err();
+    assert_eq!(orphan.first().unwrap().code, Code::BadRecord);
+    let original = support::compact_debug_vector();
+    let pool = support::directory_entry_offset(&original, 0x0111, 1);
+    let debug = support::directory_entry_offset(&original, 0x0110, 1);
+    let path = support::indexed_record_offset(&original, 0x0111, 1, 0);
+    let record = support::indexed_record_offset(&original, 0x0110, 1, 0);
+    for (offset, value) in [(pool + 2, 0), (pool + 4, 0), (debug, 0x8000)] {
+        let mut bytes = original.clone();
+        support::write_u16(&mut bytes, offset, value);
+        support::rehash(&mut bytes);
+        assert!(super::records::decode_artifact(bytes.into(), &ArtifactLimits::default()).is_err());
+    }
+    for (offset, value) in [(record + 24, 1), (record + 20, 0)] {
+        let mut bytes = original.clone();
+        support::write_u32(&mut bytes, offset, value);
+        support::rehash(&mut bytes);
+        assert!(super::records::decode_artifact(bytes.into(), &ArtifactLimits::default()).is_err());
+    }
+    for value in [b'/', 0xff] {
+        let mut bytes = original.clone();
+        bytes[path] = value;
+        support::rehash(&mut bytes);
+        assert!(super::records::decode_artifact(bytes.into(), &ArtifactLimits::default()).is_err());
+    }
+}
