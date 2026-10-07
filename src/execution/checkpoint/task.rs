@@ -45,6 +45,15 @@ checkpoint_struct!(TaskScheduler {
 });
 
 impl TaskScheduler {
+    pub(in crate::execution) fn checkpoint_task_at_slot(
+        &self,
+        slot: usize,
+    ) -> Option<(TaskId, TaskState)> {
+        self.tasks
+            .get(slot)
+            .and_then(|task| task.id.map(|id| (id, task.state)))
+    }
+
     pub(crate) fn validate_checkpoint(&self, capacity: usize) -> Result<()> {
         use crate::execution::checkpoint::CheckpointError::InvalidState;
         if capacity == 0

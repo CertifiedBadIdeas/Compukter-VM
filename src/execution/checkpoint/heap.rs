@@ -154,6 +154,85 @@ impl Heap {
     }
 }
 
+impl Heap {
+    pub(in crate::execution) fn checkpoint_live_references(&self) -> Result<Vec<Ref32>> {
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(self.live_objects as usize)
+            .map_err(|_| CheckpointError::Allocation)?;
+        let mut offset = 0_u32;
+        while offset < self.arena_bytes {
+            let block = BlockOffset(offset);
+            let size = self
+                .block_size(block)
+                .map_err(|_| CheckpointError::InvalidState)?;
+            if self
+                .read_flags(block)
+                .map_err(|_| CheckpointError::InvalidState)?
+                & LIVE
+                != 0
+            {
+                references.push(
+                    Ref32::managed(
+                        offset
+                            .checked_add(OBJECT_TYPE_ID)
+                            .ok_or(CheckpointError::InvalidState)?,
+                    )
+                    .ok_or(CheckpointError::InvalidState)?,
+                );
+            }
+            offset = offset
+                .checked_add(size)
+                .filter(|end| *end <= self.arena_bytes)
+                .ok_or(CheckpointError::InvalidState)?;
+        }
+        Ok(references)
+    }
+
+    pub(in crate::execution) fn checkpoint_gray_next(
+        &self,
+        reference: Ref32,
+    ) -> Result<Option<u32>> {
+        let block = self
+            .live_block(reference)
+            .map_err(|_| CheckpointError::InvalidState)?;
+        if self
+            .read_flags(block)
+            .map_err(|_| CheckpointError::InvalidState)?
+            & MARKED
+            == 0
+        {
+            return Err(CheckpointError::InvalidState);
+        }
+        let next = self
+            .read_previous_or_gray(block)
+            .map_err(|_| CheckpointError::InvalidState)?;
+        Ok((next != NULL_OFFSET && next != 0).then_some(next))
+    }
+
+    pub(in crate::execution) fn checkpoint_sweep_boundary(
+        &self,
+        cursor: u32,
+        previous: u32,
+    ) -> Result<()> {
+        let mut offset = 0_u32;
+        let mut previous_size = 0_u32;
+        while offset < cursor {
+            previous_size = self
+                .block_size(BlockOffset(offset))
+                .map_err(|_| CheckpointError::InvalidState)?;
+            offset = offset
+                .checked_add(previous_size)
+                .filter(|end| *end <= self.arena_bytes)
+                .ok_or(CheckpointError::InvalidState)?;
+        }
+        if offset != cursor || previous != previous_size {
+            return Err(CheckpointError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

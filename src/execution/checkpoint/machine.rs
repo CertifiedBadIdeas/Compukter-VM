@@ -251,11 +251,75 @@ impl Machine {
             self.image.maximum_channel_values(),
             tasks,
         )?;
+        if self.lifecycle == Lifecycle::Runnable {
+            use crate::execution::task::TaskState;
+            let active = self.tasks.current().ok();
+            let frame_owner = self
+                .task_string_response
+                .map(|response| response.0)
+                .or(active);
+            if let Some((task, request, previous)) = self.task_string_response {
+                if active != previous
+                    || !self.checkpoint_task_waits_for(task, request)
+                    || self.pending_host_string.is_none() && self.pending_record.is_none()
+                {
+                    return Err(invalid());
+                }
+            }
+            if frame_owner.is_some() != (self.frame_depth > 0)
+                || self.frames[self.frame_depth..]
+                    .iter()
+                    .any(|frame| frame.function != usize::MAX)
+            {
+                return Err(invalid());
+            }
+            for (slot, depth) in self.task_frame_depths.iter().copied().enumerate() {
+                match self.tasks.checkpoint_task_at_slot(slot) {
+                    Some((task, TaskState::Running))
+                        if Some(task) == active
+                            && if self.task_string_response.is_some() {
+                                depth > 0
+                            } else {
+                                depth == 0
+                            } => {}
+                    Some((task, TaskState::Waiting(_)))
+                        if self
+                            .task_string_response
+                            .is_some_and(|response| response.0 == task)
+                            && depth == 0 => {}
+                    Some((_, TaskState::Ready | TaskState::Waiting(_))) if depth > 0 => {}
+                    None | Some((_, TaskState::Completed)) if depth == 0 => {}
+                    _ => return Err(invalid()),
+                }
+                if self.task_frames[slot * width + depth..(slot + 1) * width]
+                    .iter()
+                    .any(|frame| frame.function != usize::MAX)
+                {
+                    return Err(invalid());
+                }
+            }
+            self.channels.validate_checkpoint_continuations(
+                &self.tasks,
+                &self.image,
+                &self.task_frames,
+                &self.task_frame_depths,
+            )?;
+        }
         self.heap.validate_checkpoint(&self.image.storage_plan())?;
         self.statics
             .validate_checkpoint(self.image.static_layout())?;
         let mut reservations = Vec::new();
-        for frames in core::iter::once(&self.frames[..self.frame_depth]).chain(
+        // Root completion keeps its final register storage for the halted
+        // result while clearing the scheduler and logical execution depth.
+        let retained_depth = if matches!(self.lifecycle, Lifecycle::Terminal(Outcome::Halted(_))) {
+            self.frames
+                .iter()
+                .take_while(|frame| frame.function != usize::MAX)
+                .count()
+        } else {
+            self.frame_depth
+        };
+        for frames in core::iter::once(&self.frames[..retained_depth]).chain(
             self.task_frames
                 .chunks(width)
                 .zip(&self.task_frame_depths)
@@ -323,6 +387,191 @@ impl Machine {
             })
         {
             return Err(invalid());
+        }
+        self.validate_checkpoint_references(retained_depth)?;
+        Ok(())
+    }
+
+    fn validate_checkpoint_references(&self, retained_depth: usize) -> Result<()> {
+        let invalid = || CheckpointError::InvalidState;
+        let live = self.heap.checkpoint_live_references()?;
+        self.external_roots.validate_checkpoint()?;
+        let mut runtime_roots = [None; 41];
+        let mut count = 0_usize;
+        self.visit_runtime_roots(|reference| {
+            if let Some(slot) = runtime_roots.get_mut(count) {
+                *slot = Some(reference);
+            }
+            count += 1;
+        });
+        if count > runtime_roots.len() {
+            return Err(invalid());
+        }
+        self.collector.validate_checkpoint(
+            &self.heap,
+            &self.image,
+            RootSet {
+                statics: &self.statics,
+                frames: &self.frames,
+                saved_frames: &self.task_frames,
+                task_failures: &self.task_failures,
+                frame_arena: &self.frame_arena,
+                frame_depth: self.frame_depth,
+                runtime_roots: &runtime_roots[..count],
+                external: &self.external_roots,
+            },
+            &live,
+        )?;
+        let mut roots = Vec::new();
+        roots
+            .try_reserve_exact(count + self.external_roots.len() + self.task_failures.len())
+            .map_err(|_| CheckpointError::Allocation)?;
+        roots.extend(runtime_roots[..count].iter().flatten().copied());
+        roots.extend(
+            (0..self.external_roots.len()).filter_map(|index| self.external_roots.root(index)),
+        );
+        roots.extend(
+            self.task_failures
+                .iter()
+                .flatten()
+                .map(|failure| failure.exception),
+        );
+        if let Lifecycle::Terminal(Outcome::Halted(Some(RuntimeValue::Reference(reference)))) =
+            self.lifecycle
+        {
+            roots.push(reference);
+        }
+        for field in self.image.fields() {
+            if field.value_type.kind == 7 {
+                if let Some(slot) = field.static_slot {
+                    if let Some(reference) = self.statics.reference(slot).map_err(|_| invalid())? {
+                        roots.push(reference);
+                    }
+                }
+            }
+        }
+        for frame in self.frames[..retained_depth].iter().chain(
+            self.task_frames
+                .iter()
+                .filter(|frame| frame.function != usize::MAX),
+        ) {
+            let boundary = u32::try_from(frame.instruction).map_err(|_| invalid())?;
+            if let Some(map) = self
+                .image
+                .safepoint_map(frame.function, frame.block, boundary)
+            {
+                for offset in &map.reference_offsets {
+                    if let Some(reference) = self
+                        .frame_arena
+                        .read_ref32_offset(
+                            FrameReservation {
+                                base: frame.base,
+                                byte_len: frame.byte_len,
+                            },
+                            *offset,
+                        )
+                        .map_err(|_| invalid())?
+                    {
+                        roots.push(reference);
+                    }
+                }
+            } else if self.collector.is_active() {
+                return Err(invalid());
+            }
+        }
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(reference) = roots.pop() {
+            match reference.domain() {
+                ReferenceDomain::Image | ReferenceDomain::External => {
+                    if self.image.reference_type(reference).is_none() {
+                        return Err(invalid());
+                    }
+                    continue;
+                }
+                ReferenceDomain::Reserved if reference.payload() == 0 => continue,
+                ReferenceDomain::Reserved => return Err(invalid()),
+                ReferenceDomain::Managed => {}
+            }
+            if live
+                .binary_search_by_key(&reference.payload(), |value| value.payload())
+                .is_err()
+            {
+                return Err(invalid());
+            }
+            if !visited.insert(reference.payload()) {
+                continue;
+            }
+            let ty = self
+                .image
+                .type_key(self.heap.managed_type(reference).map_err(|_| invalid())? as usize)
+                .ok_or_else(invalid)?;
+            if self.image.string_type() == Some(ty) {
+                let header = self
+                    .heap
+                    .read_payload(reference, 0, 8)
+                    .map_err(|_| invalid())?;
+                let length = u32::from_le_bytes(header[..4].try_into().map_err(|_| invalid())?);
+                let encoding = match header[4] {
+                    0 => super::super::layout::StringEncoding::Latin1,
+                    1 => super::super::layout::StringEncoding::Utf16,
+                    _ => return Err(invalid()),
+                };
+                let layout = super::super::layout::string_layout(
+                    encoding,
+                    length,
+                    self.heap.header_format(),
+                )
+                .map_err(|_| invalid())?;
+                self.heap
+                    .read_payload(reference, layout.payload_bytes, 0)
+                    .map_err(|_| invalid())?;
+                continue;
+            }
+            match self.image.type_layout(ty).ok_or_else(invalid)? {
+                RuntimeTypeLayout::Object(layout) => {
+                    self.heap
+                        .read_payload(reference, layout.payload_bytes, 0)
+                        .map_err(|_| invalid())?;
+                    roots
+                        .try_reserve(layout.reference_offsets.len())
+                        .map_err(|_| CheckpointError::Allocation)?;
+                    for offset in &layout.reference_offsets {
+                        if let RuntimeValue::Reference(reference) =
+                            load_value(&self.heap, reference, *offset, ValueWidth::Ref)
+                                .map_err(|_| invalid())?
+                        {
+                            roots.push(reference);
+                        }
+                    }
+                }
+                RuntimeTypeLayout::Array { element } => {
+                    let length = match load_value(&self.heap, reference, 0, ValueWidth::I32)
+                        .map_err(|_| invalid())?
+                    {
+                        RuntimeValue::I32(value) => value,
+                        _ => return Err(invalid()),
+                    };
+                    let layout = array_layout(*element, length, self.heap.header_format())
+                        .map_err(|_| invalid())?;
+                    self.heap
+                        .read_payload(reference, layout.payload_bytes, 0)
+                        .map_err(|_| invalid())?;
+                    if *element == ValueWidth::Ref {
+                        roots
+                            .try_reserve(layout.length as usize)
+                            .map_err(|_| CheckpointError::Allocation)?;
+                        for index in 0..layout.length {
+                            if let RuntimeValue::Reference(reference) =
+                                load_value(&self.heap, reference, 8 + index * 4, ValueWidth::Ref)
+                                    .map_err(|_| invalid())?
+                            {
+                                roots.push(reference);
+                            }
+                        }
+                    }
+                }
+                RuntimeTypeLayout::NonHeap => return Err(invalid()),
+            }
         }
         Ok(())
     }
@@ -422,6 +671,40 @@ mod tests {
             }
         }
         panic!("incremental collection did not complete");
+    }
+
+    #[test]
+    fn checkpoint_retains_halted_outcome_without_restarting_entry() {
+        let mut original = fixtures::started_zero_arg_untraced(fixtures::nested_call_artifact());
+        let expected = original.run_slice(128, 8).unwrap();
+        assert_eq!(Outcome::Halted(Some(RuntimeValue::I32(42))), expected);
+        let mut restored = round_trip(&original);
+        assert_eq!(expected, restored.run_slice(128, 8).unwrap());
+        assert_eq!(
+            original.retired_instructions(),
+            restored.retired_instructions()
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_interior_heap_reference_in_halted_result() {
+        let mut original =
+            fixtures::started_zero_arg_untraced(fixtures::object_allocation_artifact(8));
+        let reference = loop {
+            match original.run_slice(128, 8).unwrap() {
+                Outcome::SliceExhausted => {}
+                Outcome::Halted(Some(RuntimeValue::Reference(reference))) => break reference,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        };
+        original.validate_checkpoint_storage().unwrap();
+        original.lifecycle = Lifecycle::Terminal(Outcome::Halted(Some(RuntimeValue::Reference(
+            Ref32::managed(reference.payload() + 8).unwrap(),
+        ))));
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            original.validate_checkpoint_storage()
+        );
     }
 
     #[test]

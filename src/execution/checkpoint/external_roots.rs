@@ -17,10 +17,23 @@
  */
 
 use super::*;
-use crate::execution::checkpoint::checkpoint_struct;
+use crate::execution::checkpoint::{checkpoint_struct, CheckpointError, Result};
 
 checkpoint_struct!(ExternalHandle { slot, generation });
 
 checkpoint_struct!(ExternalRootEntry { generation, value });
 
 checkpoint_struct!(ExternalRootTable { entries });
+
+impl ExternalRootTable {
+    pub(in crate::execution) fn validate_checkpoint(&self) -> Result<()> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.generation == 0 && entry.value.is_some())
+        {
+            return Err(CheckpointError::InvalidState);
+        }
+        Ok(())
+    }
+}
