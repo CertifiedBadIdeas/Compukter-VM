@@ -5395,7 +5395,7 @@ mod tests {
             }))
     }
 
-    fn compiler_computer(
+    pub(super) fn compiler_computer(
         source_bytes: &[u8],
         existing_output: Option<&[u8]>,
     ) -> (ComputerMachine, FileCapability, VirtualPath, VirtualPath) {
@@ -5444,7 +5444,7 @@ mod tests {
         (computer, output, bytes)
     }
 
-    fn next_compilation_request(computer: &mut ComputerMachine) -> CompilationRequest {
+    pub(super) fn next_compilation_request(computer: &mut ComputerMachine) -> CompilationRequest {
         loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
@@ -5754,7 +5754,7 @@ mod tests {
         }
     }
 
-    fn profile() -> ExecutionProfile {
+    pub(super) fn profile() -> ExecutionProfile {
         ExecutionProfile {
             heap_bytes: 1024 * 1024,
             frame_storage_bytes: 1024 * 1024,
@@ -5800,3 +5800,7 @@ mod tests {
         assert!(frames[2].contains("block 0, instruction 1"), "{trace}");
     }
 }
+
+#[path = "checkpoint/computer.rs"]
+#[allow(dead_code)]
+mod checkpoint_state;
