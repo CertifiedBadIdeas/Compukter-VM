@@ -1328,3 +1328,6 @@ fn zeroed_u16(length: usize) -> Result<Box<[u16]>, AdmissionError> {
     values.resize(length, 0);
     Ok(values.into_boxed_slice())
 }
+
+#[path = "checkpoint/session.rs"]
+mod checkpoint_state;

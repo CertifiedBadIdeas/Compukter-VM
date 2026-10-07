@@ -188,3 +188,6 @@ impl EntryArgument {
         }
     }
 }
+
+#[path = "checkpoint/value.rs"]
+mod checkpoint_state;

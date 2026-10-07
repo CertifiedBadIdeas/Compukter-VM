@@ -1066,3 +1066,6 @@ fn downward_class(size: u32) -> Option<(u8, u8, u32)> {
 fn class_index(class: SizeClass) -> usize {
     usize::from(class.first) * 8 + usize::from(class.second)
 }
+
+#[path = "checkpoint/heap.rs"]
+mod checkpoint_state;

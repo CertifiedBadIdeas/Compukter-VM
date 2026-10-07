@@ -1538,3 +1538,6 @@ mod double_format_tests {
         }
     }
 }
+
+#[path = "checkpoint/text.rs"]
+mod checkpoint_state;

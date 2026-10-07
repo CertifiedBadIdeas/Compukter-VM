@@ -378,3 +378,6 @@ pub(crate) fn reduce_last_write_wins(
         entries: entries.into_boxed_slice(),
     })
 }
+
+#[path = "checkpoint/requests.rs"]
+mod checkpoint_state;

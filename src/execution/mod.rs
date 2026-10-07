@@ -2,6 +2,7 @@
 
 mod array_copy;
 mod channel;
+mod checkpoint;
 mod error;
 mod external_roots;
 mod frame;
@@ -62,3 +63,6 @@ pub(super) struct TypeKey {
     pub module: u32,
     pub ty: u32,
 }
+
+#[path = "checkpoint/keys.rs"]
+mod checkpoint_state;
