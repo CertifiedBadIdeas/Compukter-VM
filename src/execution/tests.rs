@@ -1205,3 +1205,23 @@ fn failed_start_is_retryable_but_successful_start_is_one_shot() {
         machine.start(&[EntryArgument::unowned(RuntimeValue::I32(8))])
     );
 }
+
+#[test]
+fn inline_values_construct_extract_copy_and_return_through_nested_calls_without_heap_allocation() {
+    let expected = [
+        RuntimeValue::I32(42),
+        RuntimeValue::F64(3.5f64.to_bits()),
+        RuntimeValue::Bool(true),
+    ];
+    for (component, expected) in expected.into_iter().enumerate() {
+        let mut machine =
+            fixtures::started_zero_arg(fixtures::inline_value_artifact(component as u16));
+        let before = machine.resource_snapshot();
+        let outcome = machine
+            .run_slice(machine.minimum_run_budget() * 4, 8)
+            .unwrap();
+        assert_eq!(outcome, Outcome::Halted(Some(expected)));
+        let after = machine.resource_snapshot();
+        assert_eq!(before.heap_used_bytes, after.heap_used_bytes);
+    }
+}

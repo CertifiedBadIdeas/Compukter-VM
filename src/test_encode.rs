@@ -310,6 +310,16 @@ fn encode_module_record(module: &DecodedModule, hash: [u8; 32]) -> Vec<u8> {
 fn encode_type(value: &NominalType) -> Vec<u8> {
     let mut bytes = Vec::new();
     match value {
+        NominalType::InlineValue { name, components } => {
+            bytes.extend_from_slice(&[4, 0]);
+            u16le(&mut bytes, 0);
+            u32le(&mut bytes, *name);
+            u16le(&mut bytes, components.len() as u16);
+            u16le(&mut bytes, 0);
+            for component in components {
+                encode_value_type(&mut bytes, *component);
+            }
+        }
         NominalType::Class {
             flags,
             generic_arity,
@@ -606,6 +616,20 @@ pub(crate) fn encode_instruction_record(values: &[Instruction]) -> Result<Vec<u8
 fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeError> {
     let mut operands = Vec::new();
     let (opcode, form) = match value {
+        Instruction::InlineConstruct { dst, components } => {
+            reg(&mut operands, *dst);
+            encode_args(&mut operands, components)?;
+            (0x05, 0)
+        }
+        Instruction::InlineComponent {
+            dst,
+            src,
+            component,
+        } => {
+            regs(&mut operands, &[*dst, *src]);
+            id(&mut operands, u32::from(*component));
+            (0x06, 0)
+        }
         Instruction::Nop => (0x00, 0),
         Instruction::Move { dst, src } => {
             regs(&mut operands, &[*dst, *src]);

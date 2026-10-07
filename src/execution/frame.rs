@@ -518,6 +518,68 @@ impl FrameArena {
         Ok(())
     }
 
+    pub(super) fn read_component_value(
+        &self,
+        base: u32,
+        component: ComponentLayout,
+    ) -> Result<RuntimeValue, VmFault> {
+        self.read_access(
+            base,
+            FrameValueAccess {
+                kind: match component.atom {
+                    PhysicalAtom::I32 => 1,
+                    PhysicalAtom::I64 => 2,
+                    PhysicalAtom::F32 => 3,
+                    PhysicalAtom::F64 => 4,
+                    PhysicalAtom::Ref32 => 7,
+                },
+                component: Some(component),
+            },
+        )
+    }
+
+    pub(super) fn copy_component(
+        &mut self,
+        source_base: u32,
+        source: &ComponentLayout,
+        destination_base: u32,
+        destination: &ComponentLayout,
+    ) -> Result<(), VmFault> {
+        if source.atom != destination.atom {
+            return Err(VmFault::InvalidValueType);
+        }
+        let source_range = self.component_range(source_base, source)?;
+        let destination_range = self.component_range(destination_base, destination)?;
+        #[cfg(test)]
+        if self.initialized[source_range.clone()]
+            .iter()
+            .any(|initialized| !initialized)
+        {
+            return Err(VmFault::InvalidStoragePlan);
+        }
+        self.bytes
+            .copy_within(source_range, destination_range.start);
+        #[cfg(test)]
+        self.initialized[destination_range].fill(true);
+        Ok(())
+    }
+
+    pub(super) fn copy_value(
+        &mut self,
+        source_base: u32,
+        source: &ValueLayout,
+        destination_base: u32,
+        destination: &ValueLayout,
+    ) -> Result<(), VmFault> {
+        if source.components.len() != destination.components.len() {
+            return Err(VmFault::InvalidValueType);
+        }
+        for (source, destination) in source.components.iter().zip(destination.components.iter()) {
+            self.copy_component(source_base, source, destination_base, destination)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn write_value(
         &mut self,
         base: u32,

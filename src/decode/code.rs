@@ -106,6 +106,21 @@ fn decode_instruction(
         0x03 => Instruction::Null {
             dst: reg(&mut cursor, offset)?,
         },
+        0x05 if form == 0 => Instruction::InlineConstruct {
+            dst: reg(&mut cursor, offset)?,
+            components: args(&mut cursor, limits, offset)?,
+        },
+        0x06 if form == 0 => Instruction::InlineComponent {
+            dst: reg(&mut cursor, offset)?,
+            src: reg(&mut cursor, offset)?,
+            component: u16::try_from(id(&mut cursor, offset)?).map_err(|_| {
+                error(
+                    Code::BadInstruction,
+                    offset,
+                    "inline component index exceeds u16",
+                )
+            })?,
+        },
         0x04 => Instruction::Convert {
             form,
             dst: reg(&mut cursor, offset)?,
@@ -704,8 +719,48 @@ impl Instruction {
         )
     }
 
+    pub(crate) fn fixed_cost_for_values(
+        &self,
+        values: &[crate::artifact::FunctionValue],
+    ) -> Result<u32, Diagnostic> {
+        let transferred: &[u16] = match self {
+            Self::Move { src, .. } => std::slice::from_ref(src),
+            Self::Return { value } if *value != u16::MAX => std::slice::from_ref(value),
+            Self::CallDirect { args, .. }
+            | Self::CallVirtual { args, .. }
+            | Self::CallInterface { args, .. }
+            | Self::CallSuspend { args, .. }
+            | Self::CoroutineSpawn { args, .. } => args,
+            _ => &[],
+        };
+        let additional = transferred.iter().try_fold(0u32, |total, register| {
+            let count = values
+                .get(*register as usize)
+                .filter(|value| value.semantic_type.kind == 8)
+                .map_or(0, |value| value.components.len().saturating_sub(1) as u32);
+            total.checked_add(count).ok_or_else(|| {
+                Diagnostic::at_offset(
+                    Family::Cost,
+                    Code::BadCost,
+                    0,
+                    "inline transfer cost overflows u32",
+                )
+            })
+        })?;
+        self.fixed_cost()?.checked_add(additional).ok_or_else(|| {
+            Diagnostic::at_offset(
+                Family::Cost,
+                Code::BadCost,
+                0,
+                "inline transfer cost overflows u32",
+            )
+        })
+    }
+
     pub(crate) fn fixed_cost(&self) -> Result<u32, Diagnostic> {
         let fixed = match self {
+            Self::InlineConstruct { components, .. } => variable_cost(2, components.len())?,
+            Self::InlineComponent { .. } => 2,
             Self::Mul { .. }
             | Self::Convert { .. }
             | Self::ArrayLength { .. }

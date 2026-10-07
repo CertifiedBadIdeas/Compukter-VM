@@ -94,7 +94,50 @@ fn verify_nominal_types(
         .map_err(|_| type_failure(limits, 0, "cannot reserve type graph"))?;
 
     for (module_id, module) in artifact.modules.iter().enumerate() {
+        let check_value = |value: crate::artifact::ValueType| -> Result<(), DiagnosticSet> {
+            if value.kind == 7 || value.kind == 8 {
+                let identity =
+                    resolved_type(artifact, module_id, value.nominal_type).ok_or_else(|| {
+                        type_failure(limits, module_id, "nominal value type does not resolve")
+                    })?;
+                let inline = matches!(
+                    artifact.modules[identity.0].types[identity.1],
+                    NominalType::InlineValue { .. }
+                );
+                if (value.kind == 8) != inline
+                    || (value.kind == 8 && artifact.header.runtime_minor < 15)
+                {
+                    return Err(type_failure(limits, module_id, "inline and managed reference representations must match their nominal type"));
+                }
+            }
+            Ok(())
+        };
+        for function in &module.functions {
+            for value in &function.values {
+                check_value(value.semantic_type)?;
+            }
+        }
+        for field in &module.fields {
+            check_value(field.value_type)?;
+        }
         for (type_id, nominal) in module.types.iter().enumerate() {
+            match nominal {
+                NominalType::InlineValue { components, .. } => {
+                    for component in components {
+                        check_value(*component)?;
+                    }
+                }
+                NominalType::Array { element, .. } => check_value(*element)?,
+                NominalType::Function {
+                    result, parameters, ..
+                } => {
+                    check_value(*result)?;
+                    for parameter in parameters {
+                        check_value(*parameter)?;
+                    }
+                }
+                _ => {}
+            }
             let mut neighbors = Vec::new();
             if let NominalType::Array {
                 element, storage, ..
@@ -116,6 +159,24 @@ fn verify_nominal_types(
                             "array storage does not match element scalar kind",
                         ));
                     }
+                }
+            }
+            if let NominalType::InlineValue { .. } = nominal {
+                if artifact.header.runtime_minor < 15 {
+                    return Err(type_failure(
+                        limits,
+                        module_id,
+                        "inline layouts require Runtime ABI 1.15",
+                    ));
+                }
+            }
+            if let NominalType::Array { element, .. } = nominal {
+                if element.kind == 8 {
+                    return Err(type_failure(
+                        limits,
+                        module_id,
+                        "heap arrays require boxed inline elements",
+                    ));
                 }
             }
             match nominal {
@@ -333,11 +394,19 @@ fn verify_nominal_types(
                 NominalType::Array {
                     super_type: None, ..
                 }
-                | NominalType::Function { .. } => {}
+                | NominalType::Function { .. }
+                | NominalType::InlineValue { .. } => {}
             }
             edges.push(neighbors);
         }
         for field in &module.fields {
+            if field.value_type.kind == 8 {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    "heap fields require boxed inline values",
+                ));
+            }
             let owner = resolved_type(artifact, module_id, field.owner)
                 .ok_or_else(|| type_failure(limits, module_id, "field owner does not resolve"))?;
             if !matches!(
@@ -668,7 +737,7 @@ pub(super) fn value_types_match(
 ) -> bool {
     left.kind == right.kind
         && left.flags == right.flags
-        && if left.kind == 7 {
+        && if left.kind == 7 || left.kind == 8 {
             let Some(left_identity) = resolved_type(artifact, left_module, left.nominal_type)
             else {
                 return false;

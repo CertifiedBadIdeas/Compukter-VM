@@ -254,3 +254,20 @@ unsigned I32 widening zero-extends. Floating-to-unsigned conversion truncates an
 with NaN and negative values producing zero. Integer-to-F64 conversion rounds to nearest
 with ties to even; unsigned-to-F32 follows Kotlin standard-library conversion through F64. Readers and verifiers reject unknown masks, incompatible register kinds and
 unsigned forms below ABI 1.14. No unsigned register kinds or native ABI changes are introduced.
+
+## Inline value layouts (Runtime ABI 1.15)
+
+Runtime ABI 1.15 introduces nominal inline value layouts. Type record tag 4 has zero flags/arity,
+a name u32, component count u16, reserved zero u16 and flattened primitive/reference value-type records.
+Semantic value kind 8 carries a nominal type reference and zero flags. Inline layouts are nonempty,
+cannot contain Unit or another inline layout, and are distinct from managed reference types. Function
+physical shapes must exactly match their nominal leaves. Heap fields and array elements use managed
+boxes rather than inline layouts.
+
+`inline_construct` (0x05, form 0) encodes destination u16, component count ULEB and source u16 registers;
+`inline_component` (0x06, form 0) encodes destination/source u16 and component index ULEB (at most u16).
+Costs are 2 + component count and 2 respectively. Move, call arguments, task-spawn arguments and returns
+charge one extra unit per additional inline component copied. Copies stay in compact frame storage;
+REF32 leaves participate in exact component safepoint maps. Nominal identity, initialization, leaf
+types, physical shapes, ABI gates and declared costs are checked by both Kotlin and Rust. Artifact
+container format 3 and exported C ABI 20 are unchanged; host entry/results retain their scalar contract.

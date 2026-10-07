@@ -200,6 +200,10 @@ pub(crate) fn scalar_values(values: Vec<ValueType>) -> Vec<FunctionValue> {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum NominalType {
+    InlineValue {
+        name: u32,
+        components: Vec<ValueType>,
+    },
     Class {
         flags: u8,
         generic_arity: u16,
@@ -358,6 +362,15 @@ pub(crate) struct SwitchCase {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Instruction {
+    InlineConstruct {
+        dst: u16,
+        components: Box<[u16]>,
+    },
+    InlineComponent {
+        dst: u16,
+        src: u16,
+        component: u16,
+    },
     Nop,
     Move {
         dst: u16,

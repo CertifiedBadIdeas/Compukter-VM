@@ -2386,3 +2386,110 @@ fn value_hash_requires_abi_1_11_matching_operand_and_i32_result() {
         );
     }
 }
+
+#[test]
+fn inline_values_reject_malformed_layouts_shapes_and_uses() {
+    use crate::artifact::{Instruction, NominalType, PhysicalAtom, TypeId, ValueType};
+    for case in 0..14 {
+        let mut artifact = crate::execution::fixtures::inline_value_decoded(0);
+        match case {
+            0 => artifact.header.runtime_minor = 14,
+            1 => {
+                if let NominalType::InlineValue { components, .. } =
+                    &mut artifact.modules[0].types[3]
+                {
+                    components.clear();
+                }
+            }
+            2 => {
+                if let NominalType::InlineValue { components, .. } =
+                    &mut artifact.modules[0].types[3]
+                {
+                    components[0].kind = 0;
+                }
+            }
+            3 => {
+                if let NominalType::InlineValue { components, .. } =
+                    &mut artifact.modules[0].types[3]
+                {
+                    components[0] = ValueType {
+                        kind: 8,
+                        flags: 0,
+                        nominal_type: TypeId(3),
+                    };
+                }
+            }
+            4 => {
+                artifact.modules[0].functions[0].values[3]
+                    .semantic_type
+                    .nominal_type = TypeId(0)
+            }
+            5 => artifact.modules[0].functions[0].values[3].components[1] = PhysicalAtom::I32,
+            6 => {
+                artifact.modules[0].code[0].instructions[3] = Instruction::InlineConstruct {
+                    dst: 3,
+                    components: Box::new([0, 1]),
+                }
+            }
+            7 => {
+                artifact.modules[0].code[0].instructions[3] = Instruction::InlineConstruct {
+                    dst: 3,
+                    components: Box::new([0, 0, 2]),
+                }
+            }
+            8 => {
+                artifact.modules[0].code[0].instructions[5] = Instruction::InlineComponent {
+                    dst: 5,
+                    src: 4,
+                    component: 3,
+                }
+            }
+            9 => {
+                artifact.modules[0].code[0].instructions[5] = Instruction::InlineComponent {
+                    dst: 1,
+                    src: 4,
+                    component: 0,
+                }
+            }
+            10 => {
+                artifact.modules[0].code[0].instructions[3] = Instruction::InlineConstruct {
+                    dst: 3,
+                    components: Box::new([5, 1, 2]),
+                }
+            }
+            11 => {
+                artifact.modules[0].functions[0].values[3]
+                    .semantic_type
+                    .kind = 7
+            }
+            12 => artifact.modules[0].blocks[0].declared_fixed_cost -= 2,
+            13 => {
+                let module = &mut artifact.modules[0];
+                let NominalType::InlineValue { name, components } = &module.types[3] else {
+                    unreachable!()
+                };
+                module.types.push(NominalType::InlineValue {
+                    name: *name,
+                    components: components.clone(),
+                });
+                module.declared_types += 1;
+                if let NominalType::Function {
+                    parameters, result, ..
+                } = &mut module.types[1]
+                {
+                    parameters[0].nominal_type = TypeId(4);
+                    result.nominal_type = TypeId(4);
+                }
+                for value in &mut module.functions[1].values {
+                    value.semantic_type.nominal_type = TypeId(4);
+                }
+            }
+            _ => unreachable!(),
+        }
+        let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+        assert!(
+            super::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).is_err(),
+            "malformed inline case {case} was admitted"
+        );
+    }
+}
