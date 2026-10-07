@@ -223,6 +223,66 @@ impl Machine {
             ))
     }
 
+    pub(in crate::execution) fn validate_checkpoint_host_string(
+        &self,
+        source: &[u16],
+    ) -> Result<()> {
+        if let Some(pending) = self.pending_host_string {
+            let destination = pending.validate_checkpoint(&self.heap, source)?;
+            let frame = self
+                .frames
+                .get(
+                    self.frame_depth
+                        .checked_sub(1)
+                        .ok_or(CheckpointError::InvalidState)?,
+                )
+                .ok_or(CheckpointError::InvalidState)?;
+            if self
+                .image
+                .function(frame.function)
+                .and_then(|function| function.registers.get(destination as usize))
+                .is_none()
+            {
+                return Err(CheckpointError::InvalidState);
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::execution) fn checkpoint_host_operation(
+        &self,
+        task: TaskId,
+        request: RequestId,
+    ) -> Option<(u32, u32)> {
+        if !self.checkpoint_task_waits_for(task, request) {
+            return None;
+        }
+        let slot = self.tasks.slot_of(task)?;
+        let depth = *self.task_frame_depths.get(slot)?;
+        let frame = self.task_frames.get(
+            slot.checked_mul(self.image.maximum_call_depth())?
+                .checked_add(depth.checked_sub(1)?)?,
+        )?;
+        let instruction = self
+            .image
+            .block(frame.block)?
+            .instructions
+            .get(frame.instruction)?;
+        match instruction {
+            ResolvedInstruction::CapabilityCallSync {
+                capability,
+                operation,
+                ..
+            }
+            | ResolvedInstruction::CapabilityCallAsync {
+                capability,
+                operation,
+                ..
+            } => Some((*capability, *operation)),
+            _ => None,
+        }
+    }
+
     fn validate_checkpoint_storage(&mut self) -> Result<()> {
         let invalid = || CheckpointError::InvalidState;
         let width = self.image.maximum_call_depth();
@@ -387,6 +447,45 @@ impl Machine {
             })
         {
             return Err(invalid());
+        }
+        if let Some(copy) = &self.pending_array_copy {
+            copy.validate_checkpoint(&self.image, &self.heap)?;
+        }
+        if let Some(record) = &self.pending_record {
+            record.validate_checkpoint(&self.image, &self.heap)?;
+        }
+        if let Some(raise) = &self.pending_raise {
+            if raise.message.is_none() {
+                raise
+                    .text
+                    .validate_checkpoint(&self.heap, &raise.units[..raise.length])?;
+            }
+        }
+        let destinations = [
+            self.pending_allocation
+                .map(|pending| pending.validate_checkpoint(&self.image, &self.heap))
+                .transpose()?
+                .filter(|destination| *destination != u16::MAX),
+            self.pending_text
+                .map(|pending| pending.validate_checkpoint(&self.image, &self.heap))
+                .transpose()?,
+            self.pending_concat
+                .map(|pending| pending.validate_checkpoint(&self.image, &self.heap))
+                .transpose()?,
+        ];
+        for destination in destinations.into_iter().flatten() {
+            let frame = self
+                .frames
+                .get(self.frame_depth.checked_sub(1).ok_or_else(invalid)?)
+                .ok_or_else(invalid)?;
+            if self
+                .image
+                .function(frame.function)
+                .and_then(|function| function.registers.get(destination as usize))
+                .is_none()
+            {
+                return Err(invalid());
+            }
         }
         self.validate_checkpoint_references(retained_depth)?;
         Ok(())

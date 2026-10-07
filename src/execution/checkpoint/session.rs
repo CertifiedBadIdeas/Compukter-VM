@@ -20,6 +20,7 @@ use super::*;
 use crate::execution::checkpoint::{
     checkpoint_enum, checkpoint_struct, Checkpoint, CheckpointError, Reader, Result, Writer,
 };
+use crate::execution::host::HostValueType;
 
 checkpoint_struct!(PreparingRequest {
     id,
@@ -143,6 +144,9 @@ impl Session {
         {
             return Err(CheckpointError::InvalidState);
         }
+        admitted
+            .machine
+            .validate_checkpoint_host_string(&admitted.inbound_utf16[..admitted.inbound_length])?;
         for request in admitted.pending_requests.requests() {
             if request.identity().request().get() >= admitted.next_request_id
                 || !admitted.machine.checkpoint_task_waits_for(
@@ -158,13 +162,51 @@ impl Session {
                 .and_then(Option::as_ref)
                 .and_then(|capability| capability.operations.get(request.operation() as usize))
                 .ok_or(CheckpointError::InvalidState)?;
-            if operation.arguments.len() != request.arguments().len() {
+            if operation.arguments.len() != request.arguments().len()
+                || admitted.machine.checkpoint_host_operation(
+                    request.identity().task(),
+                    request.identity().request(),
+                ) != Some((request.capability(), request.operation()))
+                || operation
+                    .arguments
+                    .iter()
+                    .zip(request.arguments())
+                    .any(|(expected, slot)| checkpoint_slot_type(*slot) != Some(*expected))
+            {
                 return Err(CheckpointError::InvalidState);
             }
         }
         let mut replied = std::collections::BTreeSet::new();
         for reply in &admitted.replies {
-            if reply.request.get() >= admitted.next_request_id
+            let (capability, operation) = admitted
+                .machine
+                .checkpoint_host_operation(reply.task, reply.request)
+                .ok_or(CheckpointError::InvalidState)?;
+            let schema = admitted
+                .capabilities
+                .get(capability as usize)
+                .and_then(Option::as_ref)
+                .and_then(|capability| capability.operations.get(operation as usize))
+                .ok_or(CheckpointError::InvalidState)?;
+            let valid_value = match &reply.value {
+                CopiedReply::Scalar(None) => schema.result == HostValueType::Unit,
+                CopiedReply::Scalar(Some(value)) => {
+                    runtime_slot(*value).and_then(checkpoint_slot_type) == Some(schema.result)
+                }
+                CopiedReply::String(units) => {
+                    schema.result == HostValueType::String && units.len() <= inbound_capacity
+                }
+                CopiedReply::Record(record) => schema
+                    .result_record
+                    .as_ref()
+                    .is_some_and(|schema| schema.accepts(record, inbound_capacity)),
+                CopiedReply::Failure(failure) => {
+                    !failure.detail().is_empty()
+                        && failure.detail().len() <= admitted.failure_detail.len()
+                }
+            };
+            if !valid_value
+                || reply.request.get() >= admitted.next_request_id
                 || !admitted
                     .machine
                     .checkpoint_task_waits_for(reply.task, reply.request)
@@ -178,8 +220,73 @@ impl Session {
                 return Err(CheckpointError::InvalidState);
             }
         }
+        if admitted.resuming_host_string != admitted.machine.capability_string_response_pending() {
+            return Err(CheckpointError::InvalidState);
+        }
+        if let Some(preparing) = &admitted.preparing_request {
+            let suspension = admitted
+                .machine
+                .capability_suspension()
+                .map_err(|_| CheckpointError::InvalidState)?;
+            let operation = admitted
+                .capabilities
+                .get(preparing.capability as usize)
+                .and_then(Option::as_ref)
+                .and_then(|capability| capability.operations.get(preparing.operation as usize))
+                .ok_or(CheckpointError::InvalidState)?;
+            if preparing.id.get() != admitted.next_request_id
+                || admitted.machine.current_task().ok() != Some(preparing.task)
+                || (suspension.capability, suspension.operation)
+                    != (preparing.capability, preparing.operation)
+                || suspension.arguments.len() != admitted.argument_count
+                || operation.arguments.len() != admitted.argument_count
+                || preparing.argument > admitted.argument_count
+            {
+                return Err(CheckpointError::InvalidState);
+            }
+            for (index, ((expected, slot), register)) in operation
+                .arguments
+                .iter()
+                .zip(&admitted.argument_slots[..admitted.argument_count])
+                .zip(suspension.arguments)
+                .enumerate()
+            {
+                if checkpoint_slot_type(*slot) != Some(*expected) {
+                    return Err(CheckpointError::InvalidState);
+                }
+                if let HostValueSlot::String { start, length } = slot {
+                    if start
+                        .checked_add(*length)
+                        .is_none_or(|end| end as usize > outbound_capacity)
+                        || admitted.machine.capability_string_length(*register).ok()
+                            != Some(*length)
+                        || index == preparing.argument && preparing.string_offset > *length
+                    {
+                        return Err(CheckpointError::InvalidState);
+                    }
+                } else if index == preparing.argument && preparing.string_offset != 0 {
+                    return Err(CheckpointError::InvalidState);
+                }
+            }
+            if preparing.argument == admitted.argument_count && preparing.string_offset != 0 {
+                return Err(CheckpointError::InvalidState);
+            }
+        }
         Ok(admitted)
     }
+}
+
+fn checkpoint_slot_type(slot: HostValueSlot) -> Option<HostValueType> {
+    Some(match slot {
+        HostValueSlot::Empty => return None,
+        HostValueSlot::I32(_) => HostValueType::I32,
+        HostValueSlot::I64(_) => HostValueType::I64,
+        HostValueSlot::F32(_) => HostValueType::F32,
+        HostValueSlot::F64(_) => HostValueType::F64,
+        HostValueSlot::Bool(_) => HostValueType::Bool,
+        HostValueSlot::Char(_) => HostValueType::Char,
+        HostValueSlot::String { .. } => HostValueType::String,
+    })
 }
 
 #[cfg(test)]
@@ -310,6 +417,128 @@ mod tests {
             }
         }
         panic!("host string did not complete");
+    }
+
+    #[test]
+    fn checkpoint_resumes_each_record_materialization_boundary() {
+        use crate::execution::session_tests::{record_schema, record_value};
+        let schema = record_schema();
+        let operations = [OperationSchema::asynchronous_record(&[], &schema)];
+        let bindings = [CapabilityBinding::new("app", "entry", 1, 0, &operations)];
+        let artifact = fixtures::record_response_artifact(13, true);
+        let mut original = Session::admit_untraced(artifact.clone(), profile(), &bindings).unwrap();
+        original.start(&[]).unwrap();
+        let id = match original.advance(64, 0).unwrap() {
+            AdvanceOutcome::HostRequestBatch(batch) => batch.get(0).unwrap().id(),
+            other => panic!("{other:?}"),
+        };
+        let value = record_value(0x7ff0000000000042, 128);
+        original
+            .resume(id, HostResponse::Success(HostValueInput::Record(&value)))
+            .unwrap();
+        for _ in 0..512 {
+            let mut restored = round_trip(&original, artifact.clone(), &bindings);
+            let expected = original.advance_with_retirement_limit(8, 1, 1).unwrap();
+            assert_eq!(
+                expected,
+                restored.advance_with_retirement_limit(8, 1, 1).unwrap()
+            );
+            let completed = matches!(expected, AdvanceOutcome::Halted(_));
+            let mut first = Writer::new(8 * 1024 * 1024);
+            let mut second = Writer::new(8 * 1024 * 1024);
+            original.write_checkpoint_state(&mut first).unwrap();
+            restored.write_checkpoint_state(&mut second).unwrap();
+            assert_eq!(first.finish(), second.finish());
+            if completed {
+                return;
+            }
+        }
+        panic!("record response did not complete");
+    }
+
+    fn assert_rejected(
+        original: &Session,
+        artifact: VerifiedArtifact,
+        bindings: &[CapabilityBinding<'_>],
+    ) {
+        let mut writer = Writer::new(8 * 1024 * 1024);
+        original.write_checkpoint_state(&mut writer).unwrap();
+        let bytes = writer.finish();
+        let mut reader = Reader::new(&bytes, 8 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
+        let admitted = Session::admit_untraced(artifact, profile(), bindings).unwrap();
+        assert!(matches!(
+            Session::read_checkpoint_state(admitted, &mut reader),
+            Err(CheckpointError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_rejects_queued_reply_that_disagrees_with_suspended_operation() {
+        let operations = [
+            OperationSchema::asynchronous(&[], HostValueType::I32),
+            OperationSchema::asynchronous(&[], HostValueType::Unit),
+        ];
+        let bindings = [CapabilityBinding::new("app", "entry", 1, 0, &operations)];
+        let artifact = fixtures::two_task_host_artifact();
+        let mut original = Session::admit_untraced(artifact.clone(), profile(), &bindings).unwrap();
+        original.start(&[]).unwrap();
+        original.advance(64, 0).unwrap();
+        let request = original
+            .pending_requests
+            .requests()
+            .iter()
+            .find(|request| request.operation() == 0)
+            .unwrap()
+            .identity();
+        original.pending_requests.take(request).unwrap();
+        original.replies.push_back(QueuedReply {
+            task: request.task(),
+            request: request.request(),
+            value: CopiedReply::Scalar(Some(RuntimeValue::I64(13))),
+        });
+        assert_rejected(&original, artifact, &bindings);
+    }
+
+    #[test]
+    fn checkpoint_resumes_outbound_string_copy_and_rejects_foreign_copy_cursor() {
+        let operations = [OperationSchema::asynchronous(
+            &[HostValueType::String],
+            HostValueType::Unit,
+        )];
+        let bindings = [CapabilityBinding::new("app", "entry", 1, 0, &operations)];
+        let artifact = fixtures::string_capability_artifact(&[0x61; 64], false, false);
+        let mut original = Session::admit_untraced(artifact.clone(), profile(), &bindings).unwrap();
+        original.start(&[]).unwrap();
+        for _ in 0..128 {
+            original.advance(8, 0).unwrap();
+            if original.preparing_request.is_some() {
+                break;
+            }
+        }
+        assert!(original.preparing_request.is_some());
+        let mut restored = round_trip(&original, artifact.clone(), &bindings);
+        for _ in 0..128 {
+            let expected = original.advance(8, 0).unwrap();
+            assert_eq!(expected, restored.advance(8, 0).unwrap());
+            if matches!(expected, AdvanceOutcome::HostRequestBatch(_)) {
+                break;
+            }
+        }
+        assert!(original.preparing_request.is_none());
+        assert_eq!(
+            original.pending_requests.requests(),
+            restored.pending_requests.requests()
+        );
+        let mut corrupt = Session::admit_untraced(artifact.clone(), profile(), &bindings).unwrap();
+        corrupt.start(&[]).unwrap();
+        for _ in 0..128 {
+            corrupt.advance(8, 0).unwrap();
+            if let Some(preparing) = &mut corrupt.preparing_request {
+                preparing.string_offset = 65;
+                break;
+            }
+        }
+        assert_rejected(&corrupt, artifact, &bindings);
     }
 
     #[test]
