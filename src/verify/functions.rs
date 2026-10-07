@@ -813,13 +813,23 @@ fn verify_instruction(
                 read(function, state, *register, module_id, function_id, limits)?;
                 require_kind(function, *register, 1, module_id, function_id, limits)?;
             }
-            if !value_assignable(
-                artifact,
-                source_module,
-                source_element,
-                destination_module,
-                destination_element,
-            ) {
+            let storage = |register: u16| {
+                let value = function.values.get(register as usize)?.semantic_type;
+                let identity = modules::resolved_type(artifact, module_id, value.nominal_type)?;
+                match &artifact.modules[identity.0].types[identity.1] {
+                    NominalType::Array { storage, .. } => Some(*storage),
+                    _ => None,
+                }
+            };
+            if storage(*source) != storage(*destination)
+                || !value_assignable(
+                    artifact,
+                    source_module,
+                    source_element,
+                    destination_module,
+                    destination_element,
+                )
+            {
                 return Err(type_failure(
                     limits,
                     module_id,
@@ -1829,26 +1839,30 @@ pub(super) fn value_assignable(
                             (
                                 NominalType::Array {
                                     element: source_element,
+                                    storage: source_storage,
                                     ..
                                 },
                                 NominalType::Array {
                                     element: destination_element,
+                                    storage: destination_storage,
                                     ..
                                 },
                             ) => {
-                                value_assignable(
-                                    artifact,
-                                    source.0,
-                                    *source_element,
-                                    destination.0,
-                                    *destination_element,
-                                ) && value_assignable(
-                                    artifact,
-                                    destination.0,
-                                    *destination_element,
-                                    source.0,
-                                    *source_element,
-                                )
+                                source_storage == destination_storage
+                                    && value_assignable(
+                                        artifact,
+                                        source.0,
+                                        *source_element,
+                                        destination.0,
+                                        *destination_element,
+                                    )
+                                    && value_assignable(
+                                        artifact,
+                                        destination.0,
+                                        *destination_element,
+                                        source.0,
+                                        *source_element,
+                                    )
                             }
                             _ => nominal_assignable(artifact, source, destination),
                         }

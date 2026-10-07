@@ -9,6 +9,66 @@ fn decoded(bytes: Vec<u8>) -> crate::artifact::DecodedArtifact {
 }
 
 #[test]
+fn primitive_array_compatibility_includes_storage_for_assignments_and_imports() {
+    use crate::artifact::{NominalType, TypeId, ValueType};
+    let source = crate::execution::fixtures::packed_array_roundtrip_artifact(1, 255, -1);
+    for storage in [0, 2, 3, 4, 5] {
+        let mut artifact = decoded(source.decoded().bytes.to_vec());
+        let element = match artifact.modules[0].types[1] {
+            NominalType::Array { element, .. } => element,
+            _ => unreachable!(),
+        };
+        artifact.modules[0].types.push(NominalType::Array {
+            name: 0,
+            element,
+            storage,
+            super_type: None,
+        });
+        let left = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        let right = ValueType {
+            nominal_type: TypeId(2),
+            ..left
+        };
+        assert!(!super::functions::value_assignable(
+            &artifact, 0, left, 0, right
+        ));
+        assert!(!super::functions::value_assignable(
+            &artifact, 0, right, 0, left
+        ));
+        assert!(!super::modules::value_types_match(
+            &artifact, 0, left, 0, right
+        ));
+    }
+}
+
+#[test]
+fn explicit_array_storage_requires_new_abi_and_matching_register_kind() {
+    let source = crate::execution::fixtures::packed_array_roundtrip_artifact(1, 255, -1);
+    for case in 0..3 {
+        let mut artifact = decoded(source.decoded().bytes.to_vec());
+        if case == 0 {
+            artifact.header.runtime_minor = 13;
+        }
+        if let crate::artifact::NominalType::Array {
+            element, storage, ..
+        } = &mut artifact.modules[0].types[1]
+        {
+            if case == 1 {
+                element.kind = 5;
+            }
+            if case == 2 {
+                *storage = 7;
+            }
+        }
+        assert!(super::modules::verify_modules(&artifact, &ArtifactLimits::default()).is_err());
+    }
+}
+
+#[test]
 fn integer_division_and_remainder_reject_legacy_or_missing_factory_metadata() {
     let source = crate::execution::fixtures::trap_after_write_artifact(7);
     for case in 0..2 {
@@ -377,6 +437,7 @@ fn module_accepts_structurally_equivalent_array_signature_across_modules() {
             nominal_type: crate::artifact::TypeId(1),
         });
         module.types.push(crate::artifact::NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: crate::artifact::ValueType {
@@ -821,6 +882,7 @@ fn cfg_rejects_string_materialization_from_non_char_array() {
     artifact.modules[0]
         .types
         .push(crate::artifact::NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: primitive(1),
@@ -1177,6 +1239,7 @@ fn cfg_accepts_dedicated_object_and_array_allocation_blocks() {
     array.modules[0]
         .types
         .push(crate::artifact::NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: primitive(1),
@@ -1285,6 +1348,7 @@ fn cfg_accepts_structurally_equivalent_imported_array_argument() {
         };
         parameters.push(reference(1, false));
         module.types.push(crate::artifact::NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: primitive(1),

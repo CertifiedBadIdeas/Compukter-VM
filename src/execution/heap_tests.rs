@@ -1025,6 +1025,37 @@ fn heap_instructions_use_inherited_fields_and_interface_closure() {
 }
 
 #[test]
+fn packed_integer_arrays_normalize_values_and_use_compact_storage() {
+    for (storage, width, value, expected) in [
+        (1, ValueWidth::I8, 128, -128),
+        (1, ValueWidth::I8, 255, -1),
+        (2, ValueWidth::I16, 32768, -32768),
+        (2, ValueWidth::I16, 65535, -1),
+        (3, ValueWidth::U8, -1, 255),
+        (4, ValueWidth::U16, -1, 65535),
+        (5, ValueWidth::I32, -1, -1),
+    ] {
+        let source = fixtures::packed_array_roundtrip_artifact(storage, value, expected);
+        let image = ExecutionImage::admit(source, fixtures::profile()).unwrap();
+        assert_eq!(
+            Some(&RuntimeTypeLayout::Array { element: width }),
+            image.type_layout(TypeKey { module: 0, ty: 1 })
+        );
+        let mut machine = Machine::new(image).unwrap();
+        machine.start(&[]).unwrap();
+        loop {
+            match machine.run_slice(16, 0).unwrap() {
+                Outcome::SliceExhausted => {}
+                outcome => {
+                    assert_eq!(Outcome::Halted(Some(RuntimeValue::I32(expected))), outcome);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn heap_instructions_round_trip_every_primitive_array_width() {
     for (artifact, expected) in fixtures::primitive_array_roundtrip_cases() {
         let image = ExecutionImage::admit(artifact, fixtures::profile())

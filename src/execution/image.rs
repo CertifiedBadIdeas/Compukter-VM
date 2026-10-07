@@ -1375,8 +1375,16 @@ fn derive_type_layout(
             }
             RuntimeTypeLayout::Object(object_layout(inherited, &specs, header_format)?)
         }
-        NominalType::Array { element, .. } => RuntimeTypeLayout::Array {
-            element: value_width(*element)?,
+        NominalType::Array {
+            element, storage, ..
+        } => RuntimeTypeLayout::Array {
+            element: match storage {
+                1 => ValueWidth::I8,
+                2 => ValueWidth::I16,
+                3 => ValueWidth::U8,
+                4 => ValueWidth::U16,
+                _ => value_width(*element)?,
+            },
         },
         NominalType::Interface { .. } | NominalType::Function { .. } => RuntimeTypeLayout::NonHeap,
     };

@@ -223,6 +223,7 @@ pub(crate) enum NominalType {
     },
     Array {
         name: u32,
+        storage: u8,
         element: ValueType,
         super_type: Option<TypeId>,
     },

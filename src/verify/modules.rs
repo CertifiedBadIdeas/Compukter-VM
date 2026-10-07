@@ -96,6 +96,28 @@ fn verify_nominal_types(
     for (module_id, module) in artifact.modules.iter().enumerate() {
         for (type_id, nominal) in module.types.iter().enumerate() {
             let mut neighbors = Vec::new();
+            if let NominalType::Array {
+                element, storage, ..
+            } = nominal
+            {
+                if *storage != 0 {
+                    if artifact.header.runtime_minor < 14 {
+                        return Err(type_failure(
+                            limits,
+                            module_id,
+                            "explicit array storage requires Runtime ABI 1.14",
+                        ));
+                    }
+                    let expected_kind = if *storage == 6 { 2 } else { 1 };
+                    if *storage > 6 || element.kind != expected_kind {
+                        return Err(type_failure(
+                            limits,
+                            module_id,
+                            "array storage does not match element scalar kind",
+                        ));
+                    }
+                }
+            }
             match nominal {
                 NominalType::Class {
                     flags,
@@ -662,19 +684,24 @@ pub(super) fn value_types_match(
                 (
                     crate::artifact::NominalType::Array {
                         element: left_element,
+                        storage: left_storage,
                         ..
                     },
                     crate::artifact::NominalType::Array {
                         element: right_element,
+                        storage: right_storage,
                         ..
                     },
-                ) => value_types_match(
-                    artifact,
-                    left_identity.0,
-                    *left_element,
-                    right_identity.0,
-                    *right_element,
-                ),
+                ) => {
+                    left_storage == right_storage
+                        && value_types_match(
+                            artifact,
+                            left_identity.0,
+                            *left_element,
+                            right_identity.0,
+                            *right_element,
+                        )
+                }
                 _ => left_identity == right_identity,
             }
         } else {

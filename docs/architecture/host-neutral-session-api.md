@@ -231,3 +231,14 @@ External requests use computer-wide opaque IDs routed to their live process, tas
 Repeated pending requests retain the same external ID; successful resume removes its route. Child exit purges its
 routes, and late or duplicate completions cannot target another process. The bounded routing table supports responses
 to suspended parents and includes retained allocation capacity in mutable execution-resident resource accounting.
+
+## Primitive array storage (Runtime ABI 1.14)
+
+Array type records retain their existing element value type and optional superclass. Flags bit 0 still
+indicates the superclass; bits 1..3 encode payload storage: 0 natural width, 1 signed 8-bit, 2 signed
+16-bit, 3 unsigned 8-bit, 4 unsigned 16-bit, 5 unsigned 32-bit and 6 unsigned 64-bit. Tag 7 and
+other flag bits are invalid. Tags 1..5 require I32 elements; tag 6 requires I64. Explicit storage
+requires Runtime ABI 1.14. Scalar registers retain I32/I64 values; packed loads sign- or zero-extend
+and stores retain the low payload bits. Heap layout, quotas and sliced bulk copies use actual widths.
+Array assignment, imported signatures and bulk copies include storage in their compatibility checks.
+The artifact container format and native C ABI are unchanged.

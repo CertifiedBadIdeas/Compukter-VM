@@ -24,6 +24,14 @@ pub(super) fn load_value(
 ) -> Result<RuntimeValue, VmFault> {
     let bytes = heap.read_payload(reference, offset, width.bytes())?;
     Ok(match width {
+        ValueWidth::I8 => RuntimeValue::I32(i32::from(bytes[0] as i8)),
+        ValueWidth::U8 => RuntimeValue::I32(i32::from(bytes[0])),
+        ValueWidth::I16 => RuntimeValue::I32(i32::from(i16::from_le_bytes(
+            bytes[..2].try_into().unwrap(),
+        ))),
+        ValueWidth::U16 => RuntimeValue::I32(i32::from(u16::from_le_bytes(
+            bytes[..2].try_into().unwrap(),
+        ))),
         ValueWidth::Bool => RuntimeValue::Bool(bytes[0] != 0),
         ValueWidth::Char => RuntimeValue::Char(u16::from_le_bytes(bytes[..2].try_into().unwrap())),
         ValueWidth::I32 => RuntimeValue::I32(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
@@ -45,6 +53,12 @@ pub(super) fn store_value(
     value: RuntimeValue,
 ) -> Result<(), VmFault> {
     match (width, value) {
+        (ValueWidth::I8 | ValueWidth::U8, RuntimeValue::I32(value)) => {
+            heap.write_payload(reference, offset, &[value as u8])
+        }
+        (ValueWidth::I16 | ValueWidth::U16, RuntimeValue::I32(value)) => {
+            heap.write_payload(reference, offset, &(value as u16).to_le_bytes())
+        }
         (ValueWidth::Bool, RuntimeValue::Bool(value)) => {
             heap.write_payload(reference, offset, &[u8::from(value)])
         }
