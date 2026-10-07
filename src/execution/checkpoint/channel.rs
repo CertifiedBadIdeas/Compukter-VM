@@ -134,6 +134,76 @@ impl ChannelArena {
     }
 }
 
+impl ChannelArena {
+    pub(in crate::execution) fn validate_checkpoint_continuations(
+        &self,
+        scheduler: &crate::execution::task::TaskScheduler,
+        image: &crate::execution::image::ExecutionImage,
+        frames: &[crate::execution::machine::Frame],
+        depths: &[usize],
+    ) -> Result<()> {
+        use crate::execution::{
+            checkpoint::CheckpointError::InvalidState,
+            task::{TaskState, TaskWait},
+        };
+        let width = image.maximum_call_depth();
+        let mut waiting = std::collections::BTreeSet::new();
+        for (index, channel) in self.channels[..self.channel_count].iter().enumerate() {
+            for head in [channel.send_head, channel.receive_head] {
+                let mut slot = head;
+                while slot != NONE {
+                    let waiter = self.waiters.get(slot).ok_or(InvalidState)?;
+                    let task = waiter.task.ok_or(InvalidState)?;
+                    if scheduler.slot_of(task) != Some(slot)
+                        || scheduler.state(task)
+                            != Some(TaskState::Waiting(TaskWait::Channel(index as u32 + 1)))
+                        || !waiting.insert(task)
+                    {
+                        return Err(InvalidState);
+                    }
+                    let depth = *depths
+                        .get(slot)
+                        .filter(|depth| **depth > 0 && **depth <= width)
+                        .ok_or(InvalidState)?;
+                    let frame = frames.get(slot * width + depth - 1).ok_or(InvalidState)?;
+                    let (destination, resume) = match waiter.kind {
+                        WaitKind::Send { resume_block, .. } => (None, resume_block),
+                        WaitKind::Receive {
+                            destination,
+                            resume_block,
+                        } => (Some(destination), resume_block),
+                        WaitKind::None => return Err(InvalidState),
+                    };
+                    let function = image.function(frame.function).ok_or(InvalidState)?;
+                    if image
+                        .block(resume)
+                        .is_none_or(|block| block.function != frame.function)
+                        || destination.is_some_and(|destination| {
+                            function
+                                .registers
+                                .get(destination as usize)
+                                .is_none_or(|register| register.kind != 1)
+                        })
+                    {
+                        return Err(InvalidState);
+                    }
+                    slot = waiter.next;
+                }
+            }
+        }
+        for slot in 0..scheduler.capacity() {
+            if let Some((task, TaskState::Waiting(TaskWait::Channel(_)))) =
+                scheduler.checkpoint_task_at_slot(slot)
+            {
+                if !waiting.contains(&task) {
+                    return Err(InvalidState);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +277,39 @@ mod tests {
                 resume_block: 12
             },
             restored.send(handle, 0, TaskId::ROOT, 42, 13).unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_waiter_for_wrong_task_and_foreign_continuation() {
+        use crate::execution::{
+            fixtures, image::ExecutionImage, machine::Frame, task::TaskScheduler,
+        };
+        let image =
+            ExecutionImage::admit(fixtures::nested_call_artifact(), fixtures::profile()).unwrap();
+        let mut scheduler = TaskScheduler::new(2).unwrap();
+        scheduler.start_root().unwrap();
+        let mut channels = ChannelArena::new(1, 1, 2).unwrap();
+        let handle = channels.create(1).unwrap();
+        channels.send(handle, 0, TaskId::ROOT, 1, 0).unwrap();
+        channels.send(handle, 0, TaskId::ROOT, 2, 0).unwrap();
+        let frames = [Frame::test_entry(0), Frame::test_entry(0)];
+        let depths = [1, 0];
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            channels.validate_checkpoint_continuations(&scheduler, &image, &frames, &depths)
+        );
+        scheduler.suspend_channel(handle as u32).unwrap();
+        channels
+            .validate_checkpoint_continuations(&scheduler, &image, &frames, &depths)
+            .unwrap();
+        channels.waiters[0].kind = WaitKind::Send {
+            value: 2,
+            resume_block: usize::MAX,
+        };
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            channels.validate_checkpoint_continuations(&scheduler, &image, &frames, &depths)
         );
     }
 
