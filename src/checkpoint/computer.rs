@@ -21,6 +21,8 @@ use crate::execution::checkpoint::{
     checkpoint_struct, Checkpoint, CheckpointError, Reader, Result, Writer,
 };
 use crate::filesystem::ComputerId;
+#[path = "envelope.rs"]
+mod envelope;
 
 checkpoint_struct!(RetiredExecutionAccounting {
     fixed_guest_units,
@@ -58,6 +60,46 @@ pub(crate) struct ComputerCheckpointContext {
 }
 
 impl ComputerMachine {
+    pub(crate) fn write_checkpoint_envelope(
+        &self,
+        id: ComputerId,
+        host: &[u8],
+        limits: envelope::Limits,
+    ) -> Result<Vec<u8>> {
+        let mut writer = Writer::new(limits.execution_bytes);
+        self.write_checkpoint_state(id, &mut writer)?;
+        envelope::encode(
+            id,
+            self.filesystem.generation(),
+            &writer.finish(),
+            host,
+            limits,
+        )
+    }
+
+    pub(crate) fn read_checkpoint_envelope(
+        context: ComputerCheckpointContext,
+        bytes: &[u8],
+        limits: envelope::Limits,
+    ) -> Result<(Self, Vec<u8>)> {
+        let decoded = envelope::decode(bytes, context.id, limits)?;
+        let allocation = limits
+            .allocation_bytes
+            .checked_sub(decoded.host.len())
+            .ok_or(CheckpointError::Limit)?;
+        let mut reader = Reader::new(decoded.execution, limits.execution_bytes, allocation)?;
+        let machine = Self::read_checkpoint_state(context, &mut reader)?;
+        reader.finish()?;
+        if machine.filesystem.generation() != decoded.generation {
+            return Err(CheckpointError::InvalidState);
+        }
+        let mut host = Vec::new();
+        host.try_reserve_exact(decoded.host.len())
+            .map_err(|_| CheckpointError::Allocation)?;
+        host.extend_from_slice(decoded.host);
+        Ok((machine, host))
+    }
+
     fn checkpoint_binding_identity(bindings: &[OwnedCapabilityBinding]) -> Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         let mut writer = Writer::new(16 * 1024 * 1024);
@@ -376,6 +418,56 @@ mod tests {
         first_resources.mutable_execution_resident_bytes = 0;
         second_resources.mutable_execution_resident_bytes = 0;
         assert_eq!(first_resources, second_resources);
+    }
+
+    #[test]
+    fn checkpoint_envelope_restores_computer_and_binds_filesystem_generation() {
+        use sha2::{Digest, Sha256};
+        let mut original =
+            ComputerMachine::start(fixtures::nested_call_artifact(), profile(), &[], &[]).unwrap();
+        original
+            .advance_with_retirement_limit(32, 1, 64, 1)
+            .unwrap();
+        let limits = envelope::Limits {
+            execution_bytes: 32 * 1024 * 1024,
+            host_bytes: 4096,
+            allocation_bytes: 64 * 1024 * 1024,
+        };
+        let context = || ComputerCheckpointContext {
+            id: ID,
+            profile: original.profile.clone(),
+            process_limits: original.process_limits,
+            addon_bindings: original.addon_bindings.clone(),
+            filesystem: ComputerFileSystem::with_limits(*original.filesystem.limits()),
+            initial_file_capability: original.initial_file_capability.clone(),
+        };
+        let bytes = original
+            .write_checkpoint_envelope(ID, b"host resource descriptors", limits)
+            .unwrap();
+        let (restored, host) =
+            ComputerMachine::read_checkpoint_envelope(context(), &bytes, limits).unwrap();
+        assert_eq!(b"host resource descriptors", host.as_slice());
+        assert_same_state(&original, &restored);
+        let mut inconsistent = bytes.clone();
+        inconsistent[60..68].copy_from_slice(&17_u64.to_le_bytes());
+        let end = inconsistent.len() - 32;
+        let digest = Sha256::digest(&inconsistent[..end]);
+        inconsistent[end..].copy_from_slice(&digest);
+        assert!(matches!(
+            ComputerMachine::read_checkpoint_envelope(context(), &inconsistent, limits),
+            Err(CheckpointError::InvalidState)
+        ));
+        assert!(matches!(
+            ComputerMachine::read_checkpoint_envelope(
+                context(),
+                &bytes,
+                envelope::Limits {
+                    allocation_bytes: 0,
+                    ..limits
+                }
+            ),
+            Err(CheckpointError::Limit)
+        ));
     }
 
     #[test]
