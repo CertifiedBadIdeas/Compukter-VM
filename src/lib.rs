@@ -61,11 +61,12 @@ mod verify;
 
 pub use artifact::{EntryArguments, EntryPoint, VerifiedArtifact};
 pub use computer::{
-    CompilationRequest, CompilationSource, ComputerAdvanceOutcome, ComputerDirectoryEntry,
-    ComputerDirectoryListing, ComputerError, ComputerFileChunk, ComputerFileKind,
-    ComputerFileMetadata, ComputerFileReadError, ComputerFileStat, ComputerHostMerge,
-    ComputerHostMergeEntry, ComputerHostRequest, ComputerHostRequestBatch, ComputerMachine,
-    ComputerResourceSnapshot, ComputerStartError, ComputerTerminalEventKind, ComputerValue,
+    CompilationRequest, CompilationSource, ComputerAdvanceOutcome, ComputerCheckpointError,
+    ComputerCheckpointLimits, ComputerDirectoryEntry, ComputerDirectoryListing, ComputerError,
+    ComputerFileChunk, ComputerFileKind, ComputerFileMetadata, ComputerFileReadError,
+    ComputerFileStat, ComputerHostMerge, ComputerHostMergeEntry, ComputerHostRequest,
+    ComputerHostRequestBatch, ComputerMachine, ComputerResourceSnapshot,
+    ComputerRestoreEnvironment, ComputerStartError, ComputerTerminalEventKind, ComputerValue,
 };
 pub use deployment::{DeploymentCandidate, DeploymentFailure, HostDeployError, HostVerifyError};
 pub use diagnostic::{Code, Diagnostic, DiagnosticSet, Family, Location};

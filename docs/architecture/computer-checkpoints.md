@@ -1,6 +1,6 @@
 # Logical computer checkpoints
 
-The checkpoint codec is currently internal. No C ABI, JNI/FFM, or Minecraft lifecycle entry point exposes restoration yet. Internal world-store methods support bounded atomic publication and consumption.
+The Rust checkpoint API is available for host integration; game lifecycle support remains unfinished. No C ABI, JNI/FFM, or Minecraft lifecycle entry point exposes restoration yet. World-store methods support bounded atomic publication and consumption.
 
 Rust owns the logical execution payload. It stores verified executable bytes for the root and every live child, execution profiles and process limits, admitted capability identities, machine and session state, terminal and canonical input, redstone waits, exact `/home` namespace generation and immutable file bytes, and open handle generations. Admission rebuilds execution images from verified artifacts and checks state against those images and trusted host configuration. Rust layouts, addresses, allocation capacities, and process-local machine identity are not persisted.
 
@@ -13,3 +13,5 @@ The full filesystem payload is self-contained. Reattaching a persistent filesyst
 A full-computer test closes and reopens the store, rebuilds execution against its recovered filesystem, and resumes the same instruction/accounting state. A subprocess crash test covers every atomic write phase and successful retry over an abandoned temporary file. These are process interruption tests, not simulated power-loss durability evidence. Host settlement, consumption/reset policy, retained world-save generations and lifecycle wiring remain prerequisites for a supported durable contract.
 
 Pending compilation retains the exact validated source bytes captured when the request was issued. Reconstruction uses that immutable input even if the filesystem source changed while compilation was pending; the original source/output revision guards still decide whether publication is stale.
+
+`ComputerMachine::checkpoint` captures execution and opaque host descriptor bytes within `ComputerCheckpointLimits`. `restore_checkpoint` requires a `ComputerRestoreEnvironment` containing the expected computer ID, profile, process limits, freshly resolved capability schemas, filesystem and initial file capability. It returns a machine and host descriptors without executing Guest code. The caller must freeze and settle host actions before capture, validate/rebind restored descriptors, and durably consume the snapshot before advancing restored execution. Native admission does not enforce those host lifecycle obligations.
