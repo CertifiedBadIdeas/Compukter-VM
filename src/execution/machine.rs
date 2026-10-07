@@ -2323,7 +2323,38 @@ impl Machine {
                             destination: u16::MAX,
                             initializer: None,
                         };
+                        let caller = self.frames[frame_index];
+                        let caller_function = self
+                            .image
+                            .function(caller.function)
+                            .ok_or(RunError::NotRunnable)?;
                         for (parameter, source) in args.iter().enumerate() {
+                            if caller_function
+                                .registers
+                                .get(*source as usize)
+                                .is_some_and(|value| value.kind == 8)
+                            {
+                                let source = caller_function
+                                    .frame_layout
+                                    .values
+                                    .get(*source as usize)
+                                    .ok_or(RunError::NotRunnable)?;
+                                let destination = target_function
+                                    .frame_layout
+                                    .values
+                                    .get(parameter)
+                                    .ok_or(RunError::NotRunnable)?;
+                                if let Err(fault) = self.frame_arena.copy_value(
+                                    caller.base,
+                                    source,
+                                    child_frame.base,
+                                    destination,
+                                ) {
+                                    let _ = self.frame_arena.pop(reservation);
+                                    return Ok(self.fault(fault));
+                                }
+                                continue;
+                            }
                             let value = match self.read_register(frame_index, *source) {
                                 Ok(value) => value,
                                 Err(fault) => {
