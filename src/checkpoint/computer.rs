@@ -471,6 +471,132 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_store_reopens_complete_computer_and_discards_consumed_snapshot() {
+        use crate::{RomImage, StoreError, WorldFileSystemStore};
+        use sha2::{Digest, Sha256};
+        let filesystem_limits = FileSystemLimits::testing();
+        let mut rom = b"CPKTROM\0".to_vec();
+        rom.extend_from_slice(&1_u16.to_le_bytes());
+        rom.extend_from_slice(&0_u16.to_le_bytes());
+        rom.extend_from_slice(&0_u32.to_le_bytes());
+        rom.extend_from_slice(&Sha256::digest(&rom));
+        let rom = Arc::new(RomImage::admit(rom.into(), &filesystem_limits).unwrap());
+        let root = std::env::temp_dir().join(format!(
+            "compukters-computer-checkpoint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = WorldFileSystemStore::open(&root, filesystem_limits).unwrap();
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &filesystem_limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let mut filesystem = store.open_computer(ID, Arc::clone(&rom)).unwrap();
+        let file = VirtualPath::parse_utf8("/home/data", &filesystem_limits).unwrap();
+        filesystem
+            .write_file(&owner, &file, b"before hibernation", false)
+            .unwrap();
+        let mut original = ComputerMachine::start_in_filesystem(
+            fixtures::nested_call_artifact(),
+            profile(),
+            &[],
+            &[],
+            filesystem,
+            owner.clone(),
+        )
+        .unwrap();
+        original
+            .advance_with_retirement_limit(32, 1, 64, 1)
+            .unwrap();
+        original.terminal_mut().push_text("queued input").unwrap();
+        let limits = envelope::Limits {
+            execution_bytes: 32 * 1024 * 1024,
+            host_bytes: 4096,
+            allocation_bytes: 64 * 1024 * 1024,
+        };
+        let generation = original.filesystem_generation();
+        let bytes = original
+            .write_checkpoint_envelope(ID, b"paused timers", limits)
+            .unwrap();
+        assert_eq!(
+            Err(StoreError::Busy),
+            store.save_execution_checkpoint(ID, generation, &bytes, 1)
+        );
+        store
+            .save_execution_checkpoint(ID, generation, &bytes, bytes.len())
+            .unwrap();
+        assert_eq!(
+            Err(StoreError::StorageFaulted),
+            store.read_execution_checkpoint(ID, 1)
+        );
+        store.close().unwrap();
+        drop(store);
+        let store = WorldFileSystemStore::open(&root, filesystem_limits).unwrap();
+        let filesystem = store.open_computer(ID, Arc::clone(&rom)).unwrap();
+        let persisted = store
+            .read_execution_checkpoint(ID, bytes.len())
+            .unwrap()
+            .unwrap();
+        let (mut restored, host) = ComputerMachine::read_checkpoint_envelope(
+            ComputerCheckpointContext {
+                id: ID,
+                profile: profile(),
+                process_limits: original.process_limits,
+                addon_bindings: original.addon_bindings.clone(),
+                filesystem,
+                initial_file_capability: owner,
+            },
+            &persisted,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(b"paused timers", host.as_slice());
+        assert_same_state(&original, &restored);
+        store.discard_execution_checkpoint(ID).unwrap();
+        store.discard_execution_checkpoint(ID).unwrap();
+        assert!(store
+            .read_execution_checkpoint(ID, bytes.len())
+            .unwrap()
+            .is_none());
+        for _ in 0..64 {
+            let expected = original
+                .advance_with_retirement_limit(32, 1, 64, 1)
+                .unwrap();
+            assert_eq!(
+                expected,
+                restored
+                    .advance_with_retirement_limit(32, 1, 64, 1)
+                    .unwrap()
+            );
+            assert_same_state(&original, &restored);
+            if matches!(expected, ComputerAdvanceOutcome::Halted(_)) {
+                break;
+            }
+        }
+        assert_eq!(
+            b"before hibernation",
+            restored
+                .filesystem
+                .read_file_for_test(&file)
+                .unwrap()
+                .as_slice()
+        );
+        store.close().unwrap();
+        assert_eq!(
+            Err(StoreError::Closed),
+            store.read_execution_checkpoint(ID, bytes.len())
+        );
+        drop(restored);
+        drop(original);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn checkpoint_resumes_complete_computer_at_each_boundary_and_preserves_halted_state() {
         let mut original =
             ComputerMachine::start(fixtures::nested_call_artifact(), profile(), &[], &[]).unwrap();

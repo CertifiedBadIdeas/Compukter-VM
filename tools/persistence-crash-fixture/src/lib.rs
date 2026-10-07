@@ -158,6 +158,7 @@ pub fn parse_point(value: &str) -> Option<PersistenceCrashPoint> {
         "journal" => PersistenceAtomicTarget::Journal,
         "confirmed" => PersistenceAtomicTarget::Confirmed,
         "tombstone" => PersistenceAtomicTarget::Tombstone,
+        "execution-checkpoint" => PersistenceAtomicTarget::ExecutionCheckpoint,
         _ => return None,
     };
     let phase = match phase {
@@ -177,6 +178,7 @@ pub fn atomic_point_name(target: PersistenceAtomicTarget, phase: PersistenceAtom
         PersistenceAtomicTarget::Journal => "journal",
         PersistenceAtomicTarget::Confirmed => "confirmed",
         PersistenceAtomicTarget::Tombstone => "tombstone",
+        PersistenceAtomicTarget::ExecutionCheckpoint => "execution-checkpoint",
     };
     let phase = match phase {
         PersistenceAtomicPhase::TemporaryCreated => "temporary-created",
