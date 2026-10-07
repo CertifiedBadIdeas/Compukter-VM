@@ -1225,3 +1225,16 @@ fn inline_values_construct_extract_copy_and_return_through_nested_calls_without_
         assert_eq!(before.heap_used_bytes, after.heap_used_bytes);
     }
 }
+
+#[test]
+fn inline_task_arguments_preserve_components_across_spawn_and_join() {
+    let mut machine = fixtures::started_zero_arg(fixtures::inline_task_argument_artifact());
+    for _ in 0..32 {
+        match machine.run_slice(64, 0).unwrap() {
+            Outcome::SliceExhausted => {}
+            Outcome::Halted(Some(RuntimeValue::I32(42))) => return,
+            outcome => panic!("unexpected inline task outcome: {outcome:?}"),
+        }
+    }
+    panic!("inline task did not finish under bounded slices");
+}

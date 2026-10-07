@@ -7041,22 +7041,36 @@ fn install_function_blocks(
     artifact: &mut crate::artifact::DecodedArtifact,
     programs: Vec<Vec<Instruction>>,
 ) {
+    install_owned_blocks(
+        artifact,
+        programs
+            .into_iter()
+            .enumerate()
+            .map(|(owner, instructions)| (FunctionId(owner as u32), instructions))
+            .collect(),
+    );
+}
+
+fn install_owned_blocks(
+    artifact: &mut crate::artifact::DecodedArtifact,
+    programs: Vec<(FunctionId, Vec<Instruction>)>,
+) {
     let mut blocks = Vec::with_capacity(programs.len());
     let mut code = Vec::with_capacity(programs.len());
     let mut maximum_block_cost = 0;
-    for (function_id, instructions) in programs.into_iter().enumerate() {
+    for (block_id, (owner, instructions)) in programs.into_iter().enumerate() {
         let fixed_cost = instructions
             .iter()
             .map(|instruction| {
                 instruction
-                    .fixed_cost_for_values(&artifact.modules[0].functions[function_id].values)
+                    .fixed_cost_for_values(&artifact.modules[0].functions[owner.0 as usize].values)
                     .unwrap()
             })
             .sum();
         maximum_block_cost = maximum_block_cost.max(fixed_cost);
         blocks.push(Block {
-            owner_function: FunctionId(function_id as u32),
-            code_record: BlockId(function_id as u32),
+            owner_function: owner,
+            code_record: BlockId(block_id as u32),
             instruction_count: instructions.len() as u32,
             declared_fixed_cost: fixed_cost,
             flags: 0,
@@ -7588,4 +7602,110 @@ pub(super) fn inline_reference_root_artifact() -> VerifiedArtifact {
         );
         configure_stack(artifact, 0, 1);
     })
+}
+
+pub(super) fn inline_task_argument_artifact() -> VerifiedArtifact {
+    let mut artifact = inline_value_decoded(0);
+    artifact.header.semantic_features |= 0b10;
+    artifact.manifest.maximum_coroutines = 2;
+    let inline = artifact.modules[0].functions[0].values[3].semantic_type;
+    let module = &mut artifact.modules[0];
+    module.types[0] = NominalType::Function {
+        name: 1,
+        flags: 1,
+        result: primitive(1),
+        parameters: Vec::new(),
+    };
+    module.types[1] = NominalType::Function {
+        name: 1,
+        flags: 1,
+        result: primitive(0),
+        parameters: vec![inline],
+    };
+    module.types.push(plain_class(TypeId(u32::MAX), 0, 1));
+    module.declared_types += 1;
+    module.fields = vec![Field {
+        owner: TypeId(4),
+        name: 0,
+        value_type: primitive(1),
+        flags: 3,
+    }];
+    module.functions.truncate(2);
+    module.declared_functions = 2;
+    module.functions[0].flags = 1;
+    module.functions[0].block_count = 2;
+    module.functions[0].values[4] = crate::artifact::scalar_values(vec![primitive(1)]).remove(0);
+    module.functions[1].flags = 1;
+    module.functions[1].first_block = BlockId(2);
+    module.functions[1].register_count = 3;
+    module.functions[1]
+        .values
+        .push(crate::artifact::scalar_values(vec![primitive(1)]).remove(0));
+    install_owned_blocks(
+        &mut artifact,
+        vec![
+            (
+                FunctionId(0),
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 1,
+                    },
+                    Instruction::Const {
+                        dst: 2,
+                        constant: 2,
+                    },
+                    Instruction::InlineConstruct {
+                        dst: 3,
+                        components: Box::new([0, 1, 2]),
+                    },
+                    Instruction::CoroutineSpawn {
+                        dst: 4,
+                        function_ref: 1,
+                        args: Box::new([3]),
+                    },
+                    Instruction::CoroutineJoin {
+                        dst: u16::MAX,
+                        coroutine: 4,
+                        resume_block: 1,
+                    },
+                ],
+            ),
+            (
+                FunctionId(0),
+                vec![
+                    Instruction::StaticGet {
+                        dst: 5,
+                        field_ref: 0,
+                    },
+                    Instruction::Return { value: 5 },
+                ],
+            ),
+            (
+                FunctionId(1),
+                vec![
+                    Instruction::Move { dst: 1, src: 0 },
+                    Instruction::InlineComponent {
+                        dst: 2,
+                        src: 1,
+                        component: 0,
+                    },
+                    Instruction::StaticSet {
+                        field_ref: 0,
+                        value: 2,
+                    },
+                    Instruction::Return { value: u16::MAX },
+                ],
+            ),
+        ],
+    );
+    configure_stack(&mut artifact, 0, 1);
+    artifact.manifest.required_stack_bytes *= 2;
+    install_runtime_exception_dependencies(&mut artifact);
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
