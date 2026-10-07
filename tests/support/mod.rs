@@ -472,6 +472,49 @@ pub(crate) fn debug_vector() -> Vec<u8> {
     single_module_artifact(semantic_sections, Some((debug, 2)), 0, 0, 1, 2)
 }
 
+pub(crate) fn compact_debug_vector() -> Vec<u8> {
+    compact_debug_vector_with_debug(true)
+}
+
+pub(crate) fn compact_debug_vector_without_debug() -> Vec<u8> {
+    compact_debug_vector_with_debug(false)
+}
+
+fn compact_debug_vector_with_debug(include_debug: bool) -> Vec<u8> {
+    let original = debug_vector();
+    let count = u32::from_le_bytes(original[16..20].try_into().unwrap()) as usize;
+    let mut sections = Vec::new();
+    for id in 0..count {
+        let offset = HEADER_SIZE + id * DIRECTORY_ENTRY_SIZE;
+        let kind = u16::from_le_bytes(original[offset..offset + 2].try_into().unwrap());
+        let scope = u32::from_le_bytes(original[offset + 4..offset + 8].try_into().unwrap());
+        let start =
+            u64::from_le_bytes(original[offset + 8..offset + 16].try_into().unwrap()) as usize;
+        let length =
+            u64::from_le_bytes(original[offset + 16..offset + 24].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(original[offset + 24..offset + 28].try_into().unwrap());
+        if kind == 0x0110 && !include_debug {
+            continue;
+        }
+        let payload = if kind == 0x0110 {
+            let mut first = Vec::new();
+            let mut second = Vec::new();
+            for value in [0, 0, 0, 0, 5, u32::MAX, 0] {
+                push_u32(&mut first, value);
+            }
+            for value in [0, 0, 1, 6, 12, 0, 0] {
+                push_u32(&mut second, value);
+            }
+            indexed(&[&first, &second])
+        } else {
+            original[start..start + length].to_vec()
+        };
+        sections.push((kind, scope, payload, count));
+    }
+    sections.push((0x0111, 1, indexed(&[b"src/main.kts"]), 1));
+    assemble(sections, 0)
+}
+
 #[allow(dead_code)]
 pub(crate) fn host_runtime_code() -> Vec<u8> {
     let spawn = concat_frames(&[frame(0x50, 0, &[0, 0, 0, 0]), frame(0xe3, 0, &[0xff, 0xff])]);
@@ -735,7 +778,14 @@ fn assemble(sections: Vec<(u16, u32, Vec<u8>, u32)>, semantic_features: u32) -> 
     bytes.resize(HEADER_SIZE, 0);
     for (kind, scope, offset, length, count) in &entries {
         push_u16(&mut bytes, *kind);
-        push_u16(&mut bytes, if *kind == 0x0110 { 0 } else { 3 });
+        push_u16(
+            &mut bytes,
+            match *kind {
+                0x0110 => 0,
+                0x0111 => 1,
+                _ => 3,
+            },
+        );
         push_u32(&mut bytes, *scope);
         push_u64(&mut bytes, *offset as u64);
         push_u64(&mut bytes, *length as u64);

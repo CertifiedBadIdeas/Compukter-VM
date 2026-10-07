@@ -141,6 +141,22 @@ annotated tag. Neither command pushes or publishes anything. Archive names keep
 the descriptive `compukter-runtime-*` prefix; GitHub publishes only after the
 maintainer pushes the prepared `v0.X.Y` tag.
 
+## Compact source paths
+
+Source builds after Compukters issue [#704](https://github.com/CertifiedBadIdeas/Compukters/issues/704)
+accept both legacy inline-path DEBUG and compact DEBUG selected by the module
+DEBUG_PATHS section (`0x0111`). The indexed pool contains unique canonical UTF-8
+relative paths in first-use order; every entry is referenced. Compact DEBUG
+records are exactly seven little-endian u32 fields, with the final field holding
+a pool index. Source positions and inline parents retain their existing meaning.
+Pool bytes count against debug limits and are shared as artifact byte ranges.
+
+DEBUG_PATHS is critical but nonsemantic (flags 1): older readers reject it,
+while module semantic hashes and container format 3.0 stay unchanged. Semantic
+Runtime ABI 1.15 and native C ABI 20 do not signal this reader capability.
+Published 0.20.0 bundles lack it; consumers need updated source-built natives
+until a new immutable Runtime release is published and pinned.
+
 ## Golden fixtures
 
 The committed artifact v1 compatibility set lives in `tests/fixtures/`:

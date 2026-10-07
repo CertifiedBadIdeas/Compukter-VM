@@ -3976,7 +3976,7 @@ mod tests {
 
     #[test]
     fn process_oom_reports_details_and_releases_child_before_resuming_parent() {
-        for with_debug in [false, true] {
+        for (with_debug, compact) in [(false, false), (true, false), (true, true)] {
             let child = crate::execution::fixtures::array_allocation_artifact(1024 * 1024);
             let mut decoded = crate::decode::records::decode_artifact(
                 Arc::from(crate::test_encode::encode_artifact(child.decoded()).unwrap()),
@@ -3998,10 +3998,15 @@ mod tests {
                         start,
                         end: bytes.len(),
                     },
-                    source_position: None,
+                    source_position: compact.then_some((3, 8)),
                 });
                 decoded.bytes = bytes.into();
             }
+            let child_bytes = if compact {
+                crate::test_encode::encode_artifact_with_debug_paths(&decoded).unwrap()
+            } else {
+                crate::test_encode::encode_artifact(&decoded).unwrap()
+            };
             let limits = FileSystemLimits::testing();
             let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
             let mut filesystem = ComputerFileSystem::with_limits(limits);
@@ -4009,7 +4014,7 @@ mod tests {
                 .write_file(
                     &owner,
                     &path("/home/oom", filesystem.limits()),
-                    &crate::test_encode::encode_artifact(&decoded).unwrap(),
+                    &child_bytes,
                     true,
                 )
                 .unwrap();
@@ -4052,7 +4057,12 @@ mod tests {
             assert!(diagnostic.contains("Heap limit: 256 KiB"), "{diagnostic}");
             assert!(diagnostic.contains("Allocation: "), "{diagnostic}");
             assert!(diagnostic.contains("(array)"), "{diagnostic}");
-            if with_debug {
+            if compact {
+                assert!(
+                    diagnostic.contains("at entry (src/main.kt:3:8)"),
+                    "{diagnostic}"
+                );
+            } else if with_debug {
                 assert!(
                     diagnostic.contains("at entry (src/main.kt, UTF-16 offset 42)"),
                     "{diagnostic}"

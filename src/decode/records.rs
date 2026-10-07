@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use sha2::{Digest, Sha256};
 
@@ -233,6 +233,23 @@ pub(crate) fn decode_artifact(
             &mut total_utf16_literal_code_units,
             limits,
         )?;
+        let paths = if let Some(entry) = optional(&container, scope, format::DEBUG_PATHS) {
+            if optional(&container, scope, format::DEBUG).is_none() {
+                return Err(raw(Code::BadRecord, "debug path pool requires DEBUG"));
+            }
+            let section = IndexedSection::decode(&container, entry, limits)
+                .map_err(|error| single(limits, error))?;
+            add_to_limit(
+                &mut total_debug_bytes,
+                section.record_bytes_len(),
+                limits.debug_bytes,
+                limits,
+                "total debug byte limit exceeded",
+            )?;
+            Some(parse_debug_paths(&section)?)
+        } else {
+            None
+        };
         let mut debug = match optional(&container, scope, format::DEBUG) {
             Some(entry) => {
                 let section = IndexedSection::decode(&container, entry, limits)
@@ -244,7 +261,7 @@ pub(crate) fn decode_artifact(
                     limits,
                     "total debug byte limit exceeded",
                 )?;
-                parse_debug(&section, limits)?
+                parse_debug(&section, paths.as_deref(), limits)?
             }
             None => Vec::new(),
         };
@@ -782,8 +799,40 @@ fn parse_exceptions(
     })
 }
 
+fn parse_debug_paths(section: &IndexedSection<'_>) -> Result<Vec<ByteRange>, DiagnosticSet> {
+    if section.len() == 0 {
+        return Err(raw(Code::BadRecord, "debug path pool is empty"));
+    }
+    let mut unique = HashSet::new();
+    unique
+        .try_reserve(section.len())
+        .map_err(|_| raw(Code::LimitExceeded, "cannot reserve debug paths"))?;
+    let mut paths = Vec::new();
+    paths
+        .try_reserve_exact(section.len())
+        .map_err(|_| raw(Code::LimitExceeded, "cannot reserve debug paths"))?;
+    for id in 0..section.len() {
+        let record = section.record(id as u32).map_err(single_raw)?;
+        let path = std::str::from_utf8(record)
+            .map_err(|_| raw(Code::BadRecord, "debug path is not UTF-8"))?;
+        if !canonical_source_path(path) || !unique.insert(path) {
+            return Err(raw(
+                Code::BadRecord,
+                "debug path is noncanonical or duplicated",
+            ));
+        }
+        let range = section.record_range(id as u32).map_err(single_raw)?;
+        paths.push(ByteRange {
+            start: range.start,
+            end: range.end,
+        });
+    }
+    Ok(paths)
+}
+
 fn parse_debug(
     section: &IndexedSection<'_>,
+    paths: Option<&[ByteRange]>,
     limits: &ArtifactLimits,
 ) -> Result<Vec<DebugEntry>, DiagnosticSet> {
     if section.record_bytes_len() > limits.debug_bytes {
@@ -793,6 +842,7 @@ fn parse_debug(
     values
         .try_reserve_exact(section.len())
         .map_err(|_| raw(Code::LimitExceeded, "cannot reserve debug records"))?;
+    let mut used_paths = 0;
     for id in 0..section.len() {
         let record = section.record(id as u32).map_err(single_raw)?;
         let record_range = section.record_range(id as u32).map_err(single_raw)?;
@@ -803,12 +853,32 @@ fn parse_debug(
         let start_utf16 = ru32(&mut cursor)?;
         let end_utf16 = ru32(&mut cursor)?;
         let inline_parent = ru32(&mut cursor)?;
-        let path_length = ru32(&mut cursor)? as usize;
-        let path_start = cursor.position();
-        let source_path = cursor.read_utf8(path_length).map_err(single_raw)?;
-        if !canonical_source_path(source_path) {
-            return Err(raw(Code::BadRecord, "debug source path is not canonical"));
-        }
+        let path_value = ru32(&mut cursor)? as usize;
+        let source_path = if let Some(paths) = paths {
+            let range = paths
+                .get(path_value)
+                .ok_or_else(|| raw(Code::BadRecord, "debug path index is outside pool"))?;
+            if path_value > used_paths {
+                return Err(raw(
+                    Code::BadRecord,
+                    "debug paths are not in first-use order",
+                ));
+            }
+            if path_value == used_paths {
+                used_paths += 1;
+            }
+            *range
+        } else {
+            let path_start = cursor.position();
+            let path = cursor.read_utf8(path_value).map_err(single_raw)?;
+            if !canonical_source_path(path) {
+                return Err(raw(Code::BadRecord, "debug source path is not canonical"));
+            }
+            ByteRange {
+                start: record_range.start + path_start,
+                end: record_range.start + path_start + path_value,
+            }
+        };
         finish(
             &cursor,
             record,
@@ -821,12 +891,12 @@ fn parse_debug(
             start_utf16,
             end_utf16,
             inline_parent,
-            source_path: ByteRange {
-                start: record_range.start + path_start,
-                end: record_range.start + path_start + path_length,
-            },
+            source_path,
             source_position: None,
         });
+    }
+    if paths.is_some_and(|paths| used_paths != paths.len()) {
+        return Err(raw(Code::BadRecord, "debug path pool has unused entries"));
     }
     if values.windows(2).any(|pair| {
         (pair[0].function, pair[0].block, pair[0].instruction)
@@ -1654,6 +1724,44 @@ mod tests {
     }
 
     #[test]
+    fn compact_debug_paths_reject_empty_duplicate_and_noncanonical_pools() {
+        for records in [
+            vec![],
+            vec![b"src/a.kt".to_vec(), b"src/a.kt".to_vec()],
+            vec![b"../a.kt".to_vec()],
+            vec![vec![0xff]],
+        ] {
+            let (bytes, offsets) = table(&records, format::DEBUG_PATHS);
+            assert!(parse_debug_paths(&section(format::DEBUG_PATHS, &bytes, offsets)).is_err());
+        }
+    }
+
+    #[test]
+    fn compact_debug_requires_first_use_order_all_paths_and_exact_record_width() {
+        let limits = ArtifactLimits::default();
+        let paths = [
+            ByteRange { start: 0, end: 8 },
+            ByteRange { start: 8, end: 16 },
+        ];
+        for (id, extra) in [(1, false), (0, false), (0, true)] {
+            let mut record = Vec::new();
+            for value in [0, 0, 0, 1, 2, u32::MAX, id] {
+                u32(&mut record, value);
+            }
+            if extra {
+                record.push(0);
+            }
+            let (bytes, offsets) = table(&[record], format::DEBUG);
+            assert!(parse_debug(
+                &section(format::DEBUG, &bytes, offsets),
+                Some(&paths),
+                &limits
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn decodes_every_record_shape() {
         let limits = ArtifactLimits::default();
 
@@ -1838,7 +1946,7 @@ mod tests {
         }
         debug.extend(b"src/a.kt");
         let (bytes, offsets) = table(&[debug], format::DEBUG);
-        let values = parse_debug(&section(format::DEBUG, &bytes, offsets), &limits).unwrap();
+        let values = parse_debug(&section(format::DEBUG, &bytes, offsets), None, &limits).unwrap();
         assert_eq!(values[0].source_path.slice(&bytes), b"src/a.kt");
     }
 
