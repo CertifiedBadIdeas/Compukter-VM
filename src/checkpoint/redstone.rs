@@ -32,6 +32,11 @@ checkpoint_struct!(RedstoneDevice {
     maximum_waiters
 });
 impl RedstoneDevice {
+    pub(crate) fn checkpoint_waiters(&self) -> impl Iterator<Item = (TaskId, RequestId)> + '_ {
+        self.waiters
+            .iter()
+            .map(|waiter| (waiter.task, waiter.request))
+    }
     pub(crate) fn validate_checkpoint(&self, expected: &Self) -> Result<()> {
         let mut identities = std::collections::BTreeSet::new();
         if self.maximum_waiters != expected.maximum_waiters

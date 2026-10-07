@@ -23,6 +23,10 @@ checkpoint_enum!(InputMode { 0 => Raw; 1 => Canonical; });
 checkpoint_struct!(CanonicalInput { editing, ready });
 checkpoint_struct!(StandardStreams { input, owner, maximum_line_code_units, maximum_output_code_units } defaults { output: TerminalOutput, error: TerminalOutput });
 impl StandardStreams {
+    pub(crate) fn checkpoint_input_owner(&self) -> Option<(bool, InputOwner)> {
+        self.owner
+            .map(|(mode, owner)| (mode == InputMode::Canonical, owner))
+    }
     pub(crate) fn validate_checkpoint(&self, expected: &Self) -> Result<()> {
         if self.maximum_line_code_units != expected.maximum_line_code_units
             || self.maximum_output_code_units != expected.maximum_output_code_units
