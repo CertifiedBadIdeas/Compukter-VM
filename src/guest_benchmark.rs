@@ -70,8 +70,50 @@ struct Case {
 struct Measurement {
     create_ns: u128,
     hot_ns: u128,
+    create_cpu_ns: Option<u128>,
+    hot_cpu_ns: Option<u128>,
     create: Work,
     hot: Work,
+}
+
+// 64-bit Linux thread CPU time excludes time when this benchmark is descheduled.
+// Other platforms retain wall timings and leave CPU columns empty.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn thread_cpu_ns() -> Option<u128> {
+    use std::ffi::{c_int, c_long};
+
+    #[repr(C)]
+    struct Timespec {
+        seconds: c_long,
+        nanoseconds: c_long,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock_id: c_int, time: *mut Timespec) -> c_int;
+    }
+    let mut time = std::mem::MaybeUninit::<Timespec>::uninit();
+    // SAFETY: Linux clock_gettime writes a complete native timespec on success;
+    // the pointer is valid and CLOCK_THREAD_CPUTIME_ID is Linux clock ID 3.
+    let result = unsafe { clock_gettime(3, time.as_mut_ptr()) };
+    assert_eq!(result, 0, "thread CPU clock unavailable");
+    // SAFETY: clock_gettime returned success and initialized both fields.
+    let time = unsafe { time.assume_init() };
+    assert!(time.seconds >= 0 && (0..1_000_000_000).contains(&time.nanoseconds));
+    Some(time.seconds as u128 * 1_000_000_000 + time.nanoseconds as u128)
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn thread_cpu_ns() -> Option<u128> {
+    None
+}
+
+fn cpu_elapsed(start: Option<u128>) -> Option<u128> {
+    start
+        .zip(thread_cpu_ns())
+        .map(|(start, end)| end.checked_sub(start).expect("monotonic thread CPU clock"))
+}
+
+fn optional_ns(value: Option<u128>) -> String {
+    value.map_or_else(String::new, |value| value.to_string())
 }
 
 fn profile(heap_bytes: u32) -> ExecutionProfile {
@@ -143,18 +185,22 @@ fn run(case: &Case, heap: u32, traced: bool) -> Measurement {
     .expect("benchmark admission");
     session.start(&[]).expect("benchmark start");
     let before = session.accounting();
+    let cpu_start = thread_cpu_ns();
     let start = Instant::now();
     let (ready, task, text) = request(&mut session);
     let create_ns = start.elapsed().as_nanos();
+    let create_cpu_ns = cpu_elapsed(cpu_start);
     assert_eq!(text, "ready\n", "ready marker for {}", case.id);
     let create = Work::between(session.accounting(), before);
     let before = session.accounting();
     session
         .resume_for(task, ready, HostResponse::Success(HostValueInput::Unit))
         .expect("ready acknowledgement");
+    let cpu_start = thread_cpu_ns();
     let start = Instant::now();
     let (done, task, text) = request(&mut session);
     let hot_ns = start.elapsed().as_nanos();
+    let hot_cpu_ns = cpu_elapsed(cpu_start);
     assert_eq!(text, case.expected, "checksum for {}", case.id);
     let hot = Work::between(session.accounting(), before);
     session
@@ -170,6 +216,8 @@ fn run(case: &Case, heap: u32, traced: bool) -> Measurement {
                 return Measurement {
                     create_ns,
                     hot_ns,
+                    create_cpu_ns,
+                    hot_cpu_ns,
                     create,
                     hot,
                 };
@@ -264,7 +312,9 @@ fn main() {
         );
         assert_eq!(warmup.hot, control.hot, "operation work for {}", case.id);
     }
-    let mut raw = String::from("id\tmode\tsample\theap_bytes\tcreate_ns\thot_ns\n");
+    let mut raw = String::from(
+        "id\tmode\tsample\theap_bytes\tcreate_ns\thot_ns\tcreate_cpu_ns\thot_cpu_ns\n",
+    );
     for sample in 0..repetitions {
         for position in 0..cases.len() {
             let index = if sample % 2 == 0 {
@@ -287,19 +337,21 @@ fn main() {
                 );
             }
             raw.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.id,
                 args[4],
                 sample + 1,
                 heap,
                 measurement.create_ns,
-                measurement.hot_ns
+                measurement.hot_ns,
+                optional_ns(measurement.create_cpu_ns),
+                optional_ns(measurement.hot_cpu_ns)
             ));
             case.samples.push(measurement);
         }
         eprintln!("measurement round {}/{} complete", sample + 1, repetitions);
     }
-    let mut summary = String::from("id\tmode\tsamples\theap_bytes\tcreate_median_ns\thot_min_ns\thot_median_ns\thot_max_ns\thot_fixed_units\thot_dynamic_units\thot_maintenance_units\thot_blocks\thot_executed_instructions\thot_retired_instructions\thot_requests\thot_responses\n");
+    let mut summary = String::from("id\tmode\tsamples\theap_bytes\tcreate_median_ns\thot_min_ns\thot_median_ns\thot_max_ns\thot_fixed_units\thot_dynamic_units\thot_maintenance_units\thot_blocks\thot_executed_instructions\thot_retired_instructions\thot_requests\thot_responses\tcreate_cpu_median_ns\thot_cpu_median_ns\n");
     for case in cases {
         summary.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -323,7 +375,21 @@ fn main() {
         for count in case.samples[0].hot.0 {
             summary.push_str(&format!("\t{count}"));
         }
-        summary.push('\n');
+        summary.push_str(&format!(
+            "\t{}\t{}\n",
+            optional_ns(case.samples[0].create_cpu_ns.map(|_| {
+                median(
+                    case.samples
+                        .iter()
+                        .filter_map(|sample| sample.create_cpu_ns),
+                )
+            })),
+            optional_ns(
+                case.samples[0].hot_cpu_ns.map(|_| {
+                    median(case.samples.iter().filter_map(|sample| sample.hot_cpu_ns))
+                })
+            )
+        ));
     }
     fs::create_dir_all(outputs).expect("report directory");
     fs::write(outputs.join("samples.tsv"), raw).expect("sample report");
