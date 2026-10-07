@@ -2030,6 +2030,29 @@ pub(super) fn trace_cases() -> Vec<TraceCase> {
     ]
 }
 
+pub(crate) fn unsigned_operation_artifact(
+    register_kinds: &[u8],
+    parameters: usize,
+    instruction: Instruction,
+) -> VerifiedArtifact {
+    verified_blocks(
+        primitive(*register_kinds.last().unwrap()),
+        parameters,
+        register_kinds.iter().copied().map(primitive).collect(),
+        Vec::new(),
+        vec![(
+            0,
+            vec![
+                instruction,
+                Instruction::Return {
+                    value: (register_kinds.len() - 1) as u16,
+                },
+            ],
+        )],
+        1,
+    )
+}
+
 pub(super) fn scalar_cases() -> Vec<ScalarCase> {
     let case = |name, registers: Vec<ValueType>, args: Vec<RuntimeValue>, instruction, expected| {
         let instructions = vec![
@@ -2107,42 +2130,66 @@ pub(super) fn scalar_cases() -> Vec<ScalarCase> {
             "surrogate_character",
             vec![primitive(1), primitive(6)],
             vec![RuntimeValue::I32(0xd800)],
-            Instruction::Convert { dst: 1, src: 0 },
+            Instruction::Convert {
+                form: 0,
+                dst: 1,
+                src: 0,
+            },
             Ok(RuntimeValue::Char(0xd800)),
         ),
         case(
             "negative_i32_truncates_to_char",
             vec![primitive(1), primitive(6)],
             vec![RuntimeValue::I32(-1)],
-            Instruction::Convert { dst: 1, src: 0 },
+            Instruction::Convert {
+                form: 0,
+                dst: 1,
+                src: 0,
+            },
             Ok(RuntimeValue::Char(0xffff)),
         ),
         case(
             "i32_low_sixteen_bits_wrap_to_char",
             vec![primitive(1), primitive(6)],
             vec![RuntimeValue::I32(65_536)],
-            Instruction::Convert { dst: 1, src: 0 },
+            Instruction::Convert {
+                form: 0,
+                dst: 1,
+                src: 0,
+            },
             Ok(RuntimeValue::Char(0x0000)),
         ),
         case(
             "i64_to_f32_rounding",
             vec![primitive(2), primitive(3)],
             vec![RuntimeValue::I64(16_777_217)],
-            Instruction::Convert { dst: 1, src: 0 },
+            Instruction::Convert {
+                form: 0,
+                dst: 1,
+                src: 0,
+            },
             Ok(RuntimeValue::F32(16_777_216.0_f32.to_bits())),
         ),
         case(
             "f64_to_i32_saturation",
             vec![primitive(4), primitive(1)],
             vec![RuntimeValue::F64(f64::INFINITY.to_bits())],
-            Instruction::Convert { dst: 1, src: 0 },
+            Instruction::Convert {
+                form: 0,
+                dst: 1,
+                src: 0,
+            },
             Ok(RuntimeValue::I32(i32::MAX)),
         ),
         case(
             "char_to_i32",
             vec![primitive(6), primitive(1)],
             vec![RuntimeValue::Char(0xd800)],
-            Instruction::Convert { dst: 1, src: 0 },
+            Instruction::Convert {
+                form: 0,
+                dst: 1,
+                src: 0,
+            },
             Ok(RuntimeValue::I32(0xd800)),
         ),
         case(
@@ -2946,7 +2993,14 @@ pub(super) fn scalar_string_value_artifact(form: u8, value: Constant) -> Verifie
     };
     literal_string_program_blocks_configured(
         string,
-        vec![primitive(form), string],
+        vec![
+            primitive(match form {
+                8 => 1,
+                9 => 2,
+                _ => form,
+            }),
+            string,
+        ],
         vec![value],
         &[],
         vec![
@@ -2970,6 +3024,7 @@ pub(super) fn scalar_string_value_artifact(form: u8, value: Constant) -> Verifie
             2 => artifact.header.runtime_minor = 3,
             3 => artifact.header.runtime_minor = 4,
             4 => artifact.header.runtime_minor = 12,
+            8 | 9 => artifact.header.runtime_minor = 14,
             _ => {}
         },
     )
@@ -6911,6 +6966,13 @@ fn verified_blocks(
         function.values = crate::artifact::scalar_values(registers);
         function.first_block = BlockId(0);
         function.block_count = blocks.len() as u32;
+        if blocks.iter().any(|(_, instructions)| {
+            instructions
+                .iter()
+                .any(Instruction::uses_unsigned_semantics)
+        }) {
+            artifact.header.runtime_minor = 14;
+        }
         let mut block_records = Vec::new();
         let mut code_records = Vec::new();
         let mut maximum_block_cost = 0;

@@ -242,3 +242,15 @@ requires Runtime ABI 1.14. Scalar registers retain I32/I64 values; packed loads 
 and stores retain the low payload bits. Heap layout, quotas and sliced bulk copies use actual widths.
 Array assignment, imported signatures and bulk copies include storage in their compatibility checks.
 The artifact container format and native C ABI are unchanged.
+
+Runtime ABI 1.14 also admits unsigned numeric forms 8/9 with I32/I64 operands for arithmetic
+(`0x10`..`0x14`), equality/order (`0x20`..`0x25`) and decimal text (`0x68`). Integer registers
+retain raw bit patterns; unsigned division/remainder use unsigned magnitudes and zero divisors
+raise the existing managed arithmetic exception. Bitwise and shift instructions retain forms 1/2;
+unsigned right shifts use `shift_unsigned`. The `convert` opcode (`0x04`) adds a signedness mask:
+bit 0 treats an integer source as unsigned, bit 1 converts a floating source to an unsigned
+integer destination. Zero preserves the old signed contract. Integer narrowing keeps low bits;
+unsigned I32 widening zero-extends. Floating-to-unsigned conversion truncates and saturates,
+with NaN and negative values producing zero. Integer-to-F64 conversion rounds to nearest
+with ties to even; unsigned-to-F32 follows Kotlin standard-library conversion through F64. Readers and verifiers reject unknown masks, incompatible register kinds and
+unsigned forms below ABI 1.14. No unsigned register kinds or native ABI changes are introduced.

@@ -56,13 +56,15 @@ pub(crate) fn is_module(kind: u16) -> bool {
 
 pub(crate) fn valid_instruction_form(opcode: u8, form: u8) -> bool {
     match opcode {
-        0x10..=0x15 => matches!(form, 1..=4),
+        0x04 => matches!(form, 0..=3),
+        0x10..=0x14 => matches!(form, 1..=4 | 8 | 9),
+        0x15 => matches!(form, 1..=4),
         0x16..=0x1b => matches!(form, 1 | 2),
-        0x20..=0x21 => matches!(form, 1..=6),
-        0x22..=0x25 => matches!(form, 1..=4 | 6),
+        0x20..=0x21 => matches!(form, 1..=6 | 8 | 9),
+        0x22..=0x25 => matches!(form, 1..=4 | 6 | 8 | 9),
         0x26..=0x27 => form == 7,
         0x69 => matches!(form, 1..=7),
-        0x68 => matches!(form, 1..=7),
+        0x68 => matches!(form, 1..=9),
         _ => form == 0,
     }
 }

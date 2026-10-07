@@ -448,6 +448,14 @@ fn verify_instruction(
             "suspending terminator appears in a non-suspending function",
         ));
     }
+    if instruction.uses_unsigned_semantics() && artifact.header.runtime_minor < 14 {
+        return Err(type_failure(
+            limits,
+            module_id,
+            function_id,
+            "unsigned numeric forms require Runtime ABI 1.14",
+        ));
+    }
     match instruction {
         Instruction::Nop | Instruction::Jump { .. } | Instruction::Unreachable => {}
         Instruction::Move { dst, src } => {
@@ -502,11 +510,16 @@ fn verify_instruction(
             }
             write(state, *dst, function, module_id, function_id, limits)?;
         }
-        Instruction::Convert { dst, src } => {
+        Instruction::Convert { form, dst, src } => {
             read(function, state, *src, module_id, function_id, limits)?;
             let source = register_type(function, *src, module_id, function_id, limits)?;
             let destination = register_type(function, *dst, module_id, function_id, limits)?;
-            if !convertible(source.kind, destination.kind) {
+            if (*form != 0 && artifact.header.runtime_minor < 14)
+                || (*form & 1 != 0 && !matches!(source.kind, 1 | 2))
+                || (*form & 2 != 0 && !matches!(destination.kind, 1 | 2))
+                || (*form & 1 != 0 && destination.kind == 6)
+                || !convertible(source.kind, destination.kind)
+            {
                 return Err(type_failure(
                     limits,
                     module_id,
@@ -584,8 +597,22 @@ fn verify_instruction(
         } => {
             read(function, state, *lhs, module_id, function_id, limits)?;
             read(function, state, *rhs, module_id, function_id, limits)?;
-            require_kind(function, *dst, *form, module_id, function_id, limits)?;
-            require_kind(function, *lhs, *form, module_id, function_id, limits)?;
+            require_kind(
+                function,
+                *dst,
+                numeric_form_kind(*form),
+                module_id,
+                function_id,
+                limits,
+            )?;
+            require_kind(
+                function,
+                *lhs,
+                numeric_form_kind(*form),
+                module_id,
+                function_id,
+                limits,
+            )?;
             let rhs_kind = if matches!(
                 instruction,
                 Instruction::ShiftLeft { .. }
@@ -594,7 +621,7 @@ fn verify_instruction(
             ) {
                 1
             } else {
-                *form
+                numeric_form_kind(*form)
             };
             require_kind(function, *rhs, rhs_kind, module_id, function_id, limits)?;
             write(state, *dst, function, module_id, function_id, limits)?;
@@ -602,7 +629,14 @@ fn verify_instruction(
         Instruction::Neg { form, dst, src } => {
             read(function, state, *src, module_id, function_id, limits)?;
             require_kind(function, *src, *form, module_id, function_id, limits)?;
-            require_kind(function, *dst, *form, module_id, function_id, limits)?;
+            require_kind(
+                function,
+                *dst,
+                numeric_form_kind(*form),
+                module_id,
+                function_id,
+                limits,
+            )?;
             write(state, *dst, function, module_id, function_id, limits)?;
         }
         Instruction::Equal {
@@ -643,8 +677,22 @@ fn verify_instruction(
         } => {
             read(function, state, *lhs, module_id, function_id, limits)?;
             read(function, state, *rhs, module_id, function_id, limits)?;
-            require_kind(function, *lhs, *form, module_id, function_id, limits)?;
-            require_kind(function, *rhs, *form, module_id, function_id, limits)?;
+            require_kind(
+                function,
+                *lhs,
+                numeric_form_kind(*form),
+                module_id,
+                function_id,
+                limits,
+            )?;
+            require_kind(
+                function,
+                *rhs,
+                numeric_form_kind(*form),
+                module_id,
+                function_id,
+                limits,
+            )?;
             require_kind(function, *dst, 5, module_id, function_id, limits)?;
             write(state, *dst, function, module_id, function_id, limits)?;
         }
@@ -1289,7 +1337,7 @@ fn verify_instruction(
                     "Double text and hashing require Runtime ABI 1.12",
                 ));
             }
-            if !matches!(form, 1..=7) {
+            if !matches!(form, 1..=9) {
                 return Err(type_failure(
                     limits,
                     module_id,
@@ -1306,7 +1354,14 @@ fn verify_instruction(
                 ));
             }
             read(function, state, *source, module_id, function_id, limits)?;
-            require_kind(function, *source, *form, module_id, function_id, limits)?;
+            require_kind(
+                function,
+                *source,
+                numeric_form_kind(*form),
+                module_id,
+                function_id,
+                limits,
+            )?;
             require_string(artifact, function, *dst, module_id, function_id, limits)?;
             write(state, *dst, function, module_id, function_id, limits)?;
         }
@@ -2189,4 +2244,12 @@ fn single(diagnostic: Diagnostic) -> DiagnosticSet {
     let mut errors = DiagnosticSet::new(1);
     errors.push(diagnostic);
     errors
+}
+
+fn numeric_form_kind(form: u8) -> u8 {
+    match form {
+        8 => 1,
+        9 => 2,
+        _ => form,
+    }
 }

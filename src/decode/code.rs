@@ -107,6 +107,7 @@ fn decode_instruction(
             dst: reg(&mut cursor, offset)?,
         },
         0x04 => Instruction::Convert {
+            form,
             dst: reg(&mut cursor, offset)?,
             src: reg(&mut cursor, offset)?,
         },

@@ -1206,9 +1206,13 @@ fn scalar_units(
 ) -> Result<([u16; INLINE_SCALAR_UNITS], u8, u8), TextError> {
     let mut units = [0_u16; INLINE_SCALAR_UNITS];
     match (form, value) {
-        (1, RuntimeValue::I32(value)) => {
-            let negative = value < 0;
-            let mut magnitude = value.unsigned_abs();
+        (1 | 8, RuntimeValue::I32(value)) => {
+            let negative = form == 1 && value < 0;
+            let mut magnitude = if form == 8 {
+                value as u32
+            } else {
+                value.unsigned_abs()
+            };
             let mut start = units.len();
             loop {
                 start -= 1;
@@ -1224,9 +1228,13 @@ fn scalar_units(
             }
             Ok((units, start as u8, (units.len() - start) as u8))
         }
-        (2, RuntimeValue::I64(value)) => {
-            let negative = value < 0;
-            let mut magnitude = value.unsigned_abs();
+        (2 | 9, RuntimeValue::I64(value)) => {
+            let negative = form == 2 && value < 0;
+            let mut magnitude = if form == 9 {
+                value as u64
+            } else {
+                value.unsigned_abs()
+            };
             let mut start = units.len();
             loop {
                 start -= 1;

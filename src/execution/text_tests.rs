@@ -145,6 +145,26 @@ fn string_concat_creates_a_fresh_compact_dynamic_string() {
 #[test]
 fn scalar_string_conversion_matches_kotlin_representations() {
     let cases = [
+        (
+            8,
+            Constant::I32(-1),
+            "4294967295".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            8,
+            Constant::I32(i32::MIN),
+            "2147483648".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            9,
+            Constant::I64(-1),
+            "18446744073709551615".encode_utf16().collect::<Vec<_>>(),
+        ),
+        (
+            9,
+            Constant::I64(i64::MIN),
+            "9223372036854775808".encode_utf16().collect::<Vec<_>>(),
+        ),
         (1, Constant::I32(0), "0".encode_utf16().collect::<Vec<_>>()),
         (
             1,

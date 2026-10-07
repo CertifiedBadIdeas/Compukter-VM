@@ -115,6 +115,7 @@ pub(super) enum ResolvedInstruction {
         dst: u16,
     },
     Convert {
+        form: u8,
         dst: u16,
         src: u16,
     },
@@ -2000,7 +2001,8 @@ fn resolve_instruction(
                 .ok_or(AdmissionError::StoragePlanOverflow)?,
         },
         Instruction::Null { dst } => ResolvedInstruction::Null { dst: *dst },
-        Instruction::Convert { dst, src } => ResolvedInstruction::Convert {
+        Instruction::Convert { form, dst, src } => ResolvedInstruction::Convert {
+            form: *form,
             dst: *dst,
             src: *src,
         },
