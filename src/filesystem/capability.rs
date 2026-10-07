@@ -96,3 +96,7 @@ impl FileCapability {
         self.handle_limit
     }
 }
+
+#[path = "../checkpoint/filesystem_capability.rs"]
+#[allow(dead_code)]
+mod checkpoint_state;

@@ -106,6 +106,16 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    pub(crate) fn arc_bytes(&mut self, maximum: usize) -> Result<std::sync::Arc<[u8]>> {
+        let length = usize::read(self)?;
+        if length > maximum {
+            return Err(CheckpointError::Limit);
+        }
+        self.allocate::<u8>(length)?;
+        self.allocate::<usize>(2)?;
+        Ok(std::sync::Arc::from(self.take(length)?))
+    }
+
     pub(crate) fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if self.depth == 64 {
             return Err(CheckpointError::Limit);
@@ -212,6 +222,16 @@ impl Checkpoint for bool {
             1 => Ok(true),
             _ => Err(CheckpointError::InvalidState),
         }
+    }
+}
+
+impl Checkpoint for std::sync::Arc<[u8]> {
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        self.len().write(writer)?;
+        writer.put(self)
+    }
+    fn read(reader: &mut Reader<'_>) -> Result<Self> {
+        reader.arc_bytes(usize::MAX)
     }
 }
 
