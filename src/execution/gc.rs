@@ -398,3 +398,6 @@ impl Collector {
         self.last_action
     }
 }
+
+#[path = "checkpoint/gc.rs"]
+mod checkpoint_state;

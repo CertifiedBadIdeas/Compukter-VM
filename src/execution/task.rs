@@ -363,3 +363,6 @@ mod tests {
         );
     }
 }
+
+#[path = "checkpoint/task.rs"]
+mod checkpoint_state;

@@ -231,3 +231,6 @@ mod tests {
         assert!(core::mem::size_of::<RunError>() <= 32);
     }
 }
+
+#[path = "checkpoint/error.rs"]
+mod checkpoint_state;

@@ -414,3 +414,6 @@ mod tests {
         );
     }
 }
+
+#[path = "checkpoint/layout.rs"]
+mod checkpoint_state;

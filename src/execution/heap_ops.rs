@@ -165,3 +165,6 @@ impl PendingAllocation {
         heap.abort(self.state().reservation)
     }
 }
+
+#[path = "checkpoint/heap_ops.rs"]
+mod checkpoint_state;
