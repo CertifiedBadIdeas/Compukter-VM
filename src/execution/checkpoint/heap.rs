@@ -61,6 +61,30 @@ checkpoint_struct!(Heap {
 /// Validate the allocator independently of object layouts. Object references and
 /// partial collector cursors are checked by the image-aware machine validator.
 impl Heap {
+    pub(in crate::execution) fn checkpoint_reservation_capacity(
+        &self,
+        reservation: ReservedAllocation,
+    ) -> Result<u32> {
+        let mut offset = 0_u32;
+        while offset < self.arena_bytes {
+            let block = BlockOffset(offset);
+            let size = self
+                .block_size(block)
+                .map_err(|_| CheckpointError::InvalidState)?;
+            if block == reservation.block {
+                self.validate_reservation(reservation)
+                    .map_err(|_| CheckpointError::InvalidState)?;
+                return size
+                    .checked_sub(self.payload_offset())
+                    .ok_or(CheckpointError::InvalidState);
+            }
+            offset = offset
+                .checked_add(size)
+                .ok_or(CheckpointError::InvalidState)?;
+        }
+        Err(CheckpointError::InvalidState)
+    }
+
     pub(crate) fn validate_checkpoint(&self, plan: &StoragePlan) -> Result<()> {
         let invalid = || CheckpointError::InvalidState;
         if self.header_format != plan.header_format

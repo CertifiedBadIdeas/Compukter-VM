@@ -34,3 +34,40 @@ checkpoint_enum!(PendingAllocation {
     1 => Exception(v0);
     2 => Array { state, length };
 });
+
+impl PendingAllocation {
+    pub(in crate::execution) fn validate_checkpoint(
+        self,
+        image: &super::super::image::ExecutionImage,
+        heap: &Heap,
+    ) -> crate::execution::checkpoint::Result<u16> {
+        use super::super::layout::{array_layout, RuntimeTypeLayout};
+        use crate::execution::checkpoint::CheckpointError;
+        let state = self.state();
+        let ty = (0..image.type_count())
+            .filter_map(|index| image.type_key(index))
+            .find(|ty| image.type_id(*ty) == Some(state.request.type_id))
+            .ok_or(CheckpointError::InvalidState)?;
+        let (block_bytes, payload_bytes) = match (self, image.type_layout(ty)) {
+            (Self::Object(_) | Self::Exception(_), Some(RuntimeTypeLayout::Object(layout))) => {
+                (layout.block_bytes, layout.payload_bytes)
+            }
+            (Self::Array { length, .. }, Some(RuntimeTypeLayout::Array { element })) => {
+                let layout = array_layout(*element, length as i32, heap.header_format())
+                    .map_err(|_| CheckpointError::InvalidState)?;
+                (layout.block_bytes, layout.payload_bytes)
+            }
+            _ => return Err(CheckpointError::InvalidState),
+        };
+        if !state.fixed_cost_paid
+            || state.request.block_bytes != block_bytes
+            || state.reservation.type_id != state.request.type_id
+            || state.logical_bytes != payload_bytes
+            || state.initialized_bytes > payload_bytes
+            || heap.checkpoint_reservation_capacity(state.reservation)? < payload_bytes
+        {
+            return Err(CheckpointError::InvalidState);
+        }
+        Ok(state.destination)
+    }
+}

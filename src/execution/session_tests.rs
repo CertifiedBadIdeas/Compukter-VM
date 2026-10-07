@@ -1397,7 +1397,7 @@ fn object_collection_active_frame_measurement() {
     fs::write(report, output).unwrap();
 }
 
-fn record_schema() -> super::host::HostRecordSchema {
+pub(super) fn record_schema() -> super::host::HostRecordSchema {
     use super::host::{HostRecordField, HostRecordSchema};
     HostRecordSchema {
         type_name: "fixture.Snapshot".into(),
@@ -1428,7 +1428,7 @@ fn record_schema() -> super::host::HostRecordSchema {
     }
 }
 
-fn record_value(bits: u64, units: usize) -> super::host::HostRecordValue {
+pub(super) fn record_value(bits: u64, units: usize) -> super::host::HostRecordValue {
     use super::host::{HostRecordMember, HostRecordScalar as Value, HostRecordValue};
     HostRecordValue {
         type_name: "fixture.Snapshot".into(),
