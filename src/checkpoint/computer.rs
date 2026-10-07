@@ -46,6 +46,7 @@ checkpoint_struct!(CompilationTransaction {
     owner_depth,
     source,
     source_revision,
+    source_bytes,
     output,
     output_revision
 });
@@ -365,6 +366,8 @@ impl ComputerMachine {
                     self.filesystem.limits(),
                 )
                 .is_err()
+                || compilation.source_bytes.len() > MAXIMUM_COMPILER_SOURCE_BYTES
+                || std::str::from_utf8(&compilation.source_bytes).is_err()
                 || compilation.source_revision > self.filesystem.generation()
                 || compilation
                     .output_revision
@@ -767,6 +770,38 @@ mod tests {
             }
         }
         panic!("compilation did not complete");
+    }
+
+    #[test]
+    fn checkpoint_pins_compiler_input_when_source_changes_during_compilation() {
+        use crate::computer::tests::{compiler_computer, next_compilation_request};
+        let (mut original, owner, source, _) = compiler_computer(b"fun main() = 42", None);
+        let request = next_compilation_request(&mut original);
+        original
+            .filesystem
+            .write_file(&owner, &source, b"fun main() = 13", false)
+            .unwrap();
+        let mut restored = round_trip(&original);
+        assert_eq!(
+            Some(request.clone()),
+            restored.pending_compilation_request()
+        );
+        let compiled = fixtures::two_block_artifact(1, 1);
+        restored
+            .complete_compilation_success(request.token, &compiled.decoded().bytes)
+            .unwrap();
+        assert!(restored.pending_compilation_request().is_none());
+        for _ in 0..128 {
+            match restored.advance(64, 64, u32::MAX).unwrap() {
+                ComputerAdvanceOutcome::Halted(value) => {
+                    assert_eq!(Some(ComputerValue::I32(COMPILATION_STATUS_STALE)), value);
+                    return;
+                }
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        panic!("stale compilation did not return");
     }
 
     #[test]

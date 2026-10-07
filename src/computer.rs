@@ -377,6 +377,7 @@ struct CompilationTransaction {
     owner_depth: usize,
     source: VirtualPath,
     source_revision: u64,
+    source_bytes: Box<[u8]>,
     output: VirtualPath,
     output_revision: ExecutableRevision,
 }
@@ -605,6 +606,13 @@ impl ComputerMachine {
                 .saturating_mul(std::mem::size_of::<ExternalRequestRoute>() as u64),
             &mut snapshot.counters_saturated,
         );
+        if let Some(compilation) = &self.pending_compilation {
+            add_counter(
+                &mut snapshot.mutable_execution_resident_bytes,
+                compilation.source_bytes.len() as u64,
+                &mut snapshot.counters_saturated,
+            );
+        }
         for frame in &self.sessions {
             let resource = frame.session.resource_snapshot();
             add_counter(
@@ -2104,6 +2112,7 @@ impl ComputerMachine {
             owner_depth: self.sessions.len(),
             source: source.clone(),
             source_revision: source_metadata.generation,
+            source_bytes: source_bytes.clone().into_boxed_slice(),
             output,
             output_revision,
         });
@@ -2128,6 +2137,20 @@ impl ComputerMachine {
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
         self.finish_compilation_request(task, id, COMPILATION_STATUS_REJECTED, diagnostic)?;
         Ok(ComputerAdvanceOutcome::SliceExhausted)
+    }
+
+    /// Reconstructs the same pure compiler input after restoring execution.
+    pub fn pending_compilation_request(&self) -> Option<CompilationRequest> {
+        let transaction = self.pending_compilation.as_ref()?;
+        Some(CompilationRequest {
+            version: COMPILATION_WIRE_VERSION,
+            token: transaction.token,
+            sources: vec![CompilationSource {
+                path: transaction.source.to_string().into(),
+                utf8: transaction.source_bytes.clone(),
+            }]
+            .into_boxed_slice(),
+        })
     }
 
     pub fn complete_compilation_success(
