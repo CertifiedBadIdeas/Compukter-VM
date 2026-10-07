@@ -28,6 +28,7 @@ pub(crate) const UTF16_LITERALS: u16 = 0x010a;
 pub(crate) const SAFEPOINT_ROOTS: u16 = 0x010b;
 pub(crate) const DEBUG: u16 = 0x0110;
 pub(crate) const DEBUG_PATHS: u16 = 0x0111;
+pub(crate) const SAFEPOINT_ROOT_RANGES: u16 = 0x0112;
 pub(crate) const DEBUG_SOURCE_POSITIONS: u16 = 0x8001;
 pub(crate) const OPTIONAL_EXTENSION_START: u16 = 0x8000;
 
@@ -52,6 +53,7 @@ pub(crate) fn is_module(kind: u16) -> bool {
             | SAFEPOINT_ROOTS
             | DEBUG
             | DEBUG_PATHS
+            | SAFEPOINT_ROOT_RANGES
             | DEBUG_SOURCE_POSITIONS
     )
 }

@@ -21,18 +21,25 @@ type Section = (u16, u32, Vec<u8>, u32);
 type ModuleSection = (u16, Vec<u8>, u32);
 
 pub(crate) fn encode_artifact(artifact: &DecodedArtifact) -> Result<Vec<u8>, EncodeError> {
-    encode_artifact_debug(artifact, false)
+    encode_artifact_debug(artifact, false, false)
 }
 
 pub(crate) fn encode_artifact_with_debug_paths(
     artifact: &DecodedArtifact,
 ) -> Result<Vec<u8>, EncodeError> {
-    encode_artifact_debug(artifact, true)
+    encode_artifact_debug(artifact, true, false)
+}
+
+pub(crate) fn encode_artifact_with_root_ranges(
+    artifact: &DecodedArtifact,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_artifact_debug(artifact, false, true)
 }
 
 fn encode_artifact_debug(
     artifact: &DecodedArtifact,
     compact: bool,
+    compact_roots: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     let mut encoded_modules = Vec::new();
     encoded_modules
@@ -79,6 +86,45 @@ fn encode_artifact_debug(
                 .into_iter()
                 .map(|(kind, payload, count)| (kind, scope, payload, count)),
         );
+        if compact_roots && !decoded.safepoint_roots.is_empty() {
+            let section = sections
+                .iter_mut()
+                .find(|(kind, owner, _, _)| *kind == format::SAFEPOINT_ROOTS && *owner == scope)
+                .unwrap();
+            let canonical_length = section.2.len();
+            let mut runs: Vec<(&SafepointRoots, u32)> = Vec::new();
+            for row in &decoded.safepoint_roots {
+                if let Some((previous, count)) = runs.last_mut() {
+                    if previous.function == row.function
+                        && previous.block == row.block
+                        && previous.instruction_boundary.checked_add(*count)
+                            == Some(row.instruction_boundary)
+                        && previous.references == row.references
+                    {
+                        *count += 1;
+                        continue;
+                    }
+                }
+                runs.push((row, 1));
+            }
+            let records: Vec<_> = runs
+                .iter()
+                .map(|(row, count)| {
+                    let legacy = encode_safepoint_roots(row);
+                    let mut record = legacy[..12].to_vec();
+                    u32le(&mut record, *count);
+                    record.extend_from_slice(&legacy[12..]);
+                    record
+                })
+                .collect();
+            section.3 = records.len() as u32;
+            section.2 = indexed(records)?;
+            let mut marker = Vec::new();
+            u32le(&mut marker, 1);
+            u32le(&mut marker, decoded.safepoint_roots.len() as u32);
+            u64le(&mut marker, canonical_length as u64);
+            sections.push((format::SAFEPOINT_ROOT_RANGES, scope, marker, 1));
+        }
         if !decoded.debug.is_empty() {
             let mut paths: Vec<Vec<u8>> = Vec::new();
             let records = decoded
@@ -131,6 +177,7 @@ fn encode_artifact_debug(
             }
         }
     }
+    sections.sort_by_key(|(kind, scope, _, _)| (*scope, *kind));
     assemble(
         sections,
         artifact.header.runtime_major,
@@ -1286,7 +1333,7 @@ fn assemble(
             &mut bytes,
             if matches!(*kind, format::DEBUG | format::DEBUG_SOURCE_POSITIONS) {
                 0
-            } else if *kind == format::DEBUG_PATHS {
+            } else if matches!(*kind, format::DEBUG_PATHS | format::SAFEPOINT_ROOT_RANGES) {
                 format::CRITICAL
             } else {
                 format::KNOWN_FLAGS
