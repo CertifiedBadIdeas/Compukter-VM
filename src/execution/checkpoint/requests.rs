@@ -18,7 +18,7 @@
 
 use super::*;
 use crate::execution::checkpoint::{
-    checkpoint_enum, checkpoint_struct, Checkpoint, Reader, Result, Writer,
+    checkpoint_enum, checkpoint_struct, Checkpoint, CheckpointError, Reader, Result, Writer,
 };
 
 checkpoint_struct!(HostRequestIdentity { task, request });
@@ -65,3 +65,52 @@ checkpoint_struct!(PendingRequestTable {
     total_utf16,
     total_merge_entries
 });
+
+impl PendingRequestTable {
+    pub(crate) fn validate_checkpoint(&self, expected: &Self) -> Result<()> {
+        if self.limits != expected.limits || self.requests.len() > self.limits.maximum_requests {
+            return Err(CheckpointError::InvalidState);
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        let mut arguments = 0_usize;
+        let mut utf16 = 0_usize;
+        let mut merges = 0_usize;
+        for request in &self.requests {
+            let identity = request.identity;
+            if identity.task.get() == 0
+                || identity.request.get() == 0
+                || !identities.insert((identity.task, identity.request))
+                || request.arguments.len() > self.limits.maximum_arguments_per_request
+                || request.utf16.len() > self.limits.maximum_utf16_per_request
+                || request.merge_entry_count() > self.limits.maximum_merge_entries_per_request
+                || request.arguments.iter().any(|slot| match slot {
+                    HostValueSlot::String { start, length } => start
+                        .checked_add(*length)
+                        .is_none_or(|end| end as usize > request.utf16.len()),
+                    _ => false,
+                })
+            {
+                return Err(CheckpointError::InvalidState);
+            }
+            arguments = arguments
+                .checked_add(request.arguments.len())
+                .ok_or(CheckpointError::Limit)?;
+            utf16 = utf16
+                .checked_add(request.utf16.len())
+                .ok_or(CheckpointError::Limit)?;
+            merges = merges
+                .checked_add(request.merge_entry_count())
+                .ok_or(CheckpointError::Limit)?;
+        }
+        if arguments != self.total_arguments
+            || arguments > self.limits.maximum_total_arguments
+            || utf16 != self.total_utf16
+            || utf16 > self.limits.maximum_total_utf16
+            || merges != self.total_merge_entries
+            || merges > self.limits.maximum_total_merge_entries
+        {
+            return Err(CheckpointError::InvalidState);
+        }
+        Ok(())
+    }
+}
