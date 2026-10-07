@@ -88,6 +88,13 @@ impl ComputerFileSystem {
     }
 
     pub(crate) fn write_checkpoint_state(&self, id: ComputerId, writer: &mut Writer) -> Result<()> {
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.computer_id() != id)
+        {
+            return Err(CheckpointError::Incompatible);
+        }
         self.limits.write(writer)?;
         self.checkpoint_rom_identity()?.write(writer)?;
         let nodes = self.checkpoint_home_nodes()?;
@@ -125,6 +132,13 @@ impl ComputerFileSystem {
         id: ComputerId,
         reader: &mut Reader<'_>,
     ) -> Result<Self> {
+        if expected
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.computer_id() != id)
+        {
+            return Err(CheckpointError::Incompatible);
+        }
         let limits = FileSystemLimits::read(reader)?;
         let rom: [u8; 32] = LogicalCheckpoint::read(reader)?;
         if limits != expected.limits || rom != expected.checkpoint_rom_identity()? {

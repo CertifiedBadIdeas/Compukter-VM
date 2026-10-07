@@ -172,9 +172,9 @@ impl WorldFileSystemStore {
         Ok(filesystem)
     }
 
-    // Internal until ComputerMachine/host admission and the native transport are wired.
-    #[allow(dead_code)]
-    pub(crate) fn save_execution_checkpoint(
+    /// Publishes a native checkpoint after its filesystem generation is durable.
+    /// The caller must freeze the computer and settle host mutations first.
+    pub fn save_execution_checkpoint(
         &self,
         id: ComputerId,
         generation: u64,
@@ -205,8 +205,8 @@ impl WorldFileSystemStore {
             .map_err(|_| StoreError::Io)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn read_execution_checkpoint(
+    /// Reads opaque bounded bytes; ComputerMachine validates identity and execution.
+    pub fn read_execution_checkpoint(
         &self,
         id: ComputerId,
         maximum_bytes: usize,
@@ -252,8 +252,8 @@ impl WorldFileSystemStore {
         Ok(Some(bytes))
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn discard_execution_checkpoint(&self, id: ComputerId) -> Result<(), StoreError> {
+    /// Consumes/reset-discards a snapshot before its restored execution can dispatch.
+    pub fn discard_execution_checkpoint(&self, id: ComputerId) -> Result<(), StoreError> {
         let health = self
             .health
             .lock()

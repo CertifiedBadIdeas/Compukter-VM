@@ -37,7 +37,7 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
-    fn total_bytes(self) -> Result<usize> {
+    pub(super) fn total_bytes(self) -> Result<usize> {
         HEADER_BYTES
             .checked_add(self.execution_bytes)
             .and_then(|value| value.checked_add(self.host_bytes))

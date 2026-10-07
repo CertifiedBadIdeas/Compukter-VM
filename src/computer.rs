@@ -5827,3 +5827,6 @@ mod tests {
 #[path = "checkpoint/computer.rs"]
 #[allow(dead_code)]
 mod checkpoint_state;
+
+pub use crate::execution::checkpoint::CheckpointError as ComputerCheckpointError;
+pub use checkpoint_state::{ComputerCheckpointLimits, ComputerRestoreEnvironment};

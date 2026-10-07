@@ -516,6 +516,9 @@ impl PersistenceGate {
 }
 
 impl ComputerPersistence {
+    pub(crate) const fn computer_id(&self) -> ComputerId {
+        self.computer_id
+    }
     pub fn prepare(
         &self,
         generation: u64,

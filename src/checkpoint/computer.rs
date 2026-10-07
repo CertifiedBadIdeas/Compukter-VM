@@ -51,6 +51,49 @@ checkpoint_struct!(CompilationTransaction {
     output_revision
 });
 
+/// Bounds for checkpoint encoding and restoration. These include host descriptors,
+/// but admission of those descriptors remains the caller's responsibility.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputerCheckpointLimits {
+    pub maximum_execution_bytes: usize,
+    pub maximum_host_bytes: usize,
+    pub maximum_decode_allocation_bytes: usize,
+}
+
+impl Default for ComputerCheckpointLimits {
+    fn default() -> Self {
+        Self {
+            maximum_execution_bytes: 128 << 20,
+            maximum_host_bytes: 4 << 20,
+            maximum_decode_allocation_bytes: 512 << 20,
+        }
+    }
+}
+
+impl ComputerCheckpointLimits {
+    fn envelope(self) -> envelope::Limits {
+        envelope::Limits {
+            execution_bytes: self.maximum_execution_bytes,
+            host_bytes: self.maximum_host_bytes,
+            allocation_bytes: self.maximum_decode_allocation_bytes,
+        }
+    }
+    pub fn maximum_encoded_bytes(self) -> Result<usize> {
+        self.envelope().total_bytes()
+    }
+}
+
+/// Trusted environment for restoring execution. The caller provides freshly
+/// resolved schemas and the filesystem generation belonging to this computer.
+pub struct ComputerRestoreEnvironment<'a> {
+    pub id: ComputerId,
+    pub profile: ExecutionProfile,
+    pub process_limits: ProcessLimits,
+    pub addon_bindings: &'a [CapabilityBinding<'a>],
+    pub filesystem: ComputerFileSystem,
+    pub initial_file_capability: FileCapability,
+}
+
 pub(crate) struct ComputerCheckpointContext {
     pub id: ComputerId,
     pub profile: ExecutionProfile,
@@ -61,6 +104,42 @@ pub(crate) struct ComputerCheckpointContext {
 }
 
 impl ComputerMachine {
+    /// Captures a stopped actor's execution and caller-owned host descriptors.
+    /// The host must settle world mutations and freeze callbacks before calling.
+    pub fn checkpoint(
+        &self,
+        id: ComputerId,
+        host: &[u8],
+        limits: ComputerCheckpointLimits,
+    ) -> Result<Vec<u8>> {
+        self.write_checkpoint_envelope(id, host, limits.envelope())
+    }
+
+    /// Restores execution without running Guest code. Validate and rebind the
+    /// returned host descriptors and consume the durable snapshot before advance.
+    pub fn restore_checkpoint(
+        environment: ComputerRestoreEnvironment<'_>,
+        bytes: &[u8],
+        limits: ComputerCheckpointLimits,
+    ) -> Result<(Self, Vec<u8>)> {
+        if environment.addon_bindings.len() > MAXIMUM_ADDON_CAPABILITIES {
+            return Err(CheckpointError::Limit);
+        }
+        let context = ComputerCheckpointContext {
+            id: environment.id,
+            profile: environment.profile,
+            process_limits: environment.process_limits,
+            addon_bindings: environment
+                .addon_bindings
+                .iter()
+                .map(OwnedCapabilityBinding::copy_from)
+                .collect(),
+            filesystem: environment.filesystem,
+            initial_file_capability: environment.initial_file_capability,
+        };
+        Self::read_checkpoint_envelope(context, bytes, limits.envelope())
+    }
+
     pub(crate) fn write_checkpoint_envelope(
         &self,
         id: ComputerId,
@@ -597,6 +676,14 @@ mod tests {
         let bytes = original
             .write_checkpoint_envelope(ID, b"paused timers", limits)
             .unwrap();
+        assert_eq!(
+            Err(CheckpointError::Incompatible),
+            original.checkpoint(
+                ComputerId::from_bytes([8; 16]),
+                b"",
+                ComputerCheckpointLimits::default()
+            )
+        );
         assert_eq!(
             Err(StoreError::Busy),
             store.save_execution_checkpoint(ID, generation, &bytes, 1)
