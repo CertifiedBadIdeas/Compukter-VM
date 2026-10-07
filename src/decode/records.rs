@@ -111,6 +111,7 @@ pub(crate) fn decode_artifact(
     let mut total_utf16_literal_code_units = 0;
     let mut total_code_bytes = 0;
     let mut total_debug_bytes = 0;
+    let mut total_expanded_root_bytes = 0;
     let mut total_imports = 0;
     let mut total_functions = 0;
     let mut total_blocks = 0;
@@ -227,7 +228,52 @@ pub(crate) fn decode_artifact(
         let blocks = parse_blocks(&blocks_section, limits)?;
         let code = parse_code(&code_section, &blocks, &functions, limits)?;
         let exceptions = parse_exceptions(&exceptions_section, limits)?;
-        let safepoint_roots = parse_safepoint_roots(&safepoint_roots_section, limits)?;
+        let safepoint_roots =
+            if let Some(marker) = optional(&container, scope, format::SAFEPOINT_ROOT_RANGES) {
+                let payload = &container.bytes
+                    [marker.offset as usize..(marker.offset + marker.length) as usize];
+                let mut cursor = Cursor::new(payload);
+                let version = ru32(&mut cursor)?;
+                let count = ru32(&mut cursor)? as usize;
+                let length = usize::try_from(cursor.read_u64().map_err(single_raw)?)
+                    .map_err(|_| raw(Code::LimitExceeded, "expanded root length exceeds usize"))?;
+                finish(
+                    &cursor,
+                    payload,
+                    marker.element_count == 1 && version == 1 && count > 0 && length >= 24,
+                )?;
+                if count > limits.records_per_section {
+                    return Err(raw(
+                        Code::LimitExceeded,
+                        "expanded root record limit exceeded",
+                    ));
+                }
+                add_to_limit(
+                    &mut total_expanded_root_bytes,
+                    length,
+                    limits.artifact_bytes,
+                    limits,
+                    "expanded root byte limit exceeded",
+                )?;
+                parse_root_ranges(
+                    &safepoint_roots_section,
+                    count,
+                    length,
+                    &blocks,
+                    functions.len(),
+                    limits,
+                )?
+            } else {
+                let entry = find(&container, scope, format::SAFEPOINT_ROOTS, limits)?;
+                add_to_limit(
+                    &mut total_expanded_root_bytes,
+                    entry.length as usize,
+                    limits.artifact_bytes,
+                    limits,
+                    "expanded root byte limit exceeded",
+                )?;
+                parse_safepoint_roots(&safepoint_roots_section, limits)?
+            };
         let utf16_literals = parse_utf16_literals(
             &utf16_literals_section,
             &mut total_utf16_literal_code_units,
@@ -727,6 +773,146 @@ fn parse_functions(
             values,
         })
     })
+}
+
+fn parse_root_ranges(
+    section: &IndexedSection<'_>,
+    expected_count: usize,
+    expected_length: usize,
+    blocks: &[Block],
+    function_count: usize,
+    limits: &ArtifactLimits,
+) -> Result<Vec<SafepointRoots>, DiagnosticSet> {
+    let prefix = (16 + 4 * (expected_count + 1) + 7) & !7;
+    if expected_length > limits.artifact_bytes
+        || prefix > expected_length
+        || expected_count > limits.records_per_section
+    {
+        return Err(raw(Code::LimitExceeded, "expanded root limit exceeded"));
+    }
+    let mut values: Vec<SafepointRoots> = Vec::new();
+    values
+        .try_reserve_exact(expected_count)
+        .map_err(|_| raw(Code::LimitExceeded, "cannot reserve expanded root maps"))?;
+    let mut per_function = Vec::new();
+    per_function
+        .try_reserve_exact(function_count)
+        .map_err(|_| raw(Code::LimitExceeded, "cannot reserve root counters"))?;
+    per_function.resize(function_count, 0usize);
+    let mut record_bytes = 0usize;
+    for id in 0..section.len() {
+        let record = section.record(id as u32).map_err(single_raw)?;
+        let mut cursor = Cursor::new(record);
+        let function = FunctionId(ru32(&mut cursor)?);
+        let block = BlockId(ru32(&mut cursor)?);
+        let first = ru32(&mut cursor)?;
+        let run = ru32(&mut cursor)?;
+        let root_count = ru16(&mut cursor)? as usize;
+        let reserved = ru16(&mut cursor)?;
+        let Some(owner) = blocks.get(block.0 as usize) else {
+            return Err(raw(Code::BadRecord, "root range block is out of bounds"));
+        };
+        if function.0 as usize >= function_count
+            || owner.owner_function != function
+            || run == 0
+            || first
+                .checked_add(run)
+                .is_none_or(|end| end > owner.instruction_count)
+            || reserved != 0
+        {
+            return Err(raw(
+                Code::BadRecord,
+                "invalid root range owner or boundaries",
+            ));
+        }
+        if root_count > limits.roots_per_safepoint
+            || values
+                .len()
+                .checked_add(run as usize)
+                .is_none_or(|count| count > expected_count)
+        {
+            return Err(raw(
+                Code::LimitExceeded,
+                "expanded root count limit exceeded",
+            ));
+        }
+        per_function[function.0 as usize] += run as usize;
+        if per_function[function.0 as usize] > limits.safepoints_per_function {
+            return Err(raw(
+                Code::LimitExceeded,
+                "expanded function root limit exceeded",
+            ));
+        }
+        let bytes = (16 + 4 * root_count)
+            .checked_mul(run as usize)
+            .ok_or_else(|| raw(Code::LimitExceeded, "expanded root bytes overflow"))?;
+        record_bytes = record_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| raw(Code::LimitExceeded, "expanded root bytes overflow"))?;
+        if record_bytes > u32::MAX as usize {
+            return Err(raw(
+                Code::LimitExceeded,
+                "canonical root offsets exceed u32",
+            ));
+        }
+        if prefix
+            .checked_add(record_bytes)
+            .is_none_or(|length| length > expected_length)
+        {
+            return Err(raw(
+                Code::LimitExceeded,
+                "expanded root bytes exceed marker",
+            ));
+        }
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(root_count)
+            .map_err(|_| raw(Code::LimitExceeded, "cannot reserve root references"))?;
+        for _ in 0..root_count {
+            references.push(ValueComponent {
+                value: ru16(&mut cursor)?,
+                component: ru16(&mut cursor)?,
+            });
+        }
+        finish(
+            &cursor,
+            record,
+            references.windows(2).all(|pair| pair[0] < pair[1]),
+        )?;
+        if let Some(previous) = values.last() {
+            if (
+                previous.function,
+                previous.block,
+                previous.instruction_boundary,
+            ) >= (function, block, first)
+                || (previous.function == function
+                    && previous.block == block
+                    && previous.instruction_boundary + 1 == first
+                    && previous.references == references)
+            {
+                return Err(raw(Code::BadRecord, "root ranges overlap or are unmerged"));
+            }
+        }
+        for boundary in first..first + run {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(root_count)
+                .map_err(|_| raw(Code::LimitExceeded, "cannot reserve expanded references"))?;
+            copy.extend_from_slice(&references);
+            values.push(SafepointRoots {
+                function,
+                block,
+                instruction_boundary: boundary,
+                references: copy,
+            });
+        }
+    }
+    if values.len() != expected_count || prefix + record_bytes != expected_length {
+        return Err(raw(
+            Code::BadRecord,
+            "expanded root counts disagree with marker",
+        ));
+    }
+    Ok(values)
 }
 
 fn parse_safepoint_roots(
@@ -1721,6 +1907,81 @@ mod tests {
 
     fn section<'a>(kind: u16, bytes: &'a [u8], offsets: Vec<u32>) -> IndexedSection<'a> {
         IndexedSection::from_test_records(kind, bytes, offsets)
+    }
+
+    fn root_run(first: u32, count: u32) -> Vec<u8> {
+        let mut row = Vec::new();
+        for value in [0, 0, first, count] {
+            u32(&mut row, value);
+        }
+        for value in [1, 0, 0, 0] {
+            u16(&mut row, value);
+        }
+        row
+    }
+
+    #[test]
+    fn root_ranges_expand_live_references_and_reject_overlaps_and_limits() {
+        let blocks = [Block {
+            owner_function: FunctionId(0),
+            code_record: BlockId(0),
+            instruction_count: 4,
+            declared_fixed_cost: 4,
+            flags: 0,
+        }];
+        let limits = ArtifactLimits::default();
+        let (bytes, offsets) = table(&[root_run(0, 2)], format::SAFEPOINT_ROOTS);
+        let indexed = section(format::SAFEPOINT_ROOTS, &bytes, offsets);
+        let maps = parse_root_ranges(&indexed, 2, 72, &blocks, 1, &limits).unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(
+            maps[0].references,
+            [ValueComponent {
+                value: 0,
+                component: 0
+            }]
+        );
+        assert_eq!(maps[1].instruction_boundary, 1);
+        assert_eq!(maps[0].references, maps[1].references);
+        for restricted in [
+            ArtifactLimits {
+                artifact_bytes: 71,
+                ..limits.clone()
+            },
+            ArtifactLimits {
+                safepoints_per_function: 1,
+                ..limits.clone()
+            },
+            ArtifactLimits {
+                roots_per_safepoint: 0,
+                ..limits.clone()
+            },
+            ArtifactLimits {
+                records_per_section: 1,
+                ..limits.clone()
+            },
+        ] {
+            assert!(parse_root_ranges(&indexed, 2, 72, &blocks, 1, &restricted).is_err());
+        }
+        for rows in [
+            vec![root_run(0, 0)],
+            vec![root_run(0, 5)],
+            vec![root_run(u32::MAX, 2)],
+            vec![root_run(0, 1), root_run(0, 1)],
+            vec![root_run(0, 1), root_run(1, 1)],
+            vec![root_run(0, 1)[..20].to_vec()],
+        ] {
+            let (bytes, offsets) = table(&rows, format::SAFEPOINT_ROOTS);
+            assert!(parse_root_ranges(
+                &section(format::SAFEPOINT_ROOTS, &bytes, offsets),
+                2,
+                72,
+                &blocks,
+                1,
+                &limits
+            )
+            .is_err());
+        }
     }
 
     #[test]

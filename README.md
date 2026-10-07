@@ -157,6 +157,22 @@ Runtime ABI 1.15 and native C ABI 20 do not signal this reader capability.
 Published 0.20.0 bundles lack it; consumers need updated source-built natives
 until a new immutable Runtime release is published and pinned.
 
+## Safepoint root ranges
+
+Source builds after Compukters [#706](https://github.com/CertifiedBadIdeas/Compukters/issues/706)
+also accept the critical nonsemantic SAFEPOINT_ROOT_RANGES module marker
+(`0x0112`, flags 1, count 1). Its raw payload is encoding version 1 (u32), expanded
+row count (u32) and canonical expanded indexed payload length (u64). It selects
+range records in SAFEPOINT_ROOTS: function, block, first boundary and positive
+run count (u32), reference count and reserved zero (u16), then reference pairs.
+
+Admission reconstructs every boundary map with checked block bounds, counts,
+per-function limits and a cumulative expanded-root byte budget against the
+artifact-byte policy. Legacy decoding remains supported. Module hashing streams
+the canonical expanded legacy payload to preserve imports and module identities.
+GC execution and checkpoint coverage are unchanged. Older readers reject the
+marker; updated source-built natives are needed until a new Runtime is published.
+
 ## Golden fixtures
 
 The committed artifact v1 compatibility set lives in `tests/fixtures/`:

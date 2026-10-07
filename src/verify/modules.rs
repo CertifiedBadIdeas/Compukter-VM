@@ -1,7 +1,10 @@
 use sha2::{Digest, Sha256};
 
 use crate::{
-    artifact::{format, DecodedArtifact, Instruction, ModuleId, NominalType, TypeId, ValueType},
+    artifact::{
+        format, DecodedArtifact, Instruction, ModuleId, NominalType, SafepointRoots, TypeId,
+        ValueType,
+    },
     decode::container::decode_container,
     diagnostic::{Code, Diagnostic, DiagnosticSet, Family},
     limits::ArtifactLimits,
@@ -41,6 +44,14 @@ pub(crate) fn verify_modules(
                 .iter()
                 .find(|entry| entry.scope == scope && entry.kind == kind)
                 .ok_or_else(|| failure(limits, module_id, "semantic module section is missing"))?;
+            if kind == format::SAFEPOINT_ROOTS
+                && container.directory.iter().any(|entry| {
+                    entry.scope == scope && entry.kind == format::SAFEPOINT_ROOT_RANGES
+                })
+            {
+                hash_canonical_roots(&mut hasher, &module.safepoint_roots);
+                continue;
+            }
             let start = usize::try_from(entry.offset)
                 .map_err(|_| failure(limits, module_id, "section offset does not fit usize"))?;
             let length = usize::try_from(entry.length)
@@ -69,6 +80,37 @@ pub(crate) fn verify_modules(
     resolve_imports_and_exports(artifact, &order, limits)?;
     verify_nominal_types(artifact, limits)?;
     Ok(())
+}
+
+fn hash_canonical_roots(hasher: &mut Sha256, roots: &[SafepointRoots]) {
+    // Decode has already bounded the expanded canonical payload. Stream it to
+    // preserve module identity without allocating another expanded byte buffer.
+    let count = roots.len();
+    let records_bytes: usize = roots.iter().map(|row| 16 + 4 * row.references.len()).sum();
+    let prefix = (16 + 4 * (count + 1) + 7) & !7;
+    hasher.update(format::SAFEPOINT_ROOTS.to_le_bytes());
+    hasher.update(((prefix + records_bytes) as u64).to_le_bytes());
+    hasher.update((count as u32).to_le_bytes());
+    hasher.update(0u32.to_le_bytes());
+    hasher.update((records_bytes as u64).to_le_bytes());
+    let mut offset = 0u32;
+    hasher.update(offset.to_le_bytes());
+    for row in roots {
+        offset += (16 + 4 * row.references.len()) as u32;
+        hasher.update(offset.to_le_bytes());
+    }
+    hasher.update([0u8; 7].get(..prefix - (16 + 4 * (count + 1))).unwrap());
+    for row in roots {
+        hasher.update(row.function.0.to_le_bytes());
+        hasher.update(row.block.0.to_le_bytes());
+        hasher.update(row.instruction_boundary.to_le_bytes());
+        hasher.update((row.references.len() as u16).to_le_bytes());
+        hasher.update(0u16.to_le_bytes());
+        for reference in &row.references {
+            hasher.update(reference.value.to_le_bytes());
+            hasher.update(reference.component.to_le_bytes());
+        }
+    }
 }
 
 fn verify_nominal_types(

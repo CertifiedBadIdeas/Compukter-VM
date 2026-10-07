@@ -1092,3 +1092,50 @@ fn compact_debug_rejects_bad_paths_references_flags_scope_and_orphan_pool() {
         assert!(super::records::decode_artifact(bytes.into(), &ArtifactLimits::default()).is_err());
     }
 }
+
+#[test]
+fn root_ranges_preserve_module_identity_and_native_admission() {
+    let legacy = decoded_fixture("debug.cpkt");
+    let bytes = crate::test_encode::encode_artifact_with_root_ranges(&legacy).unwrap();
+    crate::verify_artifact(Arc::from(bytes.clone()), ArtifactLimits::default()).unwrap();
+    let decoded =
+        super::records::decode_artifact(bytes.into(), &ArtifactLimits::default()).unwrap();
+    assert_eq!(
+        legacy.modules[0].semantic_hash,
+        decoded.modules[0].semantic_hash
+    );
+    assert_eq!(
+        legacy.modules[0].safepoint_roots,
+        decoded.modules[0].safepoint_roots
+    );
+}
+
+#[test]
+fn root_range_marker_rejects_bad_flags_versions_counts_and_expansion_budgets() {
+    let bytes =
+        crate::test_encode::encode_artifact_with_root_ranges(&decoded_fixture("debug.cpkt"))
+            .unwrap();
+    let directory = support::directory_entry_offset(&bytes, 0x0112, 1);
+    let marker = support::section_offset(&bytes, 0x0112, 1);
+    for (offset, value) in [
+        (marker, 2),
+        (marker + 4, 0),
+        (marker + 4, u32::MAX),
+        (directory + 24, 0),
+    ] {
+        let mut bad = bytes.clone();
+        support::write_u32(&mut bad, offset, value);
+        support::rehash(&mut bad);
+        assert!(crate::verify_artifact(Arc::from(bad), ArtifactLimits::default()).is_err());
+    }
+    for value in [24, u64::MAX] {
+        let mut bad = bytes.clone();
+        support::write_u64(&mut bad, marker + 8, value);
+        support::rehash(&mut bad);
+        assert!(crate::verify_artifact(Arc::from(bad), ArtifactLimits::default()).is_err());
+    }
+    let mut bad = bytes.clone();
+    support::write_u16(&mut bad, directory + 2, 0);
+    support::rehash(&mut bad);
+    assert!(crate::verify_artifact(Arc::from(bad), ArtifactLimits::default()).is_err());
+}

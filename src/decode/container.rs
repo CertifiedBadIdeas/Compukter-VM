@@ -450,7 +450,10 @@ fn validate_entry(
         let expected_flags = if matches!(entry.kind, format::DEBUG | format::DEBUG_SOURCE_POSITIONS)
         {
             0
-        } else if entry.kind == format::DEBUG_PATHS {
+        } else if matches!(
+            entry.kind,
+            format::DEBUG_PATHS | format::SAFEPOINT_ROOT_RANGES
+        ) {
             format::CRITICAL
         } else {
             format::KNOWN_FLAGS
