@@ -51,6 +51,10 @@ impl HeaderFormat {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ValueWidth {
+    I8,
+    I16,
+    U8,
+    U16,
     Bool,
     Char,
     I32,
@@ -359,8 +363,8 @@ pub(super) fn string_layout(
 impl ValueWidth {
     pub(super) const fn bytes(self) -> u32 {
         match self {
-            Self::Bool => 1,
-            Self::Char => 2,
+            Self::Bool | Self::I8 | Self::U8 => 1,
+            Self::Char | Self::I16 | Self::U16 => 2,
             Self::I32 | Self::F32 | Self::Ref => 4,
             Self::I64 | Self::F64 => 8,
         }

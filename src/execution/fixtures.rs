@@ -2316,6 +2316,7 @@ fn entry_string_array_artifact(code_unit: Option<(i32, i32)>) -> VerifiedArtifac
             parameters: vec![array],
         };
         module.types.push(NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: string,
@@ -3228,6 +3229,7 @@ pub(super) fn char_array_string_artifact(start: i32, end: i32) -> VerifiedArtifa
         ],
         |artifact| {
             artifact.modules[0].types.push(NominalType::Array {
+                storage: 0,
                 name: 0,
                 super_type: None,
                 element: character,
@@ -4956,6 +4958,7 @@ pub(super) fn portable_layout_artifact() -> VerifiedArtifact {
                 initializer: None,
             },
             NominalType::Array {
+                storage: 0,
                 name: 0,
                 super_type: None,
                 element: primitive(6),
@@ -5128,6 +5131,7 @@ pub(super) fn gc_array_retry_artifact(length: i32) -> VerifiedArtifact {
             parameters: Vec::new(),
         };
         artifact.modules[0].types.push(NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: primitive(1),
@@ -5290,6 +5294,7 @@ pub(crate) fn array_allocation_artifact(length: i32) -> VerifiedArtifact {
             parameters: Vec::new(),
         };
         artifact.modules[0].types.push(NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: primitive(5),
@@ -5366,6 +5371,7 @@ pub(crate) fn reference_identity_artifact(
         _ => unreachable!(),
     };
     module.types.push(NominalType::Array {
+        storage: 0,
         name,
         super_type: None,
         element: primitive(6),
@@ -5798,6 +5804,20 @@ pub(super) fn field_roundtrip_artifact() -> VerifiedArtifact {
     })
 }
 
+pub(crate) fn packed_array_roundtrip_artifact(
+    storage: u8,
+    value: i32,
+    expected: i32,
+) -> VerifiedArtifact {
+    primitive_array_storage_roundtrip_artifact(
+        1,
+        Constant::I32(value),
+        RuntimeValue::I32(expected),
+        storage,
+    )
+    .0
+}
+
 pub(super) fn primitive_array_roundtrip_cases() -> Vec<(VerifiedArtifact, RuntimeValue)> {
     vec![
         primitive_array_roundtrip_artifact(1, Constant::I32(-7), RuntimeValue::I32(-7)),
@@ -5826,6 +5846,15 @@ fn primitive_array_roundtrip_artifact(
     constant: Constant,
     expected: RuntimeValue,
 ) -> (VerifiedArtifact, RuntimeValue) {
+    primitive_array_storage_roundtrip_artifact(kind, constant, expected, 0)
+}
+
+fn primitive_array_storage_roundtrip_artifact(
+    kind: u8,
+    constant: Constant,
+    expected: RuntimeValue,
+    storage: u8,
+) -> (VerifiedArtifact, RuntimeValue) {
     let element = primitive(kind);
     let array = ValueType {
         kind: 7,
@@ -5833,6 +5862,9 @@ fn primitive_array_roundtrip_artifact(
         nominal_type: TypeId(1),
     };
     let artifact = verified_mutated(|artifact| {
+        if storage != 0 {
+            artifact.header.runtime_minor = 14;
+        }
         artifact.modules[0].types[0] = NominalType::Function {
             name: 1,
             flags: 0,
@@ -5840,12 +5872,28 @@ fn primitive_array_roundtrip_artifact(
             parameters: Vec::new(),
         };
         artifact.modules[0].types.push(NominalType::Array {
+            storage,
             name: 0,
             element,
             super_type: None,
         });
         artifact.modules[0].declared_types = 2;
-        artifact.modules[0].constants = vec![Constant::I32(0), Constant::I32(1), constant];
+        let mut constants = vec![Constant::I32(0), Constant::I32(1), constant];
+        let original = constants
+            .iter()
+            .map(crate::test_encode::encode_constant)
+            .collect::<Vec<_>>();
+        constants.sort_by_key(crate::test_encode::encode_constant);
+        let ids = original
+            .iter()
+            .map(|key| {
+                constants
+                    .iter()
+                    .position(|value| &crate::test_encode::encode_constant(value) == key)
+                    .unwrap() as u32
+            })
+            .collect::<Vec<_>>();
+        artifact.modules[0].constants = constants;
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 6;
         function.values = crate::artifact::scalar_values(vec![
@@ -5862,15 +5910,15 @@ fn primitive_array_roundtrip_artifact(
                 vec![
                     Instruction::Const {
                         dst: 0,
-                        constant: 1,
+                        constant: ids[1],
                     },
                     Instruction::Const {
                         dst: 1,
-                        constant: 0,
+                        constant: ids[0],
                     },
                     Instruction::Const {
                         dst: 2,
-                        constant: 2,
+                        constant: ids[2],
                     },
                     Instruction::Jump { target: 1 },
                 ],
@@ -5927,6 +5975,7 @@ pub(super) fn reference_array_roundtrip_artifact() -> VerifiedArtifact {
             plain_class(TypeId(u32::MAX), 0, 0),
             plain_class(TypeId(1), 0, 0),
             NominalType::Array {
+                storage: 0,
                 name: 0,
                 super_type: None,
                 element: base,
@@ -5997,6 +6046,7 @@ pub(super) fn array_bounds_artifact() -> VerifiedArtifact {
             parameters: vec![primitive(1)],
         };
         artifact.modules[0].types.push(NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: primitive(1),
@@ -6249,6 +6299,7 @@ pub(super) fn failed_array_store_artifact() -> VerifiedArtifact {
             parameters: vec![primitive(1)],
         };
         artifact.modules[0].types.push(NominalType::Array {
+            storage: 0,
             name: 0,
             super_type: None,
             element: primitive(1),

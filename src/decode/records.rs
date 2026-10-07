@@ -465,11 +465,12 @@ fn parse_types(
                 }
             }
             2 => {
-                if flags & !1 != 0 || generic_arity != 0 {
+                if flags & !15 != 0 || flags >> 1 > 6 || generic_arity != 0 {
                     return Err(raw(Code::BadType, "invalid array header"));
                 }
                 NominalType::Array {
                     name,
+                    storage: flags >> 1,
                     element: value_type(cursor)?,
                     super_type: if flags & 1 == 0 {
                         None
@@ -1077,6 +1078,7 @@ fn validate_module_tables(
                 name,
                 element,
                 super_type,
+                ..
             } => {
                 value_type_ref(module, *element, limits)?;
                 if let Some(parent) = super_type {

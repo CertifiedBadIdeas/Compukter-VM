@@ -362,10 +362,11 @@ fn encode_type(value: &NominalType) -> Vec<u8> {
         ),
         NominalType::Array {
             name,
+            storage,
             element,
             super_type,
         } => {
-            bytes.extend([2, u8::from(super_type.is_some())]);
+            bytes.extend([2, u8::from(super_type.is_some()) | (storage << 1)]);
             u16le(&mut bytes, 0);
             u32le(&mut bytes, *name);
             encode_value_type(&mut bytes, *element);
@@ -1310,6 +1311,7 @@ mod tests {
             method_count: 11,
         };
         let array = NominalType::Array {
+            storage: 0,
             name: 12,
             super_type: None,
             element: primitive(1),
