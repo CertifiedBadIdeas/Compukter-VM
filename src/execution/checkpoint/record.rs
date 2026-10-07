@@ -62,3 +62,10 @@ checkpoint_struct!(PendingRecord {
     string,
     collection_attempted
 });
+
+checkpoint_struct!(HostRecordSchema { type_name, fields });
+checkpoint_struct!(HostRecordField {
+    name,
+    value_type,
+    record
+});
