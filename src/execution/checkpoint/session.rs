@@ -60,6 +60,26 @@ impl Session {
             && self.machine.checkpoint_task_waits_for(task, request)
     }
 
+    pub(crate) fn checkpoint_host_request_operation(
+        &self,
+        task: TaskId,
+        request: RequestId,
+    ) -> Option<(&str, &str, u16, u32)> {
+        let request = self
+            .pending_requests
+            .get(HostRequestIdentity::new(task, request))?;
+        let capability = self
+            .capabilities
+            .get(request.capability() as usize)?
+            .as_ref()?;
+        Some((
+            &capability.namespace,
+            &capability.name,
+            capability.abi_major,
+            request.operation(),
+        ))
+    }
+
     fn checkpoint_capability_identity(&self) -> Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         let mut writer = Writer::new(16 * 1024 * 1024);

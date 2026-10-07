@@ -285,8 +285,46 @@ impl ComputerMachine {
         {
             return Err(invalid());
         }
+        if self.active_terminal_event_owner.is_some_and(|owner| {
+            self.standard_streams.checkpoint_input_owner() != Some((false, owner))
+        }) {
+            return Err(invalid());
+        }
+        if let Some((canonical, owner)) = self.standard_streams.checkpoint_input_owner() {
+            let frame = self
+                .sessions
+                .get(owner.frame().checked_sub(1).ok_or_else(invalid)?)
+                .ok_or_else(invalid)?;
+            let valid = if canonical {
+                frame
+                    .pending_stdio_read
+                    .is_some_and(|(task, _)| task == owner.task())
+            } else {
+                frame
+                    .pending_terminal_event
+                    .is_some_and(|(task, _)| task == owner.task())
+                    || self.active_terminal_event_owner == Some(owner)
+            };
+            if !valid {
+                return Err(invalid());
+            }
+        } else if self.active_terminal_event.is_some() {
+            return Err(invalid());
+        }
+        for (task, request) in self.redstone.checkpoint_waiters() {
+            if !self.sessions.iter().any(|frame| {
+                matches!(
+                    frame
+                        .session
+                        .checkpoint_host_request_operation(task, request),
+                    Some((TERMINAL_NAMESPACE, REDSTONE_NAME, REDSTONE_ABI_MAJOR, 1..=4))
+                )
+            }) {
+                return Err(invalid());
+            }
+        }
         let mut scopes = std::collections::BTreeSet::new();
-        for frame in &self.sessions {
+        for (frame_index, frame) in self.sessions.iter().enumerate() {
             if frame.scope_id >= self.process_starts
                 || !scopes.insert(frame.scope_id)
                 || frame.compiler_diagnostics.len()
@@ -301,6 +339,36 @@ impl ComputerMachine {
                 })
             {
                 return Err(invalid());
+            }
+            for (pending, canonical) in [
+                (frame.pending_stdio_read, true),
+                (frame.pending_terminal_event, false),
+            ] {
+                if pending.is_some_and(|(task, _)| {
+                    self.standard_streams.checkpoint_input_owner()
+                        != Some((canonical, InputOwner::new(frame_index + 1, task)))
+                }) {
+                    return Err(invalid());
+                }
+            }
+            for (pending, name, major, operation) in [
+                (
+                    frame.pending_terminal_event,
+                    TERMINAL_NAME,
+                    RAW_TERMINAL_ABI_MAJOR,
+                    3,
+                ),
+                (frame.pending_stdio_read, STDIO_NAME, STDIO_ABI_MAJOR, 0),
+            ] {
+                if let Some((task, request)) = pending {
+                    if frame
+                        .session
+                        .checkpoint_host_request_operation(task, request)
+                        != Some((TERMINAL_NAMESPACE, name, major, operation))
+                    {
+                        return Err(invalid());
+                    }
+                }
             }
             for (task, request) in [
                 frame.pending_terminal_event,
@@ -351,7 +419,11 @@ impl ComputerMachine {
                 .sessions
                 .get(compilation.owner_depth.checked_sub(1).ok_or_else(invalid)?)
                 .ok_or_else(invalid)?;
-            if compilation.token == 0
+            if frame
+                .session
+                .checkpoint_host_request_operation(compilation.task, compilation.request)
+                != Some((TERMINAL_NAMESPACE, COMPILER_NAME, COMPILER_ABI_MAJOR, 0))
+                || compilation.token == 0
                 || compilation.token >= self.next_compilation_token
                 || !frame
                     .session
@@ -802,6 +874,85 @@ mod tests {
             }
         }
         panic!("stale compilation did not return");
+    }
+
+    #[test]
+    fn checkpoint_preserves_internal_waits_alongside_external_requests() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let bindings = [CapabilityBinding::new("app", "entry", 1, 0, &operations)];
+        for (redstone, artifact) in [
+            (
+                true,
+                fixtures::redstone_wait_and_external_request_artifact(),
+            ),
+            (
+                false,
+                fixtures::raw_terminal_wait_and_external_request_artifact(),
+            ),
+        ] {
+            let mut original = ComputerMachine::start(artifact, profile(), &bindings, &[]).unwrap();
+            let batch = loop {
+                match original.advance(64, 64, u32::MAX).unwrap() {
+                    ComputerAdvanceOutcome::SliceExhausted
+                    | ComputerAdvanceOutcome::WaitingForTerminalEvent => {}
+                    ComputerAdvanceOutcome::HostRequestBatch(batch) => break batch,
+                    other => panic!("unexpected outcome {other:?}"),
+                }
+            };
+            let mut restored = round_trip(&original);
+            assert_same_state(&original, &restored);
+            for computer in [&mut original, &mut restored] {
+                for request in &batch.requests {
+                    computer
+                        .resume_host_request_for(
+                            request.task_id,
+                            request.id,
+                            HostResponse::Success(HostValueInput::Unit),
+                        )
+                        .unwrap();
+                }
+                if redstone {
+                    computer.submit_redstone_input(1 | (13 << 6)).unwrap();
+                } else {
+                    computer.terminal_mut().push_text("wake").unwrap();
+                }
+            }
+            let mut halted = false;
+            for _ in 0..128 {
+                let expected = original.advance(64, 64, u32::MAX).unwrap();
+                assert_eq!(expected, restored.advance(64, 64, u32::MAX).unwrap());
+                assert_same_state(&original, &restored);
+                if matches!(expected, ComputerAdvanceOutcome::Halted(_)) {
+                    halted = true;
+                    break;
+                }
+            }
+            assert!(halted, "internal waiter did not complete");
+        }
+    }
+
+    #[test]
+    fn checkpoint_rejects_orphaned_device_waits_and_input_owner() {
+        let mut original =
+            ComputerMachine::start(fixtures::nested_call_artifact(), profile(), &[], &[]).unwrap();
+        original
+            .redstone
+            .register_changed(TaskId::ROOT, RequestId::new(99).unwrap(), 0)
+            .unwrap();
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            original.validate_checkpoint_state()
+        );
+        let mut original =
+            ComputerMachine::start(fixtures::nested_call_artifact(), profile(), &[], &[]).unwrap();
+        original
+            .standard_streams
+            .begin_read(InputOwner::new(99, TaskId::ROOT))
+            .unwrap();
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            original.validate_checkpoint_state()
+        );
     }
 
     #[test]
