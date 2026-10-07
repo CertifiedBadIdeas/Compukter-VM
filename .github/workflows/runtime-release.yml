@@ -100,7 +100,7 @@ jobs:
             --license LICENSE \
             --notice NOTICE \
             --rustc "$(rustc --version)" \
-            --format artifact=2 \
+            --format artifact=3 \
             --format filesystem-generation=1 \
             --format executable-revision=1 \
             --format compilation-request=1 \
