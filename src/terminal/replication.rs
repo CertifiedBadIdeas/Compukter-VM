@@ -271,3 +271,7 @@ fn encoded_cell_count(change: &TerminalChange) -> usize {
         TerminalChange::Cursor { .. } | TerminalChange::Reset => 0,
     }
 }
+
+#[path = "../checkpoint/terminal_replication.rs"]
+#[allow(dead_code)] // Internal codec; the computer checkpoint boundary supplies validation context.
+mod checkpoint_state;
