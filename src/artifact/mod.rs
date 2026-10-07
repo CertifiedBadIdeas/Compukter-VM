@@ -371,6 +371,7 @@ pub(crate) enum Instruction {
         dst: u16,
     },
     Convert {
+        form: u8,
         dst: u16,
         src: u16,
     },
@@ -684,4 +685,25 @@ pub(crate) enum Instruction {
         resume_block: u32,
     },
     Unreachable,
+}
+
+impl Instruction {
+    pub(crate) fn uses_unsigned_semantics(&self) -> bool {
+        matches!(
+            self,
+            Self::Convert { form: 1..=3, .. }
+                | Self::Add { form: 8 | 9, .. }
+                | Self::Sub { form: 8 | 9, .. }
+                | Self::Mul { form: 8 | 9, .. }
+                | Self::Div { form: 8 | 9, .. }
+                | Self::Rem { form: 8 | 9, .. }
+                | Self::Equal { form: 8 | 9, .. }
+                | Self::NotEqual { form: 8 | 9, .. }
+                | Self::Less { form: 8 | 9, .. }
+                | Self::LessEqual { form: 8 | 9, .. }
+                | Self::Greater { form: 8 | 9, .. }
+                | Self::GreaterEqual { form: 8 | 9, .. }
+                | Self::StringValueOf { form: 8 | 9, .. }
+        )
+    }
 }

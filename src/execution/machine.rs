@@ -4323,7 +4323,7 @@ fn execute_scalar(
             write_frame_value(arena, frame, function, *dst, RuntimeValue::Null)
                 .map_err(InstructionFailure::Fault)
         }
-        ResolvedInstruction::Convert { dst, src } => {
+        ResolvedInstruction::Convert { form, dst, src } => {
             let destination = function
                 .registers
                 .get(*dst as usize)
@@ -4331,7 +4331,7 @@ fn execute_scalar(
                 .kind;
             let source = read_frame_value(arena, frame, function, *src)
                 .map_err(InstructionFailure::Fault)?;
-            let value = convert(source, destination)?;
+            let value = convert_with_signedness(source, destination, *form)?;
             write_frame_value(arena, frame, function, *dst, value)
                 .map_err(InstructionFailure::Fault)
         }
@@ -4583,6 +4583,34 @@ fn arithmetic(
             Arithmetic::Div => numeric::div_i64(a, b).map_err(InstructionFailure::Trap)?,
             Arithmetic::Rem => numeric::rem_i64(a, b).map_err(InstructionFailure::Trap)?,
         })),
+        (8, RuntimeValue::I32(a), RuntimeValue::I32(b)) => {
+            let (a, b) = (a as u32, b as u32);
+            Ok(RuntimeValue::I32(match operation {
+                Arithmetic::Add => a.wrapping_add(b),
+                Arithmetic::Sub => a.wrapping_sub(b),
+                Arithmetic::Mul => a.wrapping_mul(b),
+                Arithmetic::Div => a
+                    .checked_div(b)
+                    .ok_or(InstructionFailure::Trap(GuestTrap::DivisionByZero))?,
+                Arithmetic::Rem => a
+                    .checked_rem(b)
+                    .ok_or(InstructionFailure::Trap(GuestTrap::DivisionByZero))?,
+            } as i32))
+        }
+        (9, RuntimeValue::I64(a), RuntimeValue::I64(b)) => {
+            let (a, b) = (a as u64, b as u64);
+            Ok(RuntimeValue::I64(match operation {
+                Arithmetic::Add => a.wrapping_add(b),
+                Arithmetic::Sub => a.wrapping_sub(b),
+                Arithmetic::Mul => a.wrapping_mul(b),
+                Arithmetic::Div => a
+                    .checked_div(b)
+                    .ok_or(InstructionFailure::Trap(GuestTrap::DivisionByZero))?,
+                Arithmetic::Rem => a
+                    .checked_rem(b)
+                    .ok_or(InstructionFailure::Trap(GuestTrap::DivisionByZero))?,
+            } as i64))
+        }
         (3, RuntimeValue::F32(a), RuntimeValue::F32(b)) => {
             let (a, b) = (f32::from_bits(a), f32::from_bits(b));
             Ok(RuntimeValue::F32(
@@ -4671,6 +4699,8 @@ fn compare(
     let result = match (form, lhs, rhs) {
         (1, RuntimeValue::I32(a), RuntimeValue::I32(b)) => ordered(a, b, op),
         (2, RuntimeValue::I64(a), RuntimeValue::I64(b)) => ordered(a, b, op),
+        (8, RuntimeValue::I32(a), RuntimeValue::I32(b)) => ordered(a as u32, b as u32, op),
+        (9, RuntimeValue::I64(a), RuntimeValue::I64(b)) => ordered(a as u64, b as u64, op),
         (3, RuntimeValue::F32(a), RuntimeValue::F32(b)) => {
             float_compare_f32(f32::from_bits(a), f32::from_bits(b), op)
         }
@@ -4744,4 +4774,43 @@ fn convert(value: RuntimeValue, destination: u8) -> Result<RuntimeValue, Instruc
         (RuntimeValue::Char(v), 1) => Ok(RuntimeValue::I32(numeric::char_to_i32(v))),
         _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
     }
+}
+
+fn convert_with_signedness(
+    value: RuntimeValue,
+    destination: u8,
+    form: u8,
+) -> Result<RuntimeValue, InstructionFailure> {
+    if form & 1 != 0 {
+        let unsigned = match value {
+            RuntimeValue::I32(v) => u64::from(v as u32),
+            RuntimeValue::I64(v) => v as u64,
+            _ => return Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+        };
+        return match destination {
+            1 => Ok(RuntimeValue::I32(unsigned as i32)),
+            2 => Ok(RuntimeValue::I64(unsigned as i64)),
+            3 => Ok(RuntimeValue::F32(((unsigned as f64) as f32).to_bits())),
+            4 => Ok(RuntimeValue::F64((unsigned as f64).to_bits())),
+            _ => Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+        };
+    }
+    if form & 2 != 0 {
+        match (value, destination) {
+            (RuntimeValue::F32(v), 1) => {
+                return Ok(RuntimeValue::I32(f32::from_bits(v) as u32 as i32))
+            }
+            (RuntimeValue::F32(v), 2) => {
+                return Ok(RuntimeValue::I64(f32::from_bits(v) as u64 as i64))
+            }
+            (RuntimeValue::F64(v), 1) => {
+                return Ok(RuntimeValue::I32(f64::from_bits(v) as u32 as i32))
+            }
+            (RuntimeValue::F64(v), 2) => {
+                return Ok(RuntimeValue::I64(f64::from_bits(v) as u64 as i64))
+            }
+            _ => {}
+        }
+    }
+    convert(value, destination)
 }

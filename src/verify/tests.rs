@@ -9,6 +9,53 @@ fn decoded(bytes: Vec<u8>) -> crate::artifact::DecodedArtifact {
 }
 
 #[test]
+fn unsigned_forms_reject_old_abi_and_incorrect_operand_kinds() {
+    use crate::artifact::Instruction;
+    for (kinds, instruction) in [
+        (
+            vec![1, 1, 1],
+            Instruction::Div {
+                form: 8,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+        ),
+        (
+            vec![2, 2, 5],
+            Instruction::Less {
+                form: 9,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+        ),
+        (
+            vec![1, 2],
+            Instruction::Convert {
+                form: 1,
+                dst: 1,
+                src: 0,
+            },
+        ),
+    ] {
+        let source = crate::execution::fixtures::unsigned_operation_artifact(
+            &kinds,
+            kinds.len() - 1,
+            instruction,
+        );
+        let mut artifact = decoded(source.decoded().bytes.to_vec());
+        artifact.header.runtime_minor = 13;
+        assert!(verify_cfg(&artifact).is_err());
+        artifact.header.runtime_minor = 14;
+        artifact.modules[0].functions[0].values[0]
+            .semantic_type
+            .kind = 3;
+        assert!(verify_cfg(&artifact).is_err());
+    }
+}
+
+#[test]
 fn primitive_array_compatibility_includes_storage_for_assignments_and_imports() {
     use crate::artifact::{NominalType, TypeId, ValueType};
     let source = crate::execution::fixtures::packed_array_roundtrip_artifact(1, 255, -1);
@@ -1268,8 +1315,16 @@ fn cfg_accepts_i32_char_conversions() {
         vec![primitive(1), primitive(6), primitive(6), primitive(1)],
         2,
         vec![
-            crate::artifact::Instruction::Convert { dst: 2, src: 0 },
-            crate::artifact::Instruction::Convert { dst: 3, src: 1 },
+            crate::artifact::Instruction::Convert {
+                form: 0,
+                dst: 2,
+                src: 0,
+            },
+            crate::artifact::Instruction::Convert {
+                form: 0,
+                dst: 3,
+                src: 1,
+            },
             crate::artifact::Instruction::Return { value: u16::MAX },
         ],
     );
@@ -1311,7 +1366,11 @@ fn cfg_rejects_other_char_conversion_pairs() {
             vec![primitive(6), primitive(numeric_kind)],
             1,
             vec![
-                crate::artifact::Instruction::Convert { dst: 1, src: 0 },
+                crate::artifact::Instruction::Convert {
+                    form: 0,
+                    dst: 1,
+                    src: 0,
+                },
                 crate::artifact::Instruction::Return { value: u16::MAX },
             ],
         );

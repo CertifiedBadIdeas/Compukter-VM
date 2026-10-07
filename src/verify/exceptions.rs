@@ -197,7 +197,14 @@ pub(crate) fn required_runtime_exception_roles(instruction: &Instruction) -> u8 
         Instruction::CapabilityCallSync { .. } | Instruction::CapabilityCallAsync { .. } => {
             (1 << 6) | (1 << 7)
         }
-        Instruction::Div { form: 1 | 2, .. } | Instruction::Rem { form: 1 | 2, .. } => 1,
+        Instruction::Div {
+            form: 1 | 2 | 8 | 9,
+            ..
+        }
+        | Instruction::Rem {
+            form: 1 | 2 | 8 | 9,
+            ..
+        } => 1,
         Instruction::NewArray { .. } => 1 << 2,
         Instruction::ArrayLoad { .. }
         | Instruction::ArrayStore { .. }

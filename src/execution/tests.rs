@@ -498,6 +498,198 @@ fn deep_recursion_has_a_bounded_failure_stack_with_explicit_omissions() {
 }
 
 #[test]
+fn unsigned_division_by_zero_raises_the_managed_arithmetic_exception() {
+    use crate::artifact::Instruction;
+    for (kind, form, arguments) in [
+        (1, 8, vec![RuntimeValue::I32(-1), RuntimeValue::I32(0)]),
+        (2, 9, vec![RuntimeValue::I64(-1), RuntimeValue::I64(0)]),
+    ] {
+        for remainder in [false, true] {
+            let instruction = if remainder {
+                Instruction::Rem {
+                    form,
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                }
+            } else {
+                Instruction::Div {
+                    form,
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                }
+            };
+            let artifact =
+                fixtures::unsigned_operation_artifact(&[kind, kind, kind], 2, instruction);
+            let arguments = arguments
+                .iter()
+                .copied()
+                .map(super::value::EntryArgument::unowned)
+                .collect::<Vec<_>>();
+            let mut machine = fixtures::started(artifact, &arguments);
+            fixtures::finish_exception(&mut machine, "/ by zero");
+        }
+    }
+}
+
+#[test]
+fn unsigned_arithmetic_ordering_and_conversion_preserve_full_bit_ranges() {
+    use super::value::EntryArgument;
+    use crate::artifact::Instruction;
+    let cases = vec![
+        (
+            vec![1, 1, 1],
+            vec![RuntimeValue::I32(-1), RuntimeValue::I32(2)],
+            Instruction::Div {
+                form: 8,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            RuntimeValue::I32(i32::MAX),
+        ),
+        (
+            vec![2, 2, 2],
+            vec![RuntimeValue::I64(-1), RuntimeValue::I64(2)],
+            Instruction::Div {
+                form: 9,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            RuntimeValue::I64(i64::MAX),
+        ),
+        (
+            vec![2, 2, 2],
+            vec![RuntimeValue::I64(-1), RuntimeValue::I64(i64::MIN)],
+            Instruction::Rem {
+                form: 9,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            RuntimeValue::I64(i64::MAX),
+        ),
+        (
+            vec![1, 1, 5],
+            vec![RuntimeValue::I32(-1), RuntimeValue::I32(1)],
+            Instruction::Greater {
+                form: 8,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            RuntimeValue::Bool(true),
+        ),
+        (
+            vec![2, 2, 5],
+            vec![RuntimeValue::I64(i64::MIN), RuntimeValue::I64(i64::MAX)],
+            Instruction::Less {
+                form: 9,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            RuntimeValue::Bool(false),
+        ),
+        (
+            vec![1, 1, 1],
+            vec![RuntimeValue::I32(-1), RuntimeValue::I32(1)],
+            Instruction::Add {
+                form: 8,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            RuntimeValue::I32(0),
+        ),
+        (
+            vec![1, 2],
+            vec![RuntimeValue::I32(-1)],
+            Instruction::Convert {
+                form: 1,
+                dst: 1,
+                src: 0,
+            },
+            RuntimeValue::I64(4294967295),
+        ),
+        (
+            vec![1, 2],
+            vec![RuntimeValue::I32(-1)],
+            Instruction::Convert {
+                form: 2,
+                dst: 1,
+                src: 0,
+            },
+            RuntimeValue::I64(-1),
+        ),
+        (
+            vec![2, 4],
+            vec![RuntimeValue::I64(-1)],
+            Instruction::Convert {
+                form: 1,
+                dst: 1,
+                src: 0,
+            },
+            RuntimeValue::F64(18446744073709551616.0_f64.to_bits()),
+        ),
+        (
+            vec![4, 1],
+            vec![RuntimeValue::F64(f64::NAN.to_bits())],
+            Instruction::Convert {
+                form: 2,
+                dst: 1,
+                src: 0,
+            },
+            RuntimeValue::I32(0),
+        ),
+        (
+            vec![4, 2],
+            vec![RuntimeValue::F64(f64::INFINITY.to_bits())],
+            Instruction::Convert {
+                form: 2,
+                dst: 1,
+                src: 0,
+            },
+            RuntimeValue::I64(-1),
+        ),
+        (
+            vec![4, 2],
+            vec![RuntimeValue::F64((-1.0_f64).to_bits())],
+            Instruction::Convert {
+                form: 2,
+                dst: 1,
+                src: 0,
+            },
+            RuntimeValue::I64(0),
+        ),
+        (
+            vec![2, 3],
+            vec![RuntimeValue::I64(0x8000_0080_0000_0001_u64 as i64)],
+            Instruction::Convert {
+                form: 1,
+                dst: 1,
+                src: 0,
+            },
+            RuntimeValue::F32(0x5f00_0000),
+        ),
+    ];
+    for (kinds, args, instruction, expected) in cases {
+        let artifact = fixtures::unsigned_operation_artifact(&kinds, args.len(), instruction);
+        let args = args
+            .into_iter()
+            .map(EntryArgument::unowned)
+            .collect::<Vec<_>>();
+        let mut machine = fixtures::started(artifact, &args);
+        assert_eq!(
+            Outcome::Halted(Some(expected)),
+            machine.run_slice(64, 0).unwrap()
+        );
+    }
+}
+
+#[test]
 fn scalar_vectors_match_kotlin_jvm_semantics() {
     for case in fixtures::scalar_cases() {
         let profile = fixtures::profile();

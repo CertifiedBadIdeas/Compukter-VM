@@ -620,9 +620,9 @@ fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeEr
             reg(&mut operands, *dst);
             (0x03, 0)
         }
-        Instruction::Convert { dst, src } => {
+        Instruction::Convert { form, dst, src } => {
             regs(&mut operands, &[*dst, *src]);
-            (0x04, 0)
+            (0x04, *form)
         }
         Instruction::Add {
             form,
