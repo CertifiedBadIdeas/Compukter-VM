@@ -1,6 +1,6 @@
 # Logical computer checkpoints
 
-The Rust checkpoint API is available for host integration; game lifecycle support remains unfinished. No C ABI, JNI/FFM, or Minecraft lifecycle entry point exposes restoration yet. World-store methods support bounded atomic publication and consumption.
+The Rust checkpoint API is available for host integration; game lifecycle support remains unfinished. C ABI 21 and both JNI/FFM bindings expose restoration; Minecraft lifecycle integration remains unfinished. World-store methods support bounded atomic publication and consumption.
 
 Rust owns the logical execution payload. It stores verified executable bytes for the root and every live child, execution profiles and process limits, admitted capability identities, machine and session state, terminal and canonical input, redstone waits, exact `/home` namespace generation and immutable file bytes, and open handle generations. Admission rebuilds execution images from verified artifacts and checks state against those images and trusted host configuration. Rust layouts, addresses, allocation capacities, and process-local machine identity are not persisted.
 
@@ -15,3 +15,11 @@ A full-computer test closes and reopens the store, rebuilds execution against it
 Pending compilation retains the exact validated source bytes captured when the request was issued. Reconstruction uses that immutable input even if the filesystem source changed while compilation was pending; the original source/output revision guards still decide whether publication is stale.
 
 `ComputerMachine::checkpoint` captures execution and opaque host descriptor bytes within `ComputerCheckpointLimits`. `restore_checkpoint` requires a `ComputerRestoreEnvironment` containing the expected computer ID, profile, process limits, freshly resolved capability schemas, filesystem and initial file capability. It returns a machine and host descriptors without executing Guest code. The caller must freeze and settle host actions before capture, validate/rebind restored descriptors, and durably consume the snapshot before advancing restored execution. Native admission does not enforce those host lifecycle obligations.
+
+## Native transport (C ABI 21)
+
+Five exports are appended to the existing transport: `compukter_checkpoint_save`, `compukter_checkpoint_restore`, `compukter_checkpoint_discard`, `compukter_checkpoint_host_size`, and `compukter_checkpoint_host_copy`. There are 49 exported functions. JNI uses Java 21 arrays; FFM uses caller-owned native buffers. Both check the exact ABI version before calls. No input pointer is retained.
+
+Save accepts a session handle, store handle, fixed 16-byte computer ID and at most 4 MiB of opaque host descriptors. The session must belong to that store and ID. Restore accepts a store, a checked u32 boot flag (0: direct artifact entry with `/home` ownership, 1: ROM boot with root ownership), ID, trusted ROM bytes and current capability schemas. It returns the existing 9-byte creation wire with a fresh opaque session handle. A short output reports the required width before admission or handle publication. Restore does not execute Guest code or remove the durable snapshot.
+
+Status 43 means no checkpoint, 44 incompatible context or format, 45 corrupt state/integrity, and 46 a checkpoint size/allocation limit. JNI/FFM map absence to a nullable restoration and the other three to typed checkpoint failures. Corruption never falls back to boot. Existing store/handle failures retain their existing codes. Host size/copy exposes the validated opaque descriptors for host rebinding; short copy reports the actual size without writing bytes. The descriptor cache is released after the first successful advance. The caller must bind descriptors and durably discard the publication before that advance, or explicitly discard on reset.
