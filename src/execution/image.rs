@@ -102,6 +102,15 @@ struct DispatchEntry {
 
 #[derive(Debug)]
 pub(super) enum ResolvedInstruction {
+    InlineConstruct {
+        dst: u16,
+        components: Box<[u16]>,
+    },
+    InlineComponent {
+        dst: u16,
+        src: u16,
+        component: u16,
+    },
     Nop,
     Move {
         dst: u16,
@@ -922,7 +931,8 @@ impl ExecutionImage {
                     NominalType::Class { name, .. }
                     | NominalType::Interface { name, .. }
                     | NominalType::Array { name, .. }
-                    | NominalType::Function { name, .. } => *name,
+                    | NominalType::Function { name, .. }
+                    | NominalType::InlineValue { name, .. } => *name,
                 };
                 let index = if let Some(index) = name_ids.get(&(module_id, name)) {
                     *index
@@ -1387,7 +1397,9 @@ fn derive_type_layout(
                 _ => value_width(*element)?,
             },
         },
-        NominalType::Interface { .. } | NominalType::Function { .. } => RuntimeTypeLayout::NonHeap,
+        NominalType::Interface { .. }
+        | NominalType::Function { .. }
+        | NominalType::InlineValue { .. } => RuntimeTypeLayout::NonHeap,
     };
     visiting[index] = false;
     layouts[index] = Some(layout);
@@ -1768,7 +1780,7 @@ fn resolve_value_type(
     Ok(ResolvedValueType {
         kind: value.kind,
         nullable: value.flags & 1 != 0,
-        nominal: if value.kind == 7 {
+        nominal: if value.kind == 7 || value.kind == 8 {
             Some(
                 resolve_type(artifact, module, value.nominal_type)
                     .ok_or(AdmissionError::InvalidEntry)?,
@@ -1989,6 +2001,19 @@ fn resolve_instruction(
             .ok_or(AdmissionError::StoragePlanOverflow)
     };
     Ok(match instruction {
+        Instruction::InlineConstruct { dst, components } => ResolvedInstruction::InlineConstruct {
+            dst: *dst,
+            components: components.clone(),
+        },
+        Instruction::InlineComponent {
+            dst,
+            src,
+            component,
+        } => ResolvedInstruction::InlineComponent {
+            dst: *dst,
+            src: *src,
+            component: *component,
+        },
         Instruction::Nop => ResolvedInstruction::Nop,
         Instruction::Move { dst, src } => ResolvedInstruction::Move {
             dst: *dst,
@@ -2926,7 +2951,7 @@ fn assignable_types(
                     }
                 }
             }
-            NominalType::Function { .. } => {}
+            NominalType::Function { .. } | NominalType::InlineValue { .. } => {}
         }
     }
     Ok(result.into_boxed_slice())

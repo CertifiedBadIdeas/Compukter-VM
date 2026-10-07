@@ -50,6 +50,37 @@ pub(crate) fn verify_functions(
 
     for (module_id, module) in artifact.modules.iter().enumerate() {
         for (function_id, function) in module.functions.iter().enumerate() {
+            for value in &function.values {
+                if value.semantic_type.kind == 8 {
+                    let (_, layout) = inline_layout(
+                        artifact,
+                        module_id,
+                        function_id,
+                        value.semantic_type,
+                        limits,
+                    )?;
+                    if value.components.len() != layout.len()
+                        || value.components.iter().zip(layout).any(|(atom, semantic)| {
+                            let expected = match semantic.kind {
+                                1 | 5 | 6 => crate::artifact::PhysicalAtom::I32,
+                                2 => crate::artifact::PhysicalAtom::I64,
+                                3 => crate::artifact::PhysicalAtom::F32,
+                                4 => crate::artifact::PhysicalAtom::F64,
+                                7 => crate::artifact::PhysicalAtom::Ref32,
+                                _ => return true,
+                            };
+                            *atom != expected
+                        })
+                    {
+                        return Err(type_failure(
+                            limits,
+                            module_id,
+                            function_id,
+                            "inline physical shape differs from nominal layout",
+                        ));
+                    }
+                }
+            }
             let signature = verify_signature(artifact, module_id, function_id, function, limits)?;
             if function.flags & (1 << 3) != 0 {
                 if function.block_count != 0
@@ -107,7 +138,7 @@ pub(crate) fn verify_entry_arguments(
             )
         })?;
     let signature = verify_signature(artifact, module_id, function_id, function, limits)?;
-    if entry_arguments_match(artifact, signature.0, signature.2) {
+    if signature.1.kind != 8 && entry_arguments_match(artifact, signature.0, signature.2) {
         Ok(())
     } else {
         Err(type_failure(
@@ -117,6 +148,43 @@ pub(crate) fn verify_entry_arguments(
             "entry argument contract disagrees with the entry function signature",
         ))
     }
+}
+
+fn inline_layout<'a>(
+    artifact: &'a DecodedArtifact,
+    module_id: usize,
+    function_id: usize,
+    value: ValueType,
+    limits: &ArtifactLimits,
+) -> Result<(usize, &'a [ValueType]), DiagnosticSet> {
+    if value.kind != 8 || artifact.header.runtime_minor < 15 {
+        return Err(type_failure(
+            limits,
+            module_id,
+            function_id,
+            "inline values require Runtime ABI 1.15",
+        ));
+    }
+    let identity =
+        modules::resolved_type(artifact, module_id, value.nominal_type).ok_or_else(|| {
+            type_failure(
+                limits,
+                module_id,
+                function_id,
+                "inline nominal type does not resolve",
+            )
+        })?;
+    let NominalType::InlineValue { components, .. } =
+        &artifact.modules[identity.0].types[identity.1]
+    else {
+        return Err(type_failure(
+            limits,
+            module_id,
+            function_id,
+            "inline value does not name an inline layout",
+        ));
+    };
+    Ok((identity.0, components))
 }
 
 fn entry_arguments_match(
@@ -274,7 +342,11 @@ fn verify_dataflow(
             .iter()
             .try_fold(0_u32, |total, instruction| {
                 total
-                    .checked_add(instruction.fixed_cost().map_err(single)?)
+                    .checked_add(
+                        instruction
+                            .fixed_cost_for_values(&function.values)
+                            .map_err(single)?,
+                    )
                     .ok_or_else(|| {
                         failure(
                             limits,
@@ -457,6 +529,66 @@ fn verify_instruction(
         ));
     }
     match instruction {
+        Instruction::InlineConstruct { dst, components } => {
+            let value = register_type(function, *dst, module_id, function_id, limits)?;
+            let (layout_module, layout) =
+                inline_layout(artifact, module_id, function_id, value, limits)?;
+            if components.len() != layout.len() {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "inline construction component count differs",
+                ));
+            }
+            for (source, expected) in components.iter().zip(layout) {
+                read(function, state, *source, module_id, function_id, limits)?;
+                let actual = register_type(function, *source, module_id, function_id, limits)?;
+                if !modules::value_types_match(
+                    artifact,
+                    module_id,
+                    actual,
+                    layout_module,
+                    *expected,
+                ) {
+                    return Err(type_failure(
+                        limits,
+                        module_id,
+                        function_id,
+                        "inline construction component type differs",
+                    ));
+                }
+            }
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::InlineComponent {
+            dst,
+            src,
+            component,
+        } => {
+            read(function, state, *src, module_id, function_id, limits)?;
+            let value = register_type(function, *src, module_id, function_id, limits)?;
+            let (layout_module, layout) =
+                inline_layout(artifact, module_id, function_id, value, limits)?;
+            let expected = layout.get(*component as usize).ok_or_else(|| {
+                type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "inline component index is out of range",
+                )
+            })?;
+            let actual = register_type(function, *dst, module_id, function_id, limits)?;
+            if !modules::value_types_match(artifact, layout_module, *expected, module_id, actual) {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "inline extraction component type differs",
+                ));
+            }
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
         Instruction::Nop | Instruction::Jump { .. } | Instruction::Unreachable => {}
         Instruction::Move { dst, src } => {
             read(function, state, *src, module_id, function_id, limits)?;
@@ -1922,6 +2054,14 @@ pub(super) fn value_assignable(
                             _ => nominal_assignable(artifact, source, destination),
                         }
                     })
+        } else if source.kind == 8 {
+            modules::resolved_type(artifact, source_module, source.nominal_type)
+                .zip(modules::resolved_type(
+                    artifact,
+                    destination_module,
+                    destination.nominal_type,
+                ))
+                .is_some_and(|(source, destination)| source == destination)
         } else {
             true
         }
@@ -1970,7 +2110,7 @@ fn nominal_assignable(
                     stack.push(parent);
                 }
             }
-            NominalType::Function { .. } => {}
+            NominalType::Function { .. } | NominalType::InlineValue { .. } => {}
         }
     }
     false

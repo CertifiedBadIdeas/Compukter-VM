@@ -3621,7 +3621,8 @@ fn canonicalize_module_strings(
             NominalType::Class { name, .. }
             | NominalType::Interface { name, .. }
             | NominalType::Array { name, .. }
-            | NominalType::Function { name, .. } => *name = string(*name),
+            | NominalType::Function { name, .. }
+            | NominalType::InlineValue { name, .. } => *name = string(*name),
         }
     }
     for import in &mut module.imports {
@@ -7046,7 +7047,11 @@ fn install_function_blocks(
     for (function_id, instructions) in programs.into_iter().enumerate() {
         let fixed_cost = instructions
             .iter()
-            .map(|instruction| instruction.fixed_cost().unwrap())
+            .map(|instruction| {
+                instruction
+                    .fixed_cost_for_values(&artifact.modules[0].functions[function_id].values)
+                    .unwrap()
+            })
             .sum();
         maximum_block_cost = maximum_block_cost.max(fixed_cost);
         blocks.push(Block {
@@ -7429,4 +7434,158 @@ pub(super) fn record_and_scalar_tasks_artifact() -> VerifiedArtifact {
     artifact.manifest.minimum_slice_cost = maximum;
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+pub(crate) fn inline_value_decoded(component: u16) -> crate::artifact::DecodedArtifact {
+    let mut artifact = crate::decode::records::decode_artifact(
+        Arc::from(crate::test_support::minimal_vector()),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    artifact.header.runtime_minor = 15;
+    let payload = vec![primitive(1), primitive(4), primitive(5)];
+    let inline = ValueType {
+        kind: 8,
+        flags: 0,
+        nominal_type: TypeId(3),
+    };
+    let selected = payload[component as usize];
+    let inline_value = || crate::artifact::FunctionValue {
+        semantic_type: inline,
+        components: vec![
+            crate::artifact::PhysicalAtom::I32,
+            crate::artifact::PhysicalAtom::F64,
+            crate::artifact::PhysicalAtom::I32,
+        ],
+    };
+    let module = &mut artifact.modules[0];
+    module.types = vec![
+        function_type(selected, Vec::new()),
+        function_type(inline, vec![inline]),
+        function_type(inline, vec![inline]),
+        NominalType::InlineValue {
+            name: 1,
+            components: payload.clone(),
+        },
+    ];
+    module.declared_types = 4;
+    module.constants = vec![
+        Constant::I32(42),
+        Constant::F64(3.5f64.to_bits()),
+        Constant::Bool(true),
+    ];
+    let mut main = function(
+        0,
+        0,
+        vec![
+            payload[0],
+            payload[1],
+            payload[2],
+            primitive(1),
+            primitive(1),
+            selected,
+        ],
+        0,
+    );
+    main.values[3] = inline_value();
+    main.values[4] = inline_value();
+    let mut callee = function(1, 1, vec![primitive(1), primitive(1)], 1);
+    callee.values = vec![inline_value(), inline_value()];
+    let mut nested = function(2, 1, vec![primitive(1), primitive(1)], 2);
+    nested.values = vec![inline_value(), inline_value()];
+    module.functions = vec![main, callee, nested];
+    module.declared_functions = 3;
+    install_function_blocks(
+        &mut artifact,
+        vec![
+            vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: 0,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: 1,
+                },
+                Instruction::Const {
+                    dst: 2,
+                    constant: 2,
+                },
+                Instruction::InlineConstruct {
+                    dst: 3,
+                    components: Box::new([0, 1, 2]),
+                },
+                Instruction::CallDirect {
+                    dst: 4,
+                    function_ref: 1,
+                    args: Box::new([3]),
+                },
+                Instruction::InlineComponent {
+                    dst: 5,
+                    src: 4,
+                    component,
+                },
+                Instruction::Return { value: 5 },
+            ],
+            vec![
+                Instruction::CallDirect {
+                    dst: 1,
+                    function_ref: 2,
+                    args: Box::new([0]),
+                },
+                Instruction::Return { value: 1 },
+            ],
+            vec![
+                Instruction::Move { dst: 1, src: 0 },
+                Instruction::Return { value: 1 },
+            ],
+        ],
+    );
+    configure_stack(&mut artifact, 0, 3);
+    artifact
+}
+
+pub(super) fn inline_value_artifact(component: u16) -> VerifiedArtifact {
+    let bytes =
+        crate::test_encode::encode_artifact_rehashed(inline_value_decoded(component)).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+pub(super) fn inline_reference_root_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        artifact.header.runtime_minor = 15;
+        let reference = ValueType {
+            kind: 7,
+            flags: 1,
+            nominal_type: TypeId(1),
+        };
+        let module = &mut artifact.modules[0];
+        module.types = vec![
+            function_type(primitive(0), Vec::new()),
+            plain_class(TypeId(u32::MAX), 0, 0),
+            NominalType::InlineValue {
+                name: 1,
+                components: vec![reference, primitive(1), reference],
+            },
+        ];
+        module.declared_types = 3;
+        module.functions[0].register_count = 1;
+        module.functions[0].values = vec![crate::artifact::FunctionValue {
+            semantic_type: ValueType {
+                kind: 8,
+                flags: 0,
+                nominal_type: TypeId(2),
+            },
+            components: vec![
+                crate::artifact::PhysicalAtom::Ref32,
+                crate::artifact::PhysicalAtom::I32,
+                crate::artifact::PhysicalAtom::Ref32,
+            ],
+        }];
+        install_entry_blocks(
+            artifact,
+            vec![vec![Instruction::Return { value: u16::MAX }]],
+        );
+        configure_stack(artifact, 0, 1);
+    })
 }

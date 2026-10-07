@@ -1276,6 +1276,50 @@ impl Machine {
                 self.executed_instructions = executed_instructions;
                 match instruction {
                     ResolvedInstruction::Return { value } => {
+                        let returning_function = self
+                            .image
+                            .function(self.frames[frame_index].function)
+                            .ok_or(RunError::NotRunnable)?;
+                        if returning_function.result.kind == 8 {
+                            if frame_index == 0 || *value == u16::MAX {
+                                return Ok(self.fault(VmFault::InvalidValueType));
+                            }
+                            let callee = self.frames[frame_index];
+                            let caller = self.frames[frame_index - 1];
+                            let caller_function = self
+                                .image
+                                .function(caller.function)
+                                .ok_or(RunError::NotRunnable)?;
+                            let source = returning_function
+                                .frame_layout
+                                .values
+                                .get(*value as usize)
+                                .ok_or(RunError::NotRunnable)?;
+                            let destination = caller_function
+                                .frame_layout
+                                .values
+                                .get(callee.destination as usize)
+                                .ok_or(RunError::NotRunnable)?;
+                            if let Err(fault) = self.frame_arena.copy_value(
+                                callee.base,
+                                source,
+                                caller.base,
+                                destination,
+                            ) {
+                                return Ok(self.fault(fault));
+                            }
+                            if let Err(fault) = self.frame_arena.pop(FrameReservation {
+                                base: callee.base,
+                                byte_len: callee.byte_len,
+                            }) {
+                                return Ok(self.fault(fault));
+                            }
+                            self.frames[frame_index] = Frame::EMPTY;
+                            self.frame_depth = frame_index;
+                            self.frames[frame_index - 1].block = callee.caller_block;
+                            self.frames[frame_index - 1].instruction = callee.caller_instruction;
+                            break;
+                        }
                         let returned = if *value == u16::MAX {
                             None
                         } else {
@@ -1431,6 +1475,17 @@ impl Machine {
                             return Ok(self.fault(VmFault::InvalidValueType));
                         }
                         for source in args.iter() {
+                            let caller_function = self
+                                .image
+                                .function(self.frames[frame_index].function)
+                                .ok_or(RunError::NotRunnable)?;
+                            if caller_function
+                                .registers
+                                .get(*source as usize)
+                                .is_some_and(|value| value.kind == 8)
+                            {
+                                continue;
+                            }
                             if let Err(fault) = self.read_register(frame_index, *source) {
                                 return Ok(self.fault(fault));
                             }
@@ -1461,6 +1516,37 @@ impl Machine {
                             initializer: None,
                         };
                         for (parameter, source) in args.iter().enumerate() {
+                            let caller = self.frames[frame_index];
+                            let caller_function = self
+                                .image
+                                .function(caller.function)
+                                .ok_or(RunError::NotRunnable)?;
+                            if caller_function
+                                .registers
+                                .get(*source as usize)
+                                .is_some_and(|value| value.kind == 8)
+                            {
+                                let source = caller_function
+                                    .frame_layout
+                                    .values
+                                    .get(*source as usize)
+                                    .ok_or(RunError::NotRunnable)?;
+                                let destination = target_function
+                                    .frame_layout
+                                    .values
+                                    .get(parameter)
+                                    .ok_or(RunError::NotRunnable)?;
+                                if let Err(fault) = self.frame_arena.copy_value(
+                                    caller.base,
+                                    source,
+                                    callee.base,
+                                    destination,
+                                ) {
+                                    let _ = self.frame_arena.pop(reservation);
+                                    return Ok(self.fault(fault));
+                                }
+                                continue;
+                            }
                             let value = match self.read_register(frame_index, *source) {
                                 Ok(value) => value,
                                 Err(fault) => {
@@ -3894,6 +3980,46 @@ impl Machine {
                     .to_le_bytes(),
             );
             for register in 0..active_function.register_count {
+                if active_function.registers[register].kind == 8 {
+                    let layout = active_function
+                        .frame_layout
+                        .values
+                        .get(register)
+                        .ok_or(RunError::NotRunnable)?;
+                    let nominal = active_function.registers[register]
+                        .nominal
+                        .ok_or(RunError::NotRunnable)?;
+                    trace_field(&mut self.trace, &[2]);
+                    trace_field(&mut self.trace, &nominal.module.to_le_bytes());
+                    trace_field(&mut self.trace, &nominal.ty.to_le_bytes());
+                    trace_field(
+                        &mut self.trace,
+                        &(layout.components.len() as u32).to_le_bytes(),
+                    );
+                    for component in &layout.components {
+                        if component.atom == crate::artifact::PhysicalAtom::Ref32
+                            && safepoint.is_some_and(|map| {
+                                !map.reference_offsets.contains(&component.offset)
+                            })
+                        {
+                            trace_register(&mut self.trace, None, None)?;
+                            continue;
+                        }
+                        let value = self
+                            .frame_arena
+                            .read_component_value(frame.base, *component)
+                            .map_err(|_| RunError::NotRunnable)?;
+                        let reference_type = match value {
+                            RuntimeValue::Reference(reference) => Some(
+                                self.reference_type(reference)
+                                    .map_err(|_| RunError::NotRunnable)?,
+                            ),
+                            _ => None,
+                        };
+                        trace_register(&mut self.trace, Some(value), reference_type)?;
+                    }
+                    continue;
+                }
                 if let Some(map) = safepoint {
                     let register_layout = active_function
                         .frame_layout
@@ -4302,11 +4428,73 @@ fn execute_scalar(
         }};
     }
     match instruction {
+        ResolvedInstruction::InlineConstruct { dst, components } => {
+            let destination = function
+                .frame_layout
+                .values
+                .get(*dst as usize)
+                .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
+            if components.len() != destination.components.len() {
+                return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
+            }
+            for (source, destination) in components.iter().zip(destination.components.iter()) {
+                let source = function
+                    .frame_layout
+                    .values
+                    .get(*source as usize)
+                    .and_then(|layout| layout.components.first())
+                    .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
+                arena
+                    .copy_component(frame.base, source, frame.base, destination)
+                    .map_err(InstructionFailure::Fault)?;
+            }
+            Ok(())
+        }
+        ResolvedInstruction::InlineComponent {
+            dst,
+            src,
+            component,
+        } => {
+            let source = function
+                .frame_layout
+                .values
+                .get(*src as usize)
+                .and_then(|layout| layout.components.get(*component as usize))
+                .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
+            let destination = function
+                .frame_layout
+                .values
+                .get(*dst as usize)
+                .and_then(|layout| layout.components.first())
+                .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
+            arena
+                .copy_component(frame.base, source, frame.base, destination)
+                .map_err(InstructionFailure::Fault)
+        }
         ResolvedInstruction::Nop => Ok(()),
         ResolvedInstruction::Move { dst, src } => {
-            let value = read_frame_value(arena, frame, function, *src)
-                .map_err(InstructionFailure::Fault)?;
-            write_frame_value(arena, frame, function, *dst, value)
+            if function
+                .registers
+                .get(*src as usize)
+                .is_some_and(|value| value.kind != 8)
+            {
+                let value = read_frame_value(arena, frame, function, *src)
+                    .map_err(InstructionFailure::Fault)?;
+                return write_frame_value(arena, frame, function, *dst, value)
+                    .map_err(InstructionFailure::Fault);
+            }
+            let source = function
+                .frame_layout
+                .values
+                .get(*src as usize)
+                .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
+            let destination = function
+                .frame_layout
+                .values
+                .get(*dst as usize)
+                .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
+            arena
+                .copy_value(frame.base, source, frame.base, destination)
                 .map_err(InstructionFailure::Fault)
         }
         ResolvedInstruction::Const { dst, constant } => write_frame_value(

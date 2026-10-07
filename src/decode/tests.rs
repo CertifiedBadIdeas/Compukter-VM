@@ -640,7 +640,7 @@ fn instruction_decodes_unit_return_and_arithmetic_block() {
 fn instruction_rejects_unknown_opcode_form_and_bad_lengths() {
     let limits = ArtifactLimits::default();
     assert_eq!(
-        instruction_error(&[0x05, 0, 4, 0], 1, &limits),
+        instruction_error(&[0x09, 0, 4, 0], 1, &limits),
         Code::BadInstruction
     );
     assert_eq!(

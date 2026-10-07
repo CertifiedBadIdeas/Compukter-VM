@@ -209,6 +209,80 @@ fn collector_keeps_explicit_pending_runtime_roots() {
 }
 
 #[test]
+fn collector_traces_only_live_reference_components_of_inline_values() {
+    use super::frame::PhysicalValue;
+    for keep_second in [false, true] {
+        let mut image = ExecutionImage::admit(
+            fixtures::inline_reference_root_artifact(),
+            fixtures::profile(),
+        )
+        .unwrap();
+        let entry = image.entry_index();
+        let function = image.function(entry).unwrap();
+        let layout = function.frame_layout.clone();
+        let block = function.first_block;
+        let components = &layout.values[0].components;
+        let offsets = if keep_second {
+            vec![components[0].offset, components[2].offset]
+        } else {
+            vec![components[0].offset]
+        };
+        image.test_replace_safepoint_offsets(entry, block, 0, offsets.into_boxed_slice());
+        let mut heap = Heap::new(&image.storage_plan()).unwrap();
+        let ty = TypeKey { module: 0, ty: 1 };
+        let RuntimeTypeLayout::Object(object) = image.type_layout(ty).unwrap() else {
+            unreachable!()
+        };
+        let first = allocate(&mut heap, ty, object.block_bytes);
+        let second = allocate(&mut heap, ty, object.block_bytes);
+        let dead = allocate(&mut heap, ty, object.block_bytes);
+        let mut arena = FrameArena::new((layout.byte_len + 7) & !7).unwrap();
+        let reservation = arena.push(&layout).unwrap();
+        arena
+            .write_value(
+                reservation.base,
+                &layout,
+                0,
+                &[
+                    PhysicalValue::Ref32(Some(first)),
+                    PhysicalValue::I32(42),
+                    PhysicalValue::Ref32(Some(second)),
+                ],
+            )
+            .unwrap();
+        let mut frame = Frame::test_entry(entry);
+        frame.base = reservation.base;
+        frame.byte_len = reservation.byte_len;
+        frame.block = block;
+        let statics = compact_statics(&image, &[]);
+        let external = ExternalRootTable::new(0).unwrap();
+        let mut collector = Collector::new();
+        collector.start();
+        while collector.is_active() {
+            collector
+                .step(
+                    &mut heap,
+                    &image,
+                    RootSet {
+                        task_failures: &[],
+                        statics: &statics,
+                        frames: &[frame],
+                        saved_frames: &[],
+                        frame_arena: &arena,
+                        frame_depth: 1,
+                        runtime_roots: &[],
+                        external: &external,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(heap.managed_type(first).is_ok());
+        assert_eq!(keep_second, heap.managed_type(second).is_ok());
+        assert!(heap.managed_type(dead).is_err());
+    }
+}
+
+#[test]
 fn collector_ignores_reference_bytes_absent_from_the_exact_safepoint_map() {
     let mut image = ExecutionImage::admit(
         fixtures::reference_field_roundtrip_artifact(),

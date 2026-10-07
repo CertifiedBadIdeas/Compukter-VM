@@ -225,7 +225,7 @@ pub(crate) fn decode_artifact(
         let fields = parse_fields(&fields_section, limits)?;
         let functions = parse_functions(&functions_section, limits)?;
         let blocks = parse_blocks(&blocks_section, limits)?;
-        let code = parse_code(&code_section, &blocks, limits)?;
+        let code = parse_code(&code_section, &blocks, &functions, limits)?;
         let exceptions = parse_exceptions(&exceptions_section, limits)?;
         let safepoint_roots = parse_safepoint_roots(&safepoint_roots_section, limits)?;
         let utf16_literals = parse_utf16_literals(
@@ -505,6 +505,34 @@ fn parse_types(
                     result,
                     parameters,
                 }
+            }
+            4 => {
+                if flags != 0 || generic_arity != 0 {
+                    return Err(raw(Code::BadType, "invalid inline value header"));
+                }
+                let count = ru16(cursor)? as usize;
+                if ru16(cursor)? != 0 || count == 0 || count > limits.physical_components_per_value
+                {
+                    return Err(raw(
+                        Code::BadType,
+                        "invalid inline component count or reserved field",
+                    ));
+                }
+                let mut components = Vec::new();
+                components
+                    .try_reserve_exact(count)
+                    .map_err(|_| raw(Code::LimitExceeded, "cannot reserve inline components"))?;
+                for _ in 0..count {
+                    let component = value_type(cursor)?;
+                    if component.kind == 0 || component.kind == 8 {
+                        return Err(raw(
+                            Code::BadType,
+                            "inline layout must contain flattened scalar or reference components",
+                        ));
+                    }
+                    components.push(component);
+                }
+                NominalType::InlineValue { name, components }
             }
             _ => return Err(raw(Code::BadType, "unknown nominal type tag")),
         };
@@ -833,6 +861,7 @@ fn collect_ranges(
 fn parse_code(
     section: &IndexedSection<'_>,
     blocks: &[Block],
+    functions: &[Function],
     limits: &ArtifactLimits,
 ) -> Result<Vec<DecodedCode>, DiagnosticSet> {
     if section.len() != blocks.len() {
@@ -852,7 +881,15 @@ fn parse_code(
             super::code::decode_code_record(record, block.instruction_count, limits)?;
         let fixed_cost = instructions.iter().try_fold(0_u32, |total, instruction| {
             total
-                .checked_add(instruction.fixed_cost().map_err(single_raw)?)
+                .checked_add(
+                    instruction
+                        .fixed_cost_for_values(
+                            functions
+                                .get(block.owner_function.0 as usize)
+                                .map_or(&[], |function| function.values.as_slice()),
+                        )
+                        .map_err(single_raw)?,
+                )
                 .ok_or_else(|| raw(Code::BadCost, "block fixed cost overflows u32"))
         })?;
         code.push(DecodedCode {
@@ -893,9 +930,10 @@ fn value_type(cursor: &mut Cursor<'_>) -> Result<ValueType, DiagnosticSet> {
     let reserved = ru16(cursor)?;
     let nominal_type = ru32(cursor)?;
     if reserved != 0
-        || kind > 7
-        || (kind != 7 && (flags != 0 || nominal_type != u32::MAX))
+        || kind > 8
+        || (kind != 7 && kind != 8 && (flags != 0 || nominal_type != u32::MAX))
         || (kind == 7 && (flags & !1 != 0 || nominal_type == u32::MAX))
+        || (kind == 8 && (flags != 0 || nominal_type == u32::MAX))
     {
         return Err(raw(Code::BadType, "invalid value type"));
     }
@@ -1056,6 +1094,12 @@ fn validate_module_tables(
 ) -> Result<(), DiagnosticSet> {
     for nominal in &module.types {
         let name = match nominal {
+            NominalType::InlineValue { name, components } => {
+                for component in components {
+                    value_type_ref(module, *component, limits)?;
+                }
+                *name
+            }
             NominalType::Class {
                 name,
                 super_type,
@@ -1314,7 +1358,7 @@ fn value_type_ref(
     value: ValueType,
     limits: &ArtifactLimits,
 ) -> Result<(), DiagnosticSet> {
-    if value.kind == 7 {
+    if value.kind == 7 || value.kind == 8 {
         type_ref(module, value.nominal_type, false, limits)?;
     }
     Ok(())
