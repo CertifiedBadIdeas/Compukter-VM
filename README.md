@@ -241,6 +241,13 @@ reverses order on alternate rounds, excludes verification/admission/start from
 timers and records construction and operation separately in `samples.tsv` and
 `measurements.tsv`. Operation includes the final scan and output text copy.
 
+On 64-bit Linux, additional `create_cpu_ns` and `hot_cpu_ns` sample columns
+and their summary medians measure `CLOCK_THREAD_CPUTIME_ID`. These exclude
+descheduled time; CPU frequency, cache contention and other host activity still
+affect them. Other platforms leave these columns empty. Existing wall-time and
+work-counter columns retain their meaning. Compare identical harness builds,
+workloads and budgets, and retain both clocks when the host is busy.
+
 Profile separately from ordinary timing. With symbols enabled, for example:
 
 ```sh
