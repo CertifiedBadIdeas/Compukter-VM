@@ -71,6 +71,7 @@ pub struct WorldFileSystemStore {
     persistence: PersistenceGate,
     worker: Mutex<Option<JoinHandle<()>>>,
     limits: FileSystemLimits,
+    crash_injector: PersistenceCrashInjector,
 }
 
 impl WorldFileSystemStore {
@@ -120,6 +121,7 @@ impl WorldFileSystemStore {
             persistence,
             worker: Mutex::new(Some(worker)),
             limits,
+            crash_injector,
         }))
     }
 
@@ -168,6 +170,120 @@ impl WorldFileSystemStore {
             .register_computer(id, recovered.state.generation())?;
         filesystem.attach_persistence(self.persistence.computer(id, self.limits));
         Ok(filesystem)
+    }
+
+    // Internal until ComputerMachine/host admission and the native transport are wired.
+    #[allow(dead_code)]
+    pub(crate) fn save_execution_checkpoint(
+        &self,
+        id: ComputerId,
+        generation: u64,
+        bytes: &[u8],
+        maximum_bytes: usize,
+    ) -> Result<(), StoreError> {
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *health != StoreHealth::Active {
+            return Err(StoreError::Closed);
+        }
+        match self.health() {
+            StoreHealth::Active => {}
+            StoreHealth::Faulted => return Err(StoreError::StorageFaulted),
+            _ => return Err(StoreError::Closed),
+        }
+        if bytes.len() > maximum_bytes {
+            return Err(StoreError::Busy);
+        }
+        self.persistence.flush(id, generation)?;
+        if self.persistence.durable_generation(id)? != generation {
+            return Err(StoreError::InvalidGeneration);
+        }
+        let path = self.execution_checkpoint_path(id)?;
+        super::worker::write_execution_checkpoint(&path, bytes, self.crash_injector)
+            .map_err(|_| StoreError::Io)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_execution_checkpoint(
+        &self,
+        id: ComputerId,
+        maximum_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *health != StoreHealth::Active {
+            return Err(StoreError::Closed);
+        }
+        match self.health() {
+            StoreHealth::Active => {}
+            StoreHealth::Faulted => return Err(StoreError::StorageFaulted),
+            _ => return Err(StoreError::Closed),
+        }
+        let path = self.execution_checkpoint_path(id)?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::Io),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > maximum_bytes as u64
+        {
+            return Err(StoreError::StorageFaulted);
+        }
+        let length = usize::try_from(metadata.len()).map_err(|_| StoreError::StorageFaulted)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| StoreError::Busy)?;
+        let read_limit = (length as u64)
+            .checked_add(1)
+            .ok_or(StoreError::StorageFaulted)?;
+        File::open(path)
+            .and_then(|file| file.take(read_limit).read_to_end(&mut bytes))
+            .map_err(|_| StoreError::Io)?;
+        if bytes.len() != length {
+            return Err(StoreError::StorageFaulted);
+        }
+        Ok(Some(bytes))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn discard_execution_checkpoint(&self, id: ComputerId) -> Result<(), StoreError> {
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *health != StoreHealth::Active {
+            return Err(StoreError::Closed);
+        }
+        match self.health() {
+            StoreHealth::Active => {}
+            StoreHealth::Faulted => return Err(StoreError::StorageFaulted),
+            _ => return Err(StoreError::Closed),
+        }
+        let path = self.execution_checkpoint_path(id)?;
+        super::worker::discard_execution_checkpoint(&path).map_err(|_| StoreError::Io)
+    }
+
+    fn execution_checkpoint_path(&self, id: ComputerId) -> Result<PathBuf, StoreError> {
+        let directory = computer_path(&self.root, id);
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(StoreError::StorageFaulted)
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(StoreError::Io),
+        }
+        if read_tombstone(&directory.join("tombstone"), id)? {
+            return Err(StoreError::NotFound);
+        }
+        Ok(directory.join("execution"))
     }
 
     pub fn durable_generation(&self, id: ComputerId) -> Result<u64, StoreError> {
