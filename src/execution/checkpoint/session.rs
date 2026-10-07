@@ -52,6 +52,13 @@ checkpoint_enum!(SessionTerminal {
 // Internal state transport only. Persisted admission additionally needs complete
 // image-aware reference/continuation and external resource validation.
 impl Session {
+    pub(crate) fn checkpoint_has_host_request(&self, task: TaskId, request: RequestId) -> bool {
+        self.pending_requests
+            .get(HostRequestIdentity::new(task, request))
+            .is_some()
+            && self.machine.checkpoint_task_waits_for(task, request)
+    }
+
     fn checkpoint_capability_identity(&self) -> Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         let mut writer = Writer::new(16 * 1024 * 1024);
@@ -59,7 +66,7 @@ impl Session {
         Ok(Sha256::digest(writer.finish()).into())
     }
 
-    pub(in crate::execution) fn write_checkpoint_state(&self, writer: &mut Writer) -> Result<()> {
+    pub(crate) fn write_checkpoint_state(&self, writer: &mut Writer) -> Result<()> {
         self.checkpoint_capability_identity()?.write(writer)?;
         self.maximum_slice_budget.write(writer)?;
         self.maximum_replies.write(writer)?;
@@ -84,7 +91,7 @@ impl Session {
         Ok(())
     }
 
-    pub(in crate::execution) fn read_checkpoint_state(
+    pub(crate) fn read_checkpoint_state(
         mut admitted: Self,
         reader: &mut Reader<'_>,
     ) -> Result<Self> {

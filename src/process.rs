@@ -230,3 +230,6 @@ impl Default for ProcessLimits {
         .expect("fixed process limits are valid")
     }
 }
+
+#[path = "checkpoint/process.rs"]
+mod checkpoint_state;

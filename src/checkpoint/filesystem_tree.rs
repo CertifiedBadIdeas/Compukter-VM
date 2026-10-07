@@ -18,7 +18,7 @@
 
 use super::*;
 use crate::execution::checkpoint::{
-    Checkpoint as LogicalCheckpoint, CheckpointError, Reader, Result, Writer,
+    checkpoint_enum, Checkpoint as LogicalCheckpoint, CheckpointError, Reader, Result, Writer,
 };
 use crate::filesystem::{
     recover, Checkpoint as NamespaceCheckpoint, ComputerId, RecoveryCheckpoint, RecoveryInput,
@@ -428,3 +428,5 @@ mod tests {
         assert_eq!(Err(FileSystemError::NotFound), restored.read(handle, 0, 8));
     }
 }
+
+checkpoint_enum!(ExecutableRevision { 0 => Absent; 1 => Present(v0); });
