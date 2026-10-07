@@ -531,3 +531,7 @@ mod tests {
         );
     }
 }
+
+#[path = "checkpoint/stdio.rs"]
+#[allow(dead_code)] // Internal codec; the computer checkpoint boundary supplies validation context.
+mod checkpoint_state;

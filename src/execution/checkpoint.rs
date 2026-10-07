@@ -29,22 +29,22 @@ pub enum CheckpointError {
     Integrity,
 }
 
-pub(super) type Result<T> = core::result::Result<T, CheckpointError>;
+pub(crate) type Result<T> = core::result::Result<T, CheckpointError>;
 
-pub(super) struct Writer {
+pub(crate) struct Writer {
     bytes: Vec<u8>,
     maximum: usize,
 }
 
 impl Writer {
-    pub(super) fn new(maximum: usize) -> Self {
+    pub(crate) fn new(maximum: usize) -> Self {
         Self {
             bytes: Vec::new(),
             maximum,
         }
     }
 
-    pub(super) fn put(&mut self, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn put(&mut self, bytes: &[u8]) -> Result<()> {
         let length = self
             .bytes
             .len()
@@ -60,19 +60,19 @@ impl Writer {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> Vec<u8> {
+    pub(crate) fn finish(self) -> Vec<u8> {
         self.bytes
     }
 }
 
-pub(super) struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     allocation_left: usize,
     depth: usize,
 }
 
 impl<'a> Reader<'a> {
-    pub(super) fn new(
+    pub(crate) fn new(
         bytes: &'a [u8],
         maximum_bytes: usize,
         maximum_allocation: usize,
@@ -87,13 +87,13 @@ impl<'a> Reader<'a> {
         })
     }
 
-    pub(super) fn take(&mut self, length: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, length: usize) -> Result<&'a [u8]> {
         let result = self.bytes.get(..length).ok_or(CheckpointError::Truncated)?;
         self.bytes = &self.bytes[length..];
         Ok(result)
     }
 
-    pub(super) fn allocate<T>(&mut self, length: usize) -> Result<()> {
+    pub(crate) fn allocate<T>(&mut self, length: usize) -> Result<()> {
         // Charge even zero-sized values, preventing a tiny input from requesting
         // an unbounded number of allocations or decode iterations.
         let bytes = length
@@ -106,7 +106,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    pub(super) fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub(crate) fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if self.depth == 64 {
             return Err(CheckpointError::Limit);
         }
@@ -116,7 +116,7 @@ impl<'a> Reader<'a> {
         result
     }
 
-    pub(super) fn finish(self) -> Result<()> {
+    pub(crate) fn finish(self) -> Result<()> {
         if self.bytes.is_empty() {
             Ok(())
         } else {
@@ -125,7 +125,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(super) trait Checkpoint: Sized {
+pub(crate) trait Checkpoint: Sized {
     fn write(&self, writer: &mut Writer) -> Result<()>;
     fn read(reader: &mut Reader<'_>) -> Result<Self>;
 }
@@ -145,7 +145,7 @@ macro_rules! checkpoint_struct {
         }
     };
 }
-pub(super) use checkpoint_struct;
+pub(crate) use checkpoint_struct;
 
 macro_rules! checkpoint_enum {
     ($ty:ident { $($tag:literal => $variant:ident $(($($tuple:ident),*))? $({$($field:ident),*})?;)* }) => {
@@ -169,7 +169,7 @@ macro_rules! checkpoint_enum {
         }
     };
 }
-pub(super) use checkpoint_enum;
+pub(crate) use checkpoint_enum;
 
 macro_rules! integers {
     ($($ty:ty),*) => { $(

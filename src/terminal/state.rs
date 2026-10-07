@@ -529,3 +529,7 @@ fn validate_palette(index: u8) -> Result<(), TerminalError> {
         Ok(())
     }
 }
+
+#[path = "../checkpoint/terminal_state.rs"]
+#[allow(dead_code)] // Internal codec; the computer checkpoint boundary supplies validation context.
+mod checkpoint_state;

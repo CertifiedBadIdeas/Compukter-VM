@@ -2,7 +2,7 @@
 
 mod array_copy;
 mod channel;
-mod checkpoint;
+pub(crate) mod checkpoint;
 mod error;
 mod external_roots;
 mod frame;
