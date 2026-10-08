@@ -393,6 +393,22 @@ impl PersistenceGate {
         completion.wait()
     }
 
+    pub fn flush_admitted(&self, id: ComputerId) -> Result<(), StoreError> {
+        let generation = {
+            let state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            require_active_store(state.health)?;
+            state.admitted.get(&id).copied()
+        };
+        if let Some(generation) = generation {
+            self.flush(id, generation)?;
+        }
+        Ok(())
+    }
+
     pub fn flush_all(&self) -> Result<(), StoreError> {
         let admitted = {
             let state = self

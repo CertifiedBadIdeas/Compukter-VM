@@ -152,6 +152,32 @@ fn queue_backpressure_and_store_close_precede_visible_mutation() {
 }
 
 #[test]
+fn immediate_reopen_preserves_the_last_admitted_generation() {
+    let root = TestRoot::new();
+    let limits = FileSystemLimits::testing();
+    let id = ComputerId::from_bytes([51; 16]);
+    let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
+    let mut filesystem = store.open_computer(id, empty_rom(&limits)).unwrap();
+    for generation in 1..=32 {
+        let expected = format!("saved before reboot {generation}");
+        filesystem
+            .write_file(&owner(), &path("/home/draft"), expected.as_bytes(), false)
+            .unwrap();
+        assert_eq!(generation, filesystem.generation());
+        drop(filesystem);
+        filesystem = store.open_computer(id, empty_rom(&limits)).unwrap();
+        assert_eq!(generation, filesystem.generation());
+        assert_eq!(
+            expected.as_bytes(),
+            filesystem.read_file_for_test(&path("/home/draft")).unwrap()
+        );
+        assert_eq!(generation, store.durable_generation(id).unwrap());
+    }
+    drop(filesystem);
+    store.close().unwrap();
+}
+
+#[test]
 fn admitted_mutation_becomes_durable_and_recovers_after_restart() {
     let root = TestRoot::new();
     let limits = FileSystemLimits::testing();
