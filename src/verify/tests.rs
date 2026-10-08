@@ -2493,3 +2493,44 @@ fn inline_values_reject_malformed_layouts_shapes_and_uses() {
         );
     }
 }
+
+#[test]
+fn floating_math_rejects_old_abi_and_mixed_register_widths() {
+    use crate::artifact::{Instruction, MathBinaryOperation, MathUnaryOperation};
+    for (kinds, instruction) in [
+        (
+            vec![4, 4],
+            Instruction::MathUnary {
+                form: 4,
+                operation: MathUnaryOperation::Sqrt,
+                dst: 1,
+                src: 0,
+            },
+        ),
+        (
+            vec![3, 3, 3],
+            Instruction::MathBinary {
+                form: 3,
+                operation: MathBinaryOperation::Pow,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+        ),
+    ] {
+        let source = crate::execution::fixtures::unsigned_operation_artifact(
+            &kinds,
+            kinds.len() - 1,
+            instruction,
+        );
+        let mut artifact = decoded(source.decoded().bytes.to_vec());
+        assert!(verify_cfg(&artifact).is_ok());
+        artifact.header.runtime_minor = 15;
+        assert!(verify_cfg(&artifact).is_err());
+        artifact.header.runtime_minor = 16;
+        artifact.modules[0].functions[0].values[0]
+            .semantic_type
+            .kind = if kinds[0] == 4 { 3 } else { 4 };
+        assert!(verify_cfg(&artifact).is_err());
+    }
+}

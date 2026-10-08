@@ -1139,3 +1139,24 @@ fn root_range_marker_rejects_bad_flags_versions_counts_and_expansion_budgets() {
     support::rehash(&mut bad);
     assert!(crate::verify_artifact(Arc::from(bad), ArtifactLimits::default()).is_err());
 }
+
+#[test]
+fn floating_math_frames_reject_invalid_forms_selectors_and_trailing_operands() {
+    use super::code::decode_code_record;
+    let valid = [0x1c, 4, 9, 0, 19, 1, 0, 0, 0, 0xe3, 0, 6, 0, 0xff, 0xff];
+    assert!(decode_code_record(&valid, 2, &ArtifactLimits::default()).is_ok());
+    for (offset, value) in [(1, 1), (1, 9), (4, 0), (4, 30)] {
+        let mut invalid = valid;
+        invalid[offset] = value;
+        assert!(decode_code_record(&invalid, 2, &ArtifactLimits::default()).is_err());
+    }
+    let binary = [
+        0x1d, 3, 11, 0, 5, 2, 0, 0, 0, 1, 0, 0xe3, 0, 6, 0, 0xff, 0xff,
+    ];
+    assert!(decode_code_record(&binary, 2, &ArtifactLimits::default()).is_ok());
+    let mut invalid = binary;
+    invalid[4] = 9;
+    assert!(decode_code_record(&invalid, 2, &ArtifactLimits::default()).is_err());
+    let invalid = [0x1c, 4, 10, 0, 19, 1, 0, 0, 0, 0, 0xe3, 0, 6, 0, 0xff, 0xff];
+    assert!(decode_code_record(&invalid, 2, &ArtifactLimits::default()).is_err());
+}

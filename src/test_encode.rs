@@ -723,6 +723,27 @@ fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeEr
             reg(&mut operands, *dst);
             (0x03, 0)
         }
+        Instruction::MathUnary {
+            form,
+            operation,
+            dst,
+            src,
+        } => {
+            id(&mut operands, *operation as u32);
+            regs(&mut operands, &[*dst, *src]);
+            (0x1c, *form)
+        }
+        Instruction::MathBinary {
+            form,
+            operation,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            id(&mut operands, *operation as u32);
+            regs(&mut operands, &[*dst, *lhs, *rhs]);
+            (0x1d, *form)
+        }
         Instruction::Convert { form, dst, src } => {
             regs(&mut operands, &[*dst, *src]);
             (0x04, *form)

@@ -13,6 +13,7 @@ mod host;
 mod image;
 mod layout;
 mod machine;
+mod math;
 mod numeric;
 mod record;
 mod requests;

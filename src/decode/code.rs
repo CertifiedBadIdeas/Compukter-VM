@@ -1,5 +1,5 @@
 use crate::{
-    artifact::{format, Instruction, SwitchCase},
+    artifact::{format, Instruction, MathBinaryOperation, MathUnaryOperation, SwitchCase},
     bytes::Cursor,
     diagnostic::{Code, Diagnostic, DiagnosticSet, Family},
     limits::ArtifactLimits,
@@ -125,6 +125,23 @@ fn decode_instruction(
             form,
             dst: reg(&mut cursor, offset)?,
             src: reg(&mut cursor, offset)?,
+        },
+        0x1c => Instruction::MathUnary {
+            form,
+            operation: MathUnaryOperation::decode(id(&mut cursor, offset)?).ok_or_else(|| {
+                error(Code::BadInstruction, offset, "unknown unary math selector")
+            })?,
+            dst: reg(&mut cursor, offset)?,
+            src: reg(&mut cursor, offset)?,
+        },
+        0x1d => Instruction::MathBinary {
+            form,
+            operation: MathBinaryOperation::decode(id(&mut cursor, offset)?).ok_or_else(|| {
+                error(Code::BadInstruction, offset, "unknown binary math selector")
+            })?,
+            dst: reg(&mut cursor, offset)?,
+            lhs: reg(&mut cursor, offset)?,
+            rhs: reg(&mut cursor, offset)?,
         },
         0x10 => arithmetic(form, &mut cursor, offset, Arithmetic::Add)?,
         0x11 => arithmetic(form, &mut cursor, offset, Arithmetic::Sub)?,
@@ -761,6 +778,8 @@ impl Instruction {
         let fixed = match self {
             Self::InlineConstruct { components, .. } => variable_cost(2, components.len())?,
             Self::InlineComponent { .. } => 2,
+            Self::MathUnary { operation, .. } => operation.fixed_cost(),
+            Self::MathBinary { operation, .. } => operation.fixed_cost(),
             Self::Mul { .. }
             | Self::Convert { .. }
             | Self::ArrayLength { .. }

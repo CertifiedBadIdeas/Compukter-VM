@@ -26,6 +26,7 @@ persistence-crash-testing = []
 guest-benchmark = []
 
 [dependencies]
+libm = { version = "=0.2.16", default-features = false }
 ryu = { version = "1.0", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 

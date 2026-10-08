@@ -4542,6 +4542,45 @@ fn execute_scalar(
             write_frame_value(arena, frame, function, *dst, RuntimeValue::Null)
                 .map_err(InstructionFailure::Fault)
         }
+        ResolvedInstruction::MathUnary {
+            form,
+            operation,
+            dst,
+            src,
+        } => {
+            let source = read_frame_value(arena, frame, function, *src)
+                .map_err(InstructionFailure::Fault)?;
+            let value = match (*form, source) {
+                (3, RuntimeValue::F32(bits)) => RuntimeValue::F32(
+                    super::math::unary_f32(*operation, f32::from_bits(bits)).to_bits(),
+                ),
+                (4, RuntimeValue::F64(bits)) => RuntimeValue::F64(
+                    super::math::unary_f64(*operation, f64::from_bits(bits)).to_bits(),
+                ),
+                _ => return Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+            };
+            write_frame_value(arena, frame, function, *dst, value)
+                .map_err(InstructionFailure::Fault)
+        }
+        ResolvedInstruction::MathBinary {
+            form,
+            operation,
+            dst,
+            lhs,
+            rhs,
+        } => binary!(dst, lhs, rhs, |a, b| {
+            Ok(match (*form, a, b) {
+                (3, RuntimeValue::F32(x), RuntimeValue::F32(y)) => RuntimeValue::F32(
+                    super::math::binary_f32(*operation, f32::from_bits(x), f32::from_bits(y))
+                        .to_bits(),
+                ),
+                (4, RuntimeValue::F64(x), RuntimeValue::F64(y)) => RuntimeValue::F64(
+                    super::math::binary_f64(*operation, f64::from_bits(x), f64::from_bits(y))
+                        .to_bits(),
+                ),
+                _ => return Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
+            })
+        }),
         ResolvedInstruction::Convert { form, dst, src } => {
             let destination = function
                 .registers

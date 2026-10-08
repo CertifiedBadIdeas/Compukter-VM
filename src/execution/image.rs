@@ -1,3 +1,4 @@
+use crate::artifact::{MathBinaryOperation, MathUnaryOperation};
 use std::sync::Arc;
 
 use crate::artifact::{
@@ -122,6 +123,19 @@ pub(super) enum ResolvedInstruction {
     },
     Null {
         dst: u16,
+    },
+    MathUnary {
+        form: u8,
+        operation: MathUnaryOperation,
+        dst: u16,
+        src: u16,
+    },
+    MathBinary {
+        form: u8,
+        operation: MathBinaryOperation,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
     },
     Convert {
         form: u8,
@@ -2026,6 +2040,30 @@ fn resolve_instruction(
                 .ok_or(AdmissionError::StoragePlanOverflow)?,
         },
         Instruction::Null { dst } => ResolvedInstruction::Null { dst: *dst },
+        Instruction::MathUnary {
+            form,
+            operation,
+            dst,
+            src,
+        } => ResolvedInstruction::MathUnary {
+            form: *form,
+            operation: *operation,
+            dst: *dst,
+            src: *src,
+        },
+        Instruction::MathBinary {
+            form,
+            operation,
+            dst,
+            lhs,
+            rhs,
+        } => ResolvedInstruction::MathBinary {
+            form: *form,
+            operation: *operation,
+            dst: *dst,
+            lhs: *lhs,
+            rhs: *rhs,
+        },
         Instruction::Convert { form, dst, src } => ResolvedInstruction::Convert {
             form: *form,
             dst: *dst,
