@@ -146,6 +146,10 @@ impl WorldFileSystemStore {
         if read_tombstone(&computer_path(&self.root, id).join("tombstone"), id)? {
             return Err(StoreError::NotFound);
         }
+        // The previous carrier may have just admitted its final mutation. Recover
+        // only after that generation is durable; registration must not replace
+        // in-flight admitted state with an older disk generation.
+        self.persistence.flush_admitted(id)?;
         let result = self.recover_computer(id);
         let recovered = match result {
             Ok(result) => result,
