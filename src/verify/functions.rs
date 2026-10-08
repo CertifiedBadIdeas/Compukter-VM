@@ -642,6 +642,42 @@ fn verify_instruction(
             }
             write(state, *dst, function, module_id, function_id, limits)?;
         }
+        Instruction::MathUnary { form, dst, src, .. } => {
+            if artifact.header.runtime_minor < 16 || !matches!(form, 3 | 4) {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "floating math requires Runtime ABI 1.16 and F32/F64",
+                ));
+            }
+            read(function, state, *src, module_id, function_id, limits)?;
+            require_kind(function, *src, *form, module_id, function_id, limits)?;
+            require_kind(function, *dst, *form, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
+        Instruction::MathBinary {
+            form,
+            dst,
+            lhs,
+            rhs,
+            ..
+        } => {
+            if artifact.header.runtime_minor < 16 || !matches!(form, 3 | 4) {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "floating math requires Runtime ABI 1.16 and F32/F64",
+                ));
+            }
+            read(function, state, *lhs, module_id, function_id, limits)?;
+            read(function, state, *rhs, module_id, function_id, limits)?;
+            require_kind(function, *lhs, *form, module_id, function_id, limits)?;
+            require_kind(function, *rhs, *form, module_id, function_id, limits)?;
+            require_kind(function, *dst, *form, module_id, function_id, limits)?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
         Instruction::Convert { form, dst, src } => {
             read(function, state, *src, module_id, function_id, limits)?;
             let source = register_type(function, *src, module_id, function_id, limits)?;

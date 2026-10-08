@@ -1,3 +1,6 @@
+mod math;
+pub(crate) use math::{MathBinaryOperation, MathUnaryOperation};
+
 pub(crate) mod format;
 
 use std::sync::Arc;
@@ -382,6 +385,19 @@ pub(crate) enum Instruction {
     },
     Null {
         dst: u16,
+    },
+    MathUnary {
+        form: u8,
+        operation: MathUnaryOperation,
+        dst: u16,
+        src: u16,
+    },
+    MathBinary {
+        form: u8,
+        operation: MathBinaryOperation,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
     },
     Convert {
         form: u8,

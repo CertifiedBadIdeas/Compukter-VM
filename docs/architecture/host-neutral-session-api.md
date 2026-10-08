@@ -271,3 +271,17 @@ charge one extra unit per additional inline component copied. Copies stay in com
 REF32 leaves participate in exact component safepoint maps. Nominal identity, initialization, leaf
 types, physical shapes, ABI gates and declared costs are checked by both Kotlin and Rust. Artifact
 container format 3 and exported C ABI 20 are unchanged; host entry/results retain their scalar contract.
+
+## Floating math (Runtime ABI 1.16)
+
+The active Runtime adds unary `0x1c` and binary `0x1d` math instructions. Only forms 3 (F32)
+and 4 (F64) are valid. Encoding is ULEB selector, u16 destination, then one or two u16 source
+registers. Closed selectors and fixed costs are defined in `src/artifact/math.rs`; decoding,
+admission and execution share these enums. Admission checks ABI 1.16, initialized homogeneous
+floating registers and the complete declared block cost.
+
+`src/execution/math.rs` uses pinned pure-Rust `libm` 0.2.16 for both widths, preserves signed zero
+and canonicalizes NaN. Operations do not allocate or suspend. Rounding uses ties to even; min/max
+propagate NaN and select the appropriate signed zero; magnitude-one bases with infinite powers
+produce NaN. Integer and derived library functions remain ordinary Guest instructions.
+Container 3, exported native C ABI 21 and checkpoint framing are unchanged.

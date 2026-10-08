@@ -2219,6 +2219,62 @@ pub(super) fn scalar_cases() -> Vec<ScalarCase> {
             },
             Ok(RuntimeValue::Bool(false)),
         ),
+        case(
+            "math_sqrt_f64",
+            vec![primitive(4), primitive(4)],
+            vec![RuntimeValue::F64(2.0_f64.to_bits())],
+            Instruction::MathUnary {
+                form: 4,
+                operation: crate::artifact::MathUnaryOperation::Sqrt,
+                dst: 1,
+                src: 0,
+            },
+            Ok(RuntimeValue::F64(std::f64::consts::SQRT_2.to_bits())),
+        ),
+        case(
+            "math_round_signed_zero_f32",
+            vec![primitive(3), primitive(3)],
+            vec![RuntimeValue::F32((-0.5_f32).to_bits())],
+            Instruction::MathUnary {
+                form: 3,
+                operation: crate::artifact::MathUnaryOperation::Round,
+                dst: 1,
+                src: 0,
+            },
+            Ok(RuntimeValue::F32((-0.0_f32).to_bits())),
+        ),
+        case(
+            "math_min_nan_f32",
+            vec![primitive(3), primitive(3), primitive(3)],
+            vec![
+                RuntimeValue::F32(f32::NAN.to_bits()),
+                RuntimeValue::F32(1.0_f32.to_bits()),
+            ],
+            Instruction::MathBinary {
+                form: 3,
+                operation: crate::artifact::MathBinaryOperation::Min,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Ok(RuntimeValue::F32(0x7fc0_0000)),
+        ),
+        case(
+            "math_pow_f64",
+            vec![primitive(4), primitive(4), primitive(4)],
+            vec![
+                RuntimeValue::F64(2.0_f64.to_bits()),
+                RuntimeValue::F64(3.0_f64.to_bits()),
+            ],
+            Instruction::MathBinary {
+                form: 4,
+                operation: crate::artifact::MathBinaryOperation::Pow,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Ok(RuntimeValue::F64(8.0_f64.to_bits())),
+        ),
     ]
 }
 
@@ -6935,6 +6991,14 @@ fn verified_program(
             .sum();
         artifact.modules[0].blocks[0].instruction_count = instructions.len() as u32;
         artifact.modules[0].blocks[0].declared_fixed_cost = fixed_cost;
+        if instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::MathUnary { .. } | Instruction::MathBinary { .. }
+            )
+        }) {
+            artifact.header.runtime_minor = 16;
+        }
         artifact.modules[0].code[0].instructions = instructions.into_boxed_slice();
         artifact.modules[0].code[0].fixed_cost = fixed_cost;
         artifact.manifest.maximum_block_cost = fixed_cost;
@@ -6973,6 +7037,16 @@ fn verified_blocks(
                 .any(Instruction::uses_unsigned_semantics)
         }) {
             artifact.header.runtime_minor = 14;
+        }
+        if blocks.iter().any(|(_, instructions)| {
+            instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::MathUnary { .. } | Instruction::MathBinary { .. }
+                )
+            })
+        }) {
+            artifact.header.runtime_minor = 16;
         }
         let mut block_records = Vec::new();
         let mut code_records = Vec::new();

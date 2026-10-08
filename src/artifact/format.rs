@@ -4,7 +4,7 @@ pub(crate) const DIGEST_SIZE: usize = 32;
 
 pub(crate) const FORMAT_MAJOR: u16 = 3;
 pub(crate) const RUNTIME_ABI_MAJOR: u16 = 1;
-pub(crate) const RUNTIME_ABI_MINOR: u16 = 15;
+pub(crate) const RUNTIME_ABI_MINOR: u16 = 16;
 
 pub(crate) const CRITICAL: u16 = 1 << 0;
 pub(crate) const SEMANTIC: u16 = 1 << 1;
@@ -63,6 +63,7 @@ pub(crate) fn valid_instruction_form(opcode: u8, form: u8) -> bool {
         0x04 => matches!(form, 0..=3),
         0x10..=0x14 => matches!(form, 1..=4 | 8 | 9),
         0x15 => matches!(form, 1..=4),
+        0x1c..=0x1d => matches!(form, 3 | 4),
         0x16..=0x1b => matches!(form, 1 | 2),
         0x20..=0x21 => matches!(form, 1..=6 | 8 | 9),
         0x22..=0x25 => matches!(form, 1..=4 | 6 | 8 | 9),
