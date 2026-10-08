@@ -409,3 +409,6 @@ mod tests {
         );
     }
 }
+
+#[path = "checkpoint/channel.rs"]
+mod checkpoint_state;

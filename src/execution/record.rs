@@ -571,3 +571,6 @@ impl HostRecordValue {
                 .sum::<usize>()
     }
 }
+
+#[path = "checkpoint/record.rs"]
+mod checkpoint_state;

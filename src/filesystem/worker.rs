@@ -36,6 +36,7 @@ pub enum PersistenceAtomicTarget {
     Journal,
     Confirmed,
     Tombstone,
+    ExecutionCheckpoint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,6 +393,22 @@ impl PersistenceGate {
         completion.wait()
     }
 
+    pub fn flush_admitted(&self, id: ComputerId) -> Result<(), StoreError> {
+        let generation = {
+            let state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            require_active_store(state.health)?;
+            state.admitted.get(&id).copied()
+        };
+        if let Some(generation) = generation {
+            self.flush(id, generation)?;
+        }
+        Ok(())
+    }
+
     pub fn flush_all(&self) -> Result<(), StoreError> {
         let admitted = {
             let state = self
@@ -515,6 +532,9 @@ impl PersistenceGate {
 }
 
 impl ComputerPersistence {
+    pub(crate) const fn computer_id(&self) -> ComputerId {
+        self.computer_id
+    }
     pub fn prepare(
         &self,
         generation: u64,
@@ -718,6 +738,38 @@ fn write_confirmed_with_injector(
     )
 }
 
+pub(crate) fn write_execution_checkpoint(
+    path: &Path,
+    bytes: &[u8],
+    crash_injector: PersistenceCrashInjector,
+) -> io::Result<()> {
+    write_atomic(
+        path,
+        bytes,
+        PersistenceAtomicTarget::ExecutionCheckpoint,
+        crash_injector,
+    )
+}
+
+pub(crate) fn discard_execution_checkpoint(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid checkpoint file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    std::fs::remove_file(path)?;
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?,
+    )
+}
+
 fn write_atomic(
     path: &Path,
     bytes: &[u8],
@@ -858,6 +910,91 @@ fn filesystem_to_store(error: FileSystemError) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "persistence-crash-testing")]
+    #[test]
+    fn execution_checkpoint_crash_publication_is_atomic() {
+        const PHASES: [PersistenceAtomicPhase; 5] = [
+            PersistenceAtomicPhase::TemporaryCreated,
+            PersistenceAtomicPhase::BytesWritten,
+            PersistenceAtomicPhase::FileSynced,
+            PersistenceAtomicPhase::Renamed,
+            PersistenceAtomicPhase::DirectorySynced,
+        ];
+        const ROOT_ENV: &str = "COMPUKTERS_EXECUTION_CHECKPOINT_CRASH_ROOT";
+        const PHASE_ENV: &str = "COMPUKTERS_EXECUTION_CHECKPOINT_CRASH_PHASE";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let index: usize = std::env::var(PHASE_ENV).unwrap().parse().unwrap();
+            let point = PersistenceCrashPoint::Atomic {
+                target: PersistenceAtomicTarget::ExecutionCheckpoint,
+                phase: PHASES[index],
+            };
+            write_execution_checkpoint(
+                &Path::new(&root).join("execution"),
+                b"new-generation",
+                PersistenceCrashInjector::armed(point),
+            )
+            .unwrap();
+            panic!("configured crash point was not reached");
+        }
+        for (index, phase) in PHASES.into_iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "compukters-execution-crash-{}-{}-{index}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("execution");
+            write_execution_checkpoint(
+                &path,
+                b"old-generation",
+                PersistenceCrashInjector::disabled(),
+            )
+            .unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "filesystem::worker::tests::execution_checkpoint_crash_publication_is_atomic",
+                    "--nocapture",
+                ])
+                .env(ROOT_ENV, &root)
+                .env(PHASE_ENV, index.to_string())
+                .output()
+                .unwrap();
+            assert_eq!(
+                Some(86),
+                child.status.code(),
+                "{phase:?}: {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let expected: &[u8] = if matches!(
+                phase,
+                PersistenceAtomicPhase::Renamed | PersistenceAtomicPhase::DirectorySynced
+            ) {
+                b"new-generation"
+            } else {
+                b"old-generation"
+            };
+            assert_eq!(expected, std::fs::read(&path).unwrap());
+            // A later successful save replaces any abandoned temporary file.
+            write_execution_checkpoint(
+                &path,
+                b"retry-generation",
+                PersistenceCrashInjector::disabled(),
+            )
+            .unwrap();
+            assert_eq!(
+                b"retry-generation",
+                std::fs::read(&path).unwrap().as_slice()
+            );
+            discard_execution_checkpoint(&path).unwrap();
+            assert!(!path.exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn persistence_can_sync_a_directory() {

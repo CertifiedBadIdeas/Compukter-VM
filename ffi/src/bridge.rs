@@ -3,9 +3,10 @@ use std::sync::{Arc, OnceLock};
 
 use compukter_vm::{
     verify_artifact, AdmissionError, ArtifactLimits, CanonicalLineSubmissionError,
-    CapabilityBinding, CompilationRequest, ComputerAdvanceOutcome, ComputerDirectoryListing,
-    ComputerError, ComputerFileChunk, ComputerFileReadError, ComputerFileStat, ComputerHostMerge,
-    ComputerId, ComputerMachine, ComputerStartError, ComputerValue, DeploymentCandidate,
+    CapabilityBinding, CompilationRequest, ComputerAdvanceOutcome, ComputerCheckpointError,
+    ComputerCheckpointLimits, ComputerDirectoryListing, ComputerError, ComputerFileChunk,
+    ComputerFileReadError, ComputerFileStat, ComputerHostMerge, ComputerId, ComputerMachine,
+    ComputerRestoreEnvironment, ComputerStartError, ComputerValue, DeploymentCandidate,
     EntryArgumentLimits, ExecutableRevision, ExecutionProfile, FileCapability, FileRights,
     FileSystemError, FileSystemLimits, GuestTrap, HostDeployError, HostFailure, HostFailureKind,
     HostMergeSchema, HostResponse, HostValueInput, HostVerifyError, ManagedAllocationFailure,
@@ -100,15 +101,24 @@ struct BridgeSession {
     computer: ComputerMachine,
     compilation: Option<CompilationRequest>,
     filesystem_limits: FileSystemLimits,
+    store_identity: Option<(u64, ComputerId)>,
+    restored_host_state: Vec<u8>,
 }
 
 impl BridgeSession {
     fn new(computer: ComputerMachine, filesystem_limits: FileSystemLimits) -> Self {
         Self {
+            compilation: computer.pending_compilation_request(),
             computer,
-            compilation: None,
             filesystem_limits,
+            store_identity: None,
+            restored_host_state: Vec::new(),
         }
+    }
+
+    fn in_store(mut self, handle: u64, id: ComputerId) -> Self {
+        self.store_identity = Some((handle, id));
+        self
     }
 }
 
@@ -248,7 +258,7 @@ pub(crate) fn create_in_store(
         .with(store_handle, |store| *store.limits())
         .map_err(|error| CreateInStoreError::Store(StoreBridgeError::Handle(error)))?;
     sessions()
-        .insert(BridgeSession::new(computer, limits))
+        .insert(BridgeSession::new(computer, limits).in_store(store_handle, id))
         .map_err(|error| CreateInStoreError::Create(CreateError::Handle(error)))
 }
 
@@ -294,7 +304,7 @@ pub(crate) fn create_boot_in_store(
         .with(store_handle, |store| *store.limits())
         .map_err(|error| CreateInStoreError::Store(StoreBridgeError::Handle(error)))?;
     sessions()
-        .insert(BridgeSession::new(computer, limits))
+        .insert(BridgeSession::new(computer, limits).in_store(store_handle, id))
         .map_err(|error| CreateInStoreError::Create(CreateError::Handle(error)))
 }
 
@@ -346,6 +356,7 @@ pub(crate) fn advance(
                 .computer
                 .advance(guest_budget, maintenance_budget, host_request_budget)
                 .map_err(copy_error)?;
+            session.restored_host_state = Vec::new();
             if let ComputerAdvanceOutcome::CompilationRequested(request) = outcome {
                 let token = request.token;
                 session.compilation = Some(request);
@@ -378,6 +389,7 @@ pub(crate) fn advance_with_retirement_limit(
                     retirement_limit,
                 )
                 .map_err(copy_error)?;
+            session.restored_host_state = Vec::new();
             let retired = session
                 .computer
                 .resource_snapshot()
@@ -687,6 +699,128 @@ pub(crate) fn close(handle: u64) -> Result<(), BridgeError> {
 pub(crate) fn store_open(root: PathBuf, limits: FileSystemLimits) -> Result<u64, StoreCreateError> {
     let store = WorldFileSystemStore::open(&root, limits).map_err(StoreCreateError::Open)?;
     stores().insert(store).map_err(StoreCreateError::Handle)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointBridgeError {
+    Handle(HandleError),
+    Store(StoreError),
+    Snapshot(ComputerCheckpointError),
+    Absent,
+    Rom,
+}
+
+pub(crate) fn checkpoint_save(
+    session_handle: u64,
+    store_handle: u64,
+    id: ComputerId,
+    host: &[u8],
+) -> Result<(), CheckpointBridgeError> {
+    sessions()
+        .with(session_handle, |session| {
+            if session.store_identity != Some((store_handle, id)) {
+                return Err(CheckpointBridgeError::Snapshot(
+                    ComputerCheckpointError::Incompatible,
+                ));
+            }
+            let limits = ComputerCheckpointLimits::default();
+            let bytes = session
+                .computer
+                .checkpoint(id, host, limits)
+                .map_err(CheckpointBridgeError::Snapshot)?;
+            stores()
+                .with(store_handle, |store| {
+                    store.save_execution_checkpoint(
+                        id,
+                        session.computer.filesystem_generation(),
+                        &bytes,
+                        limits
+                            .maximum_encoded_bytes()
+                            .expect("fixed checkpoint bounds"),
+                    )
+                })
+                .map_err(CheckpointBridgeError::Handle)?
+                .map_err(CheckpointBridgeError::Store)
+        })
+        .map_err(CheckpointBridgeError::Handle)?
+}
+
+pub(crate) fn checkpoint_restore(
+    store_handle: u64,
+    boot: bool,
+    id: ComputerId,
+    rom_bytes: Vec<u8>,
+    schemas: &[DecodedCapabilitySchema],
+) -> Result<u64, CheckpointBridgeError> {
+    let (computer, host, filesystem_limits) = stores()
+        .with(store_handle, |store| {
+            let limits = ComputerCheckpointLimits::default();
+            let bytes = store
+                .read_execution_checkpoint(
+                    id,
+                    limits
+                        .maximum_encoded_bytes()
+                        .expect("fixed checkpoint bounds"),
+                )
+                .map_err(CheckpointBridgeError::Store)?
+                .ok_or(CheckpointBridgeError::Absent)?;
+            let filesystem_limits = *store.limits();
+            let rom = RomImage::admit(Arc::from(rom_bytes), &filesystem_limits)
+                .map(Arc::new)
+                .map_err(|_| CheckpointBridgeError::Rom)?;
+            let filesystem = store
+                .open_computer(id, rom)
+                .map_err(CheckpointBridgeError::Store)?;
+            let initial_file_capability = FileCapability::new(
+                VirtualPath::parse_utf8(if boot { "/" } else { "/home" }, &filesystem_limits)
+                    .expect("fixed capability path"),
+                FileRights::OWNER,
+            );
+            let (computer, host) = with_capability_bindings(schemas, |bindings| {
+                ComputerMachine::restore_checkpoint(
+                    ComputerRestoreEnvironment {
+                        id,
+                        profile: profile(),
+                        process_limits: ProcessLimits::default(),
+                        addon_bindings: bindings,
+                        filesystem,
+                        initial_file_capability,
+                    },
+                    &bytes,
+                    limits,
+                )
+            })
+            .map_err(CheckpointBridgeError::Snapshot)?;
+            Ok((computer, host, filesystem_limits))
+        })
+        .map_err(CheckpointBridgeError::Handle)??;
+    let mut session = BridgeSession::new(computer, filesystem_limits).in_store(store_handle, id);
+    session.restored_host_state = host;
+    sessions()
+        .insert(session)
+        .map_err(CheckpointBridgeError::Handle)
+}
+
+pub(crate) fn checkpoint_discard(
+    store_handle: u64,
+    id: ComputerId,
+) -> Result<(), CheckpointBridgeError> {
+    stores()
+        .with(store_handle, |store| store.discard_execution_checkpoint(id))
+        .map_err(CheckpointBridgeError::Handle)?
+        .map_err(CheckpointBridgeError::Store)
+}
+
+pub(crate) fn checkpoint_host_state(handle: u64) -> Result<Vec<u8>, CheckpointBridgeError> {
+    sessions()
+        .with(handle, |session| session.restored_host_state.clone())
+        .map_err(CheckpointBridgeError::Handle)
+}
+
+pub(crate) fn checkpoint_host_state_size(handle: u64) -> Result<usize, CheckpointBridgeError> {
+    sessions()
+        .with(handle, |session| session.restored_host_state.len())
+        .map_err(CheckpointBridgeError::Handle)
 }
 
 pub(crate) fn store_health(handle: u64) -> Result<StoreHealth, StoreBridgeError> {

@@ -127,3 +127,6 @@ mod tests {
         assert_eq!(first.generation + 1, next.generation);
     }
 }
+
+#[path = "checkpoint/external_roots.rs"]
+mod checkpoint_state;

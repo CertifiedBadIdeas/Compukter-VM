@@ -1212,3 +1212,6 @@ mod tests {
         assert_eq!(24, statics.reserved_bytes());
     }
 }
+
+#[path = "checkpoint/frame.rs"]
+mod checkpoint_state;

@@ -377,6 +377,7 @@ struct CompilationTransaction {
     owner_depth: usize,
     source: VirtualPath,
     source_revision: u64,
+    source_bytes: Box<[u8]>,
     output: VirtualPath,
     output_revision: ExecutableRevision,
 }
@@ -605,6 +606,13 @@ impl ComputerMachine {
                 .saturating_mul(std::mem::size_of::<ExternalRequestRoute>() as u64),
             &mut snapshot.counters_saturated,
         );
+        if let Some(compilation) = &self.pending_compilation {
+            add_counter(
+                &mut snapshot.mutable_execution_resident_bytes,
+                compilation.source_bytes.len() as u64,
+                &mut snapshot.counters_saturated,
+            );
+        }
         for frame in &self.sessions {
             let resource = frame.session.resource_snapshot();
             add_counter(
@@ -2104,6 +2112,7 @@ impl ComputerMachine {
             owner_depth: self.sessions.len(),
             source: source.clone(),
             source_revision: source_metadata.generation,
+            source_bytes: source_bytes.clone().into_boxed_slice(),
             output,
             output_revision,
         });
@@ -2128,6 +2137,20 @@ impl ComputerMachine {
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
         self.finish_compilation_request(task, id, COMPILATION_STATUS_REJECTED, diagnostic)?;
         Ok(ComputerAdvanceOutcome::SliceExhausted)
+    }
+
+    /// Reconstructs the same pure compiler input after restoring execution.
+    pub fn pending_compilation_request(&self) -> Option<CompilationRequest> {
+        let transaction = self.pending_compilation.as_ref()?;
+        Some(CompilationRequest {
+            version: COMPILATION_WIRE_VERSION,
+            token: transaction.token,
+            sources: vec![CompilationSource {
+                path: transaction.source.to_string().into(),
+                utf8: transaction.source_bytes.clone(),
+            }]
+            .into_boxed_slice(),
+        })
     }
 
     pub fn complete_compilation_success(
@@ -5405,7 +5428,7 @@ mod tests {
             }))
     }
 
-    fn compiler_computer(
+    pub(super) fn compiler_computer(
         source_bytes: &[u8],
         existing_output: Option<&[u8]>,
     ) -> (ComputerMachine, FileCapability, VirtualPath, VirtualPath) {
@@ -5454,7 +5477,7 @@ mod tests {
         (computer, output, bytes)
     }
 
-    fn next_compilation_request(computer: &mut ComputerMachine) -> CompilationRequest {
+    pub(super) fn next_compilation_request(computer: &mut ComputerMachine) -> CompilationRequest {
         loop {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
@@ -5764,7 +5787,7 @@ mod tests {
         }
     }
 
-    fn profile() -> ExecutionProfile {
+    pub(super) fn profile() -> ExecutionProfile {
         ExecutionProfile {
             heap_bytes: 1024 * 1024,
             frame_storage_bytes: 1024 * 1024,
@@ -5810,3 +5833,10 @@ mod tests {
         assert!(frames[2].contains("block 0, instruction 1"), "{trace}");
     }
 }
+
+#[path = "checkpoint/computer.rs"]
+#[allow(dead_code)]
+mod checkpoint_state;
+
+pub use crate::execution::checkpoint::CheckpointError as ComputerCheckpointError;
+pub use checkpoint_state::{ComputerCheckpointLimits, ComputerRestoreEnvironment};
