@@ -1022,3 +1022,7 @@ mod tests {
         assert_eq!(before, filesystem.snapshot_for_test());
     }
 }
+
+#[path = "../checkpoint/filesystem_tree.rs"]
+#[allow(dead_code)]
+mod checkpoint_state;

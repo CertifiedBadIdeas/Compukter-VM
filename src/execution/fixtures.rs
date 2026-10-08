@@ -54,7 +54,7 @@ pub(super) fn started_untraced(artifact: VerifiedArtifact, args: &[EntryArgument
     machine
 }
 
-pub(super) fn nested_call_artifact() -> VerifiedArtifact {
+pub(crate) fn nested_call_artifact() -> VerifiedArtifact {
     nested_call_program(false)
 }
 

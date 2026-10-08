@@ -18,8 +18,9 @@
 
 use crate::{
     bridge::{
-        self, BridgeError, CreateInStoreError, DeploymentBridgeError, DeploymentVerifyBridgeError,
-        FileInspectionBridgeError, OwnedResponse, RevisionBridgeError, StoreBridgeError,
+        self, BridgeError, CheckpointBridgeError, CreateInStoreError, DeploymentBridgeError,
+        DeploymentVerifyBridgeError, FileInspectionBridgeError, OwnedResponse, RevisionBridgeError,
+        StoreBridgeError,
     },
     handle_table::HandleError,
 };
@@ -70,6 +71,10 @@ pub enum FfiStatus {
     FilesystemClosed = 40,
     FilesystemOther = 41,
     FilesystemInvalidRange = 42,
+    CheckpointNotFound = 43,
+    CheckpointIncompatible = 44,
+    CheckpointCorrupt = 45,
+    CheckpointLimit = 46,
 }
 
 const MAXIMUM_OUTCOME_BYTES: usize = 64 * 1024;
@@ -392,6 +397,182 @@ pub unsafe extern "C" fn compukter_create(
         unsafe { core::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
         // SAFETY: Null was rejected above and the C ABI requires writable output.
         unsafe { written_out.write(encoded.len()) };
+        FfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Captures a frozen computer and atomically publishes its execution/host state.
+///
+/// # Safety
+/// `id` names 16 readable bytes. Non-empty host input names readable bytes of its
+/// declared length. Host callbacks and world mutations must be settled first.
+pub unsafe extern "C" fn compukter_checkpoint_save(
+    handle: u64,
+    store_handle: u64,
+    id: *const u8,
+    host: *const u8,
+    host_len: usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if id.is_null()
+            || host_len > compukter_vm::ComputerCheckpointLimits::default().maximum_host_bytes
+            || host_len != 0 && host.is_null()
+        {
+            return FfiStatus::InvalidArgument;
+        }
+        // SAFETY: Identity and input buffer widths were validated above.
+        let id = unsafe { copy_computer_id(id) };
+        let host = if host_len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(host, host_len) }
+        };
+        match bridge::checkpoint_save(handle, store_handle, id, host) {
+            Ok(()) => FfiStatus::Ok,
+            Err(error) => checkpoint_status(error),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Restores a computer without running it or consuming its durable snapshot.
+///
+/// # Safety
+/// `id` names 16 readable bytes; non-empty inputs/outputs name regions of their
+/// declared widths, and `written_out` names one writable `usize`.
+pub unsafe extern "C" fn compukter_checkpoint_restore(
+    store_handle: u64,
+    boot: u32,
+    id: *const u8,
+    rom: *const u8,
+    rom_len: usize,
+    schemas: *const u8,
+    schemas_len: usize,
+    output: *mut u8,
+    capacity: usize,
+    written_out: *mut usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if boot > 1
+            || id.is_null()
+            || written_out.is_null()
+            || rom_len > MAXIMUM_ROM_BYTES
+            || schemas_len > MAXIMUM_CAPABILITY_SCHEMA_BYTES
+            || rom_len != 0 && rom.is_null()
+            || schemas_len != 0 && schemas.is_null()
+            || capacity != 0 && output.is_null()
+        {
+            return FfiStatus::InvalidArgument;
+        }
+        if capacity < MAXIMUM_CREATE_BYTES {
+            // SAFETY: The output length pointer was validated above.
+            unsafe { written_out.write(MAXIMUM_CREATE_BYTES) };
+            return FfiStatus::BufferTooSmall;
+        }
+        // SAFETY: The fixed identity and bounded input widths were validated.
+        let id = unsafe { copy_computer_id(id) };
+        let rom = if rom_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { core::slice::from_raw_parts(rom, rom_len) }.to_vec()
+        };
+        let schemas = if schemas_len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(schemas, schemas_len) }
+        };
+        let Some(schemas) = crate::wire::decode_capability_schemas(schemas) else {
+            return FfiStatus::InvalidArgument;
+        };
+        let handle = match bridge::checkpoint_restore(store_handle, boot != 0, id, rom, &schemas) {
+            Ok(handle) => handle,
+            Err(error) => return checkpoint_status(error),
+        };
+        let encoded = crate::wire::encode_create(Ok(handle));
+        // SAFETY: The fixed output capacity and writable length were validated.
+        unsafe {
+            core::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
+            written_out.write(encoded.len());
+        }
+        FfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Durably consumes or reset-discards a computer snapshot.
+///
+/// # Safety
+/// `id` names 16 readable bytes.
+pub unsafe extern "C" fn compukter_checkpoint_discard(
+    store_handle: u64,
+    id: *const u8,
+) -> FfiStatus {
+    ffi_status(|| {
+        if id.is_null() {
+            return FfiStatus::InvalidArgument;
+        }
+        // SAFETY: The caller guarantees a fixed readable identity.
+        let id = unsafe { copy_computer_id(id) };
+        match bridge::checkpoint_discard(store_handle, id) {
+            Ok(()) => FfiStatus::Ok,
+            Err(error) => checkpoint_status(error),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Reports the host descriptor buffer retained by a restored session.
+///
+/// # Safety
+/// `size_out` names one writable `usize`.
+pub unsafe extern "C" fn compukter_checkpoint_host_size(
+    handle: u64,
+    size_out: *mut usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if size_out.is_null() {
+            return FfiStatus::InvalidArgument;
+        }
+        let size = match bridge::checkpoint_host_state_size(handle) {
+            Ok(size) => size,
+            Err(error) => return checkpoint_status(error),
+        };
+        // SAFETY: The output pointer was validated above.
+        unsafe { size_out.write(size) };
+        FfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Copies host descriptors for validation/rebinding before restored advance.
+///
+/// # Safety
+/// Non-empty output names a writable region of its declared width; `written_out`
+/// names one writable `usize`.
+pub unsafe extern "C" fn compukter_checkpoint_host_copy(
+    handle: u64,
+    output: *mut u8,
+    capacity: usize,
+    written_out: *mut usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if written_out.is_null() || capacity != 0 && output.is_null() {
+            return FfiStatus::InvalidArgument;
+        }
+        let bytes = match bridge::checkpoint_host_state(handle) {
+            Ok(bytes) => bytes,
+            Err(error) => return checkpoint_status(error),
+        };
+        // SAFETY: The length pointer was validated above.
+        unsafe { written_out.write(bytes.len()) };
+        if capacity < bytes.len() {
+            return FfiStatus::BufferTooSmall;
+        }
+        if !bytes.is_empty() {
+            // SAFETY: The output capacity covers all descriptor bytes.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len()) };
+        }
         FfiStatus::Ok
     })
 }
@@ -1603,6 +1784,23 @@ fn bridge_status(outcome: Result<(), BridgeError>) -> FfiStatus {
         Err(BridgeError::Resume(_)) => FfiStatus::Resume,
         Err(BridgeError::InvalidRequestId) => FfiStatus::InvalidArgument,
         Err(BridgeError::InvalidOperation) => FfiStatus::InvalidArgument,
+    }
+}
+
+fn checkpoint_status(error: CheckpointBridgeError) -> FfiStatus {
+    use compukter_vm::ComputerCheckpointError;
+    match error {
+        CheckpointBridgeError::Handle(error) => handle_status(error),
+        CheckpointBridgeError::Store(error) => store_status(StoreBridgeError::Store(error)),
+        CheckpointBridgeError::Absent => FfiStatus::CheckpointNotFound,
+        CheckpointBridgeError::Rom => FfiStatus::Admission,
+        CheckpointBridgeError::Snapshot(ComputerCheckpointError::Incompatible) => {
+            FfiStatus::CheckpointIncompatible
+        }
+        CheckpointBridgeError::Snapshot(
+            ComputerCheckpointError::Limit | ComputerCheckpointError::Allocation,
+        ) => FfiStatus::CheckpointLimit,
+        CheckpointBridgeError::Snapshot(_) => FfiStatus::CheckpointCorrupt,
     }
 }
 

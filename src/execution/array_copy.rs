@@ -246,3 +246,6 @@ mod tests {
         );
     }
 }
+
+#[path = "checkpoint/array_copy.rs"]
+mod checkpoint_state;

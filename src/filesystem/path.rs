@@ -123,3 +123,7 @@ impl fmt::Display for VirtualPath {
         Ok(())
     }
 }
+
+#[path = "../checkpoint/filesystem_path.rs"]
+#[allow(dead_code)]
+mod checkpoint_state;

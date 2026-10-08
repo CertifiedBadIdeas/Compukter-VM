@@ -151,3 +151,7 @@ impl HandleTable {
         self.slots.iter().filter(|slot| slot.file.is_some()).count()
     }
 }
+
+#[path = "../checkpoint/filesystem_handle.rs"]
+#[allow(dead_code)]
+mod checkpoint_state;

@@ -720,3 +720,6 @@ impl Instruction {
         )
     }
 }
+
+#[path = "../checkpoint/artifact.rs"]
+mod checkpoint_state;

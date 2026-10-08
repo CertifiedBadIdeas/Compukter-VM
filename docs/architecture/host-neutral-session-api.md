@@ -218,14 +218,14 @@ managed allocation. Advance materializes nodes in postorder, charging allocation
 field stores against the existing sliced budgets. Partial objects and completed child nodes remain GC roots; the
 result register is published only after the complete tree is ready. OOM remains terminal, and another task's reply
 cannot overwrite an unfinished reference response. Pending owned replies and materialization plans count towards
-execution-resident resource accounting. Records use the resume-value export introduced in C ABI 19; active transports require C ABI 20.
+execution-resident resource accounting. Records use the resume-value export introduced in C ABI 19; active transports require C ABI 21.
 
 ## Process lifecycle (C ABI 20)
 
 Computer advances publish tag 13 on successful child entry and tag 14 on child exit, each followed by a positive
 little-endian u64 process ID. The root process has ID 0. IDs are unique for the computer lifetime. Entry is returned
 before the child executes; exit is returned before the parent resumes execution. These nonterminal outcomes do not
-change the retirement allowance or artifact ABI. Both JNI and FFM require C ABI 20; the 44 exported functions remain.
+change the retirement allowance or artifact ABI. At introduction this retained 44 exports. Active JNI and FFM transports now require C ABI 21 with 49 exports, including the [checkpoint transport](computer-checkpoints.md#native-transport-c-abi-21).
 
 External requests use computer-wide opaque IDs routed to their live process, task, and internal request identity.
 Repeated pending requests retain the same external ID; successful resume removes its route. Child exit purges its

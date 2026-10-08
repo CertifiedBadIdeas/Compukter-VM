@@ -546,3 +546,6 @@ pub enum AdvanceOutcome<'a> {
     Faulted(super::error::VmFault),
     HostFailed(HostFailure<'a>),
 }
+
+#[path = "checkpoint/host.rs"]
+mod checkpoint_state;

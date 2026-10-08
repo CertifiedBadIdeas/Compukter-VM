@@ -86,3 +86,7 @@ impl Default for FileSystemLimits {
         }
     }
 }
+
+#[path = "../checkpoint/filesystem_limits.rs"]
+#[allow(dead_code)]
+mod checkpoint_state;
