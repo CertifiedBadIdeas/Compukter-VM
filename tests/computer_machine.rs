@@ -219,6 +219,125 @@ fn public_checkpoint_restores_without_starting_entry_or_consuming_input() {
 }
 
 #[test]
+fn checkpoint_continues_execution_in_a_fresh_process() {
+    let root = std::env::temp_dir().join(format!(
+        "compukters-checkpoint-process-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let executable = std::env::current_exe().unwrap();
+    for phase in ["save", "restore"] {
+        let output = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "checkpoint_process_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("COMPUKTERS_CHECKPOINT_PROCESS_ROOT", &root)
+            .env("COMPUKTERS_CHECKPOINT_PROCESS_PHASE", phase)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{phase}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "subprocess fixture"]
+fn checkpoint_process_fixture() {
+    use compukter_vm::{
+        ComputerAdvanceOutcome, ComputerCheckpointLimits, ComputerFileSystem, ComputerId,
+        ComputerRestoreEnvironment, FileCapability, FileRights, ProcessLimits,
+    };
+    let root =
+        std::path::PathBuf::from(std::env::var_os("COMPUKTERS_CHECKPOINT_PROCESS_ROOT").unwrap());
+    let phase = std::env::var("COMPUKTERS_CHECKPOINT_PROCESS_PHASE").unwrap();
+    let id = ComputerId::from_bytes([52; 16]);
+    let limits = ComputerCheckpointLimits::default();
+    if phase == "save" {
+        let artifact = verify_artifact(
+            Arc::from(support::executable_language_runtime_vector()),
+            ArtifactLimits::default(),
+        )
+        .unwrap();
+        let mut machine = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+        machine
+            .advance_with_retirement_limit(65536, 65536, 64, 6)
+            .unwrap();
+        assert_eq!(6, machine.resource_snapshot().retired_instructions);
+        assert!(machine.resource_snapshot().heap_used_bytes > 0);
+        machine
+            .terminal_mut()
+            .push_text("input from prior process")
+            .unwrap();
+        let bytes = machine
+            .checkpoint(id, b"host from prior process", limits)
+            .unwrap();
+        std::fs::write(root.join("execution"), bytes).unwrap();
+        let result = machine
+            .advance_with_retirement_limit(65536, 65536, 64, 1000)
+            .unwrap();
+        assert!(matches!(result, ComputerAdvanceOutcome::Halted(_)));
+        std::fs::write(
+            root.join("expected"),
+            format!(
+                "{}:{result:?}",
+                machine.resource_snapshot().retired_instructions
+            ),
+        )
+        .unwrap();
+    } else {
+        assert_eq!("restore", phase);
+        let fs_limits = FileSystemLimits::default();
+        let environment = ComputerRestoreEnvironment {
+            id,
+            profile: profile(),
+            process_limits: ProcessLimits::default(),
+            addon_bindings: &[],
+            filesystem: ComputerFileSystem::with_limits(fs_limits),
+            initial_file_capability: FileCapability::new(
+                VirtualPath::parse_utf8("/home", &fs_limits).unwrap(),
+                FileRights::OWNER,
+            ),
+        };
+        let (mut machine, host) = ComputerMachine::restore_checkpoint(
+            environment,
+            &std::fs::read(root.join("execution")).unwrap(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(b"host from prior process", host.as_slice());
+        assert_eq!(6, machine.resource_snapshot().retired_instructions);
+        assert!(machine.resource_snapshot().heap_used_bytes > 0);
+        assert_eq!(
+            Some(ComputerTerminalEventKind::Text),
+            machine.terminal_await_event().unwrap()
+        );
+        assert_eq!(
+            "input from prior process",
+            machine.terminal_event_text().unwrap()
+        );
+        machine.terminal_finish_event().unwrap();
+        let result = machine
+            .advance_with_retirement_limit(65536, 65536, 64, 1000)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("expected")).unwrap(),
+            format!(
+                "{}:{result:?}",
+                machine.resource_snapshot().retired_instructions
+            )
+        );
+    }
+}
+
+#[test]
 fn public_checkpoint_rejects_changed_identity_configuration_and_limits() {
     use compukter_vm::{
         ComputerCheckpointError, ComputerCheckpointLimits, ComputerFileSystem, ComputerId,
