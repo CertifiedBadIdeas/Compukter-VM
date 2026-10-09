@@ -126,9 +126,19 @@ an overwrite of `0.10.0`.
 
 Before preparing a tag, run `cargo xtask check` to verify that the canonical
 Runtime version, workspace package versions, lockfile, and exported FFI ABI agree.
-After an exported ABI increment, `cargo xtask bump abi` aligns those version files
-and creates a local commit. C ABI 21 therefore requires Runtime `0.21.0` or a
-compatible `0.21.x` revision; changing an existing `v0.20.0` tag cannot repair it.
+Version preparation queries the latest complete stable GitHub Release through the
+`gh` CLI: the published tag must have both platform bundles and the checksums asset.
+Local tags, draft/prerelease metadata, partial uploads and API errors do not admit a bump.
+Run bump commands with GitHub access and a clean checkout; tests use a deterministic
+publication provider instead of bypassing this requirement.
+
+After published `0.21.2`, `cargo xtask bump revision` prepares `0.21.3` once.
+`cargo xtask bump abi` explicitly marks incompatible changes and prepares `0.22.0`,
+from either `0.21.2` or pending `0.21.3`, updating the exported FFI constant itself.
+Repeated revision or ABI requests keep the pending candidate unchanged until it is
+published. A version outside those next-candidate states is rejected for review.
+C ABI 21 therefore requires Runtime `0.21.0` or a compatible `0.21.x` revision;
+changing an existing `v0.20.0` tag cannot repair it.
 
 Every revision of one ABI must remain compatible in both directions for native calls,
 executable admission, filesystem persistence and execution checkpoints. Checkpoint identity
@@ -136,7 +146,7 @@ includes the numeric ABI and logical schema, never the package revision. Breakin
 contracts requires an ABI bump. Before publication, the previous development checkpoint
 identity based on the full version is replaced without a legacy fallback.
 The shared verification script exchanges a full-computer checkpoint between the current
-revision and an actual `cargo xtask bump revision` build in both directions.
+revision and an adjacent-revision build fixture in both directions, entirely offline.
 
 Ordinary CI tests the workspace on Linux and Windows, builds both native transports,
 checks the FFI ABI and Java 21 JNI calls, packages and inspects each bundle, then
@@ -144,7 +154,11 @@ verifies the complete two-platform set and its checksums. One `CI` workflow in
 `.github/workflows/ci.yml` handles branch pushes, pull requests, Runtime tag pushes
 and manual runs with the same workspace, native and bundle verification scripts
 under `tools/runtime-bundler/`. A Runtime tag push additionally validates the tag
-identity and publishes the verified assets through a separate release job.
+identity and publishes the verified assets through a separate release job. Only after
+successful publication does another job prepare the next development revision on `main`
+and push its version commit. A normal fast-forward push preserves concurrent changes;
+a rejected push fails the preparation job while the published release remains available.
+The standard workflow token's push does not trigger another CI run.
 Manual dispatch validates the candidate without publishing; its optional `tag`
 input checks a requested identity against `runtime-version.toml`.
 It publishes a durable GitHub Release only for a pushed tag matching `v0.X.Y`.
@@ -168,7 +182,7 @@ cargo xtask release
 git push origin main v0.9.1
 ```
 
-`bump` updates every canonical version file and creates a local commit.
+`bump` updates the canonical version files (and FFI constant for an ABI change) and creates a local commit only when a new candidate is needed.
 `release` runs formatting, Clippy, and workspace tests before creating a local
 annotated tag. Neither command pushes or publishes anything. Archive names keep
 the descriptive `compukter-runtime-*` prefix; GitHub publishes only after the
