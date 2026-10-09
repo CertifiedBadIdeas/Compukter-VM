@@ -16,13 +16,32 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: runtime-ci-${{ github.ref }}
+  group: runtime-ci-${{ github.sha }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
+  resolve:
+    name: Select verified Runtime build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_run: ${{ steps.reuse.outputs.source_run }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Find successful build of this exact commit
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_TAG: ${{ github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name || inputs.tag || '' }}
+        run: python tools/runtime-bundler/reuse_verified_runtime.py
+
   rust:
+    needs: resolve
+    if: needs.resolve.outputs.source_run == ''
     name: Rust (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -48,17 +67,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - name: Validate Runtime identity
-        if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$RUNTIME_TAG" in
-            v0.*.*) ;;
-            *) echo "invalid Runtime tag: $RUNTIME_TAG" >&2; exit 1 ;;
-          esac
-          declared_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' runtime-version.toml)"
-          test "$RUNTIME_TAG" = "v$declared_version"
       - name: Fetch locked dependencies
         run: cargo fetch --locked
       - name: Verify workspace
@@ -75,12 +83,14 @@ jobs:
         with:
           name: runtime-${{ matrix.platform }}-${{ github.sha }}
           path: target/runtime-release/${{ steps.native.outputs.asset }}
+          overwrite: true
           if-no-files-found: error
           retention-days: 7
 
   bundles:
     name: Verify complete Runtime bundle set
-    needs: rust
+    needs: [resolve, rust]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.rust.result == 'success' || needs.rust.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -88,26 +98,36 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
       - name: Download platform bundles
+        if: needs.resolve.outputs.source_run == ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: runtime-*-${{ github.sha }}
           path: release-assets
           merge-multiple: true
+      - name: Download previously verified bundle set
+        if: needs.resolve.outputs.source_run != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: runtime-verified-${{ github.sha }}
+          run-id: ${{ needs.resolve.outputs.source_run }}
+          github-token: ${{ github.token }}
+          path: release-assets
       - name: Reinspect and checksum release assets
         env:
           RUNTIME_TAG: ${{ github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name || inputs.tag || '' }}
-        run: bash tools/runtime-bundler/verify-runtime-bundles.sh release-assets "$RUNTIME_TAG"
+        run: bash tools/runtime-bundler/verify-runtime-bundles.sh release-assets "$RUNTIME_TAG" "${{ needs.resolve.outputs.source_run != '' }}"
       - name: Upload verified release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: runtime-verified-${{ github.sha }}
           path: release-assets/*
+          overwrite: true
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Publish tagged Runtime
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: ${{ !cancelled() && needs.bundles.result == 'success' && github.event_name == 'push' && github.ref_type == 'tag' }}
     needs: bundles
     runs-on: ubuntu-latest
     timeout-minutes: 10
