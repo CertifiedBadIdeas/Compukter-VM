@@ -149,3 +149,35 @@ jobs:
             --title "Compukter Runtime ${GITHUB_REF_NAME#v}" \
             --generate-notes \
             release-assets/*
+
+  prepare:
+    name: Prepare next development revision
+    needs: release
+    if: ${{ !cancelled() && needs.release.result == 'success' && github.event_name == 'push' && github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: runtime-next-development-main
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Configure release bot identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Prepare next version from the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask bump revision
+      - name: Verify prepared version
+        run: cargo xtask check
+      - name: Push development revision
+        run: git push origin HEAD:main
