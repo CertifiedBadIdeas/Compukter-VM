@@ -130,6 +130,14 @@ After an exported ABI increment, `cargo xtask bump abi` aligns those version fil
 and creates a local commit. C ABI 21 therefore requires Runtime `0.21.0` or a
 compatible `0.21.x` revision; changing an existing `v0.20.0` tag cannot repair it.
 
+Every revision of one ABI must remain compatible in both directions for native calls,
+executable admission, filesystem persistence and execution checkpoints. Checkpoint identity
+includes the numeric ABI and logical schema, never the package revision. Breaking those
+contracts requires an ABI bump. Before publication, the previous development checkpoint
+identity based on the full version is replaced without a legacy fallback.
+The shared verification script exchanges a full-computer checkpoint between the current
+revision and an actual `cargo xtask bump revision` build in both directions.
+
 Ordinary CI tests the workspace on Linux and Windows, builds both native transports,
 checks the FFI ABI and Java 21 JNI calls, packages and inspects each bundle, then
 verifies the complete two-platform set and its checksums. One `CI` workflow in

@@ -251,6 +251,9 @@ fn checkpoint_continues_execution_in_a_fresh_process() {
 #[test]
 #[ignore = "subprocess fixture"]
 fn checkpoint_process_fixture() {
+    if let Ok(expected_version) = std::env::var("COMPUKTERS_CHECKPOINT_PROCESS_VERSION") {
+        assert_eq!(env!("CARGO_PKG_VERSION"), expected_version);
+    }
     use compukter_vm::{
         ComputerAdvanceOutcome, ComputerCheckpointLimits, ComputerFileSystem, ComputerId,
         ComputerRestoreEnvironment, FileCapability, FileRights, ProcessLimits,
