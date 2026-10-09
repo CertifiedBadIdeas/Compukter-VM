@@ -17,6 +17,7 @@
  */
 
 use runtime_bundler::smoke::require_ffi_abi;
+use runtime_bundler::version::RuntimeVersion;
 use std::path::PathBuf;
 
 #[test]
@@ -27,5 +28,10 @@ fn loads_the_exported_abi_from_the_dynamic_library() {
             .expect("COMPUKTER_FFI_SMOKE_LIBRARY must point at the built cdylib"),
     );
 
-    require_ffi_abi(&library, 5).unwrap();
+    let version = include_str!("../../../runtime-version.toml")
+        .strip_prefix("version = \"")
+        .and_then(|value| value.strip_suffix("\"\n"))
+        .expect("runtime-version.toml must contain the canonical Runtime version");
+    let version = RuntimeVersion::parse(version).unwrap();
+    require_ffi_abi(&library, version.abi).unwrap();
 }
