@@ -145,9 +145,20 @@ verifies the complete two-platform set and its checksums. One `CI` workflow in
 and manual runs with the same workspace, native and bundle verification scripts
 under `tools/runtime-bundler/`. A Runtime tag push additionally validates the tag
 identity and publishes the verified assets through a separate release job.
-Manual dispatch runs all verification without publishing; its optional `tag`
+Manual dispatch validates the candidate without publishing; its optional `tag`
 input checks a requested identity against `runtime-version.toml`.
 It publishes a durable GitHub Release only for a pushed tag matching `v0.X.Y`.
+
+Runs for the same commit share a concurrency queue (`queue: max`) without cancelling
+an active or pending publication. The first run builds and verifies both platforms.
+Later runs reuse `runtime-verified-<sha>` only from a successful push of the same
+workflow, repository and exact commit, with a nonexpired artifact. Tag identity,
+bundle manifests and the original checksums are checked again before publication.
+If no reusable artifact remains, the run performs full verification itself; API,
+download or bundle verification errors fail the run. Pull-request artifacts never
+serve as a release source. Both event orders (branch then tag, or tag then branch)
+use the same policy. Manual runs may also reuse a verified push result.
+
 Local release preparation is explicit:
 
 ```text

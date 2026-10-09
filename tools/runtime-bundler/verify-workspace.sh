@@ -6,6 +6,7 @@
 set -euo pipefail
 
 cargo xtask check
+python -m unittest discover -s tools/runtime-bundler -p 'test_*.py'
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 cargo test --workspace --locked --offline
