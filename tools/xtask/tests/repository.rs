@@ -55,7 +55,15 @@ impl TestRepository {
         );
         write(
             root.join(".github/workflows/runtime-release.yml"),
-            "tags:\n  - \"v0.*.*\"\nenv:\n  RUNTIME_TAG: input\n  RUNTIME_VERSION: dynamic\n  RUNTIME_ABI: dynamic\nsmoke: --abi \"$RUNTIME_ABI\"\nasset: compukter-runtime-${RUNTIME_VERSION}\nrelease:\n  if: github.event_name == 'push' && github.ref_type == 'tag'\n",
+            "tags:\n  - \"v0.*.*\"\nrun: bash tools/runtime-bundler/verify-native-runtime.sh\nrun: bash tools/runtime-bundler/verify-workspace.sh\nrun: bash tools/runtime-bundler/verify-runtime-bundles.sh\nrelease:\n  if: github.event_name == 'push' && github.ref_type == 'tag'\n",
+        );
+        write(
+            root.join(".github/workflows/ci.yml"),
+            "run: bash tools/runtime-bundler/verify-native-runtime.sh\nrun: bash tools/runtime-bundler/verify-workspace.sh\nrun: bash tools/runtime-bundler/verify-runtime-bundles.sh\n",
+        );
+        write(
+            root.join("tools/runtime-bundler/verify-native-runtime.sh"),
+            "RUNTIME_TAG=dynamic\nRUNTIME_VERSION=dynamic\nRUNTIME_ABI=dynamic\nsmoke --abi \"$RUNTIME_ABI\"\nasset=compukter-runtime-${RUNTIME_VERSION}\n",
         );
         git(root, &["init", "-b", "main"]);
         git(root, &["config", "user.name", "Compukters Test"]);

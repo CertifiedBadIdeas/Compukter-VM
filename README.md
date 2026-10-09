@@ -130,6 +130,12 @@ After an exported ABI increment, `cargo xtask bump abi` aligns those version fil
 and creates a local commit. C ABI 21 therefore requires Runtime `0.21.0` or a
 compatible `0.21.x` revision; changing an existing `v0.20.0` tag cannot repair it.
 
+Ordinary CI tests the workspace on Linux and Windows, builds both native transports,
+checks the FFI ABI and Java 21 JNI calls, packages and inspects each bundle, then
+verifies the complete two-platform set and its checksums. CI and `Runtime release`
+invoke the same workspace, native and bundle verification scripts under `tools/runtime-bundler/`.
+Release additionally validates the requested tag and publishes the verified assets;
+manual dispatch runs all verification without publishing.
 The `Runtime release` workflow checks this canonical state before testing and
 building natives. It may be dispatched manually to build and test
 temporary Linux and Windows artifacts. It publishes a durable GitHub Release

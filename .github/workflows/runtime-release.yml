@@ -30,13 +30,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             ffi_library: target/release/libcompukter_ffi.so
             jni_library: target/release/libcompukter_jni.so
-            extension: .tar.gz
           - platform: windows-x86_64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             ffi_library: target/release/compukter_ffi.dll
             jni_library: target/release/compukter_jni.dll
-            extension: .zip
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
@@ -48,7 +46,6 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Validate Runtime identity
-        id: identity
         shell: bash
         run: |
           set -euo pipefail
@@ -56,74 +53,32 @@ jobs:
             v0.*.*) ;;
             *) echo "invalid Runtime tag: $RUNTIME_TAG" >&2; exit 1 ;;
           esac
-          RUNTIME_VERSION="${RUNTIME_TAG#v}"
-          RUNTIME_ABI="${RUNTIME_VERSION#0.}"
-          RUNTIME_ABI="${RUNTIME_ABI%%.*}"
           declared_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' runtime-version.toml)"
-          test "$declared_version" = "$RUNTIME_VERSION"
-          asset="compukter-runtime-${RUNTIME_VERSION}-${{ matrix.platform }}${{ matrix.extension }}"
-          echo "RUNTIME_VERSION=$RUNTIME_VERSION" >> "$GITHUB_ENV"
-          echo "RUNTIME_ABI=$RUNTIME_ABI" >> "$GITHUB_ENV"
-          echo "version=$RUNTIME_VERSION" >> "$GITHUB_OUTPUT"
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          test "$RUNTIME_TAG" = "v$declared_version"
       - name: Fetch locked dependencies
         run: cargo fetch --locked
-      - name: Verify canonical Runtime release state
-        run: cargo xtask check
       - name: Verify workspace
-        run: cargo test --workspace --locked --offline
-      - name: Verify formatting
-        if: runner.os == 'Linux'
-        run: cargo fmt --all --check
-      - name: Verify Clippy
-        if: runner.os == 'Linux'
-        run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
-      - name: Build native Runtime
-        run: cargo build -p compukter-ffi -p compukter-jni --release --locked --offline
-      - name: Smoke and package native Runtime
         shell: bash
-        run: |
-          cargo run -p runtime-bundler --locked --offline -- smoke \
-            --library "${{ matrix.ffi_library }}" \
-            --abi "$RUNTIME_ABI"
-          javac -d target/runtime-release-smoke \
-            tools/runtime-bundler/fixtures/ru/lazyhat/compukters/lang/runtime/vm/JniNative.java
-          java --enable-native-access=ALL-UNNAMED -cp target/runtime-release-smoke \
-            ru.lazyhat.compukters.lang.runtime.vm.JniNative \
-            "${{ matrix.jni_library }}" \
-            "$RUNTIME_ABI"
-          cargo run -p runtime-bundler --locked --offline -- package \
-            --version-file runtime-version.toml \
-            --tag "$RUNTIME_TAG" \
-            --commit "${{ github.sha }}" \
-            --target "${{ matrix.target }}" \
-            --ffi-library "${{ matrix.ffi_library }}" \
-            --jni-library "${{ matrix.jni_library }}" \
-            --license LICENSE \
-            --notice NOTICE \
-            --rustc "$(rustc --version)" \
-            --format artifact=3 \
-            --format filesystem-generation=1 \
-            --format executable-revision=1 \
-            --format compilation-request=1 \
-            --format resource-snapshot=2 \
-            --output target/runtime-release
+        run: bash tools/runtime-bundler/verify-workspace.sh
+      - name: Build, smoke, package and inspect native Runtime
+        id: native
+        shell: bash
+        run: >-
+          bash tools/runtime-bundler/verify-native-runtime.sh
+          "${{ matrix.target }}" "${{ matrix.ffi_library }}" "${{ matrix.jni_library }}" "$RUNTIME_TAG"
       - name: Upload temporary platform bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: runtime-${{ matrix.platform }}-${{ github.sha }}
-          path: target/runtime-release/${{ steps.identity.outputs.asset }}
+          path: target/runtime-release/${{ steps.native.outputs.asset }}
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: Publish tagged Runtime
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+  bundles:
+    name: Verify complete Runtime bundle set
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Fetch locked dependencies
@@ -135,21 +90,32 @@ jobs:
           path: release-assets
           merge-multiple: true
       - name: Reinspect and checksum release assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          RUNTIME_VERSION="${GITHUB_REF_NAME#v}"
-          for bundle in release-assets/compukter-runtime-${RUNTIME_VERSION}-*; do
-            cargo run -p runtime-bundler --locked --offline -- inspect "$bundle" \
-              | jq -e --arg tag "$GITHUB_REF_NAME" \
-                '.schema == 2 and .release_tag == $tag and (.libraries | keys) == ["ffi", "jni"]'
-          done
-          (
-            cd release-assets
-            sha256sum compukter-runtime-"$RUNTIME_VERSION"-linux-x86_64.tar.gz \
-              compukter-runtime-"$RUNTIME_VERSION"-windows-x86_64.zip \
-              > compukter-runtime-"$RUNTIME_VERSION"-checksums.sha256
-          )
+        env:
+          RUNTIME_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: bash tools/runtime-bundler/verify-runtime-bundles.sh release-assets "$RUNTIME_TAG"
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-verified-${{ github.sha }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish tagged Runtime
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: bundles
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: runtime-verified-${{ github.sha }}
+          path: release-assets
       - name: Create immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
