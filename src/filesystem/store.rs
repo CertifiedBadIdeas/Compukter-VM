@@ -443,10 +443,15 @@ impl WorldFileSystemStore {
         {
             worker.join().map_err(|_| StoreError::StorageFaulted)?;
         }
-        self.lock_file
+        let mut lock_file = self
+            .lock_file
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take();
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(file) = lock_file.as_ref() {
+            // Duplicated/inherited descriptors can outlive this store during a concurrent process spawn.
+            file.unlock().map_err(|_| StoreError::Io)?;
+        }
+        lock_file.take();
         *health = StoreHealth::Closed;
         self.persistence.mark_closed();
         Ok(())
@@ -607,5 +612,46 @@ fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
 impl Drop for WorldFileSystemStore {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_close_releases_the_lock_while_a_duplicate_descriptor_is_alive() {
+        let root = std::env::temp_dir().join(format!(
+            "compukters-store-close-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let store = WorldFileSystemStore::open(&root, FileSystemLimits::testing()).unwrap();
+        let inherited_descriptor = store
+            .lock_file
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        assert!(matches!(
+            WorldFileSystemStore::open(&root, FileSystemLimits::testing()),
+            Err(StoreOpenError::Locked)
+        ));
+        store.close().unwrap();
+        let reopened = WorldFileSystemStore::open(&root, FileSystemLimits::testing()).unwrap();
+        drop(inherited_descriptor);
+        assert!(matches!(
+            WorldFileSystemStore::open(&root, FileSystemLimits::testing()),
+            Err(StoreOpenError::Locked)
+        ));
+        reopened.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
