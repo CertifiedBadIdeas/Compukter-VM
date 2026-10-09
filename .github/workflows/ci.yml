@@ -9,11 +9,17 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: cargo fetch --locked
+      - run: cargo xtask check
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
       - run: cargo test --workspace --locked --offline
