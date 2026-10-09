@@ -19,6 +19,7 @@
 use crate::cli::BumpKind;
 use crate::git::GitRepository;
 use crate::process::ProcessRunner;
+use crate::published::PublishedReleaseSource;
 use crate::state::ReleaseState;
 use crate::transaction::FileTransaction;
 use crate::version::ReleaseVersion;
@@ -26,22 +27,45 @@ use std::fs;
 use std::path::Path;
 use toml_edit::{value, DocumentMut};
 
-const VERSION_PATHS: [&str; 3] = ["runtime-version.toml", "Cargo.toml", "Cargo.lock"];
+const VERSION_PATHS: [&str; 4] = [
+    "runtime-version.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "ffi/src/lib.rs",
+];
 
-pub fn bump(root: &Path, kind: BumpKind, runner: &dyn ProcessRunner) -> Result<String, String> {
+pub fn bump(
+    root: &Path,
+    kind: BumpKind,
+    runner: &dyn ProcessRunner,
+    published: &dyn PublishedReleaseSource,
+) -> Result<String, String> {
     let git = GitRepository::open(root);
     git.require_clean()?;
     let current = ReleaseState::load(root)?;
-    let target = match kind {
-        BumpKind::Revision => {
-            current.require_current_abi()?;
-            current.version.bump_revision()?
-        }
-        BumpKind::Abi => current.version.bump_abi(current.exported_abi)?,
+    current.require_current_abi()?;
+    let baseline = published.latest(root)?;
+    let Some(target) = next_development_version(current.version, baseline, kind)? else {
+        return Ok(format!(
+            "development version {} is already prepared after published {baseline}",
+            current.version
+        ));
     };
     let paths = VERSION_PATHS.map(Path::new);
     let transaction = FileTransaction::begin(root, &paths)?;
     write_versions(root, target)?;
+    if target.abi != current.exported_abi {
+        let path = root.join("ffi/src/lib.rs");
+        let source =
+            fs::read_to_string(&path).map_err(|error| format!("cannot read FFI ABI: {error}"))?;
+        let old = format!(
+            "pub const COMPUKTER_FFI_ABI_VERSION: u32 = {};",
+            current.exported_abi
+        );
+        let new = format!("pub const COMPUKTER_FFI_ABI_VERSION: u32 = {};", target.abi);
+        fs::write(path, source.replacen(&old, &new, 1))
+            .map_err(|error| format!("cannot update FFI ABI: {error}"))?;
+    }
     runner.run(
         root,
         "cargo",
@@ -60,6 +84,31 @@ pub fn bump(root: &Path, kind: BumpKind, runner: &dyn ProcessRunner) -> Result<S
     git.commit(&message, &paths)?;
     transaction.commit();
     Ok(format!("prepared release version {target}"))
+}
+
+pub fn next_development_version(
+    current: ReleaseVersion,
+    published: ReleaseVersion,
+    kind: BumpKind,
+) -> Result<Option<ReleaseVersion>, String> {
+    if current == published {
+        return match kind {
+            BumpKind::Revision => published.bump_revision().map(Some),
+            BumpKind::Abi => published.bump_abi().map(Some),
+        };
+    }
+    if current.abi == published.abi && current.revision.checked_sub(published.revision) == Some(1) {
+        return match kind {
+            BumpKind::Revision => Ok(None),
+            BumpKind::Abi => published.bump_abi().map(Some),
+        };
+    }
+    if published.abi.checked_add(1) == Some(current.abi) && current.revision == 0 {
+        return Ok(None);
+    }
+    Err(format!(
+        "development version {current} is not the next candidate after published {published}"
+    ))
 }
 
 fn write_versions(root: &Path, version: ReleaseVersion) -> Result<(), String> {

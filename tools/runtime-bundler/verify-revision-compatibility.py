@@ -66,7 +66,7 @@ def main():
         temporary = Path(temporary)
         repository = temporary / "repository"
         repository.mkdir()
-        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=source)
+        tracked = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=source)
         for name in tracked.decode().split("\0"):
             if not name:
                 continue
@@ -75,22 +75,25 @@ def main():
             shutil.copy2(source / name, destination)
         # Keep the cache isolated: xtask embeds its repository path at compile time.
         environment = dict(os.environ, CARGO_TARGET_DIR=str(temporary / "target"))
-        for arguments in [["init", "-b", "main"], ["config", "user.name", "Compatibility Test"],
-                          ["config", "user.email", "compatibility@compukters.invalid"],
-                          ["add", "."], ["commit", "-m", "compatibility fixture"]]:
-            run(["git", *arguments], repository, stdout=subprocess.DEVNULL)
         version = json.loads((repository / "runtime-version.toml").read_text().split("=", 1)[1])
         suffix = ".exe" if os.name == "nt" else ""
         original = temporary / ("original" + suffix)
         revised = temporary / ("revised" + suffix)
         run(["cargo", "xtask", "check"], repository, env=environment)
         build_fixture(repository, original, environment)
-        run(["cargo", "xtask", "bump", "revision"], repository,
-            env=environment, stdout=subprocess.DEVNULL)
-        next_version = json.loads((repository / "runtime-version.toml").read_text().split("=", 1)[1])
+        # This is a build fixture, not a production release/version mutation.
+        # Keep it offline without bypassing the publication gate of cargo xtask bump.
         abi, revision = version.rsplit(".", 1)
-        if next_version != f"{abi}.{int(revision) + 1}":
-            raise RuntimeError(f"Revision bump did not produce the next revision: {version} -> {next_version}")
+        next_version = f"{abi}.{int(revision) + 1}"
+        (repository / "runtime-version.toml").write_text(f'version = "{next_version}"\n')
+        manifest = repository / "Cargo.toml"
+        old_version = f'version = "{version}"'
+        contents = manifest.read_text()
+        if contents.count(old_version) != 1:
+            raise RuntimeError("Expected exactly one canonical workspace version in build fixture")
+        manifest.write_text(contents.replace(old_version, f'version = "{next_version}"'))
+        run(["cargo", "metadata", "--format-version", "1", "--offline"], repository,
+            env=environment, stdout=subprocess.DEVNULL)
         run(["cargo", "xtask", "check"], repository, env=environment)
         build_fixture(repository, revised, environment)
         exchange(original, version, revised, next_version, temporary / "forward")

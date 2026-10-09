@@ -21,10 +21,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use tempfile::TempDir;
-use xtask::bump::bump;
+use xtask::bump::bump as bump_with_release;
 use xtask::cli::BumpKind;
 use xtask::process::ProcessRunner;
+use xtask::published::PublishedReleaseSource;
 use xtask::release::release;
+use xtask::version::ReleaseVersion;
+
+struct Published(&'static str);
+
+impl PublishedReleaseSource for Published {
+    fn latest(&self, _root: &Path) -> Result<ReleaseVersion, String> {
+        ReleaseVersion::parse(self.0)
+    }
+}
+
+fn bump(root: &Path, kind: BumpKind, runner: &dyn ProcessRunner) -> Result<String, String> {
+    bump_with_release(root, kind, runner, &Published("0.5.1"))
+}
 
 struct TestRepository {
     directory: TempDir,
@@ -267,12 +281,15 @@ fn dirty_repository_is_rejected_before_mutation() {
 }
 
 #[test]
-fn abi_bump_requires_the_exported_next_abi() {
-    let repository = TestRepository::consistent("0.5.2", 6);
+fn abi_bump_updates_the_exported_abi_and_requires_consistent_input() {
+    let repository = TestRepository::consistent("0.5.2", 5);
     bump(repository.path(), BumpKind::Abi, &UpdatingRunner).unwrap();
     assert_eq!("0.6.0", repository.runtime_version());
 
-    let rejected = TestRepository::consistent("0.5.2", 5);
+    assert!(String::from_utf8(repository.bytes("ffi/src/lib.rs"))
+        .unwrap()
+        .contains("u32 = 6;"));
+    let rejected = TestRepository::consistent("0.5.2", 6);
     assert!(bump(rejected.path(), BumpKind::Abi, &UpdatingRunner).is_err());
     assert_eq!("0.5.2", rejected.runtime_version());
 }
@@ -356,4 +373,102 @@ fn git_output(root: &Path, arguments: &[&str]) -> String {
         .unwrap();
     assert!(output.status.success(), "git {arguments:?} failed");
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn development_versions_do_not_advance_again_before_publication() {
+    for (version, abi) in [("0.5.2", 5), ("0.6.0", 6)] {
+        let repository = TestRepository::consistent(version, abi);
+        let before = repository.head_subject();
+        for kind in [BumpKind::Revision, BumpKind::Abi] {
+            if version == "0.5.2" && kind == BumpKind::Abi {
+                continue;
+            }
+            bump(repository.path(), kind, &FailingRunner).unwrap();
+            assert_eq!(version, repository.runtime_version());
+            assert_eq!(before, repository.head_subject());
+            assert!(repository.is_clean());
+        }
+    }
+}
+
+#[test]
+fn a_new_published_release_unlocks_the_next_bump() {
+    let repository = TestRepository::consistent("0.6.0", 6);
+    bump_with_release(
+        repository.path(),
+        BumpKind::Revision,
+        &UpdatingRunner,
+        &Published("0.6.0"),
+    )
+    .unwrap();
+    assert_eq!("0.6.1", repository.runtime_version());
+    bump_with_release(
+        repository.path(),
+        BumpKind::Abi,
+        &UpdatingRunner,
+        &Published("0.6.0"),
+    )
+    .unwrap();
+    assert_eq!("0.7.0", repository.runtime_version());
+}
+
+#[test]
+fn failed_abi_preparation_restores_all_four_files() {
+    let repository = TestRepository::consistent("0.5.1", 5);
+    let paths = [
+        "runtime-version.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "ffi/src/lib.rs",
+    ];
+    let before = paths.map(|path| repository.bytes(path));
+    assert!(bump(repository.path(), BumpKind::Abi, &FailingRunner).is_err());
+    for (path, bytes) in paths.into_iter().zip(before) {
+        assert_eq!(bytes, repository.bytes(path));
+    }
+    assert!(repository.is_clean());
+}
+
+#[test]
+fn failed_abi_commit_restores_files_and_index() {
+    let repository = TestRepository::consistent("0.5.1", 5);
+    let paths = [
+        "runtime-version.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "ffi/src/lib.rs",
+    ];
+    let before = paths.map(|path| repository.bytes(path));
+    git(repository.path(), &["config", "user.name", ""]);
+    assert!(bump(repository.path(), BumpKind::Abi, &UpdatingRunner).is_err());
+    for (path, bytes) in paths.into_iter().zip(before) {
+        assert_eq!(bytes, repository.bytes(path));
+    }
+    assert!(repository.is_clean());
+}
+
+#[test]
+fn missing_publication_and_inconsistent_candidates_cannot_mutate_versions() {
+    struct Unpublished;
+    impl PublishedReleaseSource for Unpublished {
+        fn latest(&self, _root: &Path) -> Result<ReleaseVersion, String> {
+            Err("no complete published release".to_owned())
+        }
+    }
+    let repository = TestRepository::consistent("0.5.1", 5);
+    assert!(bump_with_release(
+        repository.path(),
+        BumpKind::Abi,
+        &UpdatingRunner,
+        &Unpublished
+    )
+    .is_err());
+    assert_eq!("0.5.1", repository.runtime_version());
+    assert!(repository.is_clean());
+    for (version, abi) in [("0.5.0", 5), ("0.5.3", 5), ("0.7.0", 7), ("0.6.1", 6)] {
+        let repository = TestRepository::consistent(version, abi);
+        assert!(bump(repository.path(), BumpKind::Revision, &UpdatingRunner).is_err());
+        assert!(repository.is_clean());
+    }
 }

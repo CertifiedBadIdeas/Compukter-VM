@@ -50,16 +50,11 @@ impl ReleaseVersion {
         })
     }
 
-    pub fn bump_abi(self, exported_abi: u32) -> Result<Self, String> {
+    pub fn bump_abi(self) -> Result<Self, String> {
         let target = self
             .abi
             .checked_add(1)
             .ok_or_else(|| "version ABI exceeds u32".to_owned())?;
-        if exported_abi != target {
-            return Err(format!(
-                "next version ABI {target} does not match exported FFI ABI {exported_abi}"
-            ));
-        }
         Ok(Self {
             abi: target,
             revision: 0,
@@ -93,8 +88,7 @@ mod tests {
     fn revision_and_abi_transitions_are_strict() {
         let current = ReleaseVersion::parse("0.5.1").unwrap();
         assert_eq!("0.5.2", current.bump_revision().unwrap().to_string());
-        assert_eq!("0.6.0", current.bump_abi(6).unwrap().to_string());
-        assert!(current.bump_abi(5).is_err());
+        assert_eq!("0.6.0", current.bump_abi().unwrap().to_string());
     }
 
     #[test]
@@ -107,6 +101,6 @@ mod tests {
         }
         let maximum = ReleaseVersion::parse("0.4294967295.4294967295").unwrap();
         assert!(maximum.bump_revision().is_err());
-        assert!(maximum.bump_abi(u32::MAX).is_err());
+        assert!(maximum.bump_abi().is_err());
     }
 }

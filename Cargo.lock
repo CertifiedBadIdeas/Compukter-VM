@@ -648,6 +648,7 @@ dependencies = [
 name = "xtask"
 version = "0.21.2"
 dependencies = [
+ "serde_json",
  "tempfile",
  "toml_edit",
 ]
