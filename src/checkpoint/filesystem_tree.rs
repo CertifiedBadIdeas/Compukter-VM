@@ -375,6 +375,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let store = WorldFileSystemStore::open(&root, limits).unwrap();
         let mut original = store.open_computer(ID, Arc::clone(&rom)).unwrap();
         let capability = capability(&original);

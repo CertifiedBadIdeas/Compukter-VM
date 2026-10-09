@@ -644,6 +644,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let store = WorldFileSystemStore::open(&root, filesystem_limits).unwrap();
         let owner = FileCapability::new(
             VirtualPath::parse_utf8("/home", &filesystem_limits).unwrap(),
