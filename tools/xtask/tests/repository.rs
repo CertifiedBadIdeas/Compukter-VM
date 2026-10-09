@@ -54,12 +54,8 @@ impl TestRepository {
             &format!("pub const COMPUKTER_FFI_ABI_VERSION: u32 = {abi};\n"),
         );
         write(
-            root.join(".github/workflows/runtime-release.yml"),
-            "tags:\n  - \"v0.*.*\"\nrun: bash tools/runtime-bundler/verify-native-runtime.sh\nrun: bash tools/runtime-bundler/verify-workspace.sh\nrun: bash tools/runtime-bundler/verify-runtime-bundles.sh\nrelease:\n  if: github.event_name == 'push' && github.ref_type == 'tag'\n",
-        );
-        write(
             root.join(".github/workflows/ci.yml"),
-            "run: bash tools/runtime-bundler/verify-native-runtime.sh\nrun: bash tools/runtime-bundler/verify-workspace.sh\nrun: bash tools/runtime-bundler/verify-runtime-bundles.sh\n",
+            "tags:\n  - \"v0.*.*\"\nrun: bash tools/runtime-bundler/verify-native-runtime.sh\nrun: bash tools/runtime-bundler/verify-workspace.sh\nrun: bash tools/runtime-bundler/verify-runtime-bundles.sh\nrelease:\n  if: github.event_name == 'push' && github.ref_type == 'tag'\n",
         );
         write(
             root.join("tools/runtime-bundler/verify-native-runtime.sh"),
