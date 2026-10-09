@@ -132,14 +132,15 @@ compatible `0.21.x` revision; changing an existing `v0.20.0` tag cannot repair i
 
 Ordinary CI tests the workspace on Linux and Windows, builds both native transports,
 checks the FFI ABI and Java 21 JNI calls, packages and inspects each bundle, then
-verifies the complete two-platform set and its checksums. CI and `Runtime release`
-invoke the same workspace, native and bundle verification scripts under `tools/runtime-bundler/`.
-Release additionally validates the requested tag and publishes the verified assets;
-manual dispatch runs all verification without publishing.
-The `Runtime release` workflow checks this canonical state before testing and
-building natives. It may be dispatched manually to build and test
-temporary Linux and Windows artifacts. It publishes a durable GitHub Release
-only for a pushed tag matching `v0.X.Y`. Local release preparation is explicit:
+verifies the complete two-platform set and its checksums. One `CI` workflow in
+`.github/workflows/ci.yml` handles branch pushes, pull requests, Runtime tag pushes
+and manual runs with the same workspace, native and bundle verification scripts
+under `tools/runtime-bundler/`. A Runtime tag push additionally validates the tag
+identity and publishes the verified assets through a separate release job.
+Manual dispatch runs all verification without publishing; its optional `tag`
+input checks a requested identity against `runtime-version.toml`.
+It publishes a durable GitHub Release only for a pushed tag matching `v0.X.Y`.
+Local release preparation is explicit:
 
 ```text
 cargo xtask check

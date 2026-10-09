@@ -186,29 +186,23 @@ fn validate_workflow(
     errors: &mut Vec<String>,
 ) -> Result<(), String> {
     let workflow = read(
-        &root.join(".github/workflows/runtime-release.yml"),
-        "Runtime release workflow",
+        &root.join(".github/workflows/ci.yml"),
+        "Runtime CI and release workflow",
     )?;
     let native_script = read(
         &root.join("tools/runtime-bundler/verify-native-runtime.sh"),
         "shared native Runtime checks",
     )?;
-    let ci_workflow = read(&root.join(".github/workflows/ci.yml"), "CI workflow")?;
-    for (name, source) in [("release", workflow.as_str()), ("CI", ci_workflow.as_str())] {
-        if !source.contains("bash tools/runtime-bundler/verify-native-runtime.sh") {
-            errors.push(format!(
-                "{name} workflow does not run shared native Runtime checks"
-            ));
-        }
-        for script in ["verify-workspace.sh", "verify-runtime-bundles.sh"] {
-            if !source.contains(&format!("bash tools/runtime-bundler/{script}")) {
-                errors.push(format!(
-                    "{name} workflow does not run shared checks: {script}"
-                ));
-            }
+    for script in [
+        "verify-native-runtime.sh",
+        "verify-workspace.sh",
+        "verify-runtime-bundles.sh",
+    ] {
+        if !workflow.contains(&format!("bash tools/runtime-bundler/{script}")) {
+            errors.push(format!("CI workflow does not run shared checks: {script}"));
         }
     }
-    let build_verification = format!("{workflow}\n{native_script}\n{ci_workflow}");
+    let build_verification = format!("{workflow}\n{native_script}");
     if workflow.contains("runtime-v0") {
         errors.push("Runtime release workflow uses the legacy runtime-v tag prefix".to_owned());
     }
@@ -290,12 +284,8 @@ mod tests {
             write(
                 directory
                     .path()
-                    .join(".github/workflows/runtime-release.yml"),
+                    .join(".github/workflows/ci.yml"),
                 "tags:\n  - \"v0.*.*\"\nrun: bash tools/runtime-bundler/verify-native-runtime.sh\nrun: bash tools/runtime-bundler/verify-workspace.sh\nrun: bash tools/runtime-bundler/verify-runtime-bundles.sh\nrelease:\n  if: github.event_name == 'push' && github.ref_type == 'tag'\n",
-            );
-            write(
-                directory.path().join(".github/workflows/ci.yml"),
-                "run: bash tools/runtime-bundler/verify-native-runtime.sh\nrun: bash tools/runtime-bundler/verify-workspace.sh\nrun: bash tools/runtime-bundler/verify-runtime-bundles.sh\n",
             );
             write(
                 directory.path().join("tools/runtime-bundler/verify-native-runtime.sh"),
@@ -329,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_checks_must_run_in_both_workflows_and_use_dynamic_abi() {
+    fn unified_workflow_must_run_shared_checks_and_use_dynamic_abi() {
         let fixture = Fixture::consistent("0.5.1", 5);
         fixture.overwrite(".github/workflows/ci.yml", "run: cargo test\n");
         fixture.overwrite(
@@ -338,7 +328,7 @@ mod tests {
         );
         let error = ReleaseState::load(fixture.path()).unwrap_err();
         assert!(
-            error.contains("CI workflow does not run shared native Runtime checks"),
+            error.contains("CI workflow does not run shared checks: verify-native-runtime.sh"),
             "{error}"
         );
         assert!(error.contains("hard-coded Runtime ABI"), "{error}");
@@ -352,7 +342,7 @@ mod tests {
             "[workspace]\nmembers = [\".\", \"ffi\"]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.5.2\"\n\n[package]\nname = \"vm\"\nversion.workspace = true\nedition = \"2021\"\n",
         );
         fixture.overwrite(
-            ".github/workflows/runtime-release.yml",
+            ".github/workflows/ci.yml",
             "tags: [runtime-v0.*.*]\nasset: compukter-runtime-0.5.1-linux-x86_64.tar.gz\n",
         );
         let error = ReleaseState::load(fixture.path()).unwrap_err();
@@ -376,7 +366,7 @@ mod tests {
     fn rejects_a_fixed_smoke_abi_and_manual_release_publication() {
         let fixture = Fixture::consistent("0.6.0", 6);
         fixture.overwrite(
-            ".github/workflows/runtime-release.yml",
+            ".github/workflows/ci.yml",
             "tags: [v0.*.*]\nenv:\n  RUNTIME_TAG: input\n  RUNTIME_VERSION: dynamic\nasset: compukter-runtime-${RUNTIME_VERSION}\nsmoke: --abi 5\nrelease:\n  if: github.ref_type == 'tag'\n",
         );
         let error = ReleaseState::load(fixture.path()).unwrap_err();
