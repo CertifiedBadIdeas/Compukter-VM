@@ -56,7 +56,12 @@ fn runtime_identity() -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(SCHEMA);
     hash.update([0]);
-    hash.update(env!("CARGO_PKG_VERSION").as_bytes());
+    // Runtime 0.<abi>.<revision> uses its minor component as the C ABI.
+    // cargo xtask check verifies agreement with the exported FFI ABI.
+    let abi = env!("CARGO_PKG_VERSION_MINOR")
+        .parse::<u32>()
+        .expect("Runtime ABI must be a u32");
+    hash.update(abi.to_le_bytes());
     hash.finalize().into()
 }
 
@@ -147,6 +152,47 @@ mod tests {
         assert_eq!(17, decoded.generation);
         assert_eq!(b"execution", decoded.execution);
         assert_eq!(b"timers", decoded.host);
+    }
+
+    #[test]
+    fn checkpoint_envelope_rejects_other_abi_and_schema_with_valid_checksums() {
+        let bytes = encode(ID, 17, b"execution", b"timers", LIMITS).unwrap();
+        let abi = env!("CARGO_PKG_VERSION_MINOR").parse::<u32>().unwrap();
+        for (schema, family) in [
+            (SCHEMA, abi + 1),
+            (b"another-checkpoint-schema".as_slice(), abi),
+        ] {
+            let mut incompatible = bytes.clone();
+            let mut identity = Sha256::new();
+            identity.update(schema);
+            identity.update([0]);
+            identity.update(family.to_le_bytes());
+            incompatible[12..44].copy_from_slice(&identity.finalize());
+            let end = incompatible.len() - CHECKSUM_BYTES;
+            let checksum = Sha256::digest(&incompatible[..end]);
+            incompatible[end..].copy_from_slice(&checksum);
+            assert!(matches!(
+                decode(&incompatible, ID, LIMITS),
+                Err(CheckpointError::Incompatible)
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_envelope_rejects_previous_full_version_identity() {
+        let mut bytes = encode(ID, 17, b"execution", b"timers", LIMITS).unwrap();
+        let mut legacy = Sha256::new();
+        legacy.update(SCHEMA);
+        legacy.update([0]);
+        legacy.update(env!("CARGO_PKG_VERSION").as_bytes());
+        bytes[12..44].copy_from_slice(&legacy.finalize());
+        let end = bytes.len() - CHECKSUM_BYTES;
+        let checksum = Sha256::digest(&bytes[..end]);
+        bytes[end..].copy_from_slice(&checksum);
+        assert!(matches!(
+            decode(&bytes, ID, LIMITS),
+            Err(CheckpointError::Incompatible)
+        ));
     }
 
     #[test]
