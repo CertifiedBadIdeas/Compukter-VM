@@ -20,6 +20,7 @@ pub mod bump;
 pub mod cli;
 pub mod git;
 pub mod process;
+pub mod published;
 pub mod release;
 pub mod state;
 pub mod transaction;
@@ -28,6 +29,7 @@ pub mod version;
 use bump::bump;
 use cli::Command;
 use process::SystemProcessRunner;
+use published::GitHubPublishedRelease;
 use release::release;
 use state::ReleaseState;
 use std::path::PathBuf;
@@ -47,7 +49,12 @@ where
                 state.version, state.exported_abi
             ))
         }
-        Command::Bump(kind) => bump(&repository_root(), kind, &SystemProcessRunner),
+        Command::Bump(kind) => bump(
+            &repository_root(),
+            kind,
+            &SystemProcessRunner,
+            &GitHubPublishedRelease,
+        ),
         Command::Release => release(&repository_root(), &SystemProcessRunner),
     }
 }
