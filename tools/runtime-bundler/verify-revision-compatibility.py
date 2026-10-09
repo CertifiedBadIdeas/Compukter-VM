@@ -85,7 +85,7 @@ def main():
         # Keep it offline without bypassing the publication gate of cargo xtask bump.
         abi, revision = version.rsplit(".", 1)
         next_version = f"{abi}.{int(revision) + 1}"
-        (repository / "runtime-version.toml").write_text(f'version = "{next_version}"\n')
+        (repository / "runtime-version.toml").write_bytes(f'version = "{next_version}"\n'.encode("utf-8"))
         manifest = repository / "Cargo.toml"
         old_version = f'version = "{version}"'
         contents = manifest.read_text()
