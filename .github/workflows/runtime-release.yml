@@ -68,6 +68,8 @@ jobs:
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
       - name: Fetch locked dependencies
         run: cargo fetch --locked
+      - name: Verify canonical Runtime release state
+        run: cargo xtask check
       - name: Verify workspace
         run: cargo test --workspace --locked --offline
       - name: Verify formatting
