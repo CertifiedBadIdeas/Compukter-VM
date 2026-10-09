@@ -124,7 +124,14 @@ that manifest. Published assets are
 immutable; a compatible replacement is a new revision such as `0.10.1`, never
 an overwrite of `0.10.0`.
 
-The `Runtime release` workflow may be dispatched manually to build and test
+Before preparing a tag, run `cargo xtask check` to verify that the canonical
+Runtime version, workspace package versions, lockfile, and exported FFI ABI agree.
+After an exported ABI increment, `cargo xtask bump abi` aligns those version files
+and creates a local commit. C ABI 21 therefore requires Runtime `0.21.0` or a
+compatible `0.21.x` revision; changing an existing `v0.20.0` tag cannot repair it.
+
+The `Runtime release` workflow checks this canonical state before testing and
+building natives. It may be dispatched manually to build and test
 temporary Linux and Windows artifacts. It publishes a durable GitHub Release
 only for a pushed tag matching `v0.X.Y`. Local release preparation is explicit:
 
