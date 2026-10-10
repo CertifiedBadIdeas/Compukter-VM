@@ -33,7 +33,7 @@ pub use host::{
     HostRecordScalar, HostRecordSchema, HostRecordValue, HostRequestBatchView, HostRequestView,
     HostResponse, HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure,
     OperationSchema, OwnedHostFailure, QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
-    MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
+    MAXIMUM_HOST_BYTE_ARRAY_BYTES, MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
 };
 pub(crate) use machine::FailureStack;
 pub use session::Session;

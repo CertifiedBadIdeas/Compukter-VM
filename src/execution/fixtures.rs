@@ -7783,3 +7783,74 @@ pub(super) fn inline_task_argument_artifact() -> VerifiedArtifact {
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
+
+/// Receive bytes, pass the managed array back to the host, then return its length.
+pub(super) fn byte_array_capability_artifact(storage: u8) -> VerifiedArtifact {
+    byte_array_capability_artifact_with_arguments(storage, 1)
+}
+
+pub(super) fn byte_array_capability_artifact_with_arguments(
+    storage: u8,
+    arguments: usize,
+) -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let array = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        artifact.header.runtime_minor = 14;
+        artifact.header.semantic_features = 0b110;
+        artifact.capabilities.push(Capability {
+            namespace: 0,
+            name: 1,
+            abi_major: 1,
+            minimum_abi_minor: 0,
+            flags: 1,
+            operation_count: 2,
+        });
+        artifact.manifest.required_capabilities = 1;
+        artifact.manifest.maximum_host_requests = 1;
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 1,
+            result: primitive(1),
+            parameters: vec![],
+        };
+        artifact.modules[0].types.push(NominalType::Array {
+            storage,
+            name: 0,
+            element: primitive(1),
+            super_type: None,
+        });
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].functions[0].flags = 1;
+        artifact.modules[0].functions[0].register_count = 2;
+        artifact.modules[0].functions[0].values =
+            crate::artifact::scalar_values(vec![array, primitive(1)]);
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![Instruction::CapabilityCallAsync {
+                    dst: 0,
+                    capability: 0,
+                    operation: 0,
+                    args: Box::new([]),
+                    resume_block: 1,
+                }],
+                vec![Instruction::CapabilityCallAsync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 1,
+                    args: vec![0; arguments].into_boxed_slice(),
+                    resume_block: 2,
+                }],
+                vec![
+                    Instruction::ArrayLength { dst: 1, array: 0 },
+                    Instruction::Return { value: 1 },
+                ],
+            ],
+        );
+        configure_stack(artifact, 2, 1);
+    })
+}

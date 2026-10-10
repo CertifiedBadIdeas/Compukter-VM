@@ -586,20 +586,67 @@ impl PendingConcat {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct PendingHostString {
+pub(super) enum HostReferenceSource<'a> {
+    String(&'a [u16]),
+    ByteArray(&'a [u8]),
+}
+
+impl HostReferenceSource<'_> {
+    pub(super) fn len(self) -> usize {
+        match self {
+            Self::String(v) => v.len(),
+            Self::ByteArray(v) => v.len(),
+        }
+    }
+    pub(super) fn is_bytes(self) -> bool {
+        matches!(self, Self::ByteArray(_))
+    }
+    fn unit(self, index: usize) -> u16 {
+        match self {
+            Self::String(v) => v[index],
+            Self::ByteArray(v) => u16::from(v[index]),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HostReferenceLayout {
+    String(StringLayout),
+    ByteArray(super::layout::ArrayLayout),
+}
+
+impl HostReferenceLayout {
+    fn block_bytes(self) -> u32 {
+        match self {
+            Self::String(v) => v.block_bytes,
+            Self::ByteArray(v) => v.block_bytes,
+        }
+    }
+    fn payload_bytes(self) -> u32 {
+        match self {
+            Self::String(v) => v.payload_bytes,
+            Self::ByteArray(v) => v.payload_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingHostReference {
     destination: u16,
+    pub(super) byte_array_type: Option<super::TypeKey>,
     scan: u32,
     latin1: bool,
     reservation: Option<ReservedAllocation>,
-    layout: Option<StringLayout>,
+    layout: Option<HostReferenceLayout>,
     written: u32,
     collection_attempted: bool,
 }
 
-impl PendingHostString {
+impl PendingHostReference {
     pub(super) const fn new(destination: u16) -> Self {
         Self {
             destination,
+            byte_array_type: None,
             scan: 0,
             latin1: true,
             reservation: None,
@@ -609,20 +656,33 @@ impl PendingHostString {
         }
     }
 
+    pub(super) fn byte_array(destination: u16, ty: super::TypeKey) -> Self {
+        Self {
+            byte_array_type: Some(ty),
+            ..Self::new(destination)
+        }
+    }
+
     pub(super) fn resume(
         &mut self,
         image: &ExecutionImage,
         heap: &mut Heap,
-        source: &[u16],
+        source: HostReferenceSource<'_>,
         budget: u32,
     ) -> Result<(u32, Option<(u16, RuntimeValue)>), TextError> {
         let length = u32::try_from(source.len())
             .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?;
+        if source.is_bytes() != self.byte_array_type.is_some() {
+            return Err(TextError::Fault(VmFault::InvalidValueType));
+        }
+        if source.is_bytes() {
+            self.scan = length;
+        }
         let mut used = 0;
         while self.scan < length && used < budget {
             let end = self.scan.saturating_add(8).min(length);
             while self.scan < end {
-                self.latin1 &= source[self.scan as usize] <= 0xff;
+                self.latin1 &= source.unit(self.scan as usize) <= 0xff;
                 self.scan += 1;
             }
             used += 1;
@@ -636,13 +696,39 @@ impl PendingHostString {
             } else {
                 StringEncoding::Utf16
             };
-            let layout = string_layout(encoding, length, heap.header_format())
-                .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?;
-            let ty = image
-                .string_type()
-                .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?;
+            let (ty, layout) = if let Some(ty) = self.byte_array_type {
+                if !matches!(
+                    image.type_layout(ty),
+                    Some(super::layout::RuntimeTypeLayout::Array {
+                        element: super::layout::ValueWidth::I8
+                    })
+                ) {
+                    return Err(TextError::Fault(VmFault::InvalidValueType));
+                }
+                (
+                    ty,
+                    HostReferenceLayout::ByteArray(
+                        super::layout::array_layout(
+                            super::layout::ValueWidth::I8,
+                            length as i32,
+                            heap.header_format(),
+                        )
+                        .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?,
+                    ),
+                )
+            } else {
+                (
+                    image
+                        .string_type()
+                        .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?,
+                    HostReferenceLayout::String(
+                        string_layout(encoding, length, heap.header_format())
+                            .map_err(|_| TextError::Fault(VmFault::AccountingOverflow))?,
+                    ),
+                )
+            };
             self.reservation = match heap.reserve(AllocationRequest {
-                block_bytes: layout.block_bytes,
+                block_bytes: layout.block_bytes(),
                 type_id: image
                     .type_id(ty)
                     .ok_or(TextError::Fault(VmFault::InvalidResolvedId))?,
@@ -653,8 +739,8 @@ impl PendingHostString {
             if self.reservation.is_none() {
                 return Err(TextError::Exhausted {
                     used,
-                    block_bytes: layout.block_bytes,
-                    requested: layout.payload_bytes,
+                    block_bytes: layout.block_bytes(),
+                    requested: layout.payload_bytes(),
                     collection_attempted: self.collection_attempted,
                 });
             }
@@ -666,26 +752,39 @@ impl PendingHostString {
         let reservation = self
             .reservation
             .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?;
-        let initialized_bytes = layout.block_bytes - heap.payload_offset();
+        let initialized_bytes = layout.block_bytes() - heap.payload_offset();
         while self.written < initialized_bytes && used < budget {
             let end = self.written.saturating_add(16).min(initialized_bytes);
             let mut chunk = [0_u8; 16];
             for offset in self.written..end {
-                chunk[(offset - self.written) as usize] = if offset >= layout.payload_bytes {
+                chunk[(offset - self.written) as usize] = if offset >= layout.payload_bytes() {
                     0
                 } else if offset < 4 {
                     length.to_le_bytes()[offset as usize]
-                } else if offset == 4 {
-                    u8::from(layout.encoding == StringEncoding::Utf16)
-                } else if offset < 8 {
-                    0
                 } else {
-                    let data = offset - 8;
-                    match layout.encoding {
-                        StringEncoding::Latin1 => source[data as usize] as u8,
-                        StringEncoding::Utf16 => {
-                            let unit = source[(data / 2) as usize].to_le_bytes();
-                            unit[(data % 2) as usize]
+                    match layout {
+                        HostReferenceLayout::ByteArray(_) => {
+                            if offset < 8 {
+                                0
+                            } else {
+                                source.unit((offset - 8) as usize) as u8
+                            }
+                        }
+                        HostReferenceLayout::String(layout) => {
+                            if offset == 4 {
+                                u8::from(layout.encoding == StringEncoding::Utf16)
+                            } else if offset < 8 {
+                                0
+                            } else {
+                                let data = offset - 8;
+                                match layout.encoding {
+                                    StringEncoding::Latin1 => source.unit(data as usize) as u8,
+                                    StringEncoding::Utf16 => {
+                                        source.unit((data / 2) as usize).to_le_bytes()
+                                            [(data % 2) as usize]
+                                    }
+                                }
+                            }
                         }
                     }
                 };
