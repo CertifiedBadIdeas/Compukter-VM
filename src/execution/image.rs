@@ -2608,9 +2608,7 @@ fn validate_capability_call(
                 resolved_function
                     .registers
                     .get(*register as usize)
-                    .is_some_and(|actual| {
-                        host_type_matches(*actual, *expected, resolution.string_type)
-                    })
+                    .is_some_and(|actual| host_type_matches(*actual, *expected, resolution))
             });
     let result_matches = match schema.result {
         HostValueType::Unit => destination == u16::MAX,
@@ -2668,9 +2666,7 @@ fn validate_capability_call(
                 && resolved_function
                     .registers
                     .get(destination as usize)
-                    .is_some_and(|actual| {
-                        host_type_matches(*actual, expected, resolution.string_type)
-                    })
+                    .is_some_and(|actual| host_type_matches(*actual, expected, resolution))
         }
     };
     if schema.asynchronous != asynchronous || !arguments_match || !result_matches {
@@ -2685,7 +2681,7 @@ fn validate_capability_call(
 fn host_type_matches(
     actual: ResolvedValueType,
     expected: HostValueType,
-    string_type: Option<TypeKey>,
+    resolution: &InstructionResolution<'_>,
 ) -> bool {
     match expected {
         HostValueType::Unit | HostValueType::Record => false,
@@ -2696,7 +2692,23 @@ fn host_type_matches(
         HostValueType::Bool => actual.kind == 5,
         HostValueType::Char => actual.kind == 6,
         HostValueType::String => {
-            actual.kind == 7 && !actual.nullable && actual.nominal == string_type
+            actual.kind == 7 && !actual.nullable && actual.nominal == resolution.string_type
+        }
+        HostValueType::ByteArray => {
+            actual.kind == 7
+                && !actual.nullable
+                && actual
+                    .nominal
+                    .and_then(|ty| global_index(resolution.type_offsets, ty).ok())
+                    .and_then(|index| resolution.type_layouts.get(index))
+                    .is_some_and(|layout| {
+                        matches!(
+                            layout,
+                            RuntimeTypeLayout::Array {
+                                element: ValueWidth::I8
+                            }
+                        )
+                    })
         }
     }
 }

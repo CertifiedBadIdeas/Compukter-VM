@@ -87,6 +87,7 @@ pub(crate) struct PendingHostRequest {
     operation: u32,
     arguments: Box<[HostValueSlot]>,
     utf16: Box<[u16]>,
+    bytes: Box<[u8]>,
     merge: HostRequestMerge,
 }
 
@@ -104,6 +105,7 @@ impl PendingHostRequest {
             operation,
             arguments,
             utf16,
+            bytes: Box::default(),
             merge: HostRequestMerge::Ordinary,
         }
     }
@@ -123,6 +125,7 @@ impl PendingHostRequest {
             operation,
             arguments,
             utf16,
+            bytes: Box::default(),
             merge: HostRequestMerge::LastWriteWins { group, entries },
         }
     }
@@ -141,6 +144,15 @@ impl PendingHostRequest {
 
     pub(crate) fn arguments(&self) -> &[HostValueSlot] {
         &self.arguments
+    }
+
+    pub(crate) fn with_bytes(mut self, bytes: Box<[u8]>) -> Self {
+        self.bytes = bytes;
+        self
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     pub(crate) fn utf16(&self) -> &[u16] {
@@ -181,6 +193,7 @@ pub(crate) enum RequestTableError {
     ArgumentsPerRequestLimit,
     TotalArgumentsLimit,
     Utf16PerRequestLimit,
+    ByteArrayPerRequestLimit,
     TotalUtf16Limit,
     MergeEntriesPerRequestLimit,
     TotalMergeEntriesLimit,
@@ -254,6 +267,9 @@ impl PendingRequestTable {
             .ok_or(RequestTableError::TotalArgumentsLimit)?;
         if total_arguments > self.limits.maximum_total_arguments {
             return Err(RequestTableError::TotalArgumentsLimit);
+        }
+        if request.bytes.len() > super::host::MAXIMUM_HOST_BYTE_ARRAY_BYTES {
+            return Err(RequestTableError::ByteArrayPerRequestLimit);
         }
         if request.utf16.len() > self.limits.maximum_utf16_per_request {
             return Err(RequestTableError::Utf16PerRequestLimit);

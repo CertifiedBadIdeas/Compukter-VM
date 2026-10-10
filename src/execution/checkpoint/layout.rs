@@ -46,3 +46,10 @@ checkpoint_struct!(StringLayout {
 });
 
 checkpoint_enum!(StringEncoding { 0 => Latin1; 1 => Utf16; });
+
+checkpoint_struct!(ArrayLayout {
+    element_bytes,
+    length,
+    payload_bytes,
+    block_bytes
+});

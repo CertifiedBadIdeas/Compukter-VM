@@ -50,8 +50,11 @@ checkpoint_struct!(PendingConcat {
     collection_attempted
 });
 
-checkpoint_struct!(PendingHostString {
+checkpoint_enum!(HostReferenceLayout { 0 => String(v0); 1 => ByteArray(v0); });
+
+checkpoint_struct!(PendingHostReference {
     destination,
+    byte_array_type,
     scan,
     latin1,
     reservation,
@@ -225,22 +228,70 @@ impl PendingConcat {
     }
 }
 
-impl PendingHostString {
+impl PendingHostReference {
     pub(in crate::execution) fn validate_checkpoint(
         self,
+        image: &ExecutionImage,
         heap: &Heap,
-        source: &[u16],
+        source: HostReferenceSource<'_>,
     ) -> Result<u16> {
         let length = u32::try_from(source.len()).map_err(|_| CheckpointError::InvalidState)?;
-        validate_string_allocation(
-            heap,
-            length,
-            self.scan,
-            self.latin1,
-            self.reservation,
-            self.layout,
-            self.written,
-        )?;
+        if source.is_bytes() != self.byte_array_type.is_some()
+            || self.scan > length
+            || self.reservation.is_some() != self.layout.is_some()
+        {
+            return Err(CheckpointError::InvalidState);
+        }
+        if let Some(ty) = self.byte_array_type {
+            if length as usize > crate::execution::MAXIMUM_HOST_BYTE_ARRAY_BYTES
+                || !matches!(
+                    image.type_layout(ty),
+                    Some(super::super::layout::RuntimeTypeLayout::Array {
+                        element: super::super::layout::ValueWidth::I8
+                    })
+                )
+            {
+                return Err(CheckpointError::InvalidState);
+            }
+        }
+        if let (Some(reservation), Some(layout)) = (self.reservation, self.layout) {
+            let expected = if source.is_bytes() {
+                HostReferenceLayout::ByteArray(
+                    super::super::layout::array_layout(
+                        super::super::layout::ValueWidth::I8,
+                        length as i32,
+                        heap.header_format(),
+                    )
+                    .map_err(|_| CheckpointError::InvalidState)?,
+                )
+            } else {
+                HostReferenceLayout::String(
+                    string_layout(
+                        if self.latin1 {
+                            StringEncoding::Latin1
+                        } else {
+                            StringEncoding::Utf16
+                        },
+                        length,
+                        heap.header_format(),
+                    )
+                    .map_err(|_| CheckpointError::InvalidState)?,
+                )
+            };
+            if self.scan != length
+                || layout != expected
+                || self.written
+                    > layout
+                        .block_bytes()
+                        .checked_sub(heap.payload_offset())
+                        .ok_or(CheckpointError::InvalidState)?
+                || heap.checkpoint_reservation_capacity(reservation)? < layout.payload_bytes()
+            {
+                return Err(CheckpointError::InvalidState);
+            }
+        } else if self.written != 0 {
+            return Err(CheckpointError::InvalidState);
+        }
         Ok(self.destination)
     }
 }
@@ -278,17 +329,17 @@ mod tests {
             })
             .validate_checkpoint(&image, &heap)
         );
-        let mut pending = PendingHostString::new(0);
+        let mut pending = PendingHostReference::new(0);
         pending.scan = 2;
         assert_eq!(
             Err(CheckpointError::InvalidState),
-            pending.validate_checkpoint(&heap, &[0x61])
+            pending.validate_checkpoint(&image, &heap, HostReferenceSource::String(&[0x61]))
         );
         pending.scan = 0;
         pending.written = 1;
         assert_eq!(
             Err(CheckpointError::InvalidState),
-            pending.validate_checkpoint(&heap, &[0x61])
+            pending.validate_checkpoint(&image, &heap, HostReferenceSource::String(&[0x61]))
         );
     }
 }

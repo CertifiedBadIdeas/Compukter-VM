@@ -78,7 +78,8 @@ pub use execution::{
     HostRecordSchema, HostRecordValue, HostRequestBatchView, HostRequestView, HostResponse,
     HostValueInput, HostValueType, HostValueView, ManagedAllocationFailure, OperationSchema,
     OwnedHostFailure, QuotaExhaustion, QuotaKind, RequestId, ResidentStorageComponent, ResumeError,
-    RunError, Session, TaskId, VmFault, MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
+    RunError, Session, TaskId, VmFault, MAXIMUM_HOST_BYTE_ARRAY_BYTES,
+    MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
 };
 pub use filesystem::{
     recover, Checkpoint, CheckpointNode, ComputerFileSystem, ComputerId, ExecutableRevision,

@@ -116,6 +116,19 @@ sliceable string scan/allocation/copy machinery. All Guest work and allocation r
 no partial destination is published. Older forms remain compatible, while form 7 requires 1.10.
 The artifact container format and C ABI 18 are unchanged.
 
+## Byte arrays and ownership
+
+Native C ABI 22 adds typed `ByteArray` host arguments and results (wire tag 9), alongside the existing scalar, String
+and record types. Arrays contain raw octets, including zero and all high-bit values. Outbound arrays are copied into
+session-owned storage before request publication; inbound arrays are copied before resume returns, then materialized
+as signed I8 Guest arrays using the shared budgeted reference-allocation path. No managed reference escapes.
+
+The maximum ByteArray response and combined ByteArray arguments per request are 4096 bytes. Pending requests and
+queued responses retain snapshots, bounded by the existing request count. Outbound overflow stops before publication;
+an oversized or wrongly typed inbound response leaves the original request retryable. Copying, allocation and GC
+retry remain charged and sliceable. Checkpoints preserve pending requests, queued responses and partial allocation.
+ByteArray fields inside record results are not supported.
+
 ## Strings and ownership
 
 The boundary carries borrowed UTF-16 code units because Kotlin `Char` and
