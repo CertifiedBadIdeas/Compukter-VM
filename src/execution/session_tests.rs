@@ -1643,3 +1643,173 @@ fn other_task_responses_do_not_replace_an_incomplete_record_frame() {
         assert_eq!(2, session.accounting().accepted_responses);
     }
 }
+
+fn byte_array_operations() -> [OperationSchema<'static>; 2] {
+    [
+        OperationSchema::asynchronous(&[], HostValueType::ByteArray),
+        OperationSchema::asynchronous(&[HostValueType::ByteArray], HostValueType::Unit),
+    ]
+}
+
+#[test]
+fn byte_arrays_preserve_all_bits_and_copy_response_before_returning() {
+    for expected in [vec![], (0..=255).collect::<Vec<u8>>(), vec![255; 4096]] {
+        let operations = byte_array_operations();
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut session = Session::admit(
+            fixtures::byte_array_capability_artifact(1),
+            profile(),
+            &[binding],
+        )
+        .unwrap();
+        session.start(&[]).unwrap();
+        let id = only_request(session.advance(64, 0).unwrap()).id();
+        let mut source = expected.clone();
+        session
+            .resume(
+                id,
+                HostResponse::Success(HostValueInput::ByteArray(&source)),
+            )
+            .unwrap();
+        source.fill(17);
+        let mut slices = 0;
+        let echo_id = loop {
+            slices += 1;
+            assert!(slices < 3000);
+            match session.advance(8, 1).unwrap() {
+                AdvanceOutcome::SliceExhausted => (),
+                AdvanceOutcome::HostRequestBatch(batch) => {
+                    let echo = batch.get(0).unwrap();
+                    assert_eq!(1, echo.operation());
+                    assert_eq!(
+                        Some(HostValueView::ByteArray(expected.as_slice())),
+                        echo.arguments().get(0)
+                    );
+                    break echo.id();
+                }
+                other => panic!("unexpected byte response: {other:?}"),
+            }
+        };
+        session
+            .resume(echo_id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+        assert_eq!(
+            AdvanceOutcome::Halted(Some(HostValueView::I32(expected.len() as i32))),
+            session.advance(64, 0).unwrap()
+        );
+    }
+}
+
+#[test]
+fn byte_array_wrong_type_and_oversize_leave_request_retryable() {
+    let operations = byte_array_operations();
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::byte_array_capability_artifact(1),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = only_request(session.advance(64, 0).unwrap()).id();
+    let before = session.accounting();
+    assert_eq!(
+        Err(ResumeError::WrongResponseType),
+        session.resume(id, HostResponse::Success(HostValueInput::String(&[])))
+    );
+    assert_eq!(
+        Err(ResumeError::ResponseTooLarge),
+        session.resume(
+            id,
+            HostResponse::Success(HostValueInput::ByteArray(&vec![0; 4097]))
+        )
+    );
+    assert_eq!(before, session.accounting());
+    assert_eq!(id, only_request(session.advance(64, 0).unwrap()).id());
+    session
+        .resume(
+            id,
+            HostResponse::Success(HostValueInput::ByteArray(&[0, 128, 255])),
+        )
+        .unwrap();
+}
+
+#[test]
+fn byte_array_schema_rejects_int_and_unsigned_byte_arrays() {
+    for storage in [0, 2] {
+        let operations = byte_array_operations();
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        assert!(Session::admit(
+            fixtures::byte_array_capability_artifact(storage),
+            profile(),
+            &[binding]
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn byte_array_outbound_aggregate_is_bounded_before_publication() {
+    let operations = [
+        OperationSchema::asynchronous(&[], HostValueType::ByteArray),
+        OperationSchema::asynchronous(
+            &[HostValueType::ByteArray, HostValueType::ByteArray],
+            HostValueType::Unit,
+        ),
+    ];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::byte_array_capability_artifact_with_arguments(1, 2),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = only_request(session.advance(64, 0).unwrap()).id();
+    session
+        .resume(
+            id,
+            HostResponse::Success(HostValueInput::ByteArray(&vec![17; 4096])),
+        )
+        .unwrap();
+    for _ in 0..100 {
+        match session.advance(64, 64).unwrap() {
+            AdvanceOutcome::SliceExhausted => (),
+            AdvanceOutcome::QuotaExhausted(quota) => {
+                assert_eq!(QuotaKind::HostRequestBytes, quota.kind);
+                assert_eq!(4096, quota.limit);
+                assert_eq!(8192, quota.consumed);
+                assert_eq!(1, session.accounting().published_requests);
+                return;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("expected aggregate byte quota");
+}
+
+#[test]
+fn byte_array_oom_uses_managed_array_exhaustion() {
+    let operations = byte_array_operations();
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut limits = profile();
+    limits.heap_bytes = 256;
+    let mut session = Session::admit(
+        fixtures::byte_array_capability_artifact(1),
+        limits,
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = only_request(session.advance(64, 0).unwrap()).id();
+    session
+        .resume(
+            id,
+            HostResponse::Success(HostValueInput::ByteArray(&vec![0; 4096])),
+        )
+        .unwrap();
+    assert!(matches!(
+        session.advance(64, 64).unwrap(),
+        AdvanceOutcome::AllocationExhausted(_)
+    ));
+}

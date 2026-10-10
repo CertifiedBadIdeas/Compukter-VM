@@ -149,7 +149,12 @@ impl PendingRecord {
                     return Err(invalid());
                 }
                 if let Some(string) = self.string {
-                    if string.validate_checkpoint(heap, units)? != u16::MAX {
+                    if string.validate_checkpoint(
+                        image,
+                        heap,
+                        crate::execution::text::HostReferenceSource::String(units),
+                    )? != u16::MAX
+                    {
                         return Err(invalid());
                     }
                 }

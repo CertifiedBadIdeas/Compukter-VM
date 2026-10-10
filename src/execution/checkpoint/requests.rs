@@ -45,6 +45,7 @@ checkpoint_struct!(PendingHostRequest {
     operation,
     arguments,
     utf16,
+    bytes,
     merge
 });
 
@@ -81,9 +82,13 @@ impl PendingRequestTable {
                 || identity.request.get() == 0
                 || !identities.insert((identity.task, identity.request))
                 || request.arguments.len() > self.limits.maximum_arguments_per_request
+                || request.bytes.len() > crate::execution::MAXIMUM_HOST_BYTE_ARRAY_BYTES
                 || request.utf16.len() > self.limits.maximum_utf16_per_request
                 || request.merge_entry_count() > self.limits.maximum_merge_entries_per_request
                 || request.arguments.iter().any(|slot| match slot {
+                    HostValueSlot::ByteArray { start, length } => start
+                        .checked_add(*length)
+                        .is_none_or(|end| end as usize > request.bytes.len()),
                     HostValueSlot::String { start, length } => start
                         .checked_add(*length)
                         .is_none_or(|end| end as usize > request.utf16.len()),

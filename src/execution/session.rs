@@ -24,6 +24,9 @@ pub struct Session {
     entry_arguments: Box<[EntryArgument]>,
     outbound_utf16: Box<[u16]>,
     inbound_utf16: Box<[u16]>,
+    outbound_bytes: Box<[u8]>,
+    inbound_bytes: Box<[u8]>,
+    inbound_is_bytes: bool,
     failure_detail: [u8; MAXIMUM_HOST_FAILURE_DETAIL_BYTES],
     failure_detail_length: usize,
     argument_slots: Box<[HostValueSlot]>,
@@ -34,7 +37,7 @@ pub struct Session {
     preparing_request: Option<PreparingRequest>,
     maximum_slice_budget: u32,
     inbound_length: usize,
-    resuming_host_string: bool,
+    resuming_host_reference: bool,
     replies: std::collections::VecDeque<QueuedReply>,
     maximum_replies: usize,
     published_requests: u64,
@@ -67,6 +70,7 @@ struct QueuedReply {
 enum CopiedReply {
     Scalar(Option<RuntimeValue>),
     String(Vec<u16>),
+    ByteArray(Vec<u8>),
     Record(super::host::HostRecordValue),
     Failure(super::host::OwnedHostFailure),
 }
@@ -202,6 +206,9 @@ impl Session {
             entry_arguments,
             outbound_utf16,
             inbound_utf16,
+            outbound_bytes: zeroed_u8(super::host::MAXIMUM_HOST_BYTE_ARRAY_BYTES)?,
+            inbound_bytes: zeroed_u8(super::host::MAXIMUM_HOST_BYTE_ARRAY_BYTES)?,
+            inbound_is_bytes: false,
             failure_detail: [0; MAXIMUM_HOST_FAILURE_DETAIL_BYTES],
             failure_detail_length: 0,
             argument_slots,
@@ -212,7 +219,7 @@ impl Session {
             preparing_request: None,
             maximum_slice_budget,
             inbound_length: 0,
-            resuming_host_string: false,
+            resuming_host_reference: false,
             replies: std::collections::VecDeque::new(),
             maximum_replies: maximum_host_requests,
             published_requests: 0,
@@ -291,7 +298,7 @@ impl Session {
         if let Some(outcome) = self.machine.terminal_outcome() {
             return self.map_machine_outcome(outcome, 0, 0, &mut remaining_retirements);
         }
-        if !self.resuming_host_string && !self.machine.record_response_pending() {
+        if !self.resuming_host_reference && !self.machine.record_response_pending() {
             while let Some(reply) = self.replies.pop_front() {
                 let result = match reply.value {
                     CopiedReply::Scalar(value) => {
@@ -310,12 +317,21 @@ impl Session {
                             failure.detail(),
                         )
                     }
+                    CopiedReply::ByteArray(bytes) => {
+                        self.inbound_bytes[..bytes.len()].copy_from_slice(&bytes);
+                        self.inbound_length = bytes.len();
+                        self.inbound_is_bytes = true;
+                        self.machine
+                            .begin_task_byte_array_response(reply.task, reply.request)
+                            .map(|pending| self.resuming_host_reference = pending)
+                    }
                     CopiedReply::String(units) => {
+                        self.inbound_is_bytes = false;
                         self.inbound_utf16[..units.len()].copy_from_slice(&units);
                         self.inbound_length = units.len();
                         self.machine
-                            .begin_task_string_response(reply.task, reply.request, units.is_empty())
-                            .map(|pending| self.resuming_host_string = pending)
+                            .begin_task_host_response(reply.task, reply.request, units.is_empty())
+                            .map(|pending| self.resuming_host_reference = pending)
                     }
                     CopiedReply::Record(value) => {
                         self.machine
@@ -325,7 +341,7 @@ impl Session {
                 if let Err(fault) = result {
                     return self.establish_fault(fault);
                 }
-                if self.resuming_host_string || self.machine.record_response_pending() {
+                if self.resuming_host_reference || self.machine.record_response_pending() {
                     break;
                 }
             }
@@ -337,7 +353,7 @@ impl Session {
             if !self.machine.record_response_pending()
                 && matches!(outcome, super::error::Outcome::SliceExhausted)
             {
-                if let Err(fault) = self.machine.finish_task_string_response() {
+                if let Err(fault) = self.machine.finish_task_host_response() {
                     return self.establish_fault(fault);
                 }
             }
@@ -346,7 +362,7 @@ impl Session {
         }
         if !self.machine.has_active_task()
             && !self.pending_requests.is_empty()
-            && !self.resuming_host_string
+            && !self.resuming_host_reference
             && self.preparing_request.is_none()
         {
             return self.request_outcome().map_err(|_| RunError::NotRunnable);
@@ -354,20 +370,28 @@ impl Session {
         if self.preparing_request.is_some() {
             return self.advance_request_preparation(guest_budget, maintenance_budget);
         }
-        if self.resuming_host_string {
+        if self.resuming_host_reference {
             let before_guest = self.guest_units();
             let before_maintenance = self.machine.consumed_maintenance_cost();
-            let outcome = self.machine.run_capability_string_slice(
-                &self.inbound_utf16[..self.inbound_length],
+            let outcome = self.machine.run_capability_reference_slice(
+                if self.inbound_is_bytes {
+                    super::text::HostReferenceSource::ByteArray(
+                        &self.inbound_bytes[..self.inbound_length],
+                    )
+                } else {
+                    super::text::HostReferenceSource::String(
+                        &self.inbound_utf16[..self.inbound_length],
+                    )
+                },
                 guest_budget,
                 maintenance_budget,
             )?;
-            self.resuming_host_string = self.machine.capability_string_response_pending();
-            if !self.resuming_host_string
-                && self.machine.has_task_string_response()
+            self.resuming_host_reference = self.machine.capability_reference_response_pending();
+            if !self.resuming_host_reference
+                && self.machine.has_task_host_response()
                 && matches!(outcome, super::error::Outcome::SliceExhausted)
             {
-                if let Err(fault) = self.machine.finish_task_string_response() {
+                if let Err(fault) = self.machine.finish_task_host_response() {
                     return self.establish_fault(fault);
                 }
             }
@@ -554,6 +578,11 @@ impl Session {
             if input.value_type() != expected.result {
                 return Err(ResumeError::WrongResponseType);
             }
+            if let HostValueInput::ByteArray(bytes) = input {
+                if bytes.len() > self.inbound_bytes.len() {
+                    return Err(ResumeError::ResponseTooLarge);
+                }
+            }
             if let HostValueInput::String(units) = input {
                 if units.len() > self.inbound_utf16.len() {
                     return Err(ResumeError::ResponseTooLarge);
@@ -587,18 +616,19 @@ impl Session {
             }
         }
         if self.replies.is_empty()
-            && !self.resuming_host_string
+            && !self.resuming_host_reference
             && !self.machine.record_response_pending()
         {
             if let HostResponse::Success(HostValueInput::String(units)) = response {
+                self.inbound_is_bytes = false;
                 self.inbound_utf16[..units.len()].copy_from_slice(units);
                 match self
                     .machine
-                    .begin_task_string_response(task, request_id, units.is_empty())
+                    .begin_task_host_response(task, request_id, units.is_empty())
                 {
                     Ok(pending) => {
                         self.inbound_length = units.len();
-                        self.resuming_host_string = pending;
+                        self.resuming_host_reference = pending;
                     }
                     Err(fault) => self.terminal = Some(SessionTerminal::Faulted(fault)),
                 }
@@ -624,10 +654,11 @@ impl Session {
                 HostValueInput::Char(value) => CopiedReply::Scalar(Some(RuntimeValue::Char(value))),
                 HostValueInput::String(units) => CopiedReply::String(units.to_vec()),
                 HostValueInput::Record(value) => CopiedReply::Record(value.clone()),
+                HostValueInput::ByteArray(bytes) => CopiedReply::ByteArray(bytes.to_vec()),
             },
         };
         if self.replies.is_empty()
-            && !self.resuming_host_string
+            && !self.resuming_host_reference
             && !self.machine.record_response_pending()
         {
             if let CopiedReply::Scalar(value) = copied {
@@ -712,13 +743,22 @@ impl Session {
                 .map(|reply| match &reply.value {
                     CopiedReply::Scalar(_) => 0,
                     CopiedReply::String(units) => units.capacity() * 2,
+                    CopiedReply::ByteArray(bytes) => bytes.capacity(),
                     CopiedReply::Record(value) => value.resident_bytes(),
                     CopiedReply::Failure(failure) => failure.detail().len(),
                 })
                 .sum::<usize>();
         machine.mutable_resident_bytes = machine
             .mutable_resident_bytes
-            .saturating_add(reply_bytes as u64);
+            .saturating_add(reply_bytes as u64)
+            .saturating_add((self.outbound_bytes.len() + self.inbound_bytes.len()) as u64)
+            .saturating_add(
+                self.pending_requests
+                    .requests()
+                    .iter()
+                    .map(|r| r.bytes().len() as u64)
+                    .sum::<u64>(),
+            );
         SessionResourceSnapshot {
             accounting: self.accounting(),
             machine,
@@ -752,9 +792,19 @@ impl Session {
                 .and_then(|capability| capability.operations.get(suspension.operation as usize))
                 .ok_or(super::error::VmFault::InvalidResolvedId)?;
             let mut outbound_used = 0_u32;
+            let mut outbound_bytes_used = 0_u32;
             let mut contains_string = false;
             for (index, register) in suspension.arguments.iter().copied().enumerate() {
-                if schema.arguments.get(index) == Some(&super::host::HostValueType::String) {
+                if schema.arguments.get(index) == Some(&super::host::HostValueType::ByteArray) {
+                    let length = self.machine.capability_byte_array_length(register)?;
+                    self.argument_slots[index] = HostValueSlot::ByteArray {
+                        start: outbound_bytes_used,
+                        length,
+                    };
+                    outbound_bytes_used = outbound_bytes_used
+                        .checked_add(length)
+                        .ok_or(super::error::VmFault::AccountingOverflow)?;
+                } else if schema.arguments.get(index) == Some(&super::host::HostValueType::String) {
                     contains_string = true;
                     let length = self.machine.capability_string_length(register)?;
                     self.argument_slots[index] = HostValueSlot::String {
@@ -777,10 +827,17 @@ impl Session {
                 suspension.arguments.len(),
                 outbound_used,
                 contains_string,
+                outbound_bytes_used,
             ))
         })();
-        let (capability, operation, argument_count, outbound_used, contains_string) = match prepared
-        {
+        let (
+            capability,
+            operation,
+            argument_count,
+            outbound_used,
+            contains_string,
+            outbound_bytes_used,
+        ) = match prepared {
             Ok(prepared) => prepared,
             Err(fault) => {
                 self.terminal = Some(SessionTerminal::Faulted(fault));
@@ -797,7 +854,15 @@ impl Session {
             }));
             return Ok(false);
         }
-        if contains_string && outbound_used != 0 {
+        if outbound_bytes_used as usize > self.outbound_bytes.len() {
+            self.terminal = Some(SessionTerminal::QuotaExhausted(QuotaExhaustion {
+                kind: QuotaKind::HostRequestBytes,
+                limit: self.outbound_bytes.len() as u64,
+                consumed: u64::from(outbound_bytes_used),
+            }));
+            return Ok(false);
+        }
+        if (contains_string && outbound_used != 0) || outbound_bytes_used != 0 {
             self.preparing_request = Some(PreparingRequest {
                 id,
                 task,
@@ -840,6 +905,7 @@ impl Session {
             operation,
             &self.argument_slots[..self.argument_count],
             &self.outbound_utf16,
+            &self.outbound_bytes,
         );
         let request = PendingHostRequest::ordinary(
             HostRequestIdentity::new(task, id),
@@ -847,6 +913,20 @@ impl Session {
             operation,
             slots,
             self.outbound_utf16[..utf16_length]
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let byte_length = request
+            .arguments()
+            .iter()
+            .filter_map(|slot| match slot {
+                HostValueSlot::ByteArray { start, length } => start.checked_add(*length),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0) as usize;
+        let request = request.with_bytes(
+            self.outbound_bytes[..byte_length]
                 .to_vec()
                 .into_boxed_slice(),
         );
@@ -899,11 +979,14 @@ impl Session {
         let mut state = self.preparing_request.ok_or(RunError::NotRunnable)?;
         let mut remaining = guest_budget;
         while state.argument < self.argument_count {
-            let HostValueSlot::String { start, length } = self.argument_slots[state.argument]
-            else {
-                state.argument += 1;
-                state.string_offset = 0;
-                continue;
+            let (start, length, bytes) = match self.argument_slots[state.argument] {
+                HostValueSlot::String { start, length } => (start, length, false),
+                HostValueSlot::ByteArray { start, length } => (start, length, true),
+                _ => {
+                    state.argument += 1;
+                    state.string_offset = 0;
+                    continue;
+                }
             };
             while state.string_offset < length && remaining != 0 {
                 let end = state.string_offset.saturating_add(8).min(length);
@@ -916,18 +999,32 @@ impl Session {
                     .copied()
                     .ok_or(RunError::NotRunnable)?;
                 while state.string_offset < end {
-                    let unit = self
-                        .machine
-                        .capability_string_code_unit(register, state.string_offset)
-                        .map_err(|_| RunError::NotRunnable)?;
+                    let unit = if bytes {
+                        u16::from(
+                            self.machine
+                                .capability_byte_array_byte(register, state.string_offset)
+                                .map_err(|_| RunError::NotRunnable)?,
+                        )
+                    } else {
+                        self.machine
+                            .capability_string_code_unit(register, state.string_offset)
+                            .map_err(|_| RunError::NotRunnable)?
+                    };
                     let destination = start
                         .checked_add(state.string_offset)
                         .and_then(|index| usize::try_from(index).ok())
                         .ok_or(RunError::NotRunnable)?;
-                    *self
-                        .outbound_utf16
-                        .get_mut(destination)
-                        .ok_or(RunError::NotRunnable)? = unit;
+                    if bytes {
+                        *self
+                            .outbound_bytes
+                            .get_mut(destination)
+                            .ok_or(RunError::NotRunnable)? = unit as u8;
+                    } else {
+                        *self
+                            .outbound_utf16
+                            .get_mut(destination)
+                            .ok_or(RunError::NotRunnable)? = unit;
+                    }
                     state.string_offset += 1;
                 }
                 if let Err(fault) = self.machine.charge_capability_dynamic(1) {
@@ -1004,6 +1101,8 @@ impl Session {
             + self.entry_arguments.len() * core::mem::size_of::<EntryArgument>()
             + self.outbound_utf16.len() * core::mem::size_of::<u16>()
             + self.inbound_utf16.len() * core::mem::size_of::<u16>()
+            + self.outbound_bytes.len()
+            + self.inbound_bytes.len()
             + self.failure_detail.len()
             + self.argument_slots.len() * core::mem::size_of::<HostValueSlot>()
     }
@@ -1016,6 +1115,7 @@ fn trace_request(
     operation: u32,
     arguments: &[HostValueSlot],
     utf16: &[u16],
+    bytes: &[u8],
 ) {
     trace_field(machine, &[2]);
     trace_field(machine, &id.get().to_le_bytes());
@@ -1028,7 +1128,7 @@ fn trace_request(
             .to_le_bytes(),
     );
     for argument in arguments {
-        trace_slot(machine, *argument, utf16);
+        trace_slot(machine, *argument, utf16, bytes);
     }
 }
 
@@ -1066,6 +1166,11 @@ fn trace_input(machine: &mut Machine, value: HostValueInput<'_>) {
         HostValueInput::Char(value) => trace_scalar(machine, 6, &value.to_le_bytes()),
         HostValueInput::String(units) => trace_utf16(machine, units),
         HostValueInput::Record(value) => trace_record(machine, value),
+        HostValueInput::ByteArray(bytes) => {
+            trace_field(machine, &[9]);
+            trace_field(machine, &(bytes.len() as u32).to_le_bytes());
+            trace_field(machine, bytes);
+        }
     }
 }
 
@@ -1089,7 +1194,7 @@ fn trace_record(machine: &mut Machine, value: &super::host::HostRecordValue) {
     }
 }
 
-fn trace_slot(machine: &mut Machine, value: HostValueSlot, utf16: &[u16]) {
+fn trace_slot(machine: &mut Machine, value: HostValueSlot, utf16: &[u16], bytes: &[u8]) {
     match value {
         HostValueSlot::Empty => trace_field(machine, &[0]),
         HostValueSlot::I32(value) => trace_scalar(machine, 1, &value.to_le_bytes()),
@@ -1098,6 +1203,12 @@ fn trace_slot(machine: &mut Machine, value: HostValueSlot, utf16: &[u16]) {
         HostValueSlot::F64(value) => trace_scalar(machine, 4, &value.to_le_bytes()),
         HostValueSlot::Bool(value) => trace_scalar(machine, 5, &[u8::from(value)]),
         HostValueSlot::Char(value) => trace_scalar(machine, 6, &value.to_le_bytes()),
+        HostValueSlot::ByteArray { start, length } => {
+            let data = bytes
+                .get(start as usize..(start + length) as usize)
+                .unwrap_or_default();
+            trace_input(machine, HostValueInput::ByteArray(data));
+        }
         HostValueSlot::String { start, length } => {
             let start = usize::try_from(start).unwrap_or(usize::MAX);
             let length = usize::try_from(length).unwrap_or(usize::MAX);
@@ -1150,7 +1261,9 @@ fn runtime_view(value: RuntimeValue) -> Option<HostValueView<'static>> {
         HostValueSlot::F64(value) => Some(HostValueView::F64(value)),
         HostValueSlot::Bool(value) => Some(HostValueView::Bool(value)),
         HostValueSlot::Char(value) => Some(HostValueView::Char(value)),
-        HostValueSlot::Empty | HostValueSlot::String { .. } => None,
+        HostValueSlot::Empty | HostValueSlot::String { .. } | HostValueSlot::ByteArray { .. } => {
+            None
+        }
     }
 }
 
@@ -1321,6 +1434,15 @@ fn empty_argument_slots(length: usize) -> Result<Box<[HostValueSlot]>, Admission
 }
 
 fn zeroed_u16(length: usize) -> Result<Box<[u16]>, AdmissionError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| AdmissionError::AllocationFailed)?;
+    values.resize(length, 0);
+    Ok(values.into_boxed_slice())
+}
+
+fn zeroed_u8(length: usize) -> Result<Box<[u8]>, AdmissionError> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(length)
