@@ -98,9 +98,8 @@ impl HostRecordSchema {
                 match (&field.value_type, &field.record) {
                     (HostValueType::Record, Some(child))
                         if visit(child, depth + 1, fields, nodes) => {}
-                    (HostValueType::Record | HostValueType::Unit, _) | (_, Some(_)) => {
-                        return false
-                    }
+                    (HostValueType::Record | HostValueType::Unit | HostValueType::ByteArray, _)
+                    | (_, Some(_)) => return false,
                     (HostValueType::String, None) => {
                         *nodes += 1;
                         if *nodes > MAXIMUM_RECORD_NODES {
@@ -269,7 +268,7 @@ use super::{
     heap::{AllocationRequest, Heap},
     heap_ops::{store_value, PendingAllocation, PendingState},
     image::ExecutionImage,
-    text::{PendingHostString, TextError},
+    text::{PendingHostReference, TextError},
     value::{Ref32, RuntimeValue},
 };
 
@@ -294,7 +293,7 @@ pub(super) struct PendingRecord {
     field: usize,
     object: Option<Ref32>,
     allocation: Option<PendingAllocation>,
-    string: Option<PendingHostString>,
+    string: Option<PendingHostReference>,
     collection_attempted: bool,
 }
 
@@ -381,9 +380,13 @@ impl PendingRecord {
                     } else {
                         let pending = self
                             .string
-                            .get_or_insert_with(|| PendingHostString::new(u16::MAX));
-                        let (cost, result) = match pending.resume(image, heap, units, budget - used)
-                        {
+                            .get_or_insert_with(|| PendingHostReference::new(u16::MAX));
+                        let (cost, result) = match pending.resume(
+                            image,
+                            heap,
+                            super::text::HostReferenceSource::String(units),
+                            budget - used,
+                        ) {
                             Err(TextError::Exhausted {
                                 used: cost,
                                 block_bytes,

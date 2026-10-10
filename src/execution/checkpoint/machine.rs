@@ -130,12 +130,12 @@ impl Machine {
         self.pending_text.write(writer)?;
         self.pending_concat.write(writer)?;
         self.pending_concat_source.write(writer)?;
-        self.pending_host_string.write(writer)?;
+        self.pending_host_reference.write(writer)?;
         self.pending_record.write(writer)?;
         self.pending_record_source.write(writer)?;
-        self.pending_host_string_source.write(writer)?;
+        self.pending_host_reference_source.write(writer)?;
         self.string_collection_pending.write(writer)?;
-        self.task_string_response.write(writer)?;
+        self.task_host_response.write(writer)?;
         self.emergency_oom.write(writer)?;
         self.frame_depth.write(writer)?;
         self.failure_stack.write(writer)?;
@@ -181,12 +181,12 @@ impl Machine {
             pending_text: Checkpoint::read(reader)?,
             pending_concat: Checkpoint::read(reader)?,
             pending_concat_source: Checkpoint::read(reader)?,
-            pending_host_string: Checkpoint::read(reader)?,
+            pending_host_reference: Checkpoint::read(reader)?,
             pending_record: Checkpoint::read(reader)?,
             pending_record_source: Checkpoint::read(reader)?,
-            pending_host_string_source: Checkpoint::read(reader)?,
+            pending_host_reference_source: Checkpoint::read(reader)?,
             string_collection_pending: Checkpoint::read(reader)?,
-            task_string_response: Checkpoint::read(reader)?,
+            task_host_response: Checkpoint::read(reader)?,
             emergency_oom: Checkpoint::read(reader)?,
             frame_depth: Checkpoint::read(reader)?,
             failure_stack: Checkpoint::read(reader)?,
@@ -223,12 +223,12 @@ impl Machine {
             ))
     }
 
-    pub(in crate::execution) fn validate_checkpoint_host_string(
+    pub(in crate::execution) fn validate_checkpoint_host_reference(
         &self,
-        source: &[u16],
+        source: text::HostReferenceSource<'_>,
     ) -> Result<()> {
-        if let Some(pending) = self.pending_host_string {
-            let destination = pending.validate_checkpoint(&self.heap, source)?;
+        if let Some(pending) = self.pending_host_reference {
+            let destination = pending.validate_checkpoint(&self.image, &self.heap, source)?;
             let frame = self
                 .frames
                 .get(
@@ -241,7 +241,11 @@ impl Machine {
                 .image
                 .function(frame.function)
                 .and_then(|function| function.registers.get(destination as usize))
-                .is_none()
+                .is_none_or(|value| {
+                    pending
+                        .byte_array_type
+                        .is_some_and(|ty| value.nominal != Some(ty))
+                })
             {
                 return Err(CheckpointError::InvalidState);
             }
@@ -315,13 +319,13 @@ impl Machine {
             use crate::execution::task::TaskState;
             let active = self.tasks.current().ok();
             let frame_owner = self
-                .task_string_response
+                .task_host_response
                 .map(|response| response.0)
                 .or(active);
-            if let Some((task, request, previous)) = self.task_string_response {
+            if let Some((task, request, previous)) = self.task_host_response {
                 if active != previous
                     || !self.checkpoint_task_waits_for(task, request)
-                    || self.pending_host_string.is_none() && self.pending_record.is_none()
+                    || self.pending_host_reference.is_none() && self.pending_record.is_none()
                 {
                     return Err(invalid());
                 }
@@ -337,14 +341,14 @@ impl Machine {
                 match self.tasks.checkpoint_task_at_slot(slot) {
                     Some((task, TaskState::Running))
                         if Some(task) == active
-                            && if self.task_string_response.is_some() {
+                            && if self.task_host_response.is_some() {
                                 depth > 0
                             } else {
                                 depth == 0
                             } => {}
                     Some((task, TaskState::Waiting(_)))
                         if self
-                            .task_string_response
+                            .task_host_response
                             .is_some_and(|response| response.0 == task)
                             && depth == 0 => {}
                     Some((_, TaskState::Ready | TaskState::Waiting(_))) if depth > 0 => {}
@@ -456,9 +460,11 @@ impl Machine {
         }
         if let Some(raise) = &self.pending_raise {
             if raise.message.is_none() {
-                raise
-                    .text
-                    .validate_checkpoint(&self.heap, &raise.units[..raise.length])?;
+                raise.text.validate_checkpoint(
+                    &self.image,
+                    &self.heap,
+                    text::HostReferenceSource::String(&raise.units[..raise.length]),
+                )?;
             }
         }
         let destinations = [

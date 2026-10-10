@@ -165,6 +165,7 @@ impl<'a> CapabilitySchemaDecoder<'a> {
             6 => HostValueType::Char,
             7 => HostValueType::String,
             8 => HostValueType::Record,
+            9 => HostValueType::ByteArray,
             _ => return None,
         })
     }
@@ -223,7 +224,7 @@ impl<'a> CapabilitySchemaDecoder<'a> {
         for _ in 0..count {
             let name = self.name(false)?;
             let value_type = self.value_type()?;
-            if value_type == HostValueType::Unit {
+            if matches!(value_type, HostValueType::Unit | HostValueType::ByteArray) {
                 return None;
             }
             let record = if value_type == HostValueType::Record {
@@ -593,6 +594,7 @@ pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
             let mut encoder = Encoder::new(3);
             encoder.u8(match value.kind {
                 QuotaKind::HostRequestCodeUnits => 0,
+                QuotaKind::HostRequestBytes => 3,
                 QuotaKind::HostRequests => 1,
                 QuotaKind::AcceptedResponses => 2,
             });
@@ -1033,6 +1035,11 @@ impl Encoder {
             OwnedValue::Char(value) => {
                 self.u8(6);
                 self.u16(*value);
+            }
+            OwnedValue::ByteArray(value) => {
+                self.u8(9);
+                self.u32(u32::try_from(value.len()).expect("bounded byte array length fits u32"));
+                self.bytes.extend_from_slice(value);
             }
             OwnedValue::String(value) => {
                 self.u8(7);
@@ -1545,6 +1552,13 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Option<crate::bridge::OwnedRespon
         4 => OwnedResponse::SuccessF64(u64::from_le_bytes(value.try_into().ok()?)),
         5 if value.len() == 1 && value[0] <= 1 => OwnedResponse::SuccessBool(value[0] != 0),
         6 => OwnedResponse::SuccessChar(u16::from_le_bytes(value.try_into().ok()?)),
+        9 if value.len() >= 4 => {
+            let length = u32::from_le_bytes(value[..4].try_into().ok()?) as usize;
+            if length > compukter_vm::MAXIMUM_HOST_BYTE_ARRAY_BYTES || value.len() != 4 + length {
+                return None;
+            }
+            OwnedResponse::SuccessByteArray(value[4..].to_vec())
+        }
         7 if value.len() >= 2 => {
             let length = usize::from(u16::from_le_bytes(value[..2].try_into().ok()?));
             if length > 4096 || value.len() != 2 + 2 * length {
@@ -1568,6 +1582,31 @@ mod response_tests {
     use super::decode_response;
     use crate::bridge::OwnedResponse;
 
+    #[test]
+    fn byte_array_response_wire_preserves_raw_bytes_and_rejects_malformed_lengths() {
+        assert_eq!(
+            Some(OwnedResponse::SuccessByteArray(vec![0, 128, 255])),
+            decode_response(&[1, 9, 3, 0, 0, 0, 0, 128, 255])
+        );
+        assert_eq!(
+            Some(OwnedResponse::SuccessByteArray(vec![])),
+            decode_response(&[1, 9, 0, 0, 0, 0])
+        );
+        for bytes in [
+            &[1, 9][..],
+            &[1, 9, 3, 0, 0, 0, 1],
+            &[1, 9, 0, 0, 0, 0, 1],
+            &[1, 9, 1, 16, 0, 0],
+        ] {
+            assert_eq!(None, decode_response(bytes));
+        }
+        let mut largest = vec![1, 9, 0, 16, 0, 0];
+        largest.extend(vec![255; 4096]);
+        assert_eq!(
+            Some(OwnedResponse::SuccessByteArray(vec![255; 4096])),
+            decode_response(&largest)
+        );
+    }
     #[test]
     fn scalar_response_wire_preserves_signed_values_ieee_payloads_and_utf16() {
         for value in [i64::MIN, i64::MAX, -1, 0] {

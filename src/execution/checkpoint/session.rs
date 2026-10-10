@@ -42,6 +42,7 @@ checkpoint_enum!(CopiedReply {
     1 => String(v0);
     2 => Record(v0);
     3 => Failure(v0);
+    4 => ByteArray(v0);
 });
 
 checkpoint_enum!(SessionTerminal {
@@ -96,6 +97,9 @@ impl Session {
         self.entry_arguments.write(writer)?;
         self.outbound_utf16.write(writer)?;
         self.inbound_utf16.write(writer)?;
+        self.outbound_bytes.write(writer)?;
+        self.inbound_bytes.write(writer)?;
+        self.inbound_is_bytes.write(writer)?;
         self.failure_detail.write(writer)?;
         self.failure_detail_length.write(writer)?;
         self.argument_slots.write(writer)?;
@@ -105,7 +109,7 @@ impl Session {
         self.next_request_id.write(writer)?;
         self.preparing_request.write(writer)?;
         self.inbound_length.write(writer)?;
-        self.resuming_host_string.write(writer)?;
+        self.resuming_host_reference.write(writer)?;
         self.replies.write(writer)?;
         self.published_requests.write(writer)?;
         self.accepted_responses.write(writer)?;
@@ -135,6 +139,9 @@ impl Session {
         admitted.entry_arguments = Checkpoint::read(reader)?;
         admitted.outbound_utf16 = Checkpoint::read(reader)?;
         admitted.inbound_utf16 = Checkpoint::read(reader)?;
+        admitted.outbound_bytes = Checkpoint::read(reader)?;
+        admitted.inbound_bytes = Checkpoint::read(reader)?;
+        admitted.inbound_is_bytes = Checkpoint::read(reader)?;
         admitted.failure_detail = Checkpoint::read(reader)?;
         admitted.failure_detail_length = Checkpoint::read(reader)?;
         admitted.argument_slots = Checkpoint::read(reader)?;
@@ -146,7 +153,7 @@ impl Session {
         admitted.next_request_id = Checkpoint::read(reader)?;
         admitted.preparing_request = Checkpoint::read(reader)?;
         admitted.inbound_length = Checkpoint::read(reader)?;
-        admitted.resuming_host_string = Checkpoint::read(reader)?;
+        admitted.resuming_host_reference = Checkpoint::read(reader)?;
         admitted.replies = Checkpoint::read(reader)?;
         admitted.published_requests = Checkpoint::read(reader)?;
         admitted.accepted_responses = Checkpoint::read(reader)?;
@@ -155,7 +162,14 @@ impl Session {
             || admitted.inbound_utf16.len() != inbound_capacity
             || admitted.argument_slots.len() != argument_capacity
             || admitted.argument_count > argument_capacity
-            || admitted.inbound_length > inbound_capacity
+            || admitted.outbound_bytes.len() != crate::execution::MAXIMUM_HOST_BYTE_ARRAY_BYTES
+            || admitted.inbound_bytes.len() != crate::execution::MAXIMUM_HOST_BYTE_ARRAY_BYTES
+            || admitted.inbound_length
+                > if admitted.inbound_is_bytes {
+                    admitted.inbound_bytes.len()
+                } else {
+                    inbound_capacity
+                }
             || admitted.failure_detail_length > admitted.failure_detail.len()
             || core::str::from_utf8(&admitted.failure_detail[..admitted.failure_detail_length])
                 .is_err()
@@ -166,7 +180,15 @@ impl Session {
         }
         admitted
             .machine
-            .validate_checkpoint_host_string(&admitted.inbound_utf16[..admitted.inbound_length])?;
+            .validate_checkpoint_host_reference(if admitted.inbound_is_bytes {
+                crate::execution::text::HostReferenceSource::ByteArray(
+                    &admitted.inbound_bytes[..admitted.inbound_length],
+                )
+            } else {
+                crate::execution::text::HostReferenceSource::String(
+                    &admitted.inbound_utf16[..admitted.inbound_length],
+                )
+            })?;
         for request in admitted.pending_requests.requests() {
             if request.identity().request().get() >= admitted.next_request_id
                 || !admitted.machine.checkpoint_task_waits_for(
@@ -213,6 +235,10 @@ impl Session {
                 CopiedReply::Scalar(Some(value)) => {
                     runtime_slot(*value).and_then(checkpoint_slot_type) == Some(schema.result)
                 }
+                CopiedReply::ByteArray(bytes) => {
+                    schema.result == HostValueType::ByteArray
+                        && bytes.len() <= admitted.inbound_bytes.len()
+                }
                 CopiedReply::String(units) => {
                     schema.result == HostValueType::String && units.len() <= inbound_capacity
                 }
@@ -240,7 +266,9 @@ impl Session {
                 return Err(CheckpointError::InvalidState);
             }
         }
-        if admitted.resuming_host_string != admitted.machine.capability_string_response_pending() {
+        if admitted.resuming_host_reference
+            != admitted.machine.capability_reference_response_pending()
+        {
             return Err(CheckpointError::InvalidState);
         }
         if let Some(preparing) = &admitted.preparing_request {
@@ -274,13 +302,30 @@ impl Session {
                 if checkpoint_slot_type(*slot) != Some(*expected) {
                     return Err(CheckpointError::InvalidState);
                 }
-                if let HostValueSlot::String { start, length } = slot {
+                let span = match slot {
+                    HostValueSlot::String { start, length } => Some((
+                        *start,
+                        *length,
+                        outbound_capacity,
+                        admitted.machine.capability_string_length(*register).ok(),
+                    )),
+                    HostValueSlot::ByteArray { start, length } => Some((
+                        *start,
+                        *length,
+                        admitted.outbound_bytes.len(),
+                        admitted
+                            .machine
+                            .capability_byte_array_length(*register)
+                            .ok(),
+                    )),
+                    _ => None,
+                };
+                if let Some((start, length, capacity, actual)) = span {
                     if start
-                        .checked_add(*length)
-                        .is_none_or(|end| end as usize > outbound_capacity)
-                        || admitted.machine.capability_string_length(*register).ok()
-                            != Some(*length)
-                        || index == preparing.argument && preparing.string_offset > *length
+                        .checked_add(length)
+                        .is_none_or(|end| end as usize > capacity)
+                        || actual != Some(length)
+                        || index == preparing.argument && preparing.string_offset > length
                     {
                         return Err(CheckpointError::InvalidState);
                     }
@@ -306,6 +351,7 @@ fn checkpoint_slot_type(slot: HostValueSlot) -> Option<HostValueType> {
         HostValueSlot::Bool(_) => HostValueType::Bool,
         HostValueSlot::Char(_) => HostValueType::Char,
         HostValueSlot::String { .. } => HostValueType::String,
+        HostValueSlot::ByteArray { .. } => HostValueType::ByteArray,
     })
 }
 
@@ -586,5 +632,58 @@ mod tests {
             Session::read_checkpoint_state(admitted, &mut reader),
             Err(CheckpointError::Incompatible)
         ));
+    }
+    #[test]
+    fn byte_array_pending_request_and_partial_materialization_restore_exactly() {
+        let artifact = fixtures::byte_array_capability_artifact(1);
+        let operations = [
+            OperationSchema::asynchronous(&[], HostValueType::ByteArray),
+            OperationSchema::asynchronous(&[HostValueType::ByteArray], HostValueType::Unit),
+        ];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut original =
+            Session::admit_untraced(artifact.clone(), profile(), &[binding]).unwrap();
+        original.start(&[]).unwrap();
+        let id = match original.advance(64, 0).unwrap() {
+            AdvanceOutcome::HostRequestBatch(v) => v.get(0).unwrap().id(),
+            other => panic!("{other:?}"),
+        };
+        let mut restored = round_trip(&original, artifact.clone(), &[binding]);
+        let payload = (0..=255).collect::<Vec<u8>>();
+        restored
+            .resume(
+                id,
+                HostResponse::Success(HostValueInput::ByteArray(&payload)),
+            )
+            .unwrap();
+        assert_eq!(
+            AdvanceOutcome::SliceExhausted,
+            restored.advance(1, 0).unwrap()
+        );
+        restored = round_trip(&restored, artifact.clone(), &[binding]);
+        for _ in 0..1000 {
+            match restored.advance(8, 1).unwrap() {
+                AdvanceOutcome::SliceExhausted => (),
+                AdvanceOutcome::HostRequestBatch(v) => {
+                    let request = v.get(0).unwrap();
+                    assert_eq!(
+                        Some(HostValueView::ByteArray(payload.as_slice())),
+                        request.arguments().get(0)
+                    );
+                    let id = request.id();
+                    restored = round_trip(&restored, artifact, &[binding]);
+                    restored
+                        .resume(id, HostResponse::Success(HostValueInput::Unit))
+                        .unwrap();
+                    assert_eq!(
+                        AdvanceOutcome::Halted(Some(HostValueView::I32(256))),
+                        restored.advance(64, 0).unwrap()
+                    );
+                    return;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        panic!("byte array did not complete");
     }
 }

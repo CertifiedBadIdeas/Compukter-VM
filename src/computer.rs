@@ -119,6 +119,7 @@ pub enum ComputerValue {
     Bool(bool),
     Char(u16),
     String(Box<[u16]>),
+    ByteArray(Box<[u8]>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3350,6 +3351,7 @@ fn copy_value(value: HostValueView<'_>) -> ComputerValue {
         HostValueView::Bool(value) => ComputerValue::Bool(value),
         HostValueView::Char(value) => ComputerValue::Char(value),
         HostValueView::String(value) => ComputerValue::String(value.into()),
+        HostValueView::ByteArray(value) => ComputerValue::ByteArray(value.into()),
     }
 }
 

@@ -14,7 +14,10 @@ pub enum HostValueType {
     Char,
     String,
     Record,
+    ByteArray,
 }
+
+pub const MAXIMUM_HOST_BYTE_ARRAY_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostMergeEntrySource {
@@ -240,6 +243,7 @@ pub enum HostValueInput<'a> {
     Char(u16),
     String(&'a [u16]),
     Record(&'a HostRecordValue),
+    ByteArray(&'a [u8]),
 }
 
 impl HostValueInput<'_> {
@@ -254,6 +258,7 @@ impl HostValueInput<'_> {
             Self::Char(_) => HostValueType::Char,
             Self::String(_) => HostValueType::String,
             Self::Record(_) => HostValueType::Record,
+            Self::ByteArray(_) => HostValueType::ByteArray,
         }
     }
 }
@@ -267,6 +272,7 @@ pub enum HostValueView<'a> {
     Bool(bool),
     Char(u16),
     String(&'a [u16]),
+    ByteArray(&'a [u8]),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -349,12 +355,14 @@ pub(super) enum HostValueSlot {
     Bool(bool),
     Char(u16),
     String { start: u32, length: u32 },
+    ByteArray { start: u32, length: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct HostArguments<'a> {
     pub(super) slots: &'a [HostValueSlot],
     pub(super) utf16: &'a [u16],
+    pub(super) bytes: &'a [u8],
 }
 
 impl<'a> HostArguments<'a> {
@@ -375,6 +383,11 @@ impl<'a> HostArguments<'a> {
             HostValueSlot::F64(value) => Some(HostValueView::F64(value)),
             HostValueSlot::Bool(value) => Some(HostValueView::Bool(value)),
             HostValueSlot::Char(value) => Some(HostValueView::Char(value)),
+            HostValueSlot::ByteArray { start, length } => {
+                let start = usize::try_from(start).ok()?;
+                let end = start.checked_add(usize::try_from(length).ok()?)?;
+                self.bytes.get(start..end).map(HostValueView::ByteArray)
+            }
             HostValueSlot::String { start, length } => {
                 let start = usize::try_from(start).ok()?;
                 let end = start.checked_add(usize::try_from(length).ok()?)?;
@@ -496,6 +509,7 @@ impl<'a> HostRequestBatchView<'a> {
             arguments: HostArguments {
                 slots: request.arguments(),
                 utf16: request.utf16(),
+                bytes: request.bytes(),
             },
         })
     }
@@ -510,6 +524,7 @@ pub struct ManagedAllocationFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuotaKind {
     HostRequestCodeUnits,
+    HostRequestBytes,
     HostRequests,
     AcceptedResponses,
 }

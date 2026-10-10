@@ -48,6 +48,7 @@ pub(crate) enum OwnedValue {
     Bool(bool),
     Char(u16),
     String(Vec<u16>),
+    ByteArray(Vec<u8>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -161,6 +162,7 @@ pub(crate) enum OwnedResponse {
     SuccessF32(u32),
     SuccessBool(bool),
     SuccessString(Vec<u16>),
+    SuccessByteArray(Vec<u8>),
     SuccessRecord(compukter_vm::HostRecordValue),
     Failure {
         kind: HostFailureKind,
@@ -460,6 +462,9 @@ pub(crate) fn resume(
                 }
                 OwnedResponse::SuccessString(units) => {
                     HostResponse::Success(HostValueInput::String(units))
+                }
+                OwnedResponse::SuccessByteArray(value) => {
+                    HostResponse::Success(HostValueInput::ByteArray(value))
                 }
                 OwnedResponse::SuccessRecord(value) => {
                     HostResponse::Success(HostValueInput::Record(value))
@@ -1038,6 +1043,7 @@ fn copy_value(value: ComputerValue) -> OwnedValue {
         ComputerValue::Bool(value) => OwnedValue::Bool(value),
         ComputerValue::Char(value) => OwnedValue::Char(value),
         ComputerValue::String(value) => OwnedValue::String(value.into_vec()),
+        ComputerValue::ByteArray(value) => OwnedValue::ByteArray(value.into_vec()),
     }
 }
 
