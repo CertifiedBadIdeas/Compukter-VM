@@ -311,6 +311,9 @@ impl ComputerFileSystem {
         path: &VirtualPath,
     ) -> Result<NodeMetadata, FileSystemError> {
         require(capability, path, FileRights::INSPECT)?;
+        if path.components().len() == 0 {
+            return Ok(Node::directory(0).metadata);
+        }
         let (mount, components) = split_mount(path)?;
         if components.is_empty() {
             return Ok(Node::directory(0).metadata);
@@ -326,6 +329,9 @@ impl ComputerFileSystem {
         path: &VirtualPath,
     ) -> Result<Vec<Box<str>>, FileSystemError> {
         require(capability, path, FileRights::LIST)?;
+        if path.components().len() == 0 {
+            return Ok(vec![Box::from("home"), Box::from("rom")]);
+        }
         let (mount, components) = split_mount(path)?;
         let directory = if components.is_empty() {
             self.directory(mount)
@@ -346,6 +352,9 @@ impl ComputerFileSystem {
         path: &VirtualPath,
     ) -> Result<Arc<[u8]>, FileSystemError> {
         require(capability, path, FileRights::READ)?;
+        if path.components().len() == 0 {
+            return Err(FileSystemError::IsDirectory);
+        }
         let (mount, components) = split_mount(path)?;
         if components.is_empty() {
             return Err(FileSystemError::IsDirectory);
@@ -1065,6 +1074,31 @@ mod tests {
             Err(FileSystemError::Busy),
         );
         assert_eq!(before, filesystem.snapshot_for_test());
+    }
+
+    #[test]
+    fn virtual_root_exposes_mounts_only_to_authorized_guests() {
+        let limits = FileSystemLimits::testing();
+        let filesystem = ComputerFileSystem::with_limits(limits);
+        let root = VirtualPath::root();
+        let owner = FileCapability::new(root.clone(), FileRights::OWNER);
+        let home = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        assert_eq!(
+            NodeKind::Directory,
+            filesystem.stat(&owner, &root).unwrap().kind
+        );
+        assert_eq!(
+            vec![Box::<str>::from("home"), Box::<str>::from("rom")],
+            filesystem.list(&owner, &root).unwrap()
+        );
+        assert_eq!(
+            Err(FileSystemError::IsDirectory),
+            filesystem.read_snapshot(&owner, &root)
+        );
+        assert_eq!(
+            Err(FileSystemError::PermissionDenied),
+            filesystem.list(&home, &root)
+        );
     }
 
     #[test]
