@@ -5,9 +5,9 @@ use super::{
     host::{
         AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, EntryValue,
         ExecutionProfile, HostFailure, HostFailureKind, HostRequestBatchView, HostResponse,
-        HostValueInput, HostValueSlot, HostValueView, ManagedAllocationFailure, QuotaExhaustion,
-        QuotaKind, RequestId, ResolvedCapability, ResolvedOperation, ResumeError, TaskId,
-        MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
+        HostValueInput, HostValueSlot, HostValueType, HostValueView, ManagedAllocationFailure,
+        QuotaExhaustion, QuotaKind, RequestId, ResolvedCapability, ResolvedOperation, ResumeError,
+        TaskId, MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
     },
     image::{AdmittedReference, ExecutionImage, ExecutionProfile as ImageProfile},
     machine::{Machine, MachineResourceSnapshot},
@@ -686,6 +686,22 @@ impl Session {
         response: HostResponse<'_>,
     ) -> Result<(), ResumeError> {
         self.resume_internal_for(TaskId::ROOT, request_id, response)
+    }
+
+    pub(crate) fn internal_response_type(
+        &self,
+        task: TaskId,
+        request_id: RequestId,
+    ) -> Option<HostValueType> {
+        let pending = self
+            .pending_requests
+            .get(HostRequestIdentity::new(task, request_id))?;
+        self.capabilities
+            .get(pending.capability() as usize)?
+            .as_ref()?
+            .operations
+            .get(pending.operation() as usize)
+            .map(|operation| operation.result)
     }
 
     pub(crate) fn resume_internal_for(

@@ -4609,6 +4609,18 @@ pub(crate) fn process_v2_exit_artifact(code: i32) -> VerifiedArtifact {
 }
 
 pub(crate) fn compiler_compile_artifact(source: &[u16], output: &[u16]) -> VerifiedArtifact {
+    compiler_compile_artifact_with_abi(source, output, false)
+}
+
+pub(crate) fn compiler_compile_v2_artifact(source: &[u16], output: &[u16]) -> VerifiedArtifact {
+    compiler_compile_artifact_with_abi(source, output, true)
+}
+
+fn compiler_compile_artifact_with_abi(
+    source: &[u16],
+    output: &[u16],
+    paired: bool,
+) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
         flags: 0,
@@ -4616,7 +4628,12 @@ pub(crate) fn compiler_compile_artifact(source: &[u16], output: &[u16]) -> Verif
     };
     literal_string_program_blocks_configured(
         primitive(1),
-        vec![string, string, primitive(1)],
+        vec![
+            string,
+            string,
+            if paired { string } else { primitive(1) },
+            primitive(1),
+        ],
         Vec::new(),
         output,
         vec![
@@ -4637,7 +4654,14 @@ pub(crate) fn compiler_compile_artifact(source: &[u16], output: &[u16]) -> Verif
                     resume_block: 1,
                 },
             ],
-            vec![Instruction::Return { value: 2 }],
+            if paired {
+                vec![
+                    Instruction::StringHash { dst: 3, string: 2 },
+                    Instruction::Return { value: 3 },
+                ]
+            } else {
+                vec![Instruction::Return { value: 2 }]
+            },
         ],
         |artifact| {
             let mut bytes = artifact.bytes.to_vec();
@@ -4673,10 +4697,10 @@ pub(crate) fn compiler_compile_artifact(source: &[u16], output: &[u16]) -> Verif
             artifact.capabilities.push(crate::artifact::Capability {
                 namespace: 1,
                 name: 0,
-                abi_major: 1,
+                abi_major: if paired { 2 } else { 1 },
                 minimum_abi_minor: 0,
                 flags: 1,
-                operation_count: 2,
+                operation_count: if paired { 1 } else { 2 },
             });
             artifact.manifest.required_capabilities = 1;
             artifact.manifest.maximum_host_requests = 1;

@@ -521,7 +521,17 @@ impl ComputerMachine {
             if frame
                 .session
                 .checkpoint_host_request_operation(compilation.task, compilation.request)
-                != Some((TERMINAL_NAMESPACE, COMPILER_NAME, COMPILER_ABI_MAJOR, 0))
+                .is_none_or(|operation| {
+                    !matches!(
+                        operation,
+                        (
+                            TERMINAL_NAMESPACE,
+                            COMPILER_NAME,
+                            COMPILER_ABI_MAJOR | COMPILER_V2_ABI_MAJOR,
+                            0
+                        )
+                    )
+                })
                 || compilation.token == 0
                 || compilation.token >= self.next_compilation_token
                 || !frame
@@ -914,6 +924,35 @@ mod tests {
             }
         }
         panic!("canonical read did not complete");
+    }
+
+    #[test]
+    fn checkpoint_preserves_compiler_v2_paired_reply_without_new_transaction_state() {
+        use crate::computer::tests::{compiler_computer_with_abi, next_compilation_request};
+        let (mut original, _, _, _) = compiler_computer_with_abi(b"bad source", None, true);
+        let request = next_compilation_request(&mut original);
+        let mut restored = round_trip(&original);
+        for computer in [&mut original, &mut restored] {
+            computer
+                .complete_compilation_failure(request.token, "own diagnostics")
+                .unwrap();
+            loop {
+                match computer.advance(4096, 4096, u32::MAX).unwrap() {
+                    ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(hash))) => {
+                        let expected = [1_u16]
+                            .into_iter()
+                            .chain("own diagnostics".encode_utf16())
+                            .fold(0_i32, |hash, unit| {
+                                hash.wrapping_mul(31).wrapping_add(unit as i32)
+                            });
+                        assert_eq!(expected, hash);
+                        break;
+                    }
+                    ComputerAdvanceOutcome::SliceExhausted => {}
+                    other => panic!("unexpected reply: {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]
