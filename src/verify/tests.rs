@@ -2534,3 +2534,81 @@ fn floating_math_rejects_old_abi_and_mixed_register_widths() {
         assert!(verify_cfg(&artifact).is_err());
     }
 }
+
+#[test]
+fn matrix_admission_rejects_old_abi_wrong_shapes_uninitialized_inputs_and_costs() {
+    use crate::artifact::{Instruction, MatrixOperation::*};
+    for operation in [
+        Transpose,
+        MultiplyMatrix,
+        MultiplyVector,
+        TransformPoint,
+        TransformDirection,
+    ] {
+        for case in 0..8 {
+            let mut artifact = crate::execution::fixtures::matrix_decoded(operation, 34, 0);
+            assert!(verify_cfg(&artifact).is_ok());
+            match case {
+                0 => artifact.header.runtime_minor = 16,
+                1 => {
+                    artifact.modules[0].functions[0].values[32]
+                        .semantic_type
+                        .kind = 3
+                }
+                2 => {
+                    artifact.modules[0].functions[0].values[34]
+                        .semantic_type
+                        .nominal_type = crate::artifact::TypeId(2)
+                }
+                3 => {
+                    if let crate::artifact::NominalType::InlineValue { components, .. } =
+                        &mut artifact.modules[0].types[1]
+                    {
+                        components[0].kind = 1;
+                    }
+                }
+                4 => {
+                    artifact.modules[0].code[0].instructions[34] = Instruction::MatrixMath {
+                        operation,
+                        dst: 34,
+                        lhs: 34,
+                        rhs: operation.right_components().map(|_| 33),
+                    }
+                }
+                5 => artifact.modules[0].blocks[0].declared_fixed_cost -= 1,
+                6 => {
+                    artifact.modules[0].code[0].instructions[34] = Instruction::MatrixMath {
+                        operation,
+                        dst: 34,
+                        lhs: 32,
+                        rhs: if operation == Transpose {
+                            Some(33)
+                        } else {
+                            None
+                        },
+                    }
+                }
+                7 => {
+                    if let crate::artifact::NominalType::InlineValue { components, .. } =
+                        &mut artifact.modules[0].types[1]
+                    {
+                        components.pop();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            // Equal shapes remain legal even when nominal identities differ.
+            if case == 2
+                && operation.result_components() == operation.right_components().unwrap_or(16)
+            {
+                continue;
+            }
+            let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+            assert!(
+                super::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default())
+                    .is_err(),
+                "admitted {operation:?} case {case}"
+            );
+        }
+    }
+}

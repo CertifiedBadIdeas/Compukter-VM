@@ -300,3 +300,25 @@ produce NaN. Integer and derived library functions remain ordinary Guest instruc
 Container 3, exported native C ABI 21 and checkpoint framing are unchanged.
 
 Filesystem capability ABI 2 offers validated paths, bounded binary metadata and chunked immutable reads, process-owned atomic replacement drafts and directory snapshots. Replies carry a private status prefix; callers decode it into typed source errors. Each binary response is at most 4096 bytes, including the prefix. ByteArray value encoding and the 49-export transport inventory are unchanged. Native ABI 23 changes the logical checkpoint schema to retain these resources. The historical filesystem ABI 1 remains available for existing executable artifacts; new Guest libraries emit ABI 2 only.
+
+## Matrix kernels (Runtime ABI 1.17)
+
+`matrix_math` opcode `0x1e`, form 0, encodes a ULEB selector, destination/left u16 registers and
+an optional right u16. Closed selectors in `src/artifact/matrix.rs` are: 1 transpose (16→16, cost 18),
+2 matrix product (16+16→16, cost 128), 3 vector product (16+4→4, cost 32), 4 point (16+3→4, cost 32),
+5 direction (16+3→4, cost 32). All payloads are exact homogeneous F32 inline layouts. Admission rejects
+unknown forms/selectors, wrong arity, uninitialized sources, incorrect layouts/physical shapes,
+ABI below 1.17 and mismatched declared costs.
+
+Execution snapshots components into fixed host-stack arrays before writing; destination aliases are legal.
+No managed allocation or suspension occurs. Row-major matrices multiply column vectors; point/direction
+use a fourth input of 1/0. Every dot product retains all four multiplications and left-associated scalar
+additions, using the existing canonical F32 helpers without FMA. Signed-zero rounding matches scalar
+instructions; transpose preserves raw component bits. Container 3, native C ABI 23 and checkpoints are unchanged.
+
+Tests cover wire rejection, admission, aliases, cost/quota/heap behavior, numerical edges and independent
+scalar instructions. Run the manual release execution comparison with
+`cargo test --release --locked --offline --lib matrix_intrinsics_execution_comparison -- --ignored --nocapture`.
+It alternates seven paired samples of 100 executions of 100 stable products. Timing excludes artifact
+admission, image construction and machine start; both streams include identical input setup. Timings
+are observations rather than CI performance thresholds.

@@ -4558,6 +4558,61 @@ fn execute_scalar(
         }};
     }
     match instruction {
+        ResolvedInstruction::MatrixMath {
+            operation,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            let read = |id: u16, count: usize| -> Result<[f32; 16], InstructionFailure> {
+                let layout = function
+                    .frame_layout
+                    .values
+                    .get(id as usize)
+                    .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
+                if layout.components.len() != count {
+                    return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
+                }
+                let mut values = [0.0; 16];
+                for (index, component) in layout.components.iter().enumerate() {
+                    let RuntimeValue::F32(bits) = arena
+                        .read_component_value(frame.base, *component)
+                        .map_err(InstructionFailure::Fault)?
+                    else {
+                        return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
+                    };
+                    values[index] = f32::from_bits(bits);
+                }
+                Ok(values)
+            };
+            let left = read(*lhs, 16)?;
+            let right = match rhs {
+                Some(rhs) => read(
+                    *rhs,
+                    operation
+                        .right_components()
+                        .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?,
+                )?,
+                None => [0.0; 16],
+            };
+            let output = super::matrix::evaluate(*operation, &left, &right);
+            for (index, value) in output
+                .iter()
+                .take(operation.result_components())
+                .enumerate()
+            {
+                arena
+                    .write_f32(
+                        frame.base,
+                        &function.frame_layout,
+                        *dst as usize,
+                        index,
+                        value.to_bits(),
+                    )
+                    .map_err(InstructionFailure::Fault)?;
+            }
+            Ok(())
+        }
         ResolvedInstruction::InlineConstruct { dst, components } => {
             let destination = function
                 .frame_layout

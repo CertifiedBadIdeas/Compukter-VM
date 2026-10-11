@@ -1,3 +1,5 @@
+mod matrix;
+pub(crate) use matrix::MatrixOperation;
 mod math;
 pub(crate) use math::{MathBinaryOperation, MathUnaryOperation};
 
@@ -385,6 +387,12 @@ pub(crate) enum Instruction {
     },
     Null {
         dst: u16,
+    },
+    MatrixMath {
+        operation: MatrixOperation,
+        dst: u16,
+        lhs: u16,
+        rhs: Option<u16>,
     },
     MathUnary {
         form: u8,

@@ -1,5 +1,7 @@
 use crate::{
-    artifact::{format, Instruction, MathBinaryOperation, MathUnaryOperation, SwitchCase},
+    artifact::{
+        format, Instruction, MathBinaryOperation, MathUnaryOperation, MatrixOperation, SwitchCase,
+    },
     bytes::Cursor,
     diagnostic::{Code, Diagnostic, DiagnosticSet, Family},
     limits::ArtifactLimits,
@@ -126,6 +128,20 @@ fn decode_instruction(
             dst: reg(&mut cursor, offset)?,
             src: reg(&mut cursor, offset)?,
         },
+        0x1e if form == 0 => {
+            let operation = MatrixOperation::decode(id(&mut cursor, offset)?)
+                .ok_or_else(|| error(Code::BadInstruction, offset, "unknown matrix selector"))?;
+            Instruction::MatrixMath {
+                operation,
+                dst: reg(&mut cursor, offset)?,
+                lhs: reg(&mut cursor, offset)?,
+                rhs: if operation.right_components().is_some() {
+                    Some(reg(&mut cursor, offset)?)
+                } else {
+                    None
+                },
+            }
+        }
         0x1c => Instruction::MathUnary {
             form,
             operation: MathUnaryOperation::decode(id(&mut cursor, offset)?).ok_or_else(|| {
@@ -778,6 +794,7 @@ impl Instruction {
         let fixed = match self {
             Self::InlineConstruct { components, .. } => variable_cost(2, components.len())?,
             Self::InlineComponent { .. } => 2,
+            Self::MatrixMath { operation, .. } => operation.fixed_cost(),
             Self::MathUnary { operation, .. } => operation.fixed_cost(),
             Self::MathBinary { operation, .. } => operation.fixed_cost(),
             Self::Mul { .. }

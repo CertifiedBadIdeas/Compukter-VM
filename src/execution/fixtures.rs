@@ -7903,3 +7903,171 @@ pub(super) fn byte_array_capability_artifact_with_arguments(
         configure_stack(artifact, 2, 1);
     })
 }
+
+pub(crate) fn matrix_decoded(
+    operation: crate::artifact::MatrixOperation,
+    destination: u16,
+    component: u16,
+) -> crate::artifact::DecodedArtifact {
+    let mut artifact = crate::decode::records::decode_artifact(
+        Arc::from(crate::test_support::minimal_vector()),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    artifact.header.runtime_minor = 17;
+    let right_count = operation.right_components().unwrap_or(16);
+    let counts = [16, right_count, operation.result_components()];
+    let module = &mut artifact.modules[0];
+    module.types = vec![function_type(primitive(3), Vec::new())];
+    for count in counts {
+        module.types.push(NominalType::InlineValue {
+            name: 1,
+            components: vec![primitive(3); count],
+        });
+    }
+    module.declared_types = 4;
+    module.constants = (1..=32)
+        .map(|value| Constant::F32((value as f32).to_bits()))
+        .collect();
+    module
+        .constants
+        .sort_by_key(crate::test_encode::encode_constant);
+    let mut main = function(0, 0, vec![primitive(3); 36], 0);
+    for (index, count) in counts.into_iter().enumerate() {
+        main.values[index + 32] = crate::artifact::FunctionValue {
+            semantic_type: ValueType {
+                kind: 8,
+                flags: 0,
+                nominal_type: TypeId(index as u32 + 1),
+            },
+            components: vec![crate::artifact::PhysicalAtom::F32; count],
+        };
+    }
+    module.functions = vec![main];
+    module.declared_functions = 1;
+    let mut instructions: Vec<_> = (0..32)
+        .map(|index| Instruction::Const {
+            dst: index as u16,
+            constant: module.constants.iter().position(|constant| matches!(constant, Constant::F32(bits) if *bits == ((index + 1) as f32).to_bits())).unwrap() as u32,
+        })
+        .collect();
+    instructions.extend([
+        Instruction::InlineConstruct {
+            dst: 32,
+            components: (0..16).collect(),
+        },
+        Instruction::InlineConstruct {
+            dst: 33,
+            components: (16..16 + right_count as u16).collect(),
+        },
+        Instruction::MatrixMath {
+            operation,
+            dst: destination,
+            lhs: 32,
+            rhs: operation.right_components().map(|_| 33),
+        },
+        Instruction::InlineComponent {
+            dst: 35,
+            src: destination,
+            component,
+        },
+        Instruction::Return { value: 35 },
+    ]);
+    install_entry_blocks(&mut artifact, vec![instructions]);
+    configure_stack(&mut artifact, 0, 1);
+    artifact
+}
+
+pub(super) fn matrix_artifact(
+    operation: crate::artifact::MatrixOperation,
+    destination: u16,
+    component: u16,
+) -> VerifiedArtifact {
+    let bytes = crate::test_encode::encode_artifact_rehashed(matrix_decoded(
+        operation,
+        destination,
+        component,
+    ))
+    .unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
+/// Independent scalar opcode baseline: same inputs, row-major products, left-associated sums.
+pub(super) fn matrix_comparison_artifact(scalar: bool, repetitions: usize) -> VerifiedArtifact {
+    use crate::artifact::MatrixOperation;
+    let mut artifact = matrix_decoded(MatrixOperation::MultiplyMatrix, 34, 0);
+    let module = &mut artifact.modules[0];
+    if scalar {
+        module.functions[0]
+            .values
+            .extend(crate::artifact::scalar_values(vec![primitive(3); 19]));
+        module.functions[0].register_count = 55;
+    }
+    let body = || {
+        let mut body = Vec::new();
+        if scalar {
+            for row in 0..4u16 {
+                for column in 0..4u16 {
+                    let output = 39 + row * 4 + column;
+                    for k in 0..4u16 {
+                        body.extend([
+                            Instruction::InlineComponent {
+                                dst: 36,
+                                src: 32,
+                                component: row * 4 + k,
+                            },
+                            Instruction::InlineComponent {
+                                dst: 37,
+                                src: 33,
+                                component: k * 4 + column,
+                            },
+                            Instruction::Mul {
+                                form: 3,
+                                dst: if k == 0 { output } else { 38 },
+                                lhs: 36,
+                                rhs: 37,
+                            },
+                        ]);
+                        if k != 0 {
+                            body.push(Instruction::Add {
+                                form: 3,
+                                dst: output,
+                                lhs: output,
+                                rhs: 38,
+                            });
+                        }
+                    }
+                }
+            }
+            body.push(Instruction::InlineConstruct {
+                dst: 34,
+                components: (39..55).collect(),
+            });
+        } else {
+            body.push(Instruction::MatrixMath {
+                operation: MatrixOperation::MultiplyMatrix,
+                dst: 34,
+                lhs: 32,
+                rhs: Some(33),
+            });
+        }
+        body
+    };
+    let mut instructions = std::mem::take(&mut module.code[0].instructions).into_vec();
+    instructions.truncate(34);
+    for _ in 0..repetitions {
+        instructions.extend(body());
+    }
+    instructions.extend([
+        Instruction::InlineComponent {
+            dst: 35,
+            src: 34,
+            component: 0,
+        },
+        Instruction::Return { value: 35 },
+    ]);
+    install_entry_blocks(&mut artifact, vec![instructions]);
+    configure_stack(&mut artifact, 0, 1);
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}

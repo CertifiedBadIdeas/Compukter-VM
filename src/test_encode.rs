@@ -723,6 +723,19 @@ fn encode_instruction(value: &Instruction) -> Result<(u8, u8, Vec<u8>), EncodeEr
             reg(&mut operands, *dst);
             (0x03, 0)
         }
+        Instruction::MatrixMath {
+            operation,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            id(&mut operands, *operation as u32);
+            regs(&mut operands, &[*dst, *lhs]);
+            if let Some(rhs) = rhs {
+                reg(&mut operands, *rhs);
+            }
+            (0x1e, 0)
+        }
         Instruction::MathUnary {
             form,
             operation,

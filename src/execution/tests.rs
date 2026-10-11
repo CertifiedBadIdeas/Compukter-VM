@@ -1238,3 +1238,121 @@ fn inline_task_arguments_preserve_components_across_spawn_and_join() {
     }
     panic!("inline task did not finish under bounded slices");
 }
+
+#[test]
+fn matrix_kernels_execute_all_components_allow_aliases_charge_cost_and_allocate_no_heap() {
+    use crate::artifact::MatrixOperation::*;
+    for operation in [
+        Transpose,
+        MultiplyMatrix,
+        MultiplyVector,
+        TransformPoint,
+        TransformDirection,
+    ] {
+        let destinations: &[u16] = match operation {
+            Transpose => &[34, 32],
+            MultiplyMatrix => &[34, 32, 33],
+            MultiplyVector => &[34, 33],
+            _ => &[34],
+        };
+        for destination in destinations {
+            for component in 0..operation.result_components() {
+                let row = component / 4;
+                let column = component % 4;
+                let expected = match operation {
+                    Transpose => (column * 4 + row + 1) as f32,
+                    MultiplyMatrix => (0..4)
+                        .map(|k| ((row * 4 + k + 1) * (k * 4 + column + 17)) as f32)
+                        .sum(),
+                    _ => {
+                        let row = component;
+                        let w = match operation {
+                            TransformPoint => 1.0,
+                            TransformDirection => 0.0,
+                            _ => 20.0,
+                        };
+                        ((row * 4 + 1) as f32 * 17.0 + (row * 4 + 2) as f32 * 18.0)
+                            + (row * 4 + 3) as f32 * 19.0
+                            + (row * 4 + 4) as f32 * w
+                    }
+                };
+                let artifact = fixtures::matrix_artifact(operation, *destination, component as u16);
+                let fixed_cost = artifact.decoded().modules[0].blocks[0].declared_fixed_cost;
+                let mut machine = fixtures::started_zero_arg(artifact);
+                let before = machine.resource_snapshot();
+                let budget = machine.minimum_run_budget();
+                assert!(budget >= operation.fixed_cost());
+                assert!(matches!(
+                    machine.run_slice(budget - 1, 0),
+                    Err(RunError::InvalidSliceBudget { .. })
+                ));
+                assert_eq!(0, machine.consumed_fixed_cost());
+                assert_eq!(
+                    Outcome::Halted(Some(RuntimeValue::F32(expected.to_bits()))),
+                    machine.run_slice(budget, 0).unwrap()
+                );
+                assert_eq!(u64::from(fixed_cost), machine.consumed_fixed_cost());
+                assert_eq!(
+                    before.heap_used_bytes,
+                    machine.resource_snapshot().heap_used_bytes
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn matrix_intrinsic_matches_independent_scalar_instruction_stream() {
+    for scalar in [false, true] {
+        let mut machine =
+            fixtures::started_zero_arg(fixtures::matrix_comparison_artifact(scalar, 3));
+        assert_eq!(
+            Outcome::Halted(Some(RuntimeValue::F32(250.0f32.to_bits()))),
+            machine.run_slice(machine.minimum_run_budget(), 0).unwrap()
+        );
+        assert_eq!(
+            36 + 3 * if scalar { 241 } else { 1 },
+            machine.executed_instructions()
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual repeated release-mode execution comparison; timing is not a CI assertion"]
+fn matrix_intrinsics_execution_comparison() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    const PRODUCTS: usize = 100;
+    const RUNS: usize = 100;
+    let intrinsic = fixtures::matrix_comparison_artifact(false, PRODUCTS);
+    let scalar = fixtures::matrix_comparison_artifact(true, PRODUCTS);
+    let sample = |artifact: &crate::VerifiedArtifact| {
+        let mut elapsed = 0u128;
+        let mut count = 0;
+        for _ in 0..RUNS {
+            let mut machine = fixtures::started_zero_arg(artifact.clone());
+            let budget = machine.minimum_run_budget();
+            let started = Instant::now();
+            let outcome = black_box(machine.run_slice(budget, 0).unwrap());
+            elapsed += started.elapsed().as_nanos();
+            assert_eq!(
+                Outcome::Halted(Some(RuntimeValue::F32(250.0f32.to_bits()))),
+                outcome
+            );
+            count = machine.executed_instructions();
+        }
+        (elapsed / RUNS as u128, count)
+    };
+    // Admission, image creation and start are excluded. Both streams include identical input setup.
+    let _ = sample(&intrinsic);
+    let _ = sample(&scalar);
+    for pair in 0..7 {
+        let (fast, slow) = if pair % 2 == 0 {
+            (sample(&intrinsic), sample(&scalar))
+        } else {
+            let slow = sample(&scalar);
+            (sample(&intrinsic), slow)
+        };
+        println!("matrix pair={pair} products={PRODUCTS} runs={RUNS} intrinsic_ns={} scalar_ns={} intrinsic_instructions={} scalar_instructions={}", fast.0, slow.0, fast.1, slow.1);
+    }
+}
