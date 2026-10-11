@@ -55,6 +55,7 @@ const PROCESS_ABI_MAJOR: u16 = 2;
 const PROCESS_ABI_MINOR: u16 = 0;
 const COMPILER_NAME: &str = "compiler";
 const COMPILER_ABI_MAJOR: u16 = 1;
+const COMPILER_V2_ABI_MAJOR: u16 = 2;
 const COMPILER_ABI_MINOR: u16 = 0;
 const REDSTONE_NAME: &str = "redstone";
 const REDSTONE_ABI_MAJOR: u16 = 1;
@@ -2282,7 +2283,28 @@ impl ComputerMachine {
         status: i32,
         diagnostic: &str,
     ) -> Result<(), ComputerError> {
-        let diagnostics = bounded_utf16(diagnostic, self.maximum_text_code_units);
+        let paired = self
+            .active_frame()
+            .session
+            .internal_response_type(task, request)
+            == Some(HostValueType::String);
+        let maximum = self.maximum_text_code_units;
+        if paired {
+            // ABI 2 reserves one UTF-16 unit for the status; truncate only at scalar boundaries.
+            let mut reply = Vec::with_capacity(maximum.min(diagnostic.len().saturating_add(1)));
+            reply.push(status as u16);
+            reply.extend_from_slice(&bounded_utf16(diagnostic, maximum.saturating_sub(1)));
+            return self
+                .active_frame_mut()
+                .session
+                .resume_internal_for(
+                    task,
+                    request,
+                    HostResponse::Success(HostValueInput::String(&reply)),
+                )
+                .map_err(ComputerError::Resume);
+        }
+        let diagnostics = bounded_utf16(diagnostic, maximum);
         let frame = self.active_frame_mut();
         frame.compiler_diagnostics = diagnostics;
         frame
@@ -2608,6 +2630,10 @@ fn admit_session(
         OperationSchema::asynchronous(&compiler_arguments, HostValueType::I32),
         OperationSchema::synchronous(&[], HostValueType::String),
     ];
+    let compiler_v2_operations = [OperationSchema::asynchronous(
+        &compiler_arguments,
+        HostValueType::String,
+    )];
     let redstone_operations = [
         OperationSchema::synchronous(&redstone_side_argument, HostValueType::I32),
         OperationSchema::asynchronous(&redstone_side_argument, HostValueType::I32),
@@ -2711,6 +2737,13 @@ fn admit_session(
     ));
     bindings.push(CapabilityBinding::new(
         TERMINAL_NAMESPACE,
+        COMPILER_NAME,
+        COMPILER_V2_ABI_MAJOR,
+        0,
+        &compiler_v2_operations,
+    ));
+    bindings.push(CapabilityBinding::new(
+        TERMINAL_NAMESPACE,
         REDSTONE_NAME,
         REDSTONE_ABI_MAJOR,
         REDSTONE_ABI_MINOR,
@@ -2763,7 +2796,10 @@ fn is_process(request: HostRequestView<'_>) -> bool {
 fn is_compiler(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == COMPILER_NAME
-        && request.abi_major() == COMPILER_ABI_MAJOR
+        && matches!(
+            request.abi_major(),
+            COMPILER_ABI_MAJOR | COMPILER_V2_ABI_MAJOR
+        )
 }
 
 fn is_redstone(request: HostRequestView<'_>) -> bool {
@@ -2876,7 +2912,9 @@ fn copy_compiler_request(request: HostRequestView<'_>) -> Result<TerminalRequest
             };
             CompilerOperation::Compile(source.to_vec(), output.to_vec())
         }
-        (1, false, 0) => CompilerOperation::Diagnostics,
+        (1, false, 0) if request.abi_major() == COMPILER_ABI_MAJOR => {
+            CompilerOperation::Diagnostics
+        }
         _ => return Err(ComputerError::InvalidCompilerRequest),
     };
     Ok(TerminalRequest::Compiler {
@@ -4807,6 +4845,59 @@ mod tests {
     }
 
     #[test]
+    fn compiler_v2_returns_status_and_scalar_bounded_diagnostics_together() {
+        let (mut computer, _, _, output) = compiler_computer_with_abi(b"bad source", None, true);
+        let request = next_compilation_request(&mut computer);
+        let diagnostic = "😀".repeat(computer.maximum_text_code_units);
+        computer
+            .complete_compilation_failure(request.token, &diagnostic)
+            .unwrap();
+        // Legacy process-wide diagnostics cannot affect the ABI 2 reply.
+        computer.active_frame_mut().compiler_diagnostics = "other task".encode_utf16().collect();
+        let diagnostics = bounded_utf16(&diagnostic, computer.maximum_text_code_units - 1);
+        assert!(String::from_utf16(&diagnostics).is_ok());
+        let expected_hash = [COMPILATION_STATUS_REJECTED as u16]
+            .into_iter()
+            .chain(diagnostics.iter().copied())
+            .fold(0_i32, |hash, unit| {
+                hash.wrapping_mul(31).wrapping_add(unit as i32)
+            });
+        assert_eq!(Some(ComputerValue::I32(expected_hash)), halt(&mut computer));
+        assert!(computer.filesystem.read_file_for_test(&output).is_err());
+        assert_eq!(
+            ComputerError::NoActiveCompilation,
+            computer
+                .complete_compilation_failure(request.token, "again")
+                .unwrap_err()
+        );
+    }
+
+    #[test]
+    fn compiler_v2_installs_executable_and_returns_success_without_legacy_buffer() {
+        let (mut computer, owner, _, output) =
+            compiler_computer_with_abi(b"fun main() = 42", None, true);
+        let request = next_compilation_request(&mut computer);
+        let compiled = crate::execution::fixtures::filesystem_conformance_artifact();
+        let bytes = crate::test_encode::encode_artifact(compiled.decoded()).unwrap();
+        computer
+            .complete_compilation_success(request.token, &bytes)
+            .unwrap();
+        assert_eq!(Some(ComputerValue::I32(0)), halt(&mut computer));
+        assert!(
+            computer
+                .filesystem
+                .stat(&owner, &output)
+                .unwrap()
+                .executable
+        );
+        assert_eq!(
+            bytes,
+            computer.filesystem.read_file_for_test(&output).unwrap()
+        );
+        assert!(computer.active_frame().compiler_diagnostics.is_empty());
+    }
+
+    #[test]
     fn compiler_failure_diagnostics_are_bounded_and_resume_once() {
         let (mut computer, _, _, _) = compiler_computer(b"fun main() = 42\n", None);
         let request = next_compilation_request(&mut computer);
@@ -5481,6 +5572,14 @@ mod tests {
         source_bytes: &[u8],
         existing_output: Option<&[u8]>,
     ) -> (ComputerMachine, FileCapability, VirtualPath, VirtualPath) {
+        compiler_computer_with_abi(source_bytes, existing_output, false)
+    }
+
+    pub(super) fn compiler_computer_with_abi(
+        source_bytes: &[u8],
+        existing_output: Option<&[u8]>,
+        paired: bool,
+    ) -> (ComputerMachine, FileCapability, VirtualPath, VirtualPath) {
         let limits = FileSystemLimits::testing();
         let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
         let source = path("/home/main.kt", &limits);
@@ -5492,7 +5591,12 @@ mod tests {
         if let Some(bytes) = existing_output {
             filesystem.write_file(&owner, &output, bytes, true).unwrap();
         }
-        let artifact = crate::execution::fixtures::compiler_compile_artifact(
+        let make_artifact = if paired {
+            crate::execution::fixtures::compiler_compile_v2_artifact
+        } else {
+            crate::execution::fixtures::compiler_compile_artifact
+        };
+        let artifact = make_artifact(
             &"/home/main.kt".encode_utf16().collect::<Vec<_>>(),
             &"/home/main".encode_utf16().collect::<Vec<_>>(),
         );
