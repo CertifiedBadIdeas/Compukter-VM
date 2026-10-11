@@ -539,6 +539,17 @@ impl Session {
         self.resume_for(TaskId::ROOT, request_id, response)
     }
 
+    pub(crate) fn pending_host_request_for(
+        &self,
+        task: TaskId,
+        request: RequestId,
+    ) -> Option<super::host::HostRequestView<'_>> {
+        let batch = HostRequestBatchView::new(self.pending_requests.requests(), &self.capabilities);
+        (0..batch.len())
+            .filter_map(|index| batch.get(index))
+            .find(|pending| pending.task_id() == task && pending.id() == request)
+    }
+
     pub fn resume_for(
         &mut self,
         task: TaskId,
