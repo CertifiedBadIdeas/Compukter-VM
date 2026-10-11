@@ -892,6 +892,45 @@ impl ComputerMachine {
         if !self.terminal.input_is_empty() || self.active_terminal_event.is_some() {
             return Err(CanonicalLineSubmissionError::InputBusy);
         }
+        if let Some((task, request)) = self.active_frame().pending_terminal_event {
+            let pending = self
+                .active_frame()
+                .session
+                .pending_host_request_for(task, request)
+                .ok_or(CanonicalLineSubmissionError::NoPendingRead)?;
+            if !is_raw_terminal(pending) || pending.operation() != 18 {
+                return Err(CanonicalLineSubmissionError::NoPendingRead);
+            }
+            let Some(HostValueView::I32(limit)) = pending.arguments().get(0) else {
+                return Err(CanonicalLineSubmissionError::NoPendingRead);
+            };
+            if limit <= 0 {
+                return Err(CanonicalLineSubmissionError::PartialInput);
+            }
+            let owner = InputOwner::new(self.sessions.len(), task);
+            self.standard_streams
+                .ensure_raw_owner(owner)
+                .map_err(|_| CanonicalLineSubmissionError::InputBusy)?;
+            if line.len() > limit as usize
+                || line.len() > self.profile.maximum_inbound_utf16_code_units as usize
+            {
+                return Err(CanonicalLineSubmissionError::LineTooLong);
+            }
+            if line.iter().any(|unit| *unit < 32 || *unit == 127) {
+                return Err(CanonicalLineSubmissionError::UnsupportedCodeUnit);
+            }
+            let text = String::from_utf16(line)
+                .map_err(|_| CanonicalLineSubmissionError::UnsupportedCodeUnit)?;
+            // The complete-line kind lives in the owning Guest continuation. Its text
+            // uses the existing active-event storage and checkpoint encoding.
+            self.active_session_mut()
+                .resume_internal_for(task, request, HostResponse::Success(HostValueInput::I32(3)))
+                .map_err(|_| CanonicalLineSubmissionError::Resume)?;
+            self.active_terminal_event = Some(TerminalInputEvent::Text(text.into_boxed_str()));
+            self.active_terminal_event_owner = Some(owner);
+            self.active_frame_mut().pending_terminal_event = None;
+            return Ok(());
+        }
         let (task, request) = self
             .active_frame()
             .pending_stdio_read
@@ -1505,7 +1544,7 @@ impl ComputerMachine {
                 self.terminal.clear();
                 HostValueInput::Unit
             }
-            RawTerminalOperation::AwaitEvent => {
+            RawTerminalOperation::AwaitEvent | RawTerminalOperation::AwaitSubmittedLineEvent => {
                 let Some(kind) = self.terminal_await_event_for(task)? else {
                     self.active_frame_mut().pending_terminal_event = Some((task, id));
                     return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
@@ -2522,6 +2561,7 @@ enum RawTerminalOperation {
     ErasePrevious,
     Clear,
     AwaitEvent,
+    AwaitSubmittedLineEvent,
     EventText,
     EventKey,
     EventAction,
@@ -2597,6 +2637,7 @@ fn admit_session(
     let timer_sleep_arguments = [HostValueType::I32];
     let terminal_position_arguments = [HostValueType::I32, HostValueType::I32];
     let terminal_visibility_arguments = [HostValueType::Bool];
+    let submitted_line_arguments = [HostValueType::I32];
     let terminal_write_at_arguments = [
         HostValueType::I32,
         HostValueType::I32,
@@ -2628,6 +2669,7 @@ fn admit_session(
         OperationSchema::synchronous(&[], HostValueType::I32),
         OperationSchema::synchronous(&[], HostValueType::I32),
         OperationSchema::synchronous(&[], HostValueType::I32),
+        OperationSchema::asynchronous(&submitted_line_arguments, HostValueType::I32),
     ];
     let stdio_operations = [
         OperationSchema::asynchronous(&[], HostValueType::String),
@@ -2720,7 +2762,7 @@ fn admit_session(
         TERMINAL_NAMESPACE,
         TERMINAL_NAME,
         RAW_TERMINAL_ABI_MAJOR,
-        1,
+        2,
         &raw_terminal_operations,
     ));
     bindings.push(CapabilityBinding::new(
@@ -3295,6 +3337,13 @@ fn copy_raw_terminal_request(
         }
         15 if !request.asynchronous() && request.arguments().is_empty() => {
             RawTerminalOperation::CursorY
+        }
+        18 if request.asynchronous() && request.arguments().len() == 1 => {
+            let limit = integer(0)?;
+            if limit < 0 {
+                return Err(ComputerError::InvalidTerminalRequest);
+            }
+            RawTerminalOperation::AwaitSubmittedLineEvent
         }
         _ => return Err(ComputerError::InvalidTerminalRequest),
     };
@@ -4333,6 +4382,82 @@ mod tests {
         assert_eq!(
             '!' as u32,
             computer.terminal().cell(2, 1).unwrap().code_point()
+        );
+    }
+
+    #[test]
+    fn submitted_line_event_is_atomic_bounded_and_opt_in() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::submitted_line_terminal_artifact(8),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        advance_to_canonical_read(&mut computer);
+        for (line, error) in [
+            (
+                vec![b'x' as u16; 9],
+                CanonicalLineSubmissionError::LineTooLong,
+            ),
+            (vec![10], CanonicalLineSubmissionError::UnsupportedCodeUnit),
+            (
+                vec![0xd800],
+                CanonicalLineSubmissionError::UnsupportedCodeUnit,
+            ),
+        ] {
+            let revision = computer.terminal().revision();
+            assert_eq!(Err(error), computer.submit_canonical_line(&line));
+            assert_eq!(revision, computer.terminal().revision());
+            assert!(computer.active_frame().pending_terminal_event.is_some());
+        }
+        let line = "run 😀".encode_utf16().collect::<Vec<_>>();
+        assert_eq!(Ok(()), computer.submit_canonical_line(&line));
+        assert_eq!("run 😀", computer.terminal_event_text().unwrap());
+        assert_eq!(
+            Err(CanonicalLineSubmissionError::InputBusy),
+            computer.submit_canonical_line(&line)
+        );
+        assert_eq!(Some(ComputerValue::I32(3)), halt(&mut computer));
+
+        let mut draft = ComputerMachine::start(
+            crate::execution::fixtures::submitted_line_terminal_artifact(0),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        advance_to_canonical_read(&mut draft);
+        assert_eq!(
+            Err(CanonicalLineSubmissionError::PartialInput),
+            draft.submit_canonical_line(&line)
+        );
+
+        let mut raw = ComputerMachine::start(
+            crate::execution::fixtures::raw_terminal_conformance_artifact(&[], 1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        advance_to_canonical_read(&mut raw);
+        assert_eq!(
+            Err(CanonicalLineSubmissionError::NoPendingRead),
+            raw.submit_canonical_line(&line)
+        );
+
+        let mut queued = ComputerMachine::start(
+            crate::execution::fixtures::submitted_line_terminal_artifact(8),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        advance_to_canonical_read(&mut queued);
+        queued.terminal_mut().push_text("draft").unwrap();
+        assert_eq!(
+            Err(CanonicalLineSubmissionError::InputBusy),
+            queued.submit_canonical_line(&line)
         );
     }
 
