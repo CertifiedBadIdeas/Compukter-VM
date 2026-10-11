@@ -3975,6 +3975,18 @@ pub(crate) fn raw_terminal_conformance_artifact(
     output: &[u16],
     maximum_host_requests: u32,
 ) -> VerifiedArtifact {
+    raw_terminal_conformance_artifact_configured(output, maximum_host_requests, None)
+}
+
+pub(crate) fn submitted_line_terminal_artifact(limit: i32) -> VerifiedArtifact {
+    raw_terminal_conformance_artifact_configured(&[], 1, Some(limit))
+}
+
+fn raw_terminal_conformance_artifact_configured(
+    output: &[u16],
+    maximum_host_requests: u32,
+    submitted_line_limit: Option<i32>,
+) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
         flags: 0,
@@ -3990,77 +4002,119 @@ pub(crate) fn raw_terminal_conformance_artifact(
             primitive(1),
             primitive(1),
         ],
-        Vec::new(),
+        submitted_line_limit
+            .into_iter()
+            .map(Constant::I32)
+            .collect(),
         output,
-        vec![
+        if submitted_line_limit.is_some() {
             vec![
-                Instruction::Const {
-                    dst: 0,
-                    constant: 0,
-                },
-                Instruction::CapabilityCallSync {
-                    dst: u16::MAX,
-                    capability: 0,
-                    operation: 0,
-                    args: vec![0].into_boxed_slice(),
-                },
-                Instruction::CapabilityCallAsync {
-                    dst: 1,
-                    capability: 0,
-                    operation: 3,
-                    args: Box::new([]),
-                    resume_block: 1,
-                },
-            ],
+                vec![
+                    Instruction::Const {
+                        dst: 3,
+                        constant: 0,
+                    },
+                    Instruction::CapabilityCallAsync {
+                        dst: 1,
+                        capability: 0,
+                        operation: 18,
+                        args: Box::new([3]),
+                        resume_block: 1,
+                    },
+                ],
+                vec![
+                    Instruction::CapabilityCallSync {
+                        dst: 2,
+                        capability: 0,
+                        operation: 4,
+                        args: Box::new([]),
+                    },
+                    Instruction::CapabilityCallSync {
+                        dst: u16::MAX,
+                        capability: 0,
+                        operation: 8,
+                        args: Box::new([]),
+                    },
+                    Instruction::CapabilityCallSync {
+                        dst: u16::MAX,
+                        capability: 0,
+                        operation: 0,
+                        args: Box::new([2]),
+                    },
+                    Instruction::Return { value: 1 },
+                ],
+            ]
+        } else {
             vec![
-                Instruction::CapabilityCallSync {
-                    dst: 2,
-                    capability: 0,
-                    operation: 4,
-                    args: Box::new([]),
-                },
-                Instruction::CapabilityCallSync {
-                    dst: u16::MAX,
-                    capability: 0,
-                    operation: 8,
-                    args: Box::new([]),
-                },
-                Instruction::CapabilityCallAsync {
-                    dst: 1,
-                    capability: 0,
-                    operation: 3,
-                    args: Box::new([]),
-                    resume_block: 2,
-                },
-            ],
-            vec![
-                Instruction::CapabilityCallSync {
-                    dst: 3,
-                    capability: 0,
-                    operation: 5,
-                    args: Box::new([]),
-                },
-                Instruction::CapabilityCallSync {
-                    dst: 4,
-                    capability: 0,
-                    operation: 6,
-                    args: Box::new([]),
-                },
-                Instruction::CapabilityCallSync {
-                    dst: 5,
-                    capability: 0,
-                    operation: 7,
-                    args: Box::new([]),
-                },
-                Instruction::CapabilityCallSync {
-                    dst: u16::MAX,
-                    capability: 0,
-                    operation: 8,
-                    args: Box::new([]),
-                },
-                Instruction::Return { value: 3 },
-            ],
-        ],
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::CapabilityCallSync {
+                        dst: u16::MAX,
+                        capability: 0,
+                        operation: 0,
+                        args: vec![0].into_boxed_slice(),
+                    },
+                    Instruction::CapabilityCallAsync {
+                        dst: 1,
+                        capability: 0,
+                        operation: 3,
+                        args: Box::new([]),
+                        resume_block: 1,
+                    },
+                ],
+                vec![
+                    Instruction::CapabilityCallSync {
+                        dst: 2,
+                        capability: 0,
+                        operation: 4,
+                        args: Box::new([]),
+                    },
+                    Instruction::CapabilityCallSync {
+                        dst: u16::MAX,
+                        capability: 0,
+                        operation: 8,
+                        args: Box::new([]),
+                    },
+                    Instruction::CapabilityCallAsync {
+                        dst: 1,
+                        capability: 0,
+                        operation: 3,
+                        args: Box::new([]),
+                        resume_block: 2,
+                    },
+                ],
+                vec![
+                    Instruction::CapabilityCallSync {
+                        dst: 3,
+                        capability: 0,
+                        operation: 5,
+                        args: Box::new([]),
+                    },
+                    Instruction::CapabilityCallSync {
+                        dst: 4,
+                        capability: 0,
+                        operation: 6,
+                        args: Box::new([]),
+                    },
+                    Instruction::CapabilityCallSync {
+                        dst: 5,
+                        capability: 0,
+                        operation: 7,
+                        args: Box::new([]),
+                    },
+                    Instruction::CapabilityCallSync {
+                        dst: u16::MAX,
+                        capability: 0,
+                        operation: 8,
+                        args: Box::new([]),
+                    },
+                    Instruction::Return { value: 3 },
+                ],
+            ]
+        },
         |artifact| {
             let mut bytes = artifact.bytes.to_vec();
             let namespace_start = bytes.len();
@@ -4083,9 +4137,13 @@ pub(crate) fn raw_terminal_conformance_artifact(
                 namespace: 0,
                 name: 1,
                 abi_major: 2,
-                minimum_abi_minor: 0,
+                minimum_abi_minor: if submitted_line_limit.is_some() { 2 } else { 0 },
                 flags: 1,
-                operation_count: 9,
+                operation_count: if submitted_line_limit.is_some() {
+                    19
+                } else {
+                    9
+                },
             });
             artifact.manifest.required_capabilities = 1;
             artifact.manifest.maximum_host_requests = maximum_host_requests;

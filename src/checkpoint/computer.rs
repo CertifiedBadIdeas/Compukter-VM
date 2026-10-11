@@ -460,11 +460,19 @@ impl ComputerMachine {
                 (frame.pending_stdio_read, STDIO_NAME, STDIO_ABI_MAJOR, 0),
             ] {
                 if let Some((task, request)) = pending {
-                    if frame
+                    let actual = frame
                         .session
-                        .checkpoint_host_request_operation(task, request)
-                        != Some((TERMINAL_NAMESPACE, name, major, operation))
-                    {
+                        .checkpoint_host_request_operation(task, request);
+                    let expected = Some((TERMINAL_NAMESPACE, name, major, operation));
+                    let submitted_line = name == TERMINAL_NAME
+                        && actual
+                            == Some((
+                                TERMINAL_NAMESPACE,
+                                TERMINAL_NAME,
+                                RAW_TERMINAL_ABI_MAJOR,
+                                18,
+                            ));
+                    if actual != expected && !submitted_line {
                         return Err(invalid());
                     }
                 }
@@ -873,6 +881,46 @@ mod tests {
             original.advance(64, 1, 64).unwrap()
         );
         assert_same_state(&original, &restored);
+    }
+
+    #[test]
+    fn checkpoint_preserves_submitted_line_wait_and_owned_event() {
+        let mut original = ComputerMachine::start(
+            fixtures::submitted_line_terminal_artifact(32),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        for _ in 0..128 {
+            if original.advance(64, 64, u32::MAX).unwrap()
+                == ComputerAdvanceOutcome::WaitingForTerminalEvent
+            {
+                break;
+            }
+        }
+        assert!(original.active_frame().pending_terminal_event.is_some());
+        let mut restored = round_trip(&original);
+        let line = "run 😀".encode_utf16().collect::<Vec<_>>();
+        for computer in [&mut original, &mut restored] {
+            computer.submit_canonical_line(&line).unwrap();
+        }
+        assert_same_state(&original, &restored);
+        // Checkpoint after admission and again at every Guest decoding/finish boundary.
+        restored = round_trip(&restored);
+        for _ in 0..128 {
+            let expected = original.advance_with_retirement_limit(64, 1, 1, 1).unwrap();
+            assert_eq!(
+                expected,
+                restored.advance_with_retirement_limit(64, 1, 1, 1).unwrap()
+            );
+            assert_same_state(&original, &restored);
+            restored = round_trip(&restored);
+            if expected == ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(3))) {
+                return;
+            }
+        }
+        panic!("submitted line did not complete");
     }
 
     #[test]
