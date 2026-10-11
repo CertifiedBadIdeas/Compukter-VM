@@ -45,6 +45,11 @@ const STDIO_NAME: &str = "stdio";
 const STDIO_ABI_MAJOR: u16 = 1;
 const FILESYSTEM_NAME: &str = "filesystem";
 const FILESYSTEM_ABI_MAJOR: u16 = 1;
+const FILESYSTEM_V2_ABI_MAJOR: u16 = 2;
+
+#[path = "computer_filesystem.rs"]
+mod guest_filesystem;
+use guest_filesystem::{FileSystemV2Operation, FileTransfers};
 const PROCESS_NAME: &str = "process";
 const PROCESS_ABI_MAJOR: u16 = 2;
 const PROCESS_ABI_MINOR: u16 = 0;
@@ -360,6 +365,7 @@ struct ProcessFrame {
     pending_terminal_event: Option<(TaskId, RequestId)>,
     pending_stdio_read: Option<(TaskId, RequestId)>,
     pending_process: Option<(TaskId, RequestId)>,
+    file_transfers: FileTransfers,
 }
 
 #[derive(Debug)]
@@ -515,6 +521,7 @@ impl ComputerMachine {
                 pending_terminal_event: None,
                 pending_stdio_read: None,
                 pending_process: None,
+                file_transfers: FileTransfers::default(),
             }],
             terminal: TerminalDevice::default(),
             standard_streams: StandardStreams::new(
@@ -615,6 +622,11 @@ impl ComputerMachine {
             );
         }
         for frame in &self.sessions {
+            add_counter(
+                &mut snapshot.mutable_execution_resident_bytes,
+                frame.file_transfers.resident_bytes(),
+                &mut snapshot.counters_saturated,
+            );
             let resource = frame.session.resource_snapshot();
             add_counter(
                 &mut snapshot.fixed_guest_units,
@@ -1136,7 +1148,11 @@ impl ComputerMachine {
                             } else if is_stdio(request) {
                                 Some(copy_stdio_request(request)?)
                             } else if is_filesystem(request) {
-                                Some(copy_filesystem_request(request)?)
+                                Some(if request.abi_major() == FILESYSTEM_V2_ABI_MAJOR {
+                                    guest_filesystem::copy_request(request)?
+                                } else {
+                                    copy_filesystem_request(request)?
+                                })
                             } else if is_process(request) {
                                 Some(copy_process_request(request)?)
                             } else if is_compiler(request) {
@@ -1170,6 +1186,7 @@ impl ComputerMachine {
                             self.process_failure(ProcessFailureReason::LimitExceeded, &diagnostic),
                         );
                     }
+                    self.active_frame_mut().file_transfers.release_all();
                     return Ok(ComputerAdvanceOutcome::AllocationExhausted(value));
                 }
                 AdvanceOutcome::QuotaExhausted(value) => {
@@ -1179,6 +1196,7 @@ impl ComputerMachine {
                             "child execution quota exceeded",
                         ));
                     }
+                    self.active_frame_mut().file_transfers.release_all();
                     return Ok(ComputerAdvanceOutcome::QuotaExhausted(value));
                 }
                 AdvanceOutcome::Halted(value) => {
@@ -1186,6 +1204,7 @@ impl ComputerMachine {
                     if self.sessions.len() > 1 {
                         return self.finish_child(ProcessCompletion::Exited(0));
                     }
+                    self.active_frame_mut().file_transfers.release_all();
                     return Ok(ComputerAdvanceOutcome::Halted(value));
                 }
                 AdvanceOutcome::Crashed(value) => {
@@ -1195,6 +1214,7 @@ impl ComputerMachine {
                             &format!("guest trapped: {value:?}\n{}", self.failure_stacktrace()),
                         ));
                     }
+                    self.active_frame_mut().file_transfers.release_all();
                     return Ok(ComputerAdvanceOutcome::Crashed(value));
                 }
                 AdvanceOutcome::UncaughtException => {
@@ -1214,6 +1234,7 @@ impl ComputerMachine {
                             self.process_failure(ProcessFailureReason::Trapped, &diagnostic),
                         );
                     }
+                    self.active_frame_mut().file_transfers.release_all();
                     return Ok(ComputerAdvanceOutcome::UncaughtException(diagnostic));
                 }
                 AdvanceOutcome::Faulted(value) => {
@@ -1226,6 +1247,7 @@ impl ComputerMachine {
                             ),
                         ));
                     }
+                    self.active_frame_mut().file_transfers.release_all();
                     return Ok(ComputerAdvanceOutcome::Faulted(value));
                 }
                 AdvanceOutcome::HostFailed(value) => {
@@ -1236,6 +1258,7 @@ impl ComputerMachine {
                             &format!("host operation failed: {}", value.detail()),
                         ));
                     }
+                    self.active_frame_mut().file_transfers.release_all();
                     return Ok(ComputerAdvanceOutcome::HostFailed(value));
                 }
             }
@@ -1272,6 +1295,11 @@ impl ComputerMachine {
                 id,
                 operation,
             } => self.handle_stdio_request(task, id, operation),
+            TerminalRequest::FileSystemV2 {
+                task,
+                id,
+                operation,
+            } => self.handle_filesystem_v2_request(task, id, operation),
             TerminalRequest::FileSystem {
                 task,
                 id,
@@ -1876,6 +1904,7 @@ impl ComputerMachine {
                         if self.sessions.len() > 1 {
                             self.finish_child(ProcessCompletion::Exited(code))
                         } else {
+                            self.active_frame_mut().file_transfers.release_all();
                             Ok(ComputerAdvanceOutcome::Halted(None))
                         }
                     } else if self.sessions.len() > 1 {
@@ -1884,6 +1913,7 @@ impl ComputerMachine {
                             "exit code must be in 0..255",
                         ))
                     } else {
+                        self.active_frame_mut().file_transfers.release_all();
                         Ok(ComputerAdvanceOutcome::Crashed(GuestTrap::InvalidExitCode))
                     }
                 }
@@ -2040,6 +2070,7 @@ impl ComputerMachine {
             pending_terminal_event: None,
             pending_stdio_read: None,
             pending_process: None,
+            file_transfers: FileTransfers::default(),
         });
         Ok(ComputerAdvanceOutcome::ProcessEntered(scope_id))
     }
@@ -2406,6 +2437,11 @@ enum TerminalRequest {
         id: RequestId,
         operation: StdioOperation,
     },
+    FileSystemV2 {
+        task: TaskId,
+        id: RequestId,
+        operation: FileSystemV2Operation,
+    },
     FileSystem {
         task: TaskId,
         id: RequestId,
@@ -2620,7 +2656,8 @@ fn admit_session(
                 .collect::<Box<[_]>>()
         })
         .collect::<Box<[_]>>();
-    let mut bindings = Vec::with_capacity(addon_bindings.len() + 8);
+    let filesystem_v2_operations = guest_filesystem::operations();
+    let mut bindings = Vec::with_capacity(addon_bindings.len() + 9);
     for (index, binding) in addon_bindings.iter().enumerate() {
         bindings.push(CapabilityBinding::new(
             binding.namespace(),
@@ -2650,6 +2687,13 @@ fn admit_session(
         FILESYSTEM_ABI_MAJOR,
         0,
         &filesystem_operations,
+    ));
+    bindings.push(CapabilityBinding::new(
+        TERMINAL_NAMESPACE,
+        FILESYSTEM_NAME,
+        FILESYSTEM_V2_ABI_MAJOR,
+        0,
+        &filesystem_v2_operations,
     ));
     bindings.push(CapabilityBinding::new(
         TERMINAL_NAMESPACE,
@@ -2704,7 +2748,10 @@ fn is_stdio(request: HostRequestView<'_>) -> bool {
 fn is_filesystem(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == FILESYSTEM_NAME
-        && request.abi_major() == FILESYSTEM_ABI_MAJOR
+        && matches!(
+            request.abi_major(),
+            FILESYSTEM_ABI_MAJOR | FILESYSTEM_V2_ABI_MAJOR
+        )
 }
 
 fn is_process(request: HostRequestView<'_>) -> bool {

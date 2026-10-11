@@ -311,6 +311,9 @@ impl ComputerFileSystem {
         path: &VirtualPath,
     ) -> Result<NodeMetadata, FileSystemError> {
         require(capability, path, FileRights::INSPECT)?;
+        if path.components().len() == 0 {
+            return Ok(Node::directory(0).metadata);
+        }
         let (mount, components) = split_mount(path)?;
         if components.is_empty() {
             return Ok(Node::directory(0).metadata);
@@ -326,6 +329,9 @@ impl ComputerFileSystem {
         path: &VirtualPath,
     ) -> Result<Vec<Box<str>>, FileSystemError> {
         require(capability, path, FileRights::LIST)?;
+        if path.components().len() == 0 {
+            return Ok(vec![Box::from("home"), Box::from("rom")]);
+        }
         let (mount, components) = split_mount(path)?;
         let directory = if components.is_empty() {
             self.directory(mount)
@@ -336,6 +342,33 @@ impl ComputerFileSystem {
             }
         };
         Ok(directory.keys().cloned().collect())
+    }
+
+    /// Pins the exact immutable contents observed at open time. Namespace
+    /// mutations cannot redirect a reader to another file at the same path.
+    pub(crate) fn read_snapshot(
+        &self,
+        capability: &FileCapability,
+        path: &VirtualPath,
+    ) -> Result<Arc<[u8]>, FileSystemError> {
+        require(capability, path, FileRights::READ)?;
+        if path.components().len() == 0 {
+            return Err(FileSystemError::IsDirectory);
+        }
+        let (mount, components) = split_mount(path)?;
+        if components.is_empty() {
+            return Err(FileSystemError::IsDirectory);
+        }
+        let node = find_node(self.directory(mount), components)?;
+        let object = node.object_id().ok_or(FileSystemError::IsDirectory)?;
+        Ok(Arc::clone(
+            &self
+                .objects
+                .0
+                .get(&object)
+                .expect("admitted file object")
+                .bytes,
+        ))
     }
 
     pub fn read_executable(
@@ -478,6 +511,16 @@ impl ComputerFileSystem {
         capability: &FileCapability,
         path: &VirtualPath,
     ) -> Result<ExecutableRevision, FileSystemError> {
+        self.replacement_revision(capability, path)
+    }
+
+    /// Captures permissions and a destination precondition without publishing
+    /// an empty file or modifying its executable flag.
+    pub(crate) fn replacement_revision(
+        &self,
+        capability: &FileCapability,
+        path: &VirtualPath,
+    ) -> Result<ExecutableRevision, FileSystemError> {
         let (mount, components) = writable_path(path)?;
         let (name, parent_components) = split_name(components)?;
         let parent = find_directory(self.directory(mount), parent_components)?;
@@ -504,11 +547,22 @@ impl ComputerFileSystem {
         bytes: &[u8],
         expected: ExecutableRevision,
     ) -> Result<(), FileSystemError> {
-        let actual = self.executable_install_revision(capability, path)?;
+        self.replace_file_if_revision(capability, path, bytes, expected, true)
+    }
+
+    pub(crate) fn replace_file_if_revision(
+        &mut self,
+        capability: &FileCapability,
+        path: &VirtualPath,
+        bytes: &[u8],
+        expected: ExecutableRevision,
+        executable: bool,
+    ) -> Result<(), FileSystemError> {
+        let actual = self.replacement_revision(capability, path)?;
         if actual != expected {
             return Err(FileSystemError::Busy);
         }
-        self.write_file(capability, path, bytes, true)
+        self.write_file(capability, path, bytes, executable)
     }
 
     pub(crate) fn install_executable_from_rom(
@@ -1020,6 +1074,99 @@ mod tests {
             Err(FileSystemError::Busy),
         );
         assert_eq!(before, filesystem.snapshot_for_test());
+    }
+
+    #[test]
+    fn virtual_root_exposes_mounts_only_to_authorized_guests() {
+        let limits = FileSystemLimits::testing();
+        let filesystem = ComputerFileSystem::with_limits(limits);
+        let root = VirtualPath::root();
+        let owner = FileCapability::new(root.clone(), FileRights::OWNER);
+        let home = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        assert_eq!(
+            NodeKind::Directory,
+            filesystem.stat(&owner, &root).unwrap().kind
+        );
+        assert_eq!(
+            vec![Box::<str>::from("home"), Box::<str>::from("rom")],
+            filesystem.list(&owner, &root).unwrap()
+        );
+        assert_eq!(
+            Err(FileSystemError::IsDirectory),
+            filesystem.read_snapshot(&owner, &root)
+        );
+        assert_eq!(
+            Err(FileSystemError::PermissionDenied),
+            filesystem.list(&home, &root)
+        );
+    }
+
+    #[test]
+    fn read_snapshot_keeps_bytes_across_replacement_rename_and_path_reuse() {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let file = path("/home/file", &limits);
+        let moved = path("/home/moved", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&owner, &file, b"original", false)
+            .unwrap();
+        let snapshot = filesystem.read_snapshot(&owner, &file).unwrap();
+        filesystem
+            .write_file(&owner, &file, b"replacement", false)
+            .unwrap();
+        filesystem.rename(&owner, &file, &moved, false).unwrap();
+        filesystem
+            .write_file(&owner, &file, b"recreated", false)
+            .unwrap();
+        filesystem.remove(&owner, &moved).unwrap();
+        assert_eq!(b"original", snapshot.as_ref());
+        assert_eq!(
+            b"recreated",
+            filesystem.read_snapshot(&owner, &file).unwrap().as_ref()
+        );
+        let denied = FileCapability::new(path("/home", filesystem.limits()), FileRights::INSPECT);
+        assert_eq!(
+            Err(FileSystemError::PermissionDenied),
+            filesystem.read_snapshot(&denied, &file)
+        );
+        assert_eq!(
+            Err(FileSystemError::IsDirectory),
+            filesystem.read_snapshot(&owner, &path("/home", filesystem.limits()))
+        );
+    }
+
+    #[test]
+    fn conditional_replacement_rejects_recreated_destination_and_preserves_executable_until_commit()
+    {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let file = path("/home/file", &limits);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&owner, &file, b"original", true)
+            .unwrap();
+        let revision = filesystem.replacement_revision(&owner, &file).unwrap();
+        assert!(filesystem.stat(&owner, &file).unwrap().executable);
+        filesystem.remove(&owner, &file).unwrap();
+        filesystem
+            .write_file(&owner, &file, b"recreated", true)
+            .unwrap();
+        let before = filesystem.snapshot_for_test();
+        assert_eq!(
+            Err(FileSystemError::Busy),
+            filesystem.replace_file_if_revision(&owner, &file, b"draft", revision, false)
+        );
+        assert_eq!(before, filesystem.snapshot_for_test());
+        let current = filesystem.replacement_revision(&owner, &file).unwrap();
+        filesystem
+            .replace_file_if_revision(&owner, &file, b"draft", current, false)
+            .unwrap();
+        assert_eq!(
+            b"draft",
+            filesystem.read_snapshot(&owner, &file).unwrap().as_ref()
+        );
+        assert!(!filesystem.stat(&owner, &file).unwrap().executable);
     }
 }
 
