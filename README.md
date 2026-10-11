@@ -236,7 +236,7 @@ commit.
 The VM must remain independent of Minecraft, NeoForge, Kotlin compiler
 internals, and files outside its repository checkout.
 
-Computer terminal input reserves Ctrl+T (key 84, CONTROL) to forcibly terminate the foreground command tree.
+Computer terminal input reserves Ctrl+C (key 67, CONTROL) to forcibly terminate the foreground command tree.
 Termination runs at the next advance, emits ordered ProcessExited events and returns status 130 to its parent.
-The shell/root is preserved when idle; repeat events do not terminate another command. Existing terminal-key
+An idle shell receives Ctrl+C to cancel its input; the shell/root remains live; repeat events do not terminate another command. Existing terminal-key
 FFI/JNI calls and C ABI layouts are unchanged.

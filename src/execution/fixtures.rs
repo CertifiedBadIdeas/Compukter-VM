@@ -4176,6 +4176,14 @@ pub(crate) fn stdio_conformance_artifact(stderr: &[u16]) -> VerifiedArtifact {
 }
 
 pub(crate) fn positional_terminal_artifact() -> VerifiedArtifact {
+    positional_terminal_with_observation(None)
+}
+
+pub(crate) fn positional_terminal_observation_artifact(operation: u32) -> VerifiedArtifact {
+    positional_terminal_with_observation(Some(operation))
+}
+
+fn positional_terminal_with_observation(observation: Option<u32>) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
         flags: 0,
@@ -4208,7 +4216,11 @@ pub(crate) fn positional_terminal_artifact() -> VerifiedArtifact {
     let fill_id = constant_id(&Constant::Char('Q' as u16));
     let string_id = constants.len() as u32;
     literal_string_program_blocks_configured(
-        primitive(0),
+        if observation.is_some() {
+            primitive(1)
+        } else {
+            primitive(0)
+        },
         vec![
             string,
             primitive(1),
@@ -4222,75 +4234,88 @@ pub(crate) fn positional_terminal_artifact() -> VerifiedArtifact {
         ],
         constants,
         &[0xd83d, 0xde00, 'Z' as u16],
-        vec![vec![
-            Instruction::Const {
-                dst: 0,
-                constant: string_id,
-            },
-            Instruction::Const {
-                dst: 1,
-                constant: x_id,
-            },
-            Instruction::Const {
-                dst: 2,
-                constant: y_id,
-            },
-            Instruction::Const {
-                dst: 3,
-                constant: hidden_id,
-            },
-            Instruction::Const {
-                dst: 4,
-                constant: foreground_id,
-            },
-            Instruction::Const {
-                dst: 5,
-                constant: background_id,
-            },
-            Instruction::Const {
-                dst: 6,
-                constant: one_id,
-            },
-            Instruction::Const {
-                dst: 7,
-                constant: two_id,
-            },
-            Instruction::Const {
-                dst: 8,
-                constant: fill_id,
-            },
-            Instruction::CapabilityCallSync {
-                dst: u16::MAX,
-                capability: 0,
-                operation: 9,
-                args: Box::new([1, 2]),
-            },
-            Instruction::CapabilityCallSync {
-                dst: u16::MAX,
-                capability: 0,
-                operation: 10,
-                args: Box::new([3]),
-            },
-            Instruction::CapabilityCallSync {
-                dst: u16::MAX,
-                capability: 0,
-                operation: 11,
-                args: Box::new([4, 5]),
-            },
-            Instruction::CapabilityCallSync {
-                dst: u16::MAX,
-                capability: 0,
-                operation: 12,
-                args: Box::new([1, 2, 0]),
-            },
-            Instruction::CapabilityCallSync {
-                dst: u16::MAX,
-                capability: 0,
-                operation: 13,
-                args: Box::new([6, 7, 7, 7, 8]),
-            },
-            Instruction::Return { value: u16::MAX },
-        ]],
+        vec![{
+            let mut instructions = vec![
+                Instruction::Const {
+                    dst: 0,
+                    constant: string_id,
+                },
+                Instruction::Const {
+                    dst: 1,
+                    constant: x_id,
+                },
+                Instruction::Const {
+                    dst: 2,
+                    constant: y_id,
+                },
+                Instruction::Const {
+                    dst: 3,
+                    constant: hidden_id,
+                },
+                Instruction::Const {
+                    dst: 4,
+                    constant: foreground_id,
+                },
+                Instruction::Const {
+                    dst: 5,
+                    constant: background_id,
+                },
+                Instruction::Const {
+                    dst: 6,
+                    constant: one_id,
+                },
+                Instruction::Const {
+                    dst: 7,
+                    constant: two_id,
+                },
+                Instruction::Const {
+                    dst: 8,
+                    constant: fill_id,
+                },
+                Instruction::CapabilityCallSync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 9,
+                    args: Box::new([1, 2]),
+                },
+                Instruction::CapabilityCallSync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 10,
+                    args: Box::new([3]),
+                },
+                Instruction::CapabilityCallSync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 11,
+                    args: Box::new([4, 5]),
+                },
+                Instruction::CapabilityCallSync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 12,
+                    args: Box::new([1, 2, 0]),
+                },
+                Instruction::CapabilityCallSync {
+                    dst: u16::MAX,
+                    capability: 0,
+                    operation: 13,
+                    args: Box::new([6, 7, 7, 7, 8]),
+                },
+            ];
+            if let Some(operation) = observation {
+                instructions.push(Instruction::CapabilityCallSync {
+                    dst: 1,
+                    capability: 0,
+                    operation,
+                    args: Box::new([]),
+                });
+            }
+            instructions.push(Instruction::Return {
+                value: if observation.is_some() { 1 } else { u16::MAX },
+            });
+            instructions
+        }],
         |artifact| {
             let mut bytes = artifact.bytes.to_vec();
             let namespace_start = bytes.len();
@@ -4313,12 +4338,12 @@ pub(crate) fn positional_terminal_artifact() -> VerifiedArtifact {
                 namespace: 0,
                 name: 1,
                 abi_major: 2,
-                minimum_abi_minor: 0,
+                minimum_abi_minor: if observation.is_some() { 1 } else { 0 },
                 flags: 1,
-                operation_count: 14,
+                operation_count: if observation.is_some() { 18 } else { 14 },
             });
             artifact.manifest.required_capabilities = 1;
-            artifact.manifest.maximum_host_requests = 5;
+            artifact.manifest.maximum_host_requests = if observation.is_some() { 6 } else { 5 };
         },
     )
 }

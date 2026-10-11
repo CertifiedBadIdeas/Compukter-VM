@@ -910,13 +910,13 @@ impl ComputerMachine {
             .map_err(|_| CanonicalLineSubmissionError::Resume)
     }
 
-    /// Ctrl+T is a host control, independent of Guest input polling and input queue capacity.
+    /// Ctrl+C is a host control, independent of Guest input polling and input queue capacity.
     /// Only a PRESS starts termination; REPEAT is consumed without stopping another command.
     pub fn submit_terminal_key(
         &mut self,
         event: TerminalKeyEvent,
     ) -> Result<(), TerminalInputError> {
-        if event.key() == TerminalKey::T
+        if event.key() == TerminalKey::C
             && event.modifiers().bits() & TerminalModifiers::CONTROL != 0
         {
             if event.action() == TerminalKeyAction::Press && self.pending_termination.is_none() {
@@ -933,7 +933,10 @@ impl ComputerMachine {
                     while self.terminal.poll_input().is_some() {}
                 }
             }
-            return Ok(());
+            if self.pending_termination.is_some() || event.action() != TerminalKeyAction::Press {
+                return Ok(());
+            }
+            // At an idle prompt Ctrl+C belongs to the Guest shell editor.
         }
         self.terminal.push_key(event)
     }
@@ -1533,6 +1536,18 @@ impl ComputerMachine {
             RawTerminalOperation::FinishEvent => {
                 self.terminal_finish_event_for(task)?;
                 HostValueInput::Unit
+            }
+            RawTerminalOperation::Width => {
+                HostValueInput::I32(i32::from(self.terminal.dimensions().0))
+            }
+            RawTerminalOperation::Height => {
+                HostValueInput::I32(i32::from(self.terminal.dimensions().1))
+            }
+            RawTerminalOperation::CursorX => {
+                HostValueInput::I32(i32::from(self.terminal.cursor_position().x()))
+            }
+            RawTerminalOperation::CursorY => {
+                HostValueInput::I32(i32::from(self.terminal.cursor_position().y()))
             }
             RawTerminalOperation::SetCursor { x, y } => {
                 let position = terminal_position(x, y)?;
@@ -2517,6 +2532,10 @@ enum RawTerminalOperation {
         y: i32,
     },
     SetCursorVisible(bool),
+    CursorX,
+    CursorY,
+    Width,
+    Height,
     SetColors {
         foreground: i32,
         background: i32,
@@ -2605,6 +2624,10 @@ fn admit_session(
         OperationSchema::synchronous(&terminal_position_arguments, HostValueType::Unit),
         OperationSchema::synchronous(&terminal_write_at_arguments, HostValueType::Unit),
         OperationSchema::synchronous(&terminal_fill_arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&[], HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::I32),
+        OperationSchema::synchronous(&[], HostValueType::I32),
     ];
     let stdio_operations = [
         OperationSchema::asynchronous(&[], HostValueType::String),
@@ -2697,7 +2720,7 @@ fn admit_session(
         TERMINAL_NAMESPACE,
         TERMINAL_NAME,
         RAW_TERMINAL_ABI_MAJOR,
-        0,
+        1,
         &raw_terminal_operations,
     ));
     bindings.push(CapabilityBinding::new(
@@ -3260,6 +3283,18 @@ fn copy_raw_terminal_request(
                 height: integer(3)?,
                 character,
             }
+        }
+        14 if !request.asynchronous() && request.arguments().is_empty() => {
+            RawTerminalOperation::CursorX
+        }
+        16 if !request.asynchronous() && request.arguments().is_empty() => {
+            RawTerminalOperation::Width
+        }
+        17 if !request.asynchronous() && request.arguments().is_empty() => {
+            RawTerminalOperation::Height
+        }
+        15 if !request.asynchronous() && request.arguments().is_empty() => {
+            RawTerminalOperation::CursorY
         }
         _ => return Err(ComputerError::InvalidTerminalRequest),
     };
@@ -4479,6 +4514,29 @@ mod tests {
     }
 
     #[test]
+    fn terminal_observations_read_authoritative_geometry_without_mutating_it() {
+        for (operation, expected) in [(14, 50), (15, 6), (16, 51), (17, 19)] {
+            let artifact =
+                crate::execution::fixtures::positional_terminal_observation_artifact(operation);
+            let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+            loop {
+                match computer.advance(64, 64, u32::MAX).unwrap() {
+                    ComputerAdvanceOutcome::SliceExhausted => {}
+                    ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(value))) => {
+                        assert_eq!(expected, value);
+                        break;
+                    }
+                    other => panic!("unexpected observation outcome: {other:?}"),
+                }
+            }
+            assert_eq!(
+                TerminalPosition::new(50, 6).unwrap(),
+                computer.terminal().cursor_position()
+            );
+        }
+    }
+
+    #[test]
     fn positional_terminal_capability_mutates_one_authoritative_grid() {
         let artifact = crate::execution::fixtures::positional_terminal_artifact();
         let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
@@ -5694,14 +5752,14 @@ mod tests {
 
     fn terminate_key(action: TerminalKeyAction) -> TerminalKeyEvent {
         TerminalKeyEvent::new(
-            TerminalKey::T,
+            TerminalKey::C,
             action,
             TerminalModifiers::new(TerminalModifiers::CONTROL).unwrap(),
         )
     }
 
     #[test]
-    fn ctrl_t_terminates_a_busy_child_without_guest_input_and_preserves_files() {
+    fn ctrl_c_terminates_a_busy_child_without_guest_input_and_preserves_files() {
         let mut computer = termination_fixture(crate::execution::fixtures::empty_loop_artifact(1));
         for _ in 0..3 {
             assert_eq!(
@@ -5743,7 +5801,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_unwinds_nested_children_in_lifecycle_order() {
+    fn ctrl_c_unwinds_nested_children_in_lifecycle_order() {
         let child = crate::execution::fixtures::process_v2_run_artifact(
             &"/home/leaf".encode_utf16().collect::<Vec<_>>(),
             &[0, 0],
@@ -5775,7 +5833,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_cancels_pending_compilation_before_resuming_parent() {
+    fn ctrl_c_cancels_pending_compilation_before_resuming_parent() {
         let child = crate::execution::fixtures::compiler_compile_artifact(
             &"/home/source.kt".encode_utf16().collect::<Vec<_>>(),
             &"/home/output".encode_utf16().collect::<Vec<_>>(),
@@ -5799,7 +5857,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_does_not_terminate_an_idle_shell_and_plain_t_remains_input() {
+    fn ctrl_c_is_delivered_to_an_idle_shell_and_plain_c_remains_input() {
         let mut computer = termination_fixture(crate::execution::fixtures::empty_loop_artifact(1));
         computer.sessions[1].executable.as_mut().unwrap().0 =
             VirtualPath::parse_utf8("/rom/shell", &FileSystemLimits::testing()).unwrap();
@@ -5807,9 +5865,19 @@ mod tests {
             .submit_terminal_key(terminate_key(TerminalKeyAction::Press))
             .unwrap();
         assert_eq!(None, computer.pending_termination);
+        assert_eq!(
+            Some(ComputerTerminalEventKind::Key),
+            computer.terminal_await_event().unwrap()
+        );
+        assert_eq!(67, computer.terminal_event_key().unwrap());
+        assert_eq!(
+            TerminalModifiers::CONTROL,
+            computer.terminal_event_modifiers().unwrap()
+        );
+        computer.terminal_finish_event().unwrap();
         computer
             .submit_terminal_key(TerminalKeyEvent::new(
-                TerminalKey::T,
+                TerminalKey::C,
                 TerminalKeyAction::Press,
                 TerminalModifiers::default(),
             ))
@@ -5818,7 +5886,7 @@ mod tests {
             Some(ComputerTerminalEventKind::Key),
             computer.terminal_await_event().unwrap()
         );
-        assert_eq!(84, computer.terminal_event_key().unwrap());
+        assert_eq!(67, computer.terminal_event_key().unwrap());
     }
 
     #[test]
