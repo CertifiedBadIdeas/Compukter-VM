@@ -1160,3 +1160,21 @@ fn floating_math_frames_reject_invalid_forms_selectors_and_trailing_operands() {
     let invalid = [0x1c, 4, 10, 0, 19, 1, 0, 0, 0, 0, 0xe3, 0, 6, 0, 0xff, 0xff];
     assert!(decode_code_record(&invalid, 2, &ArtifactLimits::default()).is_err());
 }
+
+#[test]
+fn matrix_frames_reject_unknown_selectors_nonzero_forms_and_wrong_arity() {
+    use super::code::decode_code_record;
+    let transpose = [0x1e, 0, 9, 0, 1, 2, 0, 0, 0, 0xe3, 0, 6, 0, 0xff, 0xff];
+    assert!(decode_code_record(&transpose, 2, &ArtifactLimits::default()).is_ok());
+    for (offset, value) in [(1, 1), (4, 0), (4, 6), (4, 2)] {
+        let mut invalid = transpose;
+        invalid[offset] = value;
+        assert!(decode_code_record(&invalid, 2, &ArtifactLimits::default()).is_err());
+    }
+    let mut binary = vec![
+        0x1e, 0, 11, 0, 2, 2, 0, 0, 0, 1, 0, 0xe3, 0, 6, 0, 0xff, 0xff,
+    ];
+    assert!(decode_code_record(&binary, 2, &ArtifactLimits::default()).is_ok());
+    binary[4] = 1;
+    assert!(decode_code_record(&binary, 2, &ArtifactLimits::default()).is_err());
+}

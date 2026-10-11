@@ -14,6 +14,7 @@ mod image;
 mod layout;
 mod machine;
 mod math;
+mod matrix;
 mod numeric;
 mod record;
 mod requests;

@@ -642,6 +642,44 @@ fn verify_instruction(
             }
             write(state, *dst, function, module_id, function_id, limits)?;
         }
+        Instruction::MatrixMath {
+            operation,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            if artifact.header.runtime_minor < 17
+                || rhs.is_some() != operation.right_components().is_some()
+            {
+                return Err(type_failure(
+                    limits,
+                    module_id,
+                    function_id,
+                    "matrix math requires Runtime ABI 1.17 and exact arity",
+                ));
+            }
+            let check = |register, count| -> Result<(), DiagnosticSet> {
+                let value = register_type(function, register, module_id, function_id, limits)?;
+                let (_, layout) = inline_layout(artifact, module_id, function_id, value, limits)?;
+                if layout.len() != count || layout.iter().any(|value| value.kind != 3) {
+                    return Err(type_failure(
+                        limits,
+                        module_id,
+                        function_id,
+                        "matrix math requires exact F32 inline layout",
+                    ));
+                }
+                Ok(())
+            };
+            read(function, state, *lhs, module_id, function_id, limits)?;
+            check(*lhs, 16)?;
+            if let Some(rhs) = rhs {
+                read(function, state, *rhs, module_id, function_id, limits)?;
+                check(*rhs, operation.right_components().unwrap())?;
+            }
+            check(*dst, operation.result_components())?;
+            write(state, *dst, function, module_id, function_id, limits)?;
+        }
         Instruction::MathUnary { form, dst, src, .. } => {
             if artifact.header.runtime_minor < 16 || !matches!(form, 3 | 4) {
                 return Err(type_failure(
