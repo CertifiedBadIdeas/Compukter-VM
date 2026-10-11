@@ -256,9 +256,9 @@ commit.
 The VM must remain independent of Minecraft, NeoForge, Kotlin compiler
 internals, and files outside its repository checkout.
 
-Computer terminal input reserves Ctrl+T (key 84, CONTROL) to forcibly terminate the foreground command tree.
+Computer terminal input reserves Ctrl+C (key 67, CONTROL) to forcibly terminate the foreground command tree.
 Termination runs at the next advance, emits ordered ProcessExited events and returns status 130 to its parent.
-The shell/root is preserved when idle; repeat events do not terminate another command. Existing terminal-key
+An idle shell receives Ctrl+C to cancel its input; the shell/root remains live; repeat events do not terminate another command. Existing terminal-key
 FFI/JNI calls and C ABI layouts are unchanged.
 
 ## Production-path Guest benchmark
@@ -305,3 +305,5 @@ perf report -i profile.data --stdio
 
 Profiles also include warmup/control, setup and final termination; use sampling
 symbols to identify hot execution and keep profiled samples out of timing claims.
+
+Terminal capability ABI 2.1 adds synchronous no-argument I32 selectors 14 (cursor X) and 15 (cursor Y), 16 (width) and 17 (height). Existing ABI 2.0 operations remain admitted.
