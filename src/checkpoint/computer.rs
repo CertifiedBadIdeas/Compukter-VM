@@ -211,6 +211,7 @@ impl ComputerMachine {
             frame.pending_terminal_event.write(writer)?;
             frame.pending_stdio_read.write(writer)?;
             frame.pending_process.write(writer)?;
+            frame.file_transfers.write(writer)?;
         }
         self.terminal.write(writer)?;
         self.standard_streams.write(writer)?;
@@ -290,6 +291,10 @@ impl ComputerMachine {
                 pending_terminal_event: Checkpoint::read(reader)?,
                 pending_stdio_read: Checkpoint::read(reader)?,
                 pending_process: Checkpoint::read(reader)?,
+                file_transfers: FileTransfers::read_with_limits(
+                    reader,
+                    context.filesystem.limits(),
+                )?,
             });
         }
         let terminal = TerminalDevice::read(reader)?;
@@ -341,6 +346,21 @@ impl ComputerMachine {
 
     fn validate_checkpoint_state(&self) -> Result<()> {
         let invalid = || CheckpointError::InvalidState;
+        for frame in &self.sessions {
+            frame
+                .file_transfers
+                .validate(self.filesystem.limits(), &self.initial_file_capability)?;
+        }
+        self.transfer_capacity(0, false)
+            .map_err(|_| CheckpointError::Limit)?;
+        let handles: usize = self
+            .sessions
+            .iter()
+            .map(|f| f.file_transfers.resources_count())
+            .sum();
+        if handles > self.filesystem.limits().maximum_open_handles as usize {
+            return Err(CheckpointError::Limit);
+        }
         let count = self.sessions.len() as u64;
         if self.process_starts == 0
             || self.process_starts > self.process_limits.maximum_starts

@@ -298,3 +298,5 @@ and canonicalizes NaN. Operations do not allocate or suspend. Rounding uses ties
 propagate NaN and select the appropriate signed zero; magnitude-one bases with infinite powers
 produce NaN. Integer and derived library functions remain ordinary Guest instructions.
 Container 3, exported native C ABI 21 and checkpoint framing are unchanged.
+
+Filesystem capability ABI 2 offers validated paths, bounded binary metadata and chunked immutable reads, process-owned atomic replacement drafts and directory snapshots. Replies carry a private status prefix; callers decode it into typed source errors. Each binary response is at most 4096 bytes, including the prefix. ByteArray value encoding and the 49-export transport inventory are unchanged. Native ABI 23 changes the logical checkpoint schema to retain these resources. The historical filesystem ABI 1 remains available for existing executable artifacts; new Guest libraries emit ABI 2 only.
