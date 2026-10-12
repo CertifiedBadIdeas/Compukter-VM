@@ -322,3 +322,11 @@ scalar instructions. Run the manual release execution comparison with
 It alternates seven paired samples of 100 executions of 100 stable products. Timing excludes artifact
 admission, image construction and machine start; both streams include identical input setup. Timings
 are observations rather than CI performance thresholds.
+
+## Covariant method results (Runtime ABI 1.18)
+
+Virtual and interface dispatch permit a reference result that is assignable to the declared result type.
+A non-null implementation may satisfy a nullable declaration; a nullable implementation cannot satisfy
+a non-null declaration. Scalar results and parameters retain exact matching, and nominal identity includes
+the defining module. This supports `String.subSequence(): String` implementing `CharSequence.subSequence(): CharSequence`
+without bridge objects or new instructions. Artifact encoding and the native C ABI are unchanged.
