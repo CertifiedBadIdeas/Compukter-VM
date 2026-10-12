@@ -7972,25 +7972,38 @@ pub(crate) fn matrix_decoded(
         &ArtifactLimits::default(),
     )
     .unwrap();
-    artifact.header.runtime_minor = 17;
-    let right_count = operation.right_components().unwrap_or(16);
-    let counts = [16, right_count, operation.result_components()];
+    artifact.header.runtime_minor = operation.runtime_minor();
+    let right_count = operation
+        .right_components()
+        .unwrap_or(operation.left_components());
+    let kind = operation.scalar_kind();
+    let counts = [
+        operation.left_components(),
+        right_count,
+        operation.result_components(),
+    ];
     let module = &mut artifact.modules[0];
-    module.types = vec![function_type(primitive(3), Vec::new())];
+    module.types = vec![function_type(primitive(kind), Vec::new())];
     for count in counts {
         module.types.push(NominalType::InlineValue {
             name: 1,
-            components: vec![primitive(3); count],
+            components: vec![primitive(kind); count],
         });
     }
     module.declared_types = 4;
     module.constants = (1..=32)
-        .map(|value| Constant::F32((value as f32).to_bits()))
+        .map(|value| {
+            if kind == 3 {
+                Constant::F32((value as f32).to_bits())
+            } else {
+                Constant::F64((value as f64).to_bits())
+            }
+        })
         .collect();
     module
         .constants
         .sort_by_key(crate::test_encode::encode_constant);
-    let mut main = function(0, 0, vec![primitive(3); 36], 0);
+    let mut main = function(0, 0, vec![primitive(kind); 36], 0);
     for (index, count) in counts.into_iter().enumerate() {
         main.values[index + 32] = crate::artifact::FunctionValue {
             semantic_type: ValueType {
@@ -7998,7 +8011,14 @@ pub(crate) fn matrix_decoded(
                 flags: 0,
                 nominal_type: TypeId(index as u32 + 1),
             },
-            components: vec![crate::artifact::PhysicalAtom::F32; count],
+            components: vec![
+                if kind == 3 {
+                    crate::artifact::PhysicalAtom::F32
+                } else {
+                    crate::artifact::PhysicalAtom::F64
+                };
+                count
+            ],
         };
     }
     module.functions = vec![main];
@@ -8006,13 +8026,21 @@ pub(crate) fn matrix_decoded(
     let mut instructions: Vec<_> = (0..32)
         .map(|index| Instruction::Const {
             dst: index as u16,
-            constant: module.constants.iter().position(|constant| matches!(constant, Constant::F32(bits) if *bits == ((index + 1) as f32).to_bits())).unwrap() as u32,
+            constant: module
+                .constants
+                .iter()
+                .position(|constant| match constant {
+                    Constant::F32(bits) => *bits == ((index + 1) as f32).to_bits(),
+                    Constant::F64(bits) => *bits == ((index + 1) as f64).to_bits(),
+                    _ => false,
+                })
+                .unwrap() as u32,
         })
         .collect();
     instructions.extend([
         Instruction::InlineConstruct {
             dst: 32,
-            components: (0..16).collect(),
+            components: (0..operation.left_components() as u16).collect(),
         },
         Instruction::InlineConstruct {
             dst: 33,

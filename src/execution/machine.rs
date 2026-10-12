@@ -4606,52 +4606,63 @@ fn execute_scalar(
             lhs,
             rhs,
         } => {
-            let read = |id: u16, count: usize| -> Result<[f32; 16], InstructionFailure> {
-                let layout = function
-                    .frame_layout
-                    .values
-                    .get(id as usize)
-                    .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
-                if layout.components.len() != count {
-                    return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
-                }
-                let mut values = [0.0; 16];
-                for (index, component) in layout.components.iter().enumerate() {
-                    let RuntimeValue::F32(bits) = arena
-                        .read_component_value(frame.base, *component)
-                        .map_err(InstructionFailure::Fault)?
-                    else {
-                        return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
+            macro_rules! run_kernel {
+                ($scalar:ty, $variant:ident, $evaluate:ident, $write:ident) => {{
+                    let read = |id: u16,
+                                count: usize|
+                     -> Result<[$scalar; 16], InstructionFailure> {
+                        let layout = function
+                            .frame_layout
+                            .values
+                            .get(id as usize)
+                            .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?;
+                        if layout.components.len() != count {
+                            return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
+                        }
+                        let mut values = [0.0; 16];
+                        for (index, component) in layout.components.iter().enumerate() {
+                            let RuntimeValue::$variant(bits) = arena
+                                .read_component_value(frame.base, *component)
+                                .map_err(InstructionFailure::Fault)?
+                            else {
+                                return Err(InstructionFailure::Fault(VmFault::InvalidValueType));
+                            };
+                            values[index] = <$scalar>::from_bits(bits);
+                        }
+                        Ok(values)
                     };
-                    values[index] = f32::from_bits(bits);
-                }
-                Ok(values)
-            };
-            let left = read(*lhs, 16)?;
-            let right = match rhs {
-                Some(rhs) => read(
-                    *rhs,
-                    operation
-                        .right_components()
-                        .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?,
-                )?,
-                None => [0.0; 16],
-            };
-            let output = super::matrix::evaluate(*operation, &left, &right);
-            for (index, value) in output
-                .iter()
-                .take(operation.result_components())
-                .enumerate()
-            {
-                arena
-                    .write_f32(
-                        frame.base,
-                        &function.frame_layout,
-                        *dst as usize,
-                        index,
-                        value.to_bits(),
-                    )
-                    .map_err(InstructionFailure::Fault)?;
+                    let left = read(*lhs, operation.left_components())?;
+                    let right = match rhs {
+                        Some(rhs) => read(
+                            *rhs,
+                            operation
+                                .right_components()
+                                .ok_or(InstructionFailure::Fault(VmFault::InvalidValueType))?,
+                        )?,
+                        None => [0.0; 16],
+                    };
+                    let output = super::matrix::$evaluate(*operation, &left, &right);
+                    for (index, value) in output
+                        .iter()
+                        .take(operation.result_components())
+                        .enumerate()
+                    {
+                        arena
+                            .$write(
+                                frame.base,
+                                &function.frame_layout,
+                                *dst as usize,
+                                index,
+                                value.to_bits(),
+                            )
+                            .map_err(InstructionFailure::Fault)?;
+                    }
+                }};
+            }
+            if operation.scalar_kind() == 3 {
+                run_kernel!(f32, F32, evaluate, write_f32);
+            } else {
+                run_kernel!(f64, F64, evaluate_f64, write_f64);
             }
             Ok(())
         }

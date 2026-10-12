@@ -16,75 +16,61 @@
  * limitations under the License.
  */
 
-use super::numeric::{add_f32, mul_f32};
+use super::numeric::{add_f32, add_f64, mul_f32, mul_f64};
 use crate::artifact::MatrixOperation;
 
-fn dot(a: [f32; 4], b: [f32; 4]) -> f32 {
-    add_f32(
-        add_f32(
-            add_f32(mul_f32(a[0], b[0]), mul_f32(a[1], b[1])),
-            mul_f32(a[2], b[2]),
-        ),
-        mul_f32(a[3], b[3]),
-    )
-}
-
-/// Stack-only snapshots make all verified destination/input aliases safe.
-pub(super) fn evaluate(
-    operation: MatrixOperation,
-    left: &[f32; 16],
-    right: &[f32; 16],
-) -> [f32; 16] {
-    let mut output = [0.0; 16];
-    match operation {
-        MatrixOperation::Transpose => {
-            for row in 0..4 {
-                for column in 0..4 {
-                    output[row * 4 + column] = left[column * 4 + row];
+// Snapshot all operands before publication, including aliases. Start the dot with its first
+// product so signed zero follows scalar left-to-right arithmetic, without an extra +0 or FMA.
+macro_rules! matrix_kernel {
+    ($name:ident, $scalar:ty, $add:ident, $mul:ident) => {
+        pub(super) fn $name(
+            operation: MatrixOperation,
+            left: &[$scalar; 16],
+            right: &[$scalar; 16],
+        ) -> [$scalar; 16] {
+            let dimension = operation.dimension();
+            let mut output = [0.0; 16];
+            if operation.is_transpose() {
+                for row in 0..dimension {
+                    for column in 0..dimension {
+                        output[row * dimension + column] = left[column * dimension + row];
+                    }
+                }
+            } else {
+                let columns = if operation.is_matrix_product() {
+                    dimension
+                } else {
+                    1
+                };
+                for row in 0..dimension {
+                    for column in 0..columns {
+                        let factor = |k: usize| {
+                            if operation.is_matrix_product() {
+                                right[k * dimension + column]
+                            } else if k == 3 {
+                                match operation.homogeneous_w() {
+                                    Some(true) => 1.0,
+                                    Some(false) => 0.0,
+                                    None => right[k],
+                                }
+                            } else {
+                                right[k]
+                            }
+                        };
+                        let mut dot = $mul(left[row * dimension], factor(0));
+                        for k in 1..dimension {
+                            dot = $add(dot, $mul(left[row * dimension + k], factor(k)));
+                        }
+                        output[row * columns + column] = dot;
+                    }
                 }
             }
+            output
         }
-        MatrixOperation::MultiplyMatrix => {
-            for row in 0..4 {
-                for column in 0..4 {
-                    output[row * 4 + column] = dot(
-                        [
-                            left[row * 4],
-                            left[row * 4 + 1],
-                            left[row * 4 + 2],
-                            left[row * 4 + 3],
-                        ],
-                        [
-                            right[column],
-                            right[4 + column],
-                            right[8 + column],
-                            right[12 + column],
-                        ],
-                    );
-                }
-            }
-        }
-        _ => {
-            let w = match operation {
-                MatrixOperation::TransformPoint => 1.0,
-                MatrixOperation::TransformDirection => 0.0,
-                _ => right[3],
-            };
-            for row in 0..4 {
-                output[row] = dot(
-                    [
-                        left[row * 4],
-                        left[row * 4 + 1],
-                        left[row * 4 + 2],
-                        left[row * 4 + 3],
-                    ],
-                    [right[0], right[1], right[2], w],
-                );
-            }
-        }
-    }
-    output
+    };
 }
+matrix_kernel!(evaluate, f32, add_f32, mul_f32);
+matrix_kernel!(evaluate_f64, f64, add_f64, mul_f64);
 
 #[cfg(test)]
 mod tests {
@@ -136,6 +122,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn matrix_double_dot_keeps_double_rounding_signed_zero_and_nan() {
+        let mut left = [0.0; 16];
+        let right = [1.0; 16];
+        left[..4].copy_from_slice(&[9007199254740992.0, 1.0, -9007199254740992.0, 1.0]);
+        left[4..8].fill(-0.0);
+        left[8] = f64::from_bits(0x7ff0123456789abc);
+        let result = evaluate_f64(MatrixOperation::MultiplyVector4d, &left, &right);
+        assert_eq!(1.0, result[0]);
+        assert_eq!((-0.0f64).to_bits(), result[1].to_bits());
+        assert_eq!(0x7ff8000000000000, result[2].to_bits());
+        let transposed = evaluate_f64(MatrixOperation::Transpose4d, &left, &right);
+        assert_eq!(left[8].to_bits(), transposed[2].to_bits());
+        left[0] = -1.0;
+        left[1] = 1.0000000000000002;
+        left[2] = 0.0;
+        left[3] = 0.0;
+        let mut right = [0.0; 16];
+        right[0] = 1.0;
+        right[1] = 0.9999999999999999;
+        assert_eq!(
+            0.0,
+            evaluate_f64(MatrixOperation::MultiplyVector4d, &left, &right)[0]
+        );
+        assert_ne!(0.0, left[1].mul_add(right[1], -1.0));
     }
 
     #[test]
