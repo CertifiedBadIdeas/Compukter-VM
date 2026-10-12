@@ -535,6 +535,57 @@ mod tests {
         panic!("record response did not complete");
     }
 
+    #[test]
+    fn checkpoint_resumes_inline_record_components_and_staged_references() {
+        use crate::execution::session_tests::{record_schema, record_value};
+        let mut schema = record_schema();
+        for index in 0..16 {
+            schema.fields.push(crate::execution::host::HostRecordField {
+                name: format!("extra{index}"),
+                value_type: HostValueType::I64,
+                record: None,
+            });
+        }
+        let operations = [OperationSchema::asynchronous_record(&[], &schema)];
+        let bindings = [CapabilityBinding::new("app", "entry", 1, 0, &operations)];
+        let artifact = fixtures::wide_inline_record_response_artifact();
+        let mut original = Session::admit_untraced(artifact.clone(), profile(), &bindings).unwrap();
+        original.start(&[]).unwrap();
+        let id = match original.advance(64, 0).unwrap() {
+            AdvanceOutcome::HostRequestBatch(batch) => batch.get(0).unwrap().id(),
+            other => panic!("{other:?}"),
+        };
+        let mut value = record_value(0x7ff0000000000042, 128);
+        for index in 0..16 {
+            value.fields.push(crate::execution::host::HostRecordMember {
+                name: format!("extra{index}"),
+                value: crate::execution::host::HostRecordScalar::I64(index),
+            });
+        }
+        original
+            .resume(id, HostResponse::Success(HostValueInput::Record(&value)))
+            .unwrap();
+        let mut saw_staged_reference = false;
+        for _ in 0..512 {
+            saw_staged_reference |= original.machine.test_has_staged_record_reference();
+            original.test_collect_runtime_roots();
+            let mut restored = round_trip(&original, artifact.clone(), &bindings);
+            let expected = original.advance_with_retirement_limit(8, 1, 1).unwrap();
+            assert_eq!(
+                expected,
+                restored.advance_with_retirement_limit(8, 1, 1).unwrap()
+            );
+            if matches!(expected, AdvanceOutcome::Halted(_)) {
+                assert!(
+                    saw_staged_reference,
+                    "must checkpoint a partially staged inline reference"
+                );
+                return;
+            }
+        }
+        panic!("inline response did not complete");
+    }
+
     fn assert_rejected(
         original: &Session,
         artifact: VerifiedArtifact,

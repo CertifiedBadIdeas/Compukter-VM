@@ -1935,3 +1935,43 @@ fn char_array_range_schema_rejects_wrong_arrays_bounds_and_results() {
         &OperationSchema::synchronous(&[], HostValueType::CharArrayRange { start: 0, end: 0 })
     ));
 }
+
+#[test]
+fn inline_records_copy_nested_values_without_snapshot_or_vector_allocations() {
+    let schema = record_schema();
+    let operations = [OperationSchema::asynchronous_record(&[], &schema)];
+    let bindings = [CapabilityBinding::new("app", "entry", 1, 0, &operations)];
+    let mut session = Session::admit(
+        fixtures::inline_record_response_artifact(),
+        profile(),
+        &bindings,
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let id = only_request(session.advance(64, 0).unwrap()).id();
+    let bits = 0x7ff0000000000042;
+    session
+        .resume(
+            id,
+            HostResponse::Success(HostValueInput::Record(&record_value(bits, 0))),
+        )
+        .unwrap();
+    let mut slices = 0;
+    loop {
+        match session.advance_with_retirement_limit(8, 64, 1).unwrap() {
+            AdvanceOutcome::SliceExhausted => {
+                slices += 1;
+                session.test_collect_runtime_roots();
+            }
+            AdvanceOutcome::Halted(Some(HostValueView::F64(actual))) => {
+                assert_eq!(bits, actual);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(slices < 100);
+    }
+    assert!(slices >= 1);
+    assert_eq!(0, session.resource_snapshot().machine.heap_used_bytes);
+    assert_eq!(0, session.resource_snapshot().machine.live_objects);
+}

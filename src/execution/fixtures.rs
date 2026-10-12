@@ -8265,3 +8265,90 @@ pub(crate) fn char_array_range_artifact(start: i32, end: i32, capacity: i32) -> 
         },
     )
 }
+
+pub(super) fn inline_record_response_artifact() -> VerifiedArtifact {
+    inline_record_response_fixture(false)
+}
+
+pub(super) fn wide_inline_record_response_artifact() -> VerifiedArtifact {
+    inline_record_response_fixture(true)
+}
+
+fn inline_record_response_fixture(wide: bool) -> VerifiedArtifact {
+    let base = record_response_artifact(20, true);
+    let mut artifact = crate::decode::records::decode_artifact(
+        base.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    artifact.manifest.required_stack_bytes = if wide { 192 } else { 32 };
+    let module = &mut artifact.modules[0];
+    let mut bytes = artifact.bytes.to_vec();
+    let name = match module.types[1] {
+        NominalType::Class { name, .. } => name,
+        _ => unreachable!(),
+    };
+    let start = bytes.len();
+    bytes.extend_from_slice(b"fixture.Snapshot.<inline-value>");
+    module.strings[name as usize] = ByteRange {
+        start,
+        end: bytes.len(),
+    };
+    artifact.bytes = Arc::from(bytes);
+    let reference = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x80000000),
+    };
+    module.types[1] = NominalType::InlineValue {
+        name,
+        components: vec![primitive(2), primitive(4), reference],
+    };
+    module.fields = vec![module.fields.remove(3)];
+    if let NominalType::Class { field_start, .. } = &mut module.types[2] {
+        *field_start = 0;
+    }
+    module.functions[0].values[0] = crate::artifact::FunctionValue {
+        semantic_type: ValueType {
+            kind: 8,
+            flags: 0,
+            nominal_type: TypeId(1),
+        },
+        components: vec![
+            crate::artifact::PhysicalAtom::I64,
+            crate::artifact::PhysicalAtom::F64,
+            crate::artifact::PhysicalAtom::Ref32,
+        ],
+    };
+    if wide {
+        if let NominalType::InlineValue { components, .. } = &mut module.types[1] {
+            components.extend((0..16).map(|_| primitive(2)));
+        }
+        module.functions[0].values[0]
+            .components
+            .extend((0..16).map(|_| crate::artifact::PhysicalAtom::I64));
+    }
+    let instructions = vec![
+        Instruction::InlineComponent {
+            dst: 2,
+            src: 0,
+            component: 1,
+        },
+        Instruction::Return { value: 2 },
+    ];
+    let cost = instructions.iter().map(|i| i.fixed_cost().unwrap()).sum();
+    module.blocks[1].instruction_count = instructions.len() as u32;
+    module.blocks[1].declared_fixed_cost = cost;
+    module.code[1].instructions = instructions.into_boxed_slice();
+    module.code[1].fixed_cost = cost;
+    // The only reference component of the new direct value is the label.
+    for roots in &mut module.safepoint_roots {
+        for reference in &mut roots.references {
+            if reference.value == 0 {
+                reference.component = 2;
+            }
+        }
+    }
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}

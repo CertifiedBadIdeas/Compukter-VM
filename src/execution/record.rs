@@ -179,6 +179,7 @@ impl HostRecordSchema {
 pub(super) struct RecordLayout {
     pub ty: super::TypeKey,
     pub fields: Vec<RecordFieldLayout>,
+    pub inline: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +187,7 @@ pub(super) struct RecordFieldLayout {
     pub offset: u32,
     pub width: super::layout::ValueWidth,
     pub record: Option<Box<RecordLayout>>,
+    pub path: Vec<usize>,
 }
 
 pub(super) fn admit_record(
@@ -196,86 +198,213 @@ pub(super) fn admit_record(
     field_offsets: &[usize],
     string_type: Option<super::TypeKey>,
 ) -> Option<RecordLayout> {
-    use super::layout::ValueWidth;
+    use super::{image::ResolvedValueType, layout::ValueWidth};
     use crate::artifact::NominalType;
     let module = artifact.modules.get(ty.module as usize)?;
-    let NominalType::Class {
-        name,
-        generic_arity,
-        interfaces,
-        field_start,
-        field_count,
-        initializer,
-        ..
-    } = module.types.get(ty.ty as usize)?
-    else {
-        return None;
-    };
-    if *generic_arity != 0
-        || !interfaces.is_empty()
-        || initializer.is_some()
-        || *field_count as usize != schema.fields.len()
-        || module.strings.get(*name as usize)?.slice(&artifact.bytes) != schema.type_name.as_bytes()
-    {
-        return None;
-    }
-    let declared = module
-        .fields
-        .get(*field_start as usize..(*field_start as usize).checked_add(*field_count as usize)?)?;
-    let mut result = Vec::with_capacity(schema.fields.len());
-    for expected in &schema.fields {
-        let (local, field) = declared.iter().enumerate().find(|(_, field)| {
-            module
-                .strings
-                .get(field.name as usize)
-                .is_some_and(|name| name.slice(&artifact.bytes) == expected.name.as_bytes())
-        })?;
-        // Instance storage only. Artifact writability includes constructor initialization of Guest val fields;
-        // source-level immutability is checked by SDK authoring. Physical layout rejects inherited hidden state.
-        if field.flags & 2 != 0 {
-            return None;
-        }
-        let resolved = fields.get(
-            field_offsets
-                .get(ty.module as usize)?
-                .checked_add(*field_start as usize)?
-                .checked_add(local)?,
-        )?;
-        if resolved.owner != ty || resolved.value_type.nullable {
-            return None;
-        }
-        let (width, nested) = match expected.value_type {
-            HostValueType::I32 if resolved.value_type.kind == 1 => (ValueWidth::I32, None),
-            HostValueType::I64 if resolved.value_type.kind == 2 => (ValueWidth::I64, None),
-            HostValueType::F32 if resolved.value_type.kind == 3 => (ValueWidth::F32, None),
-            HostValueType::F64 if resolved.value_type.kind == 4 => (ValueWidth::F64, None),
-            HostValueType::Bool if resolved.value_type.kind == 5 => (ValueWidth::Bool, None),
-            HostValueType::Char if resolved.value_type.kind == 6 => (ValueWidth::Char, None),
-            HostValueType::String
-                if resolved.value_type.kind == 7 && resolved.value_type.nominal == string_type =>
-            {
-                (ValueWidth::Ref, None)
+    let (inline, flattened, slots): (bool, bool, Vec<(ResolvedValueType, u32)>) =
+        match module.types.get(ty.ty as usize)? {
+            NominalType::InlineValue { name, components } => {
+                if module.strings.get(*name as usize)?.slice(&artifact.bytes)
+                    != format!("{}.<inline-value>", schema.type_name).as_bytes()
+                {
+                    return None;
+                }
+                let mut slots = Vec::with_capacity(components.len());
+                for (index, component) in components.iter().enumerate() {
+                    let nominal = if component.kind == 7 {
+                        Some(super::image::resolve_type(
+                            artifact,
+                            ty.module as usize,
+                            component.nominal_type,
+                        )?)
+                    } else {
+                        None
+                    };
+                    slots.push((
+                        ResolvedValueType {
+                            kind: component.kind,
+                            nullable: component.flags & 1 != 0,
+                            nominal,
+                        },
+                        index as u32,
+                    ));
+                }
+                (true, true, slots)
             }
-            HostValueType::Record if resolved.value_type.kind == 7 => (
-                ValueWidth::Ref,
-                Some(Box::new(admit_record(
-                    artifact,
-                    resolved.value_type.nominal?,
-                    expected.record.as_ref()?,
-                    fields,
-                    field_offsets,
-                    string_type,
-                )?)),
-            ),
+            NominalType::Class {
+                name,
+                generic_arity,
+                interfaces,
+                field_start,
+                field_count,
+                initializer,
+                ..
+            } => {
+                if *generic_arity != 0
+                    || !interfaces.is_empty()
+                    || initializer.is_some()
+                    || module.strings.get(*name as usize)?.slice(&artifact.bytes)
+                        != schema.type_name.as_bytes()
+                {
+                    return None;
+                }
+                let declared = module.fields.get(
+                    *field_start as usize
+                        ..(*field_start as usize).checked_add(*field_count as usize)?,
+                )?;
+                let flattened = declared.first().is_some_and(|field| {
+                    module.strings[field.name as usize].slice(&artifact.bytes) == b"<boxed-value>"
+                });
+                let mut slots = Vec::new();
+                if flattened {
+                    if artifact.header.runtime_minor < 20 {
+                        return None;
+                    }
+                    for (index, field) in declared.iter().enumerate() {
+                        let expected = "<boxed-value>";
+                        if module.strings[field.name as usize].slice(&artifact.bytes)
+                            != expected.as_bytes()
+                            || field.flags & 2 != 0
+                        {
+                            return None;
+                        }
+                        let resolved = fields.get(
+                            field_offsets
+                                .get(ty.module as usize)?
+                                .checked_add(*field_start as usize)?
+                                .checked_add(index)?,
+                        )?;
+                        if resolved.owner != ty || resolved.value_type.nullable {
+                            return None;
+                        }
+                        slots.push((resolved.value_type, resolved.offset?));
+                    }
+                } else {
+                    if declared.len() != schema.fields.len() {
+                        return None;
+                    }
+                    for expected in &schema.fields {
+                        let (index, field) = declared.iter().enumerate().find(|(_, field)| {
+                            module.strings[field.name as usize].slice(&artifact.bytes)
+                                == expected.name.as_bytes()
+                        })?;
+                        if field.flags & 2 != 0 {
+                            return None;
+                        }
+                        let resolved = fields.get(
+                            field_offsets
+                                .get(ty.module as usize)?
+                                .checked_add(*field_start as usize)?
+                                .checked_add(index)?,
+                        )?;
+                        if resolved.owner != ty || resolved.value_type.nullable {
+                            return None;
+                        }
+                        slots.push((resolved.value_type, resolved.offset?));
+                    }
+                }
+                (false, flattened, slots)
+            }
             _ => return None,
         };
-        result.push(RecordFieldLayout {
-            offset: resolved.offset?,
-            width,
-            record: nested,
-        });
+    struct Admission<'a> {
+        artifact: &'a crate::artifact::DecodedArtifact,
+        fields: &'a [super::image::ResolvedField],
+        field_offsets: &'a [usize],
+        string_type: Option<super::TypeKey>,
     }
-    Some(RecordLayout { ty, fields: result })
+    impl Admission<'_> {
+        fn walk(
+            &self,
+            schema: &HostRecordSchema,
+            slots: &[(ResolvedValueType, u32)],
+            cursor: &mut usize,
+            path: &mut Vec<usize>,
+            result: &mut Vec<RecordFieldLayout>,
+            flattened: bool,
+        ) -> Option<()> {
+            for (index, expected) in schema.fields.iter().enumerate() {
+                path.push(index);
+                let (actual, offset) = *slots.get(*cursor)?;
+                if actual.nullable {
+                    return None;
+                }
+                let (width, record) = match expected.value_type {
+                    HostValueType::I32 if actual.kind == 1 => (ValueWidth::I32, None),
+                    HostValueType::I64 if actual.kind == 2 => (ValueWidth::I64, None),
+                    HostValueType::F32 if actual.kind == 3 => (ValueWidth::F32, None),
+                    HostValueType::F64 if actual.kind == 4 => (ValueWidth::F64, None),
+                    HostValueType::Bool if actual.kind == 5 => (ValueWidth::Bool, None),
+                    HostValueType::Char if actual.kind == 6 => (ValueWidth::Char, None),
+                    HostValueType::String
+                        if actual.kind == 7 && actual.nominal == self.string_type =>
+                    {
+                        (ValueWidth::Ref, None)
+                    }
+                    HostValueType::Record => {
+                        let child = expected.record.as_ref()?;
+                        let managed = if actual.kind == 7 {
+                            actual.nominal.and_then(|key| {
+                                admit_record(
+                                    self.artifact,
+                                    key,
+                                    child,
+                                    self.fields,
+                                    self.field_offsets,
+                                    self.string_type,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(record) = managed {
+                            (ValueWidth::Ref, Some(Box::new(record)))
+                        } else if flattened {
+                            self.walk(child, slots, cursor, path, result, true)?;
+                            path.pop();
+                            continue;
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                };
+                result.push(RecordFieldLayout {
+                    offset,
+                    width,
+                    record,
+                    path: path.clone(),
+                });
+                *cursor += 1;
+                path.pop();
+            }
+            Some(())
+        }
+    }
+    let mut result = Vec::new();
+    let mut cursor = 0;
+    Admission {
+        artifact,
+        fields,
+        field_offsets,
+        string_type,
+    }
+    .walk(
+        schema,
+        &slots,
+        &mut cursor,
+        &mut Vec::new(),
+        &mut result,
+        flattened,
+    )?;
+    if cursor != slots.len() {
+        return None;
+    }
+    Some(RecordLayout {
+        ty,
+        fields: result,
+        inline,
+    })
 }
 
 use super::{
@@ -299,6 +428,15 @@ enum PlannedNode {
         ty: super::TypeKey,
         fields: Vec<(RecordFieldLayout, PlannedValue)>,
     },
+    Inline {
+        ty: super::TypeKey,
+        fields: Vec<(RecordFieldLayout, PlannedValue)>,
+    },
+}
+
+pub(super) enum RecordOutput {
+    Scalar(RuntimeValue),
+    Inline(Vec<RuntimeValue>),
 }
 
 pub(super) struct PendingRecord {
@@ -310,21 +448,44 @@ pub(super) struct PendingRecord {
     allocation: Option<PendingAllocation>,
     string: Option<PendingHostReference>,
     collection_attempted: bool,
+    inline_values: Vec<RuntimeValue>,
 }
 
 impl PendingRecord {
+    #[cfg(test)]
+    pub(super) fn test_has_staged_reference(&self) -> bool {
+        self.inline_values
+            .iter()
+            .any(|value| matches!(value, RuntimeValue::Reference(_)))
+    }
+
     pub(super) fn new(layout: &RecordLayout, value: HostRecordValue) -> Result<Self, VmFault> {
         fn plan(
             layout: &RecordLayout,
-            value: HostRecordValue,
+            mut value: HostRecordValue,
             nodes: &mut Vec<PlannedNode>,
         ) -> Result<usize, VmFault> {
-            if layout.fields.len() != value.fields.len() {
-                return Err(VmFault::InvalidValueType);
+            fn take(
+                fields: &mut [HostRecordMember],
+                path: &[usize],
+            ) -> Result<HostRecordScalar, VmFault> {
+                let (index, tail) = path.split_first().ok_or(VmFault::InvalidValueType)?;
+                let value = &mut fields
+                    .get_mut(*index)
+                    .ok_or(VmFault::InvalidValueType)?
+                    .value;
+                if tail.is_empty() {
+                    return Ok(std::mem::replace(value, HostRecordScalar::I32(0)));
+                }
+                let HostRecordScalar::Record(child) = value else {
+                    return Err(VmFault::InvalidValueType);
+                };
+                take(&mut child.fields, tail)
             }
             let mut fields = Vec::with_capacity(layout.fields.len());
-            for (field, member) in layout.fields.iter().zip(value.fields) {
-                let value = match member.value {
+            for field in &layout.fields {
+                let member = take(&mut value.fields, &field.path)?;
+                let value = match member {
                     HostRecordScalar::I32(v) => PlannedValue::Scalar(RuntimeValue::I32(v)),
                     HostRecordScalar::I64(v) => PlannedValue::Scalar(RuntimeValue::I64(v)),
                     HostRecordScalar::F32(v) => PlannedValue::Scalar(RuntimeValue::F32(v)),
@@ -347,14 +508,22 @@ impl PendingRecord {
                         offset: field.offset,
                         width: field.width,
                         record: None,
+                        path: field.path.clone(),
                     },
                     value,
                 ));
             }
             let index = nodes.len();
-            nodes.push(PlannedNode::Object {
-                ty: layout.ty,
-                fields,
+            nodes.push(if layout.inline {
+                PlannedNode::Inline {
+                    ty: layout.ty,
+                    fields,
+                }
+            } else {
+                PlannedNode::Object {
+                    ty: layout.ty,
+                    fields,
+                }
             });
             Ok(index)
         }
@@ -372,6 +541,11 @@ impl PendingRecord {
             allocation: None,
             string: None,
             collection_attempted: false,
+            inline_values: Vec::with_capacity(if layout.inline {
+                layout.fields.len()
+            } else {
+                0
+            }),
         })
     }
 
@@ -380,7 +554,7 @@ impl PendingRecord {
         image: &ExecutionImage,
         heap: &mut Heap,
         budget: u32,
-    ) -> Result<(u32, Option<RuntimeValue>), TextError> {
+    ) -> Result<(u32, Option<RecordOutput>), TextError> {
         let mut used = 0;
         while self.index < self.nodes.len() && used < budget {
             let value = match &self.nodes[self.index] {
@@ -420,6 +594,24 @@ impl PendingRecord {
                         used += cost;
                         result.map(|(_, value)| value)
                     }
+                }
+                PlannedNode::Inline { fields, .. } => {
+                    while self.field < fields.len() && used < budget {
+                        let (_, value) = &fields[self.field];
+                        let value = match value {
+                            PlannedValue::Scalar(v) => *v,
+                            PlannedValue::Node(index) => self
+                                .completed
+                                .get(*index)
+                                .copied()
+                                .flatten()
+                                .ok_or(TextError::Fault(VmFault::CorruptLifecycle))?,
+                        };
+                        self.inline_values.push(value);
+                        self.field += 1;
+                        used += 1;
+                    }
+                    (self.field == fields.len()).then_some(RuntimeValue::Null)
                 }
                 PlannedNode::Object { ty, fields } => {
                     if self.object.is_none() {
@@ -505,7 +697,17 @@ impl PendingRecord {
         Ok((
             used,
             if self.index == self.nodes.len() {
-                self.completed.last().copied().flatten()
+                if matches!(self.nodes.last(), Some(PlannedNode::Inline { .. })) {
+                    Some(RecordOutput::Inline(std::mem::take(
+                        &mut self.inline_values,
+                    )))
+                } else {
+                    self.completed
+                        .last()
+                        .copied()
+                        .flatten()
+                        .map(RecordOutput::Scalar)
+                }
             } else {
                 None
             },
@@ -514,6 +716,11 @@ impl PendingRecord {
 
     pub(super) fn visit_roots(&self, mut visit: impl FnMut(Ref32)) {
         for value in self.completed.iter().flatten() {
+            if let RuntimeValue::Reference(reference) = value {
+                visit(*reference);
+            }
+        }
+        for value in &self.inline_values {
             if let RuntimeValue::Reference(reference) = value {
                 visit(*reference);
             }
@@ -548,12 +755,13 @@ impl PendingRecord {
     pub(super) fn resident_bytes(&self) -> u64 {
         (self.nodes.capacity() * core::mem::size_of::<PlannedNode>()
             + self.completed.capacity() * core::mem::size_of::<Option<RuntimeValue>>()
+            + self.inline_values.capacity() * core::mem::size_of::<RuntimeValue>()
             + self
                 .nodes
                 .iter()
                 .map(|node| match node {
                     PlannedNode::String(units) => units.capacity() * 2,
-                    PlannedNode::Object { fields, .. } => {
+                    PlannedNode::Object { fields, .. } | PlannedNode::Inline { fields, .. } => {
                         fields.capacity()
                             * core::mem::size_of::<(RecordFieldLayout, PlannedValue)>()
                     }

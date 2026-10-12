@@ -233,6 +233,22 @@ result register is published only after the complete tree is ready. OOM remains 
 cannot overwrite an unfinished reference response. Pending owned replies and materialization plans count towards
 execution-resident resource accounting. Records use the resume-value export introduced in C ABI 19; active transports require C ABI 21.
 
+## Inline structured responses (Runtime ABI 1.20)
+
+Asynchronous record destinations may use a nominal inline value layout. Admission matches the registered
+record tree to flattened primitive/reference components and verifies boxed value payloads in mixed data/value
+records. Wire schema version 2 and response tag 8 remain unchanged; physical representation belongs to the
+verified artifact, not the host schema. Existing data-record artifacts remain supported.
+
+Inline record roots and nested inline fields create no Guest record objects. Strings and ordinary data fields
+retain owned managed storage; explicit Guest reference contexts use the ordinary nominal value box. Component
+staging is charged against each advance budget, participates in GC roots and checkpoint validation, and publishes
+the entire result atomically into the suspended frame. Constructor-free admission remains restricted by the SDK
+to immutable payloads without construction effects; constrained values must pass their Guest factories.
+Runtime 0.23.1 accepts ABI 1.20; native C ABI 23 and the host wire encodings remain unchanged.
+The logical checkpoint envelope/schema advances to 4 for the new pending record layout and staging state.
+Older envelopes cold boot while published files remain intact.
+
 ## Process lifecycle (C ABI 20)
 
 Computer advances publish tag 13 on successful child entry and tag 14 on child exit, each followed by a positive

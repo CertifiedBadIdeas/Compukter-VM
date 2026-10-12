@@ -34,12 +34,13 @@ checkpoint_enum!(HostRecordScalar {
     7 => Record(v0);
 });
 
-checkpoint_struct!(RecordLayout { ty, fields });
+checkpoint_struct!(RecordLayout { ty, fields, inline });
 
 checkpoint_struct!(RecordFieldLayout {
     offset,
     width,
-    record
+    record,
+    path
 });
 
 checkpoint_enum!(PlannedValue {
@@ -50,6 +51,7 @@ checkpoint_enum!(PlannedValue {
 checkpoint_enum!(PlannedNode {
     0 => String(v0);
     1 => Object { ty, fields };
+    2 => Inline { ty, fields };
 });
 
 checkpoint_struct!(PendingRecord {
@@ -60,7 +62,8 @@ checkpoint_struct!(PendingRecord {
     object,
     allocation,
     string,
-    collection_attempted
+    collection_attempted,
+    inline_values
 });
 
 checkpoint_struct!(HostRecordSchema { type_name, fields });
@@ -91,6 +94,11 @@ impl PendingRecord {
         {
             return Err(invalid());
         }
+        if !matches!(self.nodes.last(), Some(PlannedNode::Inline { .. }))
+            && !self.inline_values.is_empty()
+        {
+            return Err(invalid());
+        }
         let mut total_units = 0_usize;
         for (index, node) in self.nodes.iter().enumerate() {
             match node {
@@ -100,19 +108,24 @@ impl PendingRecord {
                         return Err(invalid());
                     }
                 }
-                PlannedNode::Object { ty, fields } => {
+                PlannedNode::Object { ty, fields } | PlannedNode::Inline { ty, fields } => {
                     let layout = (0..image.type_count())
                         .filter_map(|index| image.type_key(index))
                         .filter_map(|root| image.record_layout(root))
                         .find_map(|layout| checkpoint_record_layout(layout, *ty))
                         .ok_or_else(invalid)?;
-                    if fields.len() != layout.fields.len() {
+                    if matches!(node, PlannedNode::Inline { .. }) != layout.inline
+                        || matches!(node, PlannedNode::Inline { .. })
+                            && index + 1 != self.nodes.len()
+                        || fields.len() != layout.fields.len()
+                    {
                         return Err(invalid());
                     }
                     for ((field, value), expected) in fields.iter().zip(&layout.fields) {
                         if field.offset != expected.offset
                             || field.width != expected.width
                             || field.record.is_some()
+                            || field.path != expected.path
                         {
                             return Err(invalid());
                         }
@@ -156,6 +169,33 @@ impl PendingRecord {
                     )? != u16::MAX
                     {
                         return Err(invalid());
+                    }
+                }
+            }
+            Some(PlannedNode::Inline { fields, .. }) => {
+                if self.index + 1 != self.nodes.len()
+                    || self.object.is_some()
+                    || self.allocation.is_some()
+                    || self.string.is_some()
+                    || self.field > fields.len()
+                    || self.inline_values.len() != self.field
+                {
+                    return Err(invalid());
+                }
+                for (index, value) in self.inline_values.iter().enumerate() {
+                    let expected = match &fields[index].1 {
+                        PlannedValue::Scalar(v) => *v,
+                        PlannedValue::Node(child) => self.completed[*child].ok_or_else(invalid)?,
+                    };
+                    if *value != expected {
+                        return Err(invalid());
+                    }
+                    if let RuntimeValue::Reference(reference) = value {
+                        if heap.managed_type(*reference).is_err()
+                            && image.reference_type(*reference).is_none()
+                        {
+                            return Err(invalid());
+                        }
                     }
                 }
             }
