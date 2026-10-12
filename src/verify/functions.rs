@@ -648,31 +648,35 @@ fn verify_instruction(
             lhs,
             rhs,
         } => {
-            if artifact.header.runtime_minor < 17
+            if artifact.header.runtime_minor < operation.runtime_minor()
                 || rhs.is_some() != operation.right_components().is_some()
             {
                 return Err(type_failure(
                     limits,
                     module_id,
                     function_id,
-                    "matrix math requires Runtime ABI 1.17 and exact arity",
+                    "matrix math requires operation ABI and exact arity",
                 ));
             }
             let check = |register, count| -> Result<(), DiagnosticSet> {
                 let value = register_type(function, register, module_id, function_id, limits)?;
                 let (_, layout) = inline_layout(artifact, module_id, function_id, value, limits)?;
-                if layout.len() != count || layout.iter().any(|value| value.kind != 3) {
+                if layout.len() != count
+                    || layout
+                        .iter()
+                        .any(|value| value.kind != operation.scalar_kind())
+                {
                     return Err(type_failure(
                         limits,
                         module_id,
                         function_id,
-                        "matrix math requires exact F32 inline layout",
+                        "matrix math requires exact scalar-width inline layout",
                     ));
                 }
                 Ok(())
             };
             read(function, state, *lhs, module_id, function_id, limits)?;
-            check(*lhs, 16)?;
+            check(*lhs, operation.left_components())?;
             if let Some(rhs) = rhs {
                 read(function, state, *rhs, module_id, function_id, limits)?;
                 check(*rhs, operation.right_components().unwrap())?;

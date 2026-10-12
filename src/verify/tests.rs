@@ -2544,21 +2544,34 @@ fn matrix_admission_rejects_old_abi_wrong_shapes_uninitialized_inputs_and_costs(
         MultiplyVector,
         TransformPoint,
         TransformDirection,
+        Transpose3f,
+        MultiplyMatrix3f,
+        MultiplyVector3f,
+        Transpose3d,
+        MultiplyMatrix3d,
+        MultiplyVector3d,
+        Transpose4d,
+        MultiplyMatrix4d,
+        MultiplyVector4d,
+        TransformPoint4d,
+        TransformDirection4d,
     ] {
         for case in 0..8 {
             let mut artifact = crate::execution::fixtures::matrix_decoded(operation, 34, 0);
             assert!(verify_cfg(&artifact).is_ok());
             match case {
-                0 => artifact.header.runtime_minor = 16,
+                0 => artifact.header.runtime_minor = operation.runtime_minor() - 1,
                 1 => {
                     artifact.modules[0].functions[0].values[32]
                         .semantic_type
                         .kind = 3
                 }
                 2 => {
-                    artifact.modules[0].functions[0].values[34]
-                        .semantic_type
-                        .nominal_type = crate::artifact::TypeId(2)
+                    if let crate::artifact::NominalType::InlineValue { components, .. } =
+                        &mut artifact.modules[0].types[3]
+                    {
+                        components[0].kind = if operation.scalar_kind() == 3 { 4 } else { 3 };
+                    }
                 }
                 3 => {
                     if let crate::artifact::NominalType::InlineValue { components, .. } =
@@ -2581,7 +2594,7 @@ fn matrix_admission_rejects_old_abi_wrong_shapes_uninitialized_inputs_and_costs(
                         operation,
                         dst: 34,
                         lhs: 32,
-                        rhs: if operation == Transpose {
+                        rhs: if operation.is_transpose() {
                             Some(33)
                         } else {
                             None

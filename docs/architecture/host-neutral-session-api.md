@@ -354,3 +354,15 @@ Scalar Char output decodes a single UTF-16 unit using the existing terminal repl
 Surrogate pairs must be supplied in one String or buffer-range call. Buffer output preserves
 stream control behavior and positional clipping/colors/cursor behavior of existing String output.
 The native C ABI and executable instruction encoding remain unchanged.
+
+## Additional matrix shapes (Runtime ABI 1.19)
+
+The existing matrix_math encoding adds selectors 6/7/8 for Matrix3f transpose/matrix/vector products,
+9/10/11 for Matrix3d transpose/matrix/vector products, and 12/13/14/15/16 for Matrix4d
+transpose/matrix/vector/point/direction operations. Original selectors 1–5 retain their layout and cost.
+Three-dimensional matrices use nine components and three-dimensional vectors; Double shapes require
+exact F64 inline components. The verifier rejects an ABI below the selector minimum and mixed scalar
+widths. Three-dimensional costs are 11 for transpose, 54 for matrix product and 18 for vector product;
+4D Double costs equal their Float counterparts. Execution uses fixed stack snapshots and canonical
+scalar helpers, preserves left-to-right rounding without FMA, and supports all valid destination aliases.
+Container framing, native C ABI 23 and checkpoints are unchanged.

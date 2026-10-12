@@ -1248,33 +1248,53 @@ fn matrix_kernels_execute_all_components_allow_aliases_charge_cost_and_allocate_
         MultiplyVector,
         TransformPoint,
         TransformDirection,
+        Transpose3f,
+        MultiplyMatrix3f,
+        MultiplyVector3f,
+        Transpose3d,
+        MultiplyMatrix3d,
+        MultiplyVector3d,
+        Transpose4d,
+        MultiplyMatrix4d,
+        MultiplyVector4d,
+        TransformPoint4d,
+        TransformDirection4d,
     ] {
-        let destinations: &[u16] = match operation {
-            Transpose => &[34, 32],
-            MultiplyMatrix => &[34, 32, 33],
-            MultiplyVector => &[34, 33],
-            _ => &[34],
+        let destinations: &[u16] = if operation.is_transpose() {
+            &[34, 32]
+        } else if operation.is_matrix_product() {
+            &[34, 32, 33]
+        } else if operation.homogeneous_w().is_none() {
+            &[34, 33]
+        } else {
+            &[34]
         };
         for destination in destinations {
             for component in 0..operation.result_components() {
-                let row = component / 4;
-                let column = component % 4;
-                let expected = match operation {
-                    Transpose => (column * 4 + row + 1) as f32,
-                    MultiplyMatrix => (0..4)
-                        .map(|k| ((row * 4 + k + 1) * (k * 4 + column + 17)) as f32)
-                        .sum(),
-                    _ => {
-                        let row = component;
-                        let w = match operation {
-                            TransformPoint => 1.0,
-                            TransformDirection => 0.0,
-                            _ => 20.0,
-                        };
-                        ((row * 4 + 1) as f32 * 17.0 + (row * 4 + 2) as f32 * 18.0)
-                            + (row * 4 + 3) as f32 * 19.0
-                            + (row * 4 + 4) as f32 * w
-                    }
+                let dimension = operation.dimension();
+                let row = component / dimension;
+                let column = component % dimension;
+                let expected: f64 = if operation.is_transpose() {
+                    (column * dimension + row + 1) as f64
+                } else if operation.is_matrix_product() {
+                    (0..dimension)
+                        .map(|k| ((row * dimension + k + 1) * (k * dimension + column + 17)) as f64)
+                        .sum()
+                } else {
+                    (0..dimension)
+                        .map(|k| {
+                            let factor = if k == 3 {
+                                match operation.homogeneous_w() {
+                                    Some(true) => 1.0,
+                                    Some(false) => 0.0,
+                                    None => 20.0,
+                                }
+                            } else {
+                                (k + 17) as f64
+                            };
+                            (component * dimension + k + 1) as f64 * factor
+                        })
+                        .sum()
                 };
                 let artifact = fixtures::matrix_artifact(operation, *destination, component as u16);
                 let fixed_cost = artifact.decoded().modules[0].blocks[0].declared_fixed_cost;
@@ -1288,7 +1308,11 @@ fn matrix_kernels_execute_all_components_allow_aliases_charge_cost_and_allocate_
                 ));
                 assert_eq!(0, machine.consumed_fixed_cost());
                 assert_eq!(
-                    Outcome::Halted(Some(RuntimeValue::F32(expected.to_bits()))),
+                    Outcome::Halted(Some(if operation.scalar_kind() == 3 {
+                        RuntimeValue::F32((expected as f32).to_bits())
+                    } else {
+                        RuntimeValue::F64(expected.to_bits())
+                    })),
                     machine.run_slice(budget, 0).unwrap()
                 );
                 assert_eq!(u64::from(fixed_cost), machine.consumed_fixed_cost());

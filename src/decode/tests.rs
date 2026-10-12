@@ -1166,7 +1166,7 @@ fn matrix_frames_reject_unknown_selectors_nonzero_forms_and_wrong_arity() {
     use super::code::decode_code_record;
     let transpose = [0x1e, 0, 9, 0, 1, 2, 0, 0, 0, 0xe3, 0, 6, 0, 0xff, 0xff];
     assert!(decode_code_record(&transpose, 2, &ArtifactLimits::default()).is_ok());
-    for (offset, value) in [(1, 1), (4, 0), (4, 6), (4, 2)] {
+    for (offset, value) in [(1, 1), (4, 0), (4, 255), (4, 2)] {
         let mut invalid = transpose;
         invalid[offset] = value;
         assert!(decode_code_record(&invalid, 2, &ArtifactLimits::default()).is_err());
