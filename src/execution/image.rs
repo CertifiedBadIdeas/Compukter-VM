@@ -2862,7 +2862,14 @@ fn find_method_implementation(
                 .functions
                 .get(local_method as usize)
                 .ok_or(AdmissionError::InvalidEntry)?;
-            if same_method_shape(artifact, functions, declaration, candidate)? {
+            if same_method_shape(
+                artifact,
+                functions,
+                type_offsets,
+                assignable_types,
+                declaration,
+                candidate,
+            )? {
                 return Ok((decoded.flags & (1 << 3) == 0).then_some(candidate));
             }
         }
@@ -2888,7 +2895,14 @@ fn find_method_implementation(
             let candidate = function_offsets[owner.module as usize]
                 .checked_add(local_method as usize)
                 .ok_or(AdmissionError::StoragePlanOverflow)?;
-            if same_method_shape(artifact, functions, declaration, candidate)? {
+            if same_method_shape(
+                artifact,
+                functions,
+                type_offsets,
+                assignable_types,
+                declaration,
+                candidate,
+            )? {
                 candidates.push((owner, candidate));
             }
         }
@@ -2931,6 +2945,8 @@ fn most_specific_interface_method(
 fn same_method_shape(
     artifact: &DecodedArtifact,
     functions: &[ResolvedFunction],
+    type_offsets: &[usize],
+    assignable_types: &[Box<[TypeKey]>],
     declaration: usize,
     candidate: usize,
 ) -> Result<bool, AdmissionError> {
@@ -2949,7 +2965,12 @@ fn same_method_shape(
     let candidate_name =
         candidate_module.strings[candidate_record.name as usize].slice(&artifact.bytes);
     if declaration_name != candidate_name
-        || declaration.result != candidate.result
+        || !covariant_result(
+            declaration.result,
+            candidate.result,
+            type_offsets,
+            assignable_types,
+        )?
         || declaration.parameter_count == 0
         || candidate.parameter_count != declaration.parameter_count
     {
@@ -2957,6 +2978,28 @@ fn same_method_shape(
     }
     Ok(declaration.registers[1..declaration.parameter_count]
         == candidate.registers[1..candidate.parameter_count])
+}
+
+fn covariant_result(
+    declaration: ResolvedValueType,
+    candidate: ResolvedValueType,
+    type_offsets: &[usize],
+    assignable_types: &[Box<[TypeKey]>],
+) -> Result<bool, AdmissionError> {
+    if declaration == candidate {
+        return Ok(true);
+    }
+    if declaration.kind != 7 || candidate.kind != 7 || (candidate.nullable && !declaration.nullable)
+    {
+        return Ok(false);
+    }
+    let (Some(expected), Some(actual)) = (declaration.nominal, candidate.nominal) else {
+        return Ok(false);
+    };
+    Ok(assignable_types
+        .get(global_index(type_offsets, actual)?)
+        .ok_or(AdmissionError::InvalidEntry)?
+        .contains(&expected))
 }
 
 fn type_exists(artifact: &DecodedArtifact, key: TypeKey) -> bool {
@@ -3028,6 +3071,40 @@ fn assignable_types(
 mod tests {
     use super::*;
     use crate::execution::{error::AdmissionError, fixtures, FunctionKey};
+
+    #[test]
+    fn method_results_allow_only_assignable_reference_covariance() {
+        let base = TypeKey { module: 0, ty: 0 };
+        let child = TypeKey { module: 0, ty: 1 };
+        let foreign = TypeKey { module: 1, ty: 0 };
+        let offsets = [0, 2, 3];
+        let types: Vec<Box<[TypeKey]>> = vec![
+            vec![base].into(),
+            vec![child, base].into(),
+            vec![foreign].into(),
+        ];
+        let reference = |nominal, nullable| ResolvedValueType {
+            kind: 7,
+            nullable,
+            nominal: Some(nominal),
+        };
+        let accepts =
+            |expected, actual| covariant_result(expected, actual, &offsets, &types).unwrap();
+        assert!(accepts(reference(base, false), reference(child, false)));
+        assert!(accepts(reference(base, true), reference(child, false)));
+        assert!(accepts(reference(base, true), reference(child, true)));
+        assert!(!accepts(reference(base, false), reference(child, true)));
+        assert!(!accepts(reference(child, false), reference(base, false)));
+        assert!(!accepts(reference(base, false), reference(foreign, false)));
+        let scalar = |kind| ResolvedValueType {
+            kind,
+            nullable: false,
+            nominal: None,
+        };
+        assert!(accepts(scalar(1), scalar(1)));
+        assert!(!accepts(scalar(1), scalar(2)));
+        assert!(!accepts(reference(base, false), scalar(1)));
+    }
 
     #[test]
     fn global_type_ids_preserve_module_identity_across_empty_modules() {
