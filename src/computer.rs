@@ -1536,6 +1536,18 @@ impl ComputerMachine {
                     .map_err(|_| ComputerError::InvalidTerminalRequest)?;
                 HostValueInput::Unit
             }
+            RawTerminalOperation::WriteChar(character) => {
+                self.terminal
+                    .write_utf16(&[character])
+                    .map_err(|_| ComputerError::InvalidTerminalRequest)?;
+                HostValueInput::Unit
+            }
+            RawTerminalOperation::WriteCharAt { x, y, character } => {
+                self.terminal
+                    .write_at(terminal_position(x, y)?, &[character])
+                    .map_err(|_| ComputerError::InvalidTerminalRequest)?;
+                HostValueInput::Unit
+            }
             RawTerminalOperation::ErasePrevious => {
                 self.terminal.erase_previous();
                 HostValueInput::Unit
@@ -2558,6 +2570,12 @@ enum StdioOperation {
 
 enum RawTerminalOperation {
     Write(Vec<u16>),
+    WriteChar(u16),
+    WriteCharAt {
+        x: i32,
+        y: i32,
+        character: u16,
+    },
     ErasePrevious,
     Clear,
     AwaitEvent,
@@ -2650,6 +2668,20 @@ fn admit_session(
         HostValueType::I32,
         HostValueType::Char,
     ];
+    let terminal_char_arguments = [HostValueType::Char];
+    let terminal_char_at_arguments = [HostValueType::I32, HostValueType::I32, HostValueType::Char];
+    let terminal_range_arguments = [
+        HostValueType::CharArrayRange { start: 1, end: 2 },
+        HostValueType::I32,
+        HostValueType::I32,
+    ];
+    let terminal_range_at_arguments = [
+        HostValueType::I32,
+        HostValueType::I32,
+        HostValueType::CharArrayRange { start: 3, end: 4 },
+        HostValueType::I32,
+        HostValueType::I32,
+    ];
     let raw_terminal_operations = [
         OperationSchema::synchronous(&string_argument, HostValueType::Unit),
         OperationSchema::synchronous(&[], HostValueType::Unit),
@@ -2670,6 +2702,10 @@ fn admit_session(
         OperationSchema::synchronous(&[], HostValueType::I32),
         OperationSchema::synchronous(&[], HostValueType::I32),
         OperationSchema::asynchronous(&submitted_line_arguments, HostValueType::I32),
+        OperationSchema::synchronous(&terminal_char_arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&terminal_char_at_arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&terminal_range_arguments, HostValueType::Unit),
+        OperationSchema::synchronous(&terminal_range_at_arguments, HostValueType::Unit),
     ];
     let stdio_operations = [
         OperationSchema::asynchronous(&[], HostValueType::String),
@@ -2762,7 +2798,7 @@ fn admit_session(
         TERMINAL_NAMESPACE,
         TERMINAL_NAME,
         RAW_TERMINAL_ABI_MAJOR,
-        2,
+        3,
         &raw_terminal_operations,
     ));
     bindings.push(CapabilityBinding::new(
@@ -3344,6 +3380,38 @@ fn copy_raw_terminal_request(
                 return Err(ComputerError::InvalidTerminalRequest);
             }
             RawTerminalOperation::AwaitSubmittedLineEvent
+        }
+        19 if !request.asynchronous() && request.arguments().len() == 1 => {
+            let Some(HostValueView::Char(character)) = request.arguments().get(0) else {
+                return Err(ComputerError::InvalidTerminalRequest);
+            };
+            RawTerminalOperation::WriteChar(character)
+        }
+        20 if !request.asynchronous() && request.arguments().len() == 3 => {
+            let Some(HostValueView::Char(character)) = request.arguments().get(2) else {
+                return Err(ComputerError::InvalidTerminalRequest);
+            };
+            RawTerminalOperation::WriteCharAt {
+                x: integer(0)?,
+                y: integer(1)?,
+                character,
+            }
+        }
+        21 if !request.asynchronous() && request.arguments().len() == 3 => {
+            let Some(HostValueView::String(units)) = request.arguments().get(0) else {
+                return Err(ComputerError::InvalidTerminalRequest);
+            };
+            RawTerminalOperation::Write(units.to_vec())
+        }
+        22 if !request.asynchronous() && request.arguments().len() == 5 => {
+            let Some(HostValueView::String(units)) = request.arguments().get(2) else {
+                return Err(ComputerError::InvalidTerminalRequest);
+            };
+            RawTerminalOperation::WriteAt {
+                x: integer(0)?,
+                y: integer(1)?,
+                units: units.to_vec(),
+            }
         }
         _ => return Err(ComputerError::InvalidTerminalRequest),
     };

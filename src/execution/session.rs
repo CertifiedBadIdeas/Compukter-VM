@@ -831,6 +831,20 @@ impl Session {
                     outbound_bytes_used = outbound_bytes_used
                         .checked_add(length)
                         .ok_or(super::error::VmFault::AccountingOverflow)?;
+                } else if let Some(super::host::HostValueType::CharArrayRange { start, end }) =
+                    schema.arguments.get(index)
+                {
+                    contains_string = true;
+                    let (_, length) = self
+                        .machine
+                        .capability_char_array_range(register, *start, *end)?;
+                    self.argument_slots[index] = HostValueSlot::String {
+                        start: outbound_used,
+                        length,
+                    };
+                    outbound_used = outbound_used
+                        .checked_add(length)
+                        .ok_or(super::error::VmFault::AccountingOverflow)?;
                 } else if schema.arguments.get(index) == Some(&super::host::HostValueType::String) {
                     contains_string = true;
                     let length = self.machine.capability_string_length(register)?;
@@ -1032,6 +1046,22 @@ impl Session {
                                 .capability_byte_array_byte(register, state.string_offset)
                                 .map_err(|_| RunError::NotRunnable)?,
                         )
+                    } else if let Some(super::host::HostValueType::CharArrayRange { start, end }) =
+                        self.capabilities
+                            .get(state.capability as usize)
+                            .and_then(Option::as_ref)
+                            .and_then(|capability| {
+                                capability.operations.get(state.operation as usize)
+                            })
+                            .and_then(|operation| operation.arguments.get(state.argument))
+                    {
+                        let (offset, _) = self
+                            .machine
+                            .capability_char_array_range(register, *start, *end)
+                            .map_err(|_| RunError::NotRunnable)?;
+                        self.machine
+                            .capability_char_array_code_unit(register, offset + state.string_offset)
+                            .map_err(|_| RunError::NotRunnable)?
                     } else {
                         self.machine
                             .capability_string_code_unit(register, state.string_offset)

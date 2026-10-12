@@ -330,3 +330,27 @@ A non-null implementation may satisfy a nullable declaration; a nullable impleme
 a non-null declaration. Scalar results and parameters retain exact matching, and nominal identity includes
 the defining module. This supports `String.subSequence(): String` implementing `CharSequence.subSequence(): CharSequence`
 without bridge objects or new instructions. Artifact encoding and the native C ABI are unchanged.
+
+## Terminal UTF-16 buffer arguments
+
+Terminal capability ABI 2.3 appends synchronous selectors 19 `writeChar(Char)`, 20
+`writeCharAt(I32,I32,Char)`, 21 `writeRange(CharArray,I32,I32)` and 22
+`writeRangeAt(I32,I32,CharArray,I32,I32)`. Older terminal ABI 2.0–2.2 artifacts remain admitted.
+
+The internal argument-only `HostValueType::CharArrayRange { start, end }` selects a non-null
+CharArray and indexes its bounds through I32 arguments in the same request. Admission validates
+that array element type and bound argument schemas match. Request preparation rechecks
+`0 <= start <= end <= array.length`, snapshots only selected UTF-16 units into the existing
+bounded outbound buffer and charges the ordinary sliced dynamic preparation cost and host-code-unit
+quota. A large backing array therefore does not consume quota for its unused capacity.
+
+The published argument uses the existing UTF-16 `HostValueView::String` snapshot representation;
+no managed Guest String is created and no native pointer into Guest memory escapes. Slice
+bounds are argument metadata rather than part of the encoded snapshot. Results and record fields
+cannot use CharArrayRange. Checkpoints append internal host-schema tag 10 and retain the existing
+snapshot/preparation state; restore validates both pending and partial range requests.
+
+Scalar Char output decodes a single UTF-16 unit using the existing terminal replacement policy.
+Surrogate pairs must be supplied in one String or buffer-range call. Buffer output preserves
+stream control behavior and positional clipping/colors/cursor behavior of existing String output.
+The native C ABI and executable instruction encoding remain unchanged.

@@ -213,7 +213,7 @@ impl Session {
                     .arguments
                     .iter()
                     .zip(request.arguments())
-                    .any(|(expected, slot)| checkpoint_slot_type(*slot) != Some(*expected))
+                    .any(|(expected, slot)| !checkpoint_argument_matches(*slot, *expected))
             {
                 return Err(CheckpointError::InvalidState);
             }
@@ -299,7 +299,7 @@ impl Session {
                 .zip(suspension.arguments)
                 .enumerate()
             {
-                if checkpoint_slot_type(*slot) != Some(*expected) {
+                if !checkpoint_argument_matches(*slot, *expected) {
                     return Err(CheckpointError::InvalidState);
                 }
                 let span = match slot {
@@ -307,7 +307,14 @@ impl Session {
                         *start,
                         *length,
                         outbound_capacity,
-                        admitted.machine.capability_string_length(*register).ok(),
+                        match expected {
+                            HostValueType::CharArrayRange { start, end } => admitted
+                                .machine
+                                .capability_char_array_range(*register, *start, *end)
+                                .ok()
+                                .map(|(_, length)| length),
+                            _ => admitted.machine.capability_string_length(*register).ok(),
+                        },
                     )),
                     HostValueSlot::ByteArray { start, length } => Some((
                         *start,
@@ -339,6 +346,12 @@ impl Session {
         }
         Ok(admitted)
     }
+}
+
+fn checkpoint_argument_matches(slot: HostValueSlot, expected: HostValueType) -> bool {
+    checkpoint_slot_type(slot) == Some(expected)
+        || matches!(expected, HostValueType::CharArrayRange { .. })
+            && matches!(slot, HostValueSlot::String { .. })
 }
 
 fn checkpoint_slot_type(slot: HostValueSlot) -> Option<HostValueType> {
@@ -685,5 +698,57 @@ mod tests {
             }
         }
         panic!("byte array did not complete");
+    }
+    #[test]
+    fn char_array_range_copy_restores_before_during_and_after_publication() {
+        let artifact = fixtures::char_array_range_artifact(1, 33, 64);
+        let arguments = [
+            HostValueType::CharArrayRange { start: 1, end: 2 },
+            HostValueType::I32,
+            HostValueType::I32,
+        ];
+        let operations = [OperationSchema::synchronous(
+            &arguments,
+            HostValueType::Unit,
+        )];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut original =
+            Session::admit_untraced(artifact.clone(), profile(), &[binding]).unwrap();
+        original.start(&[]).unwrap();
+        let mut visited_partial = false;
+        for _ in 0..1000 {
+            original = round_trip(&original, artifact.clone(), &[binding]);
+            visited_partial |= original.preparing_request.is_some();
+            let budget = if original.preparing_request.is_some() {
+                1
+            } else {
+                64
+            };
+            match original.advance(budget, 1).unwrap() {
+                AdvanceOutcome::SliceExhausted => (),
+                AdvanceOutcome::HostRequestBatch(batch) => {
+                    let request = batch.get(0).unwrap();
+                    let mut expected = vec![0; 32];
+                    expected[..3].copy_from_slice(&[0xd83d, 0xde00, 'Z' as u16]);
+                    assert_eq!(
+                        Some(HostValueView::String(&expected)),
+                        request.arguments().get(0)
+                    );
+                    let id = request.id();
+                    original = round_trip(&original, artifact, &[binding]);
+                    original
+                        .resume(id, HostResponse::Success(HostValueInput::Unit))
+                        .unwrap();
+                    assert_eq!(
+                        AdvanceOutcome::Halted(Some(HostValueView::I32(1))),
+                        original.advance(64, 64).unwrap()
+                    );
+                    assert!(visited_partial);
+                    return;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        panic!("range copy did not complete");
     }
 }
