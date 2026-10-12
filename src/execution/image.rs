@@ -1822,7 +1822,11 @@ fn physical_atom(value: ResolvedValueType) -> Result<PhysicalAtom, AdmissionErro
     }
 }
 
-fn resolve_type(artifact: &DecodedArtifact, module: usize, reference: TypeId) -> Option<TypeKey> {
+pub(super) fn resolve_type(
+    artifact: &DecodedArtifact,
+    module: usize,
+    reference: TypeId,
+) -> Option<TypeKey> {
     if reference.0 == u32::MAX {
         return None;
     }
@@ -2633,7 +2637,8 @@ fn validate_capability_call(
             let actual = resolved_function.registers.get(destination as usize);
             match (actual, schema.result_record.as_ref()) {
                 (Some(actual), Some(record))
-                    if actual.kind == 7
+                    if (actual.kind == 7
+                        || actual.kind == 8 && resolution.artifact.header.runtime_minor >= 20)
                         && !actual.nullable
                         && resolution.artifact.header.runtime_minor >= 13 =>
                 {
@@ -2654,6 +2659,9 @@ fn validate_capability_call(
                             ) -> Option<()> {
                                 let index =
                                     checked_global_index(resolution.type_offsets, layout.ty)?;
+                                if layout.inline {
+                                    return Some(());
+                                }
                                 let RuntimeTypeLayout::Object(object) =
                                     resolution.type_layouts.get(index)?
                                 else {

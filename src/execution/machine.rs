@@ -303,6 +303,13 @@ impl AllocationRetry {
 }
 
 impl Machine {
+    #[cfg(test)]
+    pub(super) fn test_has_staged_record_reference(&self) -> bool {
+        self.pending_record
+            .as_ref()
+            .is_some_and(|pending| pending.test_has_staged_reference())
+    }
+
     pub(super) const fn task_failure_bytes(capacity: u64, host_failures: bool) -> Option<u64> {
         let per_task = core::mem::size_of::<Option<TaskFailure>>()
             + if host_failures {
@@ -817,7 +824,15 @@ impl Machine {
         match result {
             Ok((_, Some(value))) => {
                 self.pending_record_source = None;
-                if let Err(fault) = self.complete_capability(Some(value)) {
+                let completed = match value {
+                    super::record::RecordOutput::Scalar(value) => {
+                        self.complete_capability(Some(value))
+                    }
+                    super::record::RecordOutput::Inline(values) => {
+                        self.complete_inline_capability(&values)
+                    }
+                };
+                if let Err(fault) = completed {
                     return Ok(self.fault(fault));
                 }
             }
@@ -3864,6 +3879,87 @@ impl Machine {
         } else {
             frame.instruction += 1;
         }
+        Ok(())
+    }
+
+    fn complete_inline_capability(&mut self, values: &[RuntimeValue]) -> Result<(), VmFault> {
+        let index = self
+            .frame_depth
+            .checked_sub(1)
+            .ok_or(VmFault::CorruptLifecycle)?;
+        let frame = self.frames[index];
+        let (destination, resume) = match self
+            .image
+            .block(frame.block)
+            .and_then(|b| b.instructions.get(frame.instruction))
+        {
+            Some(ResolvedInstruction::CapabilityCallAsync {
+                dst, resume_block, ..
+            }) => (*dst, *resume_block),
+            _ => return Err(VmFault::CorruptLifecycle),
+        };
+        let function = self
+            .image
+            .function(frame.function)
+            .ok_or(VmFault::InvalidResolvedId)?;
+        if function
+            .registers
+            .get(destination as usize)
+            .is_none_or(|v| v.kind != 8)
+            || function
+                .frame_layout
+                .values
+                .get(destination as usize)
+                .is_none_or(|v| v.components.len() != values.len())
+        {
+            return Err(VmFault::InvalidValueType);
+        }
+        for (component, value) in values.iter().enumerate() {
+            let value_index = destination as usize;
+            let layout = &function.frame_layout;
+            match value {
+                RuntimeValue::I32(v) => {
+                    self.frame_arena
+                        .write_i32(frame.base, layout, value_index, component, *v)?
+                }
+                RuntimeValue::I64(v) => {
+                    self.frame_arena
+                        .write_i64(frame.base, layout, value_index, component, *v)?
+                }
+                RuntimeValue::F32(v) => {
+                    self.frame_arena
+                        .write_f32(frame.base, layout, value_index, component, *v)?
+                }
+                RuntimeValue::F64(v) => {
+                    self.frame_arena
+                        .write_f64(frame.base, layout, value_index, component, *v)?
+                }
+                RuntimeValue::Bool(v) => self.frame_arena.write_i32(
+                    frame.base,
+                    layout,
+                    value_index,
+                    component,
+                    i32::from(*v),
+                )?,
+                RuntimeValue::Char(v) => self.frame_arena.write_i32(
+                    frame.base,
+                    layout,
+                    value_index,
+                    component,
+                    i32::from(*v),
+                )?,
+                RuntimeValue::Reference(v) => self.frame_arena.write_ref32(
+                    frame.base,
+                    layout,
+                    value_index,
+                    component,
+                    Some(*v),
+                )?,
+                RuntimeValue::Null => return Err(VmFault::InvalidValueType),
+            }
+        }
+        self.frames[index].block = resume;
+        self.frames[index].instruction = 0;
         Ok(())
     }
 

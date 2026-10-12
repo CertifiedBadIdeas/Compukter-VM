@@ -1350,6 +1350,16 @@ fn verify_instruction(
                 read(function, state, *argument, module_id, function_id, limits)?;
             }
             if *dst != u16::MAX {
+                if register_type(function, *dst, module_id, function_id, limits)?.kind == 8
+                    && artifact.header.runtime_minor < 20
+                {
+                    return Err(type_failure(
+                        limits,
+                        module_id,
+                        function_id,
+                        "inline host responses require Runtime ABI 1.20",
+                    ));
+                }
                 write(state, *dst, function, module_id, function_id, limits)?;
             }
         }
@@ -1469,6 +1479,16 @@ fn verify_instruction(
                 read(function, state, *argument, module_id, function_id, limits)?;
             }
             if *dst != u16::MAX {
+                if register_type(function, *dst, module_id, function_id, limits)?.kind == 8
+                    && artifact.header.runtime_minor < 20
+                {
+                    return Err(type_failure(
+                        limits,
+                        module_id,
+                        function_id,
+                        "inline host responses require Runtime ABI 1.20",
+                    ));
+                }
                 write(state, *dst, function, module_id, function_id, limits)?;
             }
         }
