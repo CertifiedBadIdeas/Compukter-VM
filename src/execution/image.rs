@@ -2727,6 +2727,22 @@ fn host_type_matches(
                         )
                     })
         }
+        HostValueType::CharArrayRange { .. } => {
+            actual.kind == 7
+                && !actual.nullable
+                && actual
+                    .nominal
+                    .and_then(|ty| global_index(resolution.type_offsets, ty).ok())
+                    .and_then(|index| resolution.type_layouts.get(index))
+                    .is_some_and(|layout| {
+                        matches!(
+                            layout,
+                            RuntimeTypeLayout::Array {
+                                element: ValueWidth::Char
+                            }
+                        )
+                    })
+        }
     }
 }
 

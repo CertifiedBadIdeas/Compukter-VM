@@ -8129,3 +8129,111 @@ pub(super) fn matrix_comparison_artifact(scalar: bool, repetitions: usize) -> Ve
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
+
+/// A large reusable buffer with a small selectable UTF-16 range.
+pub(crate) fn char_array_range_artifact(start: i32, end: i32, capacity: i32) -> VerifiedArtifact {
+    let array = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(1),
+    };
+    let mut constants = vec![
+        Constant::I32(start),
+        Constant::I32(end),
+        Constant::I32(capacity),
+        Constant::I32(0),
+        Constant::I32(1),
+        Constant::I32(2),
+        Constant::I32(3),
+        Constant::Char('A' as u16),
+        Constant::Char(0xd83d),
+        Constant::Char(0xde00),
+        Constant::Char('Z' as u16),
+    ];
+    constants.sort_by_key(crate::test_encode::encode_constant);
+    constants.dedup();
+    let id = |value: Constant| constants.iter().position(|v| *v == value).unwrap() as u32;
+    let mut code = vec![
+        Instruction::Const {
+            dst: 1,
+            constant: id(Constant::I32(start)),
+        },
+        Instruction::Const {
+            dst: 2,
+            constant: id(Constant::I32(end)),
+        },
+        Instruction::Const {
+            dst: 5,
+            constant: id(Constant::I32(capacity)),
+        },
+        Instruction::NewArray {
+            dst: 0,
+            type_ref: 1,
+            length: 5,
+        },
+    ];
+    for (index, unit) in ['A' as u16, 0xd83d, 0xde00, 'Z' as u16]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        code.push(Instruction::Const {
+            dst: 3,
+            constant: id(Constant::I32(index as i32)),
+        });
+        code.push(Instruction::Const {
+            dst: 4,
+            constant: id(Constant::Char(unit)),
+        });
+        code.push(Instruction::ArrayStore {
+            array: 0,
+            index: 3,
+            value: 4,
+        });
+    }
+    code.push(Instruction::CapabilityCallSync {
+        dst: u16::MAX,
+        capability: 0,
+        operation: 0,
+        args: Box::new([0, 1, 2]),
+    });
+    code.push(Instruction::Return { value: 1 });
+    let allocation = code.remove(3);
+    let mut prepare = code.drain(..3).collect::<Vec<_>>();
+    prepare.push(Instruction::Jump { target: 1 });
+    code.insert(0, allocation);
+    literal_string_program_blocks_configured(
+        primitive(1),
+        vec![
+            array,
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(6),
+            primitive(1),
+        ],
+        constants,
+        &[],
+        vec![prepare, code],
+        |artifact| {
+            artifact.modules[0].types.push(NominalType::Array {
+                name: 0,
+                storage: 0,
+                element: primitive(6),
+                super_type: None,
+            });
+            artifact.modules[0].declared_types = 2;
+            artifact.header.semantic_features = 0b1100;
+            artifact.capabilities.push(crate::artifact::Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 1,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+        },
+    )
+}

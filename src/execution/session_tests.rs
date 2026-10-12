@@ -1813,3 +1813,125 @@ fn byte_array_oom_uses_managed_array_exhaustion() {
         AdvanceOutcome::AllocationExhausted(_)
     ));
 }
+
+#[test]
+fn char_array_ranges_copy_only_selected_units_and_enforce_host_quota() {
+    let arguments = [
+        HostValueType::CharArrayRange { start: 1, end: 2 },
+        HostValueType::I32,
+        HostValueType::I32,
+    ];
+    let operations = [OperationSchema::synchronous(
+        &arguments,
+        HostValueType::Unit,
+    )];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    for (start, end, expected) in [
+        (1, 4, vec![0xd83d, 0xde00, 'Z' as u16]),
+        (2, 3, vec![0xde00]),
+        (4, 4, vec![]),
+    ] {
+        let mut session = Session::admit_untraced(
+            fixtures::char_array_range_artifact(start, end, 8192),
+            profile(),
+            &[binding],
+        )
+        .unwrap();
+        session.start(&[]).unwrap();
+        let id = loop {
+            match session.advance(64, 64).unwrap() {
+                AdvanceOutcome::SliceExhausted => (),
+                AdvanceOutcome::HostRequestBatch(batch) => {
+                    let request = batch.get(0).unwrap();
+                    assert_eq!(
+                        Some(HostValueView::String(&expected)),
+                        request.arguments().get(0)
+                    );
+                    break request.id();
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        session
+            .resume(id, HostResponse::Success(HostValueInput::Unit))
+            .unwrap();
+        assert_eq!(
+            AdvanceOutcome::Halted(Some(HostValueView::I32(start))),
+            session.advance(64, 64).unwrap()
+        );
+    }
+    for (start, end) in [(-1, 3), (3, 2), (0, 8193)] {
+        let mut session = Session::admit_untraced(
+            fixtures::char_array_range_artifact(start, end, 8192),
+            profile(),
+            &[binding],
+        )
+        .unwrap();
+        session.start(&[]).unwrap();
+        loop {
+            match session.advance(64, 64).unwrap() {
+                AdvanceOutcome::SliceExhausted => (),
+                AdvanceOutcome::Faulted(_) => break,
+                other => panic!("invalid range was published: {other:?}"),
+            }
+        }
+    }
+    let mut limits = profile();
+    limits.maximum_outbound_utf16_code_units = 2;
+    let mut session = Session::admit_untraced(
+        fixtures::char_array_range_artifact(1, 4, 8192),
+        limits,
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    loop {
+        match session.advance(64, 64).unwrap() {
+            AdvanceOutcome::SliceExhausted => (),
+            AdvanceOutcome::QuotaExhausted(quota) => {
+                assert_eq!(QuotaKind::HostRequestCodeUnits, quota.kind);
+                assert_eq!(3, quota.consumed);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn char_array_range_schema_rejects_wrong_arrays_bounds_and_results() {
+    let artifact = fixtures::char_array_range_artifact(1, 4, 64);
+    let wrong_array = [
+        HostValueType::ByteArray,
+        HostValueType::I32,
+        HostValueType::I32,
+    ];
+    let operations = [OperationSchema::synchronous(
+        &wrong_array,
+        HostValueType::Unit,
+    )];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    assert!(Session::admit_untraced(artifact, profile(), &[binding]).is_err());
+    for arguments in [
+        vec![
+            HostValueType::CharArrayRange { start: 0, end: 1 },
+            HostValueType::I32,
+        ],
+        vec![
+            HostValueType::CharArrayRange { start: 1, end: 2 },
+            HostValueType::I32,
+        ],
+        vec![
+            HostValueType::CharArrayRange { start: 1, end: 2 },
+            HostValueType::Bool,
+            HostValueType::I32,
+        ],
+    ] {
+        assert!(!super::record::valid_operation(
+            &OperationSchema::synchronous(&arguments, HostValueType::Unit)
+        ));
+    }
+    assert!(!super::record::valid_operation(
+        &OperationSchema::synchronous(&[], HostValueType::CharArrayRange { start: 0, end: 0 })
+    ));
+}

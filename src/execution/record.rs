@@ -54,7 +54,16 @@ pub(super) fn valid_type_name(name: &str) -> bool {
 }
 
 pub(super) fn valid_operation(operation: &OperationSchema<'_>) -> bool {
-    if operation.arguments.contains(&HostValueType::Record) {
+    if matches!(operation.result, HostValueType::CharArrayRange { .. })
+        || operation.arguments.iter().any(|ty| match ty {
+            HostValueType::CharArrayRange { start, end } => {
+                operation.arguments.get(*start as usize) != Some(&HostValueType::I32)
+                    || operation.arguments.get(*end as usize) != Some(&HostValueType::I32)
+            }
+            _ => false,
+        })
+        || operation.arguments.contains(&HostValueType::Record)
+    {
         return false;
     }
     match operation.result_record {
@@ -98,7 +107,13 @@ impl HostRecordSchema {
                 match (&field.value_type, &field.record) {
                     (HostValueType::Record, Some(child))
                         if visit(child, depth + 1, fields, nodes) => {}
-                    (HostValueType::Record | HostValueType::Unit | HostValueType::ByteArray, _)
+                    (
+                        HostValueType::Record
+                        | HostValueType::Unit
+                        | HostValueType::ByteArray
+                        | HostValueType::CharArrayRange { .. },
+                        _,
+                    )
                     | (_, Some(_)) => return false,
                     (HostValueType::String, None) => {
                         *nodes += 1;

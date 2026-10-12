@@ -15,6 +15,12 @@ pub enum HostValueType {
     String,
     Record,
     ByteArray,
+    /// Argument-only CharArray slice. Bounds refer to I32 arguments in the same request.
+    /// Published as an owned UTF-16 String view, without creating a Guest String.
+    CharArrayRange {
+        start: u16,
+        end: u16,
+    },
 }
 
 pub const MAXIMUM_HOST_BYTE_ARRAY_BYTES: usize = 4096;

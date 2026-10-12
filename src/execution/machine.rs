@@ -3764,6 +3764,48 @@ impl Machine {
         Ok(self.heap.read_payload(reference, 8 + index, 1)?[0])
     }
 
+    pub(super) fn capability_char_array_range(
+        &self,
+        register: u16,
+        start_argument: u16,
+        end_argument: u16,
+    ) -> Result<(u32, u32), VmFault> {
+        let (_, _, element, length) = self
+            .resolve_array(self.capability_argument(register)?)
+            .map_err(|_| VmFault::InvalidValueType)?;
+        let arguments = self.capability_suspension()?.arguments;
+        let integer = |argument: u16| -> Result<i32, VmFault> {
+            let register = *arguments
+                .get(argument as usize)
+                .ok_or(VmFault::InvalidStoragePlan)?;
+            match self.capability_argument(register)? {
+                RuntimeValue::I32(value) => Ok(value),
+                _ => Err(VmFault::InvalidValueType),
+            }
+        };
+        let start = integer(start_argument)?;
+        let end = integer(end_argument)?;
+        if element != ValueWidth::Char || start < 0 || end < start || end > length {
+            return Err(VmFault::InvalidReference);
+        }
+        Ok((start as u32, (end - start) as u32))
+    }
+
+    pub(super) fn capability_char_array_code_unit(
+        &self,
+        register: u16,
+        index: u32,
+    ) -> Result<u16, VmFault> {
+        let (reference, _, element, length) = self
+            .resolve_array(self.capability_argument(register)?)
+            .map_err(|_| VmFault::InvalidValueType)?;
+        if element != ValueWidth::Char || index >= length as u32 {
+            return Err(VmFault::InvalidReference);
+        }
+        let bytes = self.heap.read_payload(reference, 8 + index * 2, 2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
     pub(super) fn charge_capability_dynamic(&mut self, units: u32) -> Result<(), VmFault> {
         self.consumed_dynamic_cost = self
             .consumed_dynamic_cost

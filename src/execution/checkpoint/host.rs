@@ -99,7 +99,7 @@ checkpoint_struct!(EntryArgumentLimits {
     maximum_total_code_units
 });
 
-checkpoint_enum!(HostValueType { 0 => Unit; 1 => I32; 2 => I64; 3 => F32; 4 => F64; 5 => Bool; 6 => Char; 7 => String; 8 => Record; 9 => ByteArray; });
+checkpoint_enum!(HostValueType { 0 => Unit; 1 => I32; 2 => I64; 3 => F32; 4 => F64; 5 => Bool; 6 => Char; 7 => String; 8 => Record; 9 => ByteArray; 10 => CharArrayRange { start, end }; });
 checkpoint_enum!(HostMergeEntrySource { 0 => ArgumentPair { key, value }; 1 => PackedFields { argument, width, count }; });
 checkpoint_enum!(HostMergeSchema { 0 => Ordinary; 1 => LastWriteWins { group, source }; });
 checkpoint_struct!(ResolvedOperation {
