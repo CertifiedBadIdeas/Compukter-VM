@@ -358,10 +358,10 @@ fn replication_preserves_scroll_order_and_resyncs_after_journal_eviction() {
     };
     assert!(matches!(second.changes()[0], TerminalChange::Patch { .. }));
     assert!(matches!(
-        second.changes()[1],
+        second.changes()[2],
         TerminalChange::Scroll { rows: 1, .. }
     ));
-    assert!(matches!(second.changes()[2], TerminalChange::Patch { .. }));
+    assert!(matches!(second.changes()[3], TerminalChange::Patch { .. }));
     assert!(matches!(
         terminal.changes_since(1),
         TerminalUpdate::Delta(delta) if delta.target_revision() == 2
@@ -399,7 +399,7 @@ fn oversized_pending_journal_compacts_to_one_bounded_full_replacement() {
         panic!("mutations must commit");
     };
 
-    assert_eq!(3, delta.changes().len());
+    assert_eq!(4, delta.changes().len());
     assert!(matches!(delta.changes()[0], TerminalChange::Reset));
     assert!(matches!(
         &delta.changes()[1],
@@ -407,7 +407,11 @@ fn oversized_pending_journal_compacts_to_one_bounded_full_replacement() {
             if cells.len() == TERMINAL_WIDTH as usize * TERMINAL_HEIGHT as usize
                 && cells[0] == cell
     ));
-    assert!(matches!(delta.changes()[2], TerminalChange::Cursor { .. }));
+    assert!(matches!(
+        delta.changes()[2],
+        TerminalChange::HistoryReplace { .. }
+    ));
+    assert!(matches!(delta.changes()[3], TerminalChange::Cursor { .. }));
 }
 
 #[test]
@@ -440,4 +444,76 @@ fn oversized_accumulated_journal_resyncs_with_a_bounded_full_state() {
         cell_heavy.changes_since(0),
         TerminalUpdate::Full(snapshot) if snapshot.revision() == 9
     ));
+}
+
+#[test]
+fn history_is_complete_after_compaction_and_bounded_after_long_output() {
+    let mut terminal = compukter_vm::TerminalDevice::default();
+    for line in 0..600 {
+        terminal
+            .write_utf16(&format!("{line}\n").encode_utf16().collect::<Vec<_>>())
+            .unwrap();
+    }
+    terminal.commit();
+    let compukter_vm::TerminalUpdate::Full(snapshot) = terminal.changes_since(u64::MAX) else {
+        panic!("expected full")
+    };
+    assert_eq!(512 * 51, snapshot.history_cells().len());
+    assert_eq!(70, snapshot.history_start());
+    assert_eq!('7' as u32, snapshot.history_cells()[0].code_point());
+    // The bounded delta cell budget deliberately falls back to a complete snapshot.
+    let compukter_vm::TerminalUpdate::Full(compacted) = terminal.changes_since(0) else {
+        panic!("expected full fallback")
+    };
+    assert_eq!(snapshot, compacted);
+    terminal.clear();
+    terminal.commit();
+    let compukter_vm::TerminalUpdate::Full(snapshot) = terminal.changes_since(u64::MAX) else {
+        panic!("expected full")
+    };
+    assert_eq!(512 * 51, snapshot.history_cells().len());
+}
+
+#[test]
+fn history_append_contains_actual_removed_cells_and_stable_row_identity() {
+    let mut terminal = compukter_vm::TerminalDevice::default();
+    terminal
+        .write_at(
+            compukter_vm::TerminalPosition::new(0, 0).unwrap(),
+            &"Привет😀".encode_utf16().collect::<Vec<_>>(),
+        )
+        .unwrap();
+    terminal.scroll(1).unwrap();
+    terminal.commit();
+    let compukter_vm::TerminalUpdate::Delta(delta) = terminal.changes_since(0) else {
+        panic!("expected delta")
+    };
+    assert!(delta.changes().iter().any(|change| matches!(change, compukter_vm::TerminalChange::HistoryAppend { first_row: 0, cells } if cells.len() == 51 && cells[6].code_point() == '😀' as u32)));
+}
+
+#[test]
+fn clear_before_commit_preserves_scrolled_rows_without_retransmitting_unchanged_history() {
+    let mut terminal = TerminalDevice::default();
+    terminal
+        .write_at(TerminalPosition::new(0, 0).unwrap(), &[65])
+        .unwrap();
+    terminal.scroll(1).unwrap();
+    terminal.clear();
+    let TerminalCommit::Committed(delta) = terminal.commit() else {
+        panic!("expected changes")
+    };
+    assert!(matches!(
+        delta.changes()[0],
+        TerminalChange::HistoryAppend { first_row: 0, .. }
+    ));
+    assert!(matches!(delta.changes()[1], TerminalChange::Reset));
+    terminal.clear();
+    let TerminalCommit::Committed(delta) = terminal.commit() else {
+        panic!("expected changes")
+    };
+    assert_eq!([TerminalChange::Reset], delta.changes());
+    let TerminalUpdate::Full(full) = terminal.changes_since(u64::MAX) else {
+        panic!("expected snapshot")
+    };
+    assert_eq!('A' as u32, full.history_cells()[0].code_point());
 }

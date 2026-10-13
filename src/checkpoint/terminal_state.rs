@@ -23,6 +23,8 @@ use crate::execution::checkpoint::{
 checkpoint_struct!(TerminalDevice {
     cells,
     row_head,
+    history,
+    history_start,
     cursor,
     cursor_visible,
     foreground,
@@ -52,7 +54,13 @@ impl Checkpoint for TerminalPosition {
 }
 impl TerminalDevice {
     pub(crate) fn validate_checkpoint(&self, expected: &Self) -> Result<()> {
-        if self.row_head >= TERMINAL_HEIGHT as usize
+        if self.history.len() > TERMINAL_HISTORY_ROWS * TERMINAL_WIDTH as usize
+            || !self.history.len().is_multiple_of(TERMINAL_WIDTH as usize)
+            || self
+                .history_start
+                .checked_add((self.history.len() / TERMINAL_WIDTH as usize) as u64)
+                .is_none()
+            || self.row_head >= TERMINAL_HEIGHT as usize
             || validate_palette(self.foreground).is_err()
             || validate_palette(self.background).is_err()
         {
@@ -102,6 +110,36 @@ mod tests {
         restored.write_utf16(&[0x43]).unwrap();
         assert_eq!(original.commit(), restored.commit());
     }
+    #[test]
+    fn checkpoint_retains_the_full_history_window_and_rejects_incomplete_rows() {
+        let mut original = TerminalDevice::default();
+        for _ in 0..600 {
+            original.write_utf16(&[65, 10]).unwrap();
+        }
+        original.commit();
+        let mut writer = Writer::new(1024 * 1024);
+        original.write(&mut writer).unwrap();
+        let bytes = writer.finish();
+        let mut reader = Reader::new(&bytes, 1024 * 1024, 1024 * 1024).unwrap();
+        let restored = TerminalDevice::read(&mut reader).unwrap();
+        reader.finish().unwrap();
+        restored
+            .validate_checkpoint(&TerminalDevice::default())
+            .unwrap();
+        assert_eq!(
+            original.changes_since(u64::MAX),
+            restored.changes_since(u64::MAX)
+        );
+        let invalid = TerminalDevice {
+            history: VecDeque::from(vec![TerminalCell::default()]),
+            ..TerminalDevice::default()
+        };
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            invalid.validate_checkpoint(&TerminalDevice::default())
+        );
+    }
+
     #[test]
     fn checkpoint_rejects_invalid_terminal_scalars_and_cursor() {
         let mut writer = Writer::new(32);

@@ -733,6 +733,11 @@ fn encode_terminal_full(snapshot: TerminalSnapshot) -> Vec<u8> {
     encoder.u16(snapshot.cursor_position().x());
     encoder.u16(snapshot.cursor_position().y());
     encoder.u8(u8::from(snapshot.cursor_visible()));
+    encoder.u64(snapshot.history_start());
+    encoder.u32(snapshot.history_cells().len() as u32);
+    for cell in snapshot.history_cells() {
+        encoder.cell(*cell);
+    }
     encoder.finish()
 }
 
@@ -772,6 +777,8 @@ pub(crate) fn encode_terminal_full_into(
         terminal.logical_cells(),
         terminal.cursor_position(),
         terminal.cursor_visible(),
+        terminal.history_start(),
+        terminal.history_cells(),
     )
 }
 
@@ -785,6 +792,8 @@ fn encode_terminal_snapshot_into(
         snapshot.cells().iter().copied(),
         snapshot.cursor_position(),
         snapshot.cursor_visible(),
+        snapshot.history_start(),
+        snapshot.history_cells().iter().copied(),
     )
 }
 
@@ -794,6 +803,8 @@ fn encode_terminal_cells_into(
     cells: impl ExactSizeIterator<Item = TerminalCell>,
     cursor: compukter_vm::TerminalPosition,
     cursor_visible: bool,
+    history_start: u64,
+    history_cells: impl ExactSizeIterator<Item = TerminalCell>,
 ) -> Result<usize, TerminalEncodeError> {
     let mut encoder = SliceEncoder::new(output, 2)?;
     encoder.u64(revision)?;
@@ -806,6 +817,11 @@ fn encode_terminal_cells_into(
     encoder.u16(cursor.x())?;
     encoder.u16(cursor.y())?;
     encoder.u8(u8::from(cursor_visible))?;
+    encoder.u64(history_start)?;
+    encoder.u32(history_cells.len() as u32)?;
+    for cell in history_cells {
+        encoder.cell(cell)?;
+    }
     Ok(encoder.finish())
 }
 
@@ -924,6 +940,20 @@ impl<'a> SliceEncoder<'a> {
                 self.u8(u8::from(*visible))
             }
             TerminalChange::Reset => self.u8(4),
+            TerminalChange::HistoryAppend { first_row, cells }
+            | TerminalChange::HistoryReplace { first_row, cells } => {
+                self.u8(if matches!(change, TerminalChange::HistoryAppend { .. }) {
+                    5
+                } else {
+                    6
+                })?;
+                self.u64(*first_row)?;
+                self.u32(cells.len() as u32)?;
+                for cell in cells {
+                    self.cell(*cell)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1095,6 +1125,19 @@ impl Encoder {
                 self.u8(u8::from(*visible));
             }
             TerminalChange::Reset => self.u8(4),
+            TerminalChange::HistoryAppend { first_row, cells }
+            | TerminalChange::HistoryReplace { first_row, cells } => {
+                self.u8(if matches!(change, TerminalChange::HistoryAppend { .. }) {
+                    5
+                } else {
+                    6
+                });
+                self.u64(*first_row);
+                self.u32(cells.len() as u32);
+                for cell in cells {
+                    self.cell(*cell);
+                }
+            }
         }
     }
 }
@@ -1509,6 +1552,12 @@ mod tests {
         assert_terminal_slice_encoding(terminal.changes_since(0));
 
         terminal.write_utf16(&['A' as u16]).unwrap();
+        terminal.commit();
+        assert_terminal_slice_encoding(terminal.changes_since(0));
+        assert_terminal_slice_encoding(terminal.changes_since(u64::MAX));
+        for _ in 0..600 {
+            terminal.write_utf16(&[65, 10]).unwrap();
+        }
         terminal.commit();
         assert_terminal_slice_encoding(terminal.changes_since(0));
         assert_terminal_slice_encoding(terminal.changes_since(u64::MAX));

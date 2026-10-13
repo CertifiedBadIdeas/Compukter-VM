@@ -99,7 +99,8 @@ pub use terminal::{
     TerminalCell, TerminalChange, TerminalCommit, TerminalConfig, TerminalDelta, TerminalDevice,
     TerminalError, TerminalInputError, TerminalInputEvent, TerminalInputLimits, TerminalKey,
     TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, TerminalPosition, TerminalRectangle,
-    TerminalSnapshot, TerminalUpdate, TERMINAL_HEIGHT, TERMINAL_PALETTE_SIZE, TERMINAL_WIDTH,
+    TerminalSnapshot, TerminalUpdate, TERMINAL_HEIGHT, TERMINAL_HISTORY_ROWS,
+    TERMINAL_PALETTE_SIZE, TERMINAL_WIDTH,
 };
 
 /// Decodes and verifies an untrusted Compukter artifact before publishing it.

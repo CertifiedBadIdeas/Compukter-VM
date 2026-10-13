@@ -46,6 +46,14 @@ pub enum TerminalChange {
         visible: bool,
     },
     Reset,
+    HistoryAppend {
+        first_row: u64,
+        cells: Box<[TerminalCell]>,
+    },
+    HistoryReplace {
+        first_row: u64,
+        cells: Box<[TerminalCell]>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +83,8 @@ pub struct TerminalSnapshot {
     cells: Box<[TerminalCell]>,
     cursor: TerminalPosition,
     cursor_visible: bool,
+    history_start: u64,
+    history_cells: Box<[TerminalCell]>,
 }
 
 impl TerminalSnapshot {
@@ -83,13 +93,25 @@ impl TerminalSnapshot {
         cells: Box<[TerminalCell]>,
         cursor: TerminalPosition,
         cursor_visible: bool,
+        history_start: u64,
+        history_cells: Box<[TerminalCell]>,
     ) -> Self {
         Self {
             revision,
             cells,
             cursor,
             cursor_visible,
+            history_start,
+            history_cells,
         }
+    }
+
+    pub const fn history_start(&self) -> u64 {
+        self.history_start
+    }
+
+    pub fn history_cells(&self) -> &[TerminalCell] {
+        &self.history_cells
     }
 
     pub const fn revision(&self) -> u64 {
@@ -174,9 +196,14 @@ impl ReplicationState {
     }
 
     pub(super) fn record_reset(&mut self) {
-        self.pending.clear();
-        self.requires_full_replacement = false;
-        self.pending.push(TerminalChange::Reset);
+        // Clearing the live grid must not discard rows scrolled earlier in this commit.
+        self.pending.retain(|change| {
+            matches!(
+                change,
+                TerminalChange::HistoryAppend { .. } | TerminalChange::HistoryReplace { .. }
+            )
+        });
+        self.record(TerminalChange::Reset);
     }
 
     pub(super) const fn requires_full_replacement(&self) -> bool {
@@ -188,6 +215,8 @@ impl ReplicationState {
         full_cells: Option<Box<[TerminalCell]>>,
         cursor: TerminalPosition,
         cursor_visible: bool,
+        history_start: u64,
+        history_cells: impl FnOnce() -> Box<[TerminalCell]>,
     ) -> TerminalCommit {
         if self.requires_full_replacement {
             self.pending = vec![
@@ -195,6 +224,10 @@ impl ReplicationState {
                 TerminalChange::Patch {
                     start: 0,
                     cells: full_cells.expect("compacted commit requires full terminal cells"),
+                },
+                TerminalChange::HistoryReplace {
+                    first_row: history_start,
+                    cells: history_cells(),
                 },
                 TerminalChange::Cursor {
                     position: cursor,
@@ -217,7 +250,13 @@ impl ReplicationState {
             target_revision: self.revision,
             changes: std::mem::take(&mut self.pending).into_boxed_slice(),
         };
-        self.journal.push_back(delta.clone());
+        if delta.changes.iter().map(encoded_cell_count).sum::<usize>() > MAXIMUM_ACCUMULATED_CELLS {
+            // A large compacted history is available through full state; do not retain one copy
+            // per journal revision in long-running raw-terminal programs.
+            self.journal.clear();
+        } else {
+            self.journal.push_back(delta.clone());
+        }
         while self.journal.len() > self.journal_capacity {
             self.journal.pop_front();
         }
@@ -266,7 +305,9 @@ impl ReplicationState {
 
 fn encoded_cell_count(change: &TerminalChange) -> usize {
     match change {
-        TerminalChange::Patch { cells, .. } => cells.len(),
+        TerminalChange::Patch { cells, .. }
+        | TerminalChange::HistoryAppend { cells, .. }
+        | TerminalChange::HistoryReplace { cells, .. } => cells.len(),
         TerminalChange::Fill { .. } | TerminalChange::Scroll { .. } => 1,
         TerminalChange::Cursor { .. } | TerminalChange::Reset => 0,
     }

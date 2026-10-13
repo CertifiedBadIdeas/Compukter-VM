@@ -19,7 +19,7 @@
 use super::*;
 use crate::execution::checkpoint::{checkpoint_enum, checkpoint_struct, CheckpointError, Result};
 checkpoint_enum!(TerminalChange {
- 0 => Patch { start, cells }; 1 => Fill { x, y, width, height, cell }; 2 => Scroll { rows, fill }; 3 => Cursor { position, visible }; 4 => Reset;
+ 0 => Patch { start, cells }; 1 => Fill { x, y, width, height, cell }; 2 => Scroll { rows, fill }; 3 => Cursor { position, visible }; 4 => Reset; 5 => HistoryAppend { first_row, cells }; 6 => HistoryReplace { first_row, cells };
 });
 checkpoint_struct!(TerminalDelta {
     base_revision,
@@ -53,6 +53,14 @@ impl ReplicationState {
                         .is_some_and(|end| end <= TERMINAL_HEIGHT)
             }
             TerminalChange::Scroll { rows, .. } => *rows <= TERMINAL_HEIGHT,
+            TerminalChange::HistoryAppend { first_row, cells }
+            | TerminalChange::HistoryReplace { first_row, cells } => {
+                cells.len() <= super::super::state::TERMINAL_HISTORY_ROWS * TERMINAL_WIDTH as usize
+                    && cells.len() % TERMINAL_WIDTH as usize == 0
+                    && first_row
+                        .checked_add((cells.len() / TERMINAL_WIDTH as usize) as u64)
+                        .is_some()
+            }
             TerminalChange::Cursor { .. } | TerminalChange::Reset => true,
         };
         if self.journal_capacity != expected.journal_capacity

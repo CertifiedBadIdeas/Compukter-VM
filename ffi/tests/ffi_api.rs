@@ -47,7 +47,7 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(23, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(24, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
@@ -945,7 +945,7 @@ fn deploy(
 }
 
 fn terminal_full_state(handle: u64) -> Vec<u8> {
-    let mut output = vec![0_u8; compukter_max_outcome_bytes()];
+    let mut output = vec![0_u8; 256 * 1024];
     let mut written = 0_usize;
     assert_eq!(FfiStatus::Ok, unsafe {
         compukter_terminal_full_state(handle, output.as_mut_ptr(), output.len(), &mut written)
@@ -955,7 +955,7 @@ fn terminal_full_state(handle: u64) -> Vec<u8> {
 }
 
 fn terminal_changes_since(handle: u64, revision: u64) -> Vec<u8> {
-    let mut output = vec![0_u8; compukter_max_outcome_bytes()];
+    let mut output = vec![0_u8; 256 * 1024];
     let mut written = 0_usize;
     assert_eq!(FfiStatus::Ok, unsafe {
         compukter_terminal_changes_since(
