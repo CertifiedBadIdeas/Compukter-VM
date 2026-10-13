@@ -29,5 +29,6 @@ pub use replication::{
 };
 pub use state::{
     TerminalCell, TerminalConfig, TerminalDevice, TerminalError, TerminalPosition,
-    TerminalRectangle, TERMINAL_HEIGHT, TERMINAL_PALETTE_SIZE, TERMINAL_WIDTH,
+    TerminalRectangle, TERMINAL_HEIGHT, TERMINAL_HISTORY_ROWS, TERMINAL_PALETTE_SIZE,
+    TERMINAL_WIDTH,
 };

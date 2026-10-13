@@ -23,11 +23,11 @@ use crate::filesystem::ComputerId;
 use sha2::{Digest, Sha256};
 
 const MAGIC: [u8; 8] = *b"CPKTHIB\0";
-const FORMAT: u32 = 4;
+const FORMAT: u32 = 5;
 const HEADER_BYTES: usize = 84;
 const CHECKSUM_BYTES: usize = 32;
 // Bump the format whenever any constituent logical codec changes its meaning.
-const SCHEMA: &[u8] = b"compukters.computer.logical-checkpoint/4";
+const SCHEMA: &[u8] = b"compukters.computer.logical-checkpoint/5";
 
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {

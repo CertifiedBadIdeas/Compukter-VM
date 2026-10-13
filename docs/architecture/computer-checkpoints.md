@@ -1,6 +1,6 @@
 # Logical computer checkpoints
 
-The Rust checkpoint API and C ABI 23 expose bounded logical capture and restoration through both JNI and FFM. World-store methods provide atomic publication and consumption; host integrations own freeze, world-action settlement, resource rebinding and activation.
+The Rust checkpoint API and C ABI 24 expose bounded logical capture and restoration through both JNI and FFM. World-store methods provide atomic publication and consumption; host integrations own freeze, world-action settlement, resource rebinding and activation.
 
 Rust owns the logical execution payload. It stores verified executable bytes for the root and every live child, execution profiles and process limits, admitted capability identities, machine and session state, terminal and canonical input, redstone waits, exact `/home` namespace generation and immutable file bytes, and open handle generations. Admission rebuilds execution images from verified artifacts and checks state against those images and trusted host configuration. Rust layouts, addresses, allocation capacities, and process-local machine identity are not persisted.
 
@@ -16,7 +16,7 @@ Pending compilation retains the exact validated source bytes captured when the r
 
 `ComputerMachine::checkpoint` captures execution and opaque host descriptor bytes within `ComputerCheckpointLimits`. `restore_checkpoint` requires a `ComputerRestoreEnvironment` containing the expected computer ID, profile, process limits, freshly resolved capability schemas, filesystem and initial file capability. It returns a machine and host descriptors without executing Guest code. The caller must freeze and settle host actions before capture, validate/rebind restored descriptors, and durably consume the snapshot before advancing restored execution. Native admission does not enforce those host lifecycle obligations.
 
-## Native transport (C ABI 23)
+## Native transport (C ABI 24)
 
 Five exports are appended to the existing transport: `compukter_checkpoint_save`, `compukter_checkpoint_restore`, `compukter_checkpoint_discard`, `compukter_checkpoint_host_size`, and `compukter_checkpoint_host_copy`. There are 49 exported functions. JNI uses Java 21 arrays; FFM uses caller-owned native buffers. Both check the exact ABI version before calls. No input pointer is retained.
 
@@ -29,3 +29,7 @@ Computer filesystem admission flushes its last admitted generation before readin
 ## Guest filesystem transfers
 
 Filesystem capability ABI 2 retains process-owned immutable read snapshots, sorted directory-name snapshots, guarded move sources and private append-only replacement drafts. Checkpoints preserve their non-reused positive IDs, positions, pinned bytes, staged bytes, destination revision guards and poisoned-write state. Restore validates IDs, paths, rights, ordering, positions, file sizes and aggregate storage/handle limits against the trusted filesystem configuration. Captured read content may legitimately outlive its path. A draft is never published by capture, close or process exit; commit alone performs the native guarded atomic replacement. A failed append poisons the draft so a later commit cannot publish a prefix. These additions require native ABI 23 and logical checkpoint envelope/schema 3; ABI 22 checkpoints are incompatible and retain their filesystem through cold boot.
+
+Terminal history is retained in logical envelope/schema 5 (Runtime 0.24.0), bounded to 512 complete rows.
+Restore validates history cells, alignment, retained row identity and capacity. Older checkpoint schemas
+remain incompatible and use the existing filesystem-preserving cold-boot fallback.

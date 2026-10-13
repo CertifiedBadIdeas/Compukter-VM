@@ -78,6 +78,7 @@ pub enum FfiStatus {
 }
 
 const MAXIMUM_OUTCOME_BYTES: usize = 64 * 1024;
+const MAXIMUM_TERMINAL_BYTES: usize = 256 * 1024;
 const MAXIMUM_CREATE_BYTES: usize = 9;
 const MAXIMUM_INBOUND_UTF16_CODE_UNITS: usize = 4_096;
 const MAXIMUM_HOST_FAILURE_DETAIL_BYTES: usize = compukter_vm::MAXIMUM_HOST_FAILURE_DETAIL_BYTES;
@@ -1592,9 +1593,9 @@ pub unsafe extern "C" fn compukter_terminal_full_state(
         if written_out.is_null() || (output_capacity != 0 && output.is_null()) {
             return FfiStatus::InvalidArgument;
         }
-        if output_capacity < MAXIMUM_OUTCOME_BYTES {
+        if output_capacity < MAXIMUM_TERMINAL_BYTES {
             // SAFETY: The validated ABI contract provides writable output.
-            unsafe { written_out.write(MAXIMUM_OUTCOME_BYTES) };
+            unsafe { written_out.write(MAXIMUM_TERMINAL_BYTES) };
             return FfiStatus::BufferTooSmall;
         }
         // SAFETY: The validated ABI contract provides enough writable output.
@@ -1631,9 +1632,9 @@ pub unsafe extern "C" fn compukter_terminal_changes_since(
         if written_out.is_null() || (output_capacity != 0 && output.is_null()) {
             return FfiStatus::InvalidArgument;
         }
-        if output_capacity < MAXIMUM_OUTCOME_BYTES {
+        if output_capacity < MAXIMUM_TERMINAL_BYTES {
             // SAFETY: The validated ABI contract provides writable output.
-            unsafe { written_out.write(MAXIMUM_OUTCOME_BYTES) };
+            unsafe { written_out.write(MAXIMUM_TERMINAL_BYTES) };
             return FfiStatus::BufferTooSmall;
         }
         let update = match bridge::terminal_changes_since(handle, revision) {

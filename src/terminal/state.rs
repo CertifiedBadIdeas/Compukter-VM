@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+use std::collections::VecDeque;
+
 use super::input::{
     TerminalInputError, TerminalInputEvent, TerminalInputLimits, TerminalInputQueue,
     TerminalKeyEvent,
@@ -23,6 +25,8 @@ use super::input::{
 use super::replication::{
     ReplicationState, TerminalChange, TerminalCommit, TerminalSnapshot, TerminalUpdate,
 };
+
+pub const TERMINAL_HISTORY_ROWS: usize = 512;
 
 pub const TERMINAL_WIDTH: u16 = 51;
 pub const TERMINAL_HEIGHT: u16 = 19;
@@ -178,6 +182,8 @@ impl TerminalRectangle {
 pub struct TerminalDevice {
     cells: [TerminalCell; CELL_COUNT],
     row_head: usize,
+    history: VecDeque<TerminalCell>,
+    history_start: u64,
     cursor: TerminalPosition,
     cursor_visible: bool,
     foreground: u8,
@@ -200,6 +206,8 @@ impl TerminalDevice {
         Ok(Self {
             cells: [TerminalCell::default(); CELL_COUNT],
             row_head: 0,
+            history: VecDeque::new(),
+            history_start: 0,
             cursor: TerminalPosition { x: 0, y: 0 },
             cursor_visible: true,
             foreground: DEFAULT_FOREGROUND,
@@ -240,6 +248,14 @@ impl TerminalDevice {
             };
             self.cells[self.physical_index(position)]
         })
+    }
+
+    pub const fn history_start(&self) -> u64 {
+        self.history_start
+    }
+
+    pub fn history_cells(&self) -> impl ExactSizeIterator<Item = TerminalCell> + '_ {
+        self.history.iter().copied()
     }
 
     pub fn set_cursor(&mut self, position: TerminalPosition) {
@@ -448,8 +464,19 @@ impl TerminalDevice {
             .replication
             .requires_full_replacement()
             .then(|| self.materialize_logical_cells());
-        self.replication
-            .commit(full_cells, self.cursor, self.cursor_visible)
+        self.replication.commit(
+            full_cells,
+            self.cursor,
+            self.cursor_visible,
+            self.history_start,
+            || {
+                self.history
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            },
+        )
     }
 
     pub fn changes_since(&self, base_revision: u64) -> TerminalUpdate {
@@ -487,6 +514,24 @@ impl TerminalDevice {
     }
 
     fn scroll_with(&mut self, rows: u16, fill: TerminalCell) {
+        let first_row = self.history_start + (self.history.len() / TERMINAL_WIDTH as usize) as u64;
+        let removed = (0..rows)
+            .flat_map(|y| (0..TERMINAL_WIDTH).map(move |x| TerminalPosition { x, y }))
+            .map(|position| self.cells[self.physical_index(position)])
+            .collect::<Vec<_>>();
+        self.history.extend(removed.iter().copied());
+        while self.history.len() > TERMINAL_HISTORY_ROWS * TERMINAL_WIDTH as usize {
+            for _ in 0..TERMINAL_WIDTH {
+                self.history.pop_front();
+            }
+            self.history_start += 1;
+        }
+        if rows != 0 {
+            self.replication.record(TerminalChange::HistoryAppend {
+                first_row,
+                cells: removed.into_boxed_slice(),
+            });
+        }
         for _ in 0..rows {
             self.row_head = (self.row_head + 1) % TERMINAL_HEIGHT as usize;
             let reclaimed_row =
@@ -514,6 +559,12 @@ impl TerminalDevice {
             self.materialize_logical_cells(),
             self.cursor,
             self.cursor_visible,
+            self.history_start,
+            self.history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         )
     }
 

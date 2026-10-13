@@ -382,3 +382,19 @@ widths. Three-dimensional costs are 11 for transpose, 54 for matrix product and 
 4D Double costs equal their Float counterparts. Execution uses fixed stack snapshots and canonical
 scalar helpers, preserves left-to-right rounding without FMA, and supports all valid destination aliases.
 Container framing, native C ABI 23 and checkpoints are unchanged.
+
+## Terminal history (Runtime 0.24.0 / C ABI 24)
+
+The VM retains the last 512 rows removed by terminal scrolling, including Unicode scalars and palette colors.
+History is separate from the live 51x19 grid and starts at a monotonic row identity. Screen clear preserves
+history; reboot starts a fresh terminal. Logical checkpoint envelope/schema 5 retains history and validates
+its row alignment, capacity and identity. Earlier checkpoint schemas use the existing cold-boot fallback.
+
+Native full-terminal wire results append LE U64 history-start, LE U32 history-cell-count and six-byte cells
+after cursor visibility. Count is at most 512*51 and divisible by 51. Delta tag 5 appends history rows
+(U64 first-row, U32 cell-count, cells); tag 6 replaces the history window with the same fields. Append starts
+at the current history end; clients evict oldest complete rows over capacity. Compacted commits replace
+history as well as the grid. Delta-budget overflow falls back to a complete snapshot, preserving history.
+Terminal full/delta calls require a 256 KiB caller buffer (BufferTooSmall reports that capacity).
+The outcome maximum remains 64 KiB. The 49 exported functions retain their signatures; consumers require
+C ABI 24 before decoding.
