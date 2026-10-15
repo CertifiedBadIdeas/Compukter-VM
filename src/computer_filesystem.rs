@@ -918,8 +918,10 @@ mod tests {
 
     #[test]
     fn transfer_chunks_respect_smaller_filesystem_io_limits() {
-        let mut limits = FileSystemLimits::default();
-        limits.maximum_io_bytes = 2;
+        let limits = FileSystemLimits {
+            maximum_io_bytes: 2,
+            ..FileSystemLimits::default()
+        };
         let mut c = computer(limits);
         put(&mut c, "/home/note", b"ok");
         let read = c.open_read_transfer(path("/home/note")).unwrap();
@@ -985,8 +987,10 @@ mod tests {
     }
     #[test]
     fn aborted_conflicting_and_oversized_drafts_preserve_published_files() {
-        let mut limits = FileSystemLimits::default();
-        limits.maximum_file_bytes = 5;
+        let limits = FileSystemLimits {
+            maximum_file_bytes: 5,
+            ..FileSystemLimits::default()
+        };
         let mut c = computer(limits);
         put(&mut c, "/home/note", b"old");
         let draft = c.open_write_transfer(path("/home/note")).unwrap();
@@ -1048,9 +1052,11 @@ mod tests {
     }
     #[test]
     fn aggregate_transfer_storage_and_handle_limits_release_on_close() {
-        let mut limits = FileSystemLimits::default();
-        limits.maximum_logical_bytes = 8;
-        limits.maximum_open_handles = 2;
+        let limits = FileSystemLimits {
+            maximum_logical_bytes: 8,
+            maximum_open_handles: 2,
+            ..FileSystemLimits::default()
+        };
         let mut c = computer(limits);
         put(&mut c, "/home/note", b"four");
         let first = c.open_read_transfer(path("/home/note")).unwrap();
