@@ -706,15 +706,19 @@ pub(crate) fn two_task_host_artifact() -> VerifiedArtifact {
 }
 
 pub(crate) fn redstone_wait_and_external_request_artifact() -> VerifiedArtifact {
-    internal_wait_and_external_request_artifact(b"redstone", 1, 8, 1, Some(0), true)
+    internal_wait_and_external_request_artifact(b"redstone", 1, 8, 1, Some(0), true, false)
 }
 
 pub(crate) fn external_request_then_redstone_wait_artifact() -> VerifiedArtifact {
-    internal_wait_and_external_request_artifact(b"redstone", 1, 8, 1, Some(0), false)
+    internal_wait_and_external_request_artifact(b"redstone", 1, 8, 1, Some(0), false, false)
 }
 
 pub(crate) fn raw_terminal_wait_and_external_request_artifact() -> VerifiedArtifact {
-    internal_wait_and_external_request_artifact(b"terminal", 2, 14, 3, None, true)
+    internal_wait_and_external_request_artifact(b"terminal", 2, 14, 3, None, true, false)
+}
+
+pub(crate) fn raw_terminal_wait_and_delayed_external_request_artifact() -> VerifiedArtifact {
+    internal_wait_and_external_request_artifact(b"terminal", 2, 14, 3, None, true, true)
 }
 
 fn internal_wait_and_external_request_artifact(
@@ -724,6 +728,7 @@ fn internal_wait_and_external_request_artifact(
     internal_operation: u32,
     argument: Option<i32>,
     waiter_first: bool,
+    delay_caller: bool,
 ) -> VerifiedArtifact {
     let mut decoded = crate::decode::records::decode_artifact(
         Arc::from(crate::test_support::minimal_vector()),
@@ -854,16 +859,20 @@ fn internal_wait_and_external_request_artifact(
             instructions
         }),
         (FunctionId(1), vec![Instruction::Return { value: u16::MAX }]),
-        (
-            FunctionId(2),
-            vec![Instruction::CapabilityCallAsync {
+        (FunctionId(2), {
+            let mut work = Vec::new();
+            if delay_caller {
+                work.extend((0..32).map(|_| Instruction::Nop));
+            }
+            work.push(Instruction::CapabilityCallAsync {
                 dst: u16::MAX,
                 capability: 0,
                 operation: 0,
                 args: Box::new([]),
                 resume_block: 6,
-            }],
-        ),
+            });
+            work
+        }),
         (FunctionId(2), vec![Instruction::Return { value: u16::MAX }]),
     ];
     let mut maximum_block_cost = 0;

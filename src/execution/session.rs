@@ -761,6 +761,15 @@ impl Session {
         true
     }
 
+    /// Parked internal requests do not make a session idle while execution or reply staging remains.
+    pub(crate) fn has_runnable_work(&self) -> bool {
+        self.machine.has_active_task()
+            || self.preparing_request.is_some()
+            || self.resuming_host_reference
+            || self.machine.record_response_pending()
+            || !self.replies.is_empty()
+    }
+
     pub(crate) fn resource_snapshot(&self) -> SessionResourceSnapshot {
         let mut machine = self.machine.resource_snapshot();
         let reply_bytes = self.replies.capacity() * core::mem::size_of::<QueuedReply>()

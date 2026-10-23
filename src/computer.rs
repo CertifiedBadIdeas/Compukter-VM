@@ -1318,8 +1318,9 @@ impl ComputerMachine {
         }
         let Some(internal) = internal else {
             return Ok(
-                if self.active_frame().pending_stdio_read.is_some()
-                    || self.active_frame().pending_terminal_event.is_some()
+                if (self.active_frame().pending_stdio_read.is_some()
+                    || self.active_frame().pending_terminal_event.is_some())
+                    && !self.active_frame().session.has_runnable_work()
                 {
                     ComputerAdvanceOutcome::WaitingForTerminalEvent
                 } else {
@@ -3893,37 +3894,42 @@ mod tests {
     fn parked_terminal_wait_does_not_hide_an_external_request_from_another_task() {
         let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
         let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
-        let mut computer = ComputerMachine::start(
+        for artifact in [
             crate::execution::fixtures::raw_terminal_wait_and_external_request_artifact(),
-            profile(),
-            &[addon],
-            &[],
-        )
-        .unwrap();
-
-        assert_eq!(
-            ComputerAdvanceOutcome::SliceExhausted,
-            computer.advance(64, 64, u32::MAX).unwrap(),
-        );
-        let request = match computer.advance(64, 64, u32::MAX).unwrap() {
-            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests[0].clone(),
-            other => panic!("parked terminal wait hid external work: {other:?}"),
-        };
-        computer
-            .resume_host_request_for(
-                request.task_id,
-                request.id,
-                HostResponse::Success(HostValueInput::Unit),
-            )
-            .unwrap();
-        computer.terminal_mut().push_text("x").unwrap();
-        assert!(matches!(
-            computer.advance(64, 64, u32::MAX).unwrap(),
-            ComputerAdvanceOutcome::SliceExhausted
-                | ComputerAdvanceOutcome::ProcessEntered(_)
-                | ComputerAdvanceOutcome::ProcessExited(_)
-        ));
-        assert_eq!(None, halt(&mut computer));
+            crate::execution::fixtures::raw_terminal_wait_and_delayed_external_request_artifact(),
+        ] {
+            for retirement_limit in [1, u32::MAX] {
+                let mut computer =
+                    ComputerMachine::start(artifact.clone(), profile(), &[addon], &[]).unwrap();
+                let mut pending = None;
+                for _ in 0..256 {
+                    match computer.advance_with_retirement_limit(64, 64, u32::MAX, retirement_limit).unwrap() {
+                        ComputerAdvanceOutcome::SliceExhausted => {}
+                        ComputerAdvanceOutcome::HostRequestBatch(batch) => {
+                            pending = Some(batch.requests[0].clone());
+                            break;
+                        }
+                        other => panic!("terminal wait hid other task work at retirement limit {retirement_limit}: {other:?}"),
+                    }
+                }
+                let request = pending.expect("external request was never exposed");
+                computer
+                    .resume_host_request_for(
+                        request.task_id,
+                        request.id,
+                        HostResponse::Success(HostValueInput::Unit),
+                    )
+                    .unwrap();
+                computer.terminal_mut().push_text("x").unwrap();
+                assert!(matches!(
+                    computer.advance(64, 64, u32::MAX).unwrap(),
+                    ComputerAdvanceOutcome::SliceExhausted
+                        | ComputerAdvanceOutcome::ProcessEntered(_)
+                        | ComputerAdvanceOutcome::ProcessExited(_)
+                ));
+                assert_eq!(None, halt(&mut computer));
+            }
+        }
     }
 
     #[test]

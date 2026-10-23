@@ -403,6 +403,7 @@ C ABI 24 before decoding.
 
 Arming a raw-terminal or canonical-input wait returns `SliceExhausted`, so a bounded caller can
 continue advancing and expose queued work from other Guest tasks. `WaitingForTerminalEvent` is
-reported only after parked terminal requests have been skipped and no other request is available.
+reported only after parked terminal requests have been skipped, no other request is available,
+and no runnable execution or request/reply preparation remains in the active session.
 External timer requests remain host-owned; the host must continue their server-tick deadlines
 while a different task waits for input. This changes no capability, C ABI, or checkpoint encoding.
