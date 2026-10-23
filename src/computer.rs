@@ -1429,7 +1429,9 @@ impl ComputerMachine {
                     return Ok(ComputerAdvanceOutcome::SliceExhausted);
                 }
                 self.active_frame_mut().pending_stdio_read = Some((task, id));
-                self.advance_pending_stdio()
+                self.advance_pending_stdio()?;
+                // Parking one reader is progress, not proof that every other task is idle.
+                Ok(ComputerAdvanceOutcome::SliceExhausted)
             }
             StdioOperation::Write(units) => {
                 let response = match self
@@ -1559,7 +1561,8 @@ impl ComputerMachine {
             RawTerminalOperation::AwaitEvent | RawTerminalOperation::AwaitSubmittedLineEvent => {
                 let Some(kind) = self.terminal_await_event_for(task)? else {
                     self.active_frame_mut().pending_terminal_event = Some((task, id));
-                    return Ok(ComputerAdvanceOutcome::WaitingForTerminalEvent);
+                    // Expose other tasks' queued requests before declaring input-only idleness.
+                    return Ok(ComputerAdvanceOutcome::SliceExhausted);
                 };
                 HostValueInput::I32(kind as i32)
             }
@@ -3899,7 +3902,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            ComputerAdvanceOutcome::WaitingForTerminalEvent,
+            ComputerAdvanceOutcome::SliceExhausted,
             computer.advance(64, 64, u32::MAX).unwrap(),
         );
         let request = match computer.advance(64, 64, u32::MAX).unwrap() {
@@ -4562,6 +4565,20 @@ mod tests {
         assert_eq!(
             TerminalPosition::new(line.len() as u16 + 1, 1).unwrap(),
             computer.terminal().cursor_position(),
+        );
+    }
+
+    #[test]
+    fn newly_parked_canonical_reader_allows_continuation_before_input_idleness() {
+        let artifact = crate::execution::fixtures::stdio_conformance_artifact(&[]);
+        let mut computer = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64, u32::MAX).unwrap(),
+        );
+        assert_eq!(
+            ComputerAdvanceOutcome::WaitingForTerminalEvent,
+            computer.advance(64, 64, u32::MAX).unwrap(),
         );
     }
 

@@ -398,3 +398,11 @@ history as well as the grid. Delta-budget overflow falls back to a complete snap
 Terminal full/delta calls require a 256 KiB caller buffer (BufferTooSmall reports that capacity).
 The outcome maximum remains 64 KiB. The 49 exported functions retain their signatures; consumers require
 C ABI 24 before decoding.
+
+## Terminal parking and computer idleness
+
+Arming a raw-terminal or canonical-input wait returns `SliceExhausted`, so a bounded caller can
+continue advancing and expose queued work from other Guest tasks. `WaitingForTerminalEvent` is
+reported only after parked terminal requests have been skipped and no other request is available.
+External timer requests remain host-owned; the host must continue their server-tick deadlines
+while a different task waits for input. This changes no capability, C ABI, or checkpoint encoding.
