@@ -1141,6 +1141,8 @@ impl ComputerMachine {
         let pending_terminal_event = self.active_frame().pending_terminal_event;
         let compilation_pending = self.pending_compilation.is_some();
         let redstone = &self.redstone;
+        let scope_id = self.active_frame().scope_id;
+        let external_requests = &self.external_requests;
         let (internal, mut external) = {
             let outcome = self
                 .sessions
@@ -1208,7 +1210,38 @@ impl ComputerMachine {
                             if internal.is_some() {
                                 break;
                             }
+                        }
+                        // An exposed external wait remains owned by the host. It must not hide
+                        // internal work later in this batch, nor new external calls behind it.
+                        // Publish fresh external requests first so a busy internal writer cannot
+                        // starve another task; service the internal request on the following slice.
+                        for index in 0..batch.len() {
+                            let request = batch
+                                .get(index)
+                                .ok_or(ComputerError::Run(RunError::NotRunnable))?;
+                            if is_parked(request)
+                                || is_raw_terminal(request)
+                                || is_stdio(request)
+                                || is_filesystem(request)
+                                || is_process(request)
+                                || is_compiler(request)
+                                || is_redstone_local(request)
+                            {
+                                continue;
+                            }
+                            if internal.is_some()
+                                && external_requests.iter().any(|route| {
+                                    route.scope_id == scope_id
+                                        && route.task_id == request.task_id().get()
+                                        && route.internal_id == request.id().get()
+                                })
+                            {
+                                continue;
+                            }
                             if allowed == 0 {
+                                if internal.is_some() {
+                                    break;
+                                }
                                 return Ok(ComputerAdvanceOutcome::WaitingForHostQuota);
                             }
                             external.push(copy_external_request(request)?);
@@ -3887,6 +3920,87 @@ mod tests {
                 HostResponse::Success(HostValueInput::Unit),
             )
             .unwrap();
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn older_external_request_does_not_starve_internal_terminal_work() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::external_request_then_terminal_wait_artifact(),
+            profile(),
+            &[addon],
+            &[],
+        )
+        .unwrap();
+        let mut external = None;
+        for _ in 0..8 {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted => (),
+                ComputerAdvanceOutcome::HostRequestBatch(batch) => {
+                    assert_eq!(1, batch.requests.len());
+                    if let Some(previous) = &external {
+                        assert_eq!(previous, &batch.requests[0]);
+                    }
+                    external = Some(batch.requests[0].clone());
+                }
+                other => panic!("{other:?}"),
+            }
+            if external.is_some() && computer.active_frame().pending_terminal_event.is_some() {
+                break;
+            }
+        }
+        assert!(
+            computer.active_frame().pending_terminal_event.is_some(),
+            "an unanswered external prefix must not hide a later internal request"
+        );
+        let request = external.expect("external request must still be published");
+        computer.terminal_mut().push_text("x").unwrap();
+        computer
+            .resume_host_request_for(
+                request.task_id,
+                request.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn internal_terminal_work_progresses_with_zero_external_request_allowance() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::external_request_then_terminal_wait_artifact(),
+            profile(),
+            &[addon],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64, 0).unwrap()
+        );
+        assert!(computer.active_frame().pending_terminal_event.is_some());
+        assert_eq!(
+            ComputerAdvanceOutcome::WaitingForHostQuota,
+            computer.advance(64, 64, 0).unwrap()
+        );
+        let ComputerAdvanceOutcome::HostRequestBatch(batch) = computer.advance(64, 64, 1).unwrap()
+        else {
+            panic!("external request was lost")
+        };
+        assert_eq!(1, batch.requests.len());
+        let request = &batch.requests[0];
+        computer
+            .resume_host_request_for(
+                request.task_id,
+                request.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        computer.terminal_mut().push_text("x").unwrap();
         assert_eq!(None, halt(&mut computer));
     }
 
