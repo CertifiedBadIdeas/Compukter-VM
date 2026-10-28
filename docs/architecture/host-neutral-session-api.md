@@ -424,5 +424,6 @@ Computer request selection scans past already exposed external waits to find int
 filesystem and process work. Fresh external calls are still published before that internal work,
 so an internal writer cannot hide another task's first request. Existing opaque request routes
 distinguish published waits from fresh calls; no new state or checkpoint fields are required.
-Each advance retains its existing work and host-request allowances, including internal progress
-when the external request allowance is zero.
+Already published requests retain their positions in the bounded external allowance prefix; fresh calls
+cannot reuse those occupied slots. Each advance retains its existing work and host-request allowances,
+including internal progress when the external request allowance is zero.

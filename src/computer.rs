@@ -1211,6 +1211,7 @@ impl ComputerMachine {
                                 break;
                             }
                         }
+                        let mut fresh_external = false;
                         // An exposed external wait remains owned by the host. It must not hide
                         // internal work later in this batch, nor new external calls behind it.
                         // Publish fresh external requests first so a busy internal writer cannot
@@ -1229,25 +1230,27 @@ impl ComputerMachine {
                             {
                                 continue;
                             }
-                            if internal.is_some()
-                                && external_requests.iter().any(|route| {
-                                    route.scope_id == scope_id
-                                        && route.task_id == request.task_id().get()
-                                        && route.internal_id == request.id().get()
-                                })
-                            {
-                                continue;
-                            }
+                            let exposed = external_requests.iter().any(|route| {
+                                route.scope_id == scope_id
+                                    && route.task_id == request.task_id().get()
+                                    && route.internal_id == request.id().get()
+                            });
                             if allowed == 0 {
                                 if internal.is_some() {
                                     break;
                                 }
                                 return Ok(ComputerAdvanceOutcome::WaitingForHostQuota);
                             }
+                            fresh_external |= !exposed;
                             external.push(copy_external_request(request)?);
                             if external.len() == allowed {
                                 break;
                             }
+                        }
+                        if internal.is_some() && !fresh_external {
+                            // Keep exposed waits in the allowance prefix while looking for fresh
+                            // calls. Only returning them would stall this internal operation.
+                            external.clear();
                         }
                     }
                     (internal, external)
@@ -4001,6 +4004,49 @@ mod tests {
             )
             .unwrap();
         computer.terminal_mut().push_text("x").unwrap();
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn internal_progress_preserves_the_external_allowance_prefix() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::external_prefix_internal_and_fresh_request_artifact(),
+            profile(),
+            &[addon],
+            &[],
+        )
+        .unwrap();
+        let ComputerAdvanceOutcome::HostRequestBatch(first) = computer.advance(64, 64, 1).unwrap()
+        else {
+            panic!("no first external request")
+        };
+        assert_eq!(1, first.requests.len());
+        // The allowance now covers the one outstanding request and no fresh calls.
+        assert_eq!(
+            ComputerAdvanceOutcome::SliceExhausted,
+            computer.advance(64, 64, 1).unwrap()
+        );
+        assert!(computer.active_frame().pending_terminal_event.is_some());
+        // Adding one fresh-call slot must expose the later task without replacing the old slot.
+        let ComputerAdvanceOutcome::HostRequestBatch(next) = computer.advance(64, 64, 2).unwrap()
+        else {
+            panic!("fresh request was hidden")
+        };
+        assert_eq!(2, next.requests.len());
+        assert_eq!(first.requests[0], next.requests[0]);
+        assert_ne!(next.requests[0].id, next.requests[1].id);
+        computer.terminal_mut().push_text("x").unwrap();
+        for request in &next.requests {
+            computer
+                .resume_host_request_for(
+                    request.task_id,
+                    request.id,
+                    HostResponse::Success(HostValueInput::Unit),
+                )
+                .unwrap();
+        }
         assert_eq!(None, halt(&mut computer));
     }
 
