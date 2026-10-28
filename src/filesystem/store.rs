@@ -105,9 +105,10 @@ impl WorldFileSystemStore {
             return Err(StoreOpenError::RootNotDirectory);
         }
         let canonical = root.canonicalize().map_err(|_| StoreOpenError::Io)?;
-        if canonical != root {
+        if !canonical_root_matches(root, &canonical) {
             return Err(StoreOpenError::RootNotCanonical);
         }
+        let root = canonical.as_path();
         let lock_file = acquire_store_lock(&root.join("lock"))?;
         std::fs::create_dir_all(root.join("objects")).map_err(|_| StoreOpenError::Io)?;
         std::fs::create_dir_all(root.join("computers")).map_err(|_| StoreOpenError::Io)?;
@@ -615,10 +616,66 @@ impl Drop for WorldFileSystemStore {
     }
 }
 
-#[cfg(all(test, unix))]
+fn canonical_root_matches(root: &Path, canonical: &Path) -> bool {
+    if root == canonical {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut supplied = root.components();
+        let mut resolved = canonical.components();
+        let (Some(Component::Prefix(supplied_prefix)), Some(Component::Prefix(resolved_prefix))) =
+            (supplied.next(), resolved.next())
+        else {
+            return false;
+        };
+        // Java's toRealPath omits the verbatim prefix returned by Rust on Windows.
+        // Compare only these equivalent prefixes; the resolved path must still match.
+        let same_prefix = match (supplied_prefix.kind(), resolved_prefix.kind()) {
+            (Prefix::Disk(left), Prefix::VerbatimDisk(right)) => left == right,
+            (
+                Prefix::UNC(left_server, left_share),
+                Prefix::VerbatimUNC(right_server, right_share),
+            ) => left_server == right_server && left_share == right_share,
+            _ => false,
+        };
+        same_prefix && supplied.eq(resolved)
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn canonical_windows_prefixes_preserve_drive_share_and_remaining_path() {
+        assert!(canonical_root_matches(
+            Path::new(r"C:\world\compukters"),
+            Path::new(r"\\?\C:\world\compukters"),
+        ));
+        assert!(canonical_root_matches(
+            Path::new(r"\\server\share\world"),
+            Path::new(r"\\?\UNC\server\share\world"),
+        ));
+        for (supplied, canonical) in [
+            (r"D:\world", r"\\?\C:\world"),
+            (r"C:\alias", r"\\?\C:\world"),
+            (r"\\server\other\world", r"\\?\UNC\server\share\world"),
+            (r"\\other\share\world", r"\\?\UNC\server\share\world"),
+        ] {
+            assert!(!canonical_root_matches(
+                Path::new(supplied),
+                Path::new(canonical)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn explicit_close_releases_the_lock_while_a_duplicate_descriptor_is_alive() {
         let root = std::env::temp_dir().join(format!(

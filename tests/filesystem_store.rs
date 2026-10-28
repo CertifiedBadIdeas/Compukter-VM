@@ -126,6 +126,43 @@ fn symlink_world_root_is_rejected() {
     std::fs::remove_file(link).unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn ordinary_windows_root_shares_the_canonical_store_lock() {
+    let root = TestRoot::new();
+    let canonical = root.path().to_str().unwrap();
+    let ordinary = Path::new(canonical.strip_prefix(r"\\?\").unwrap());
+    assert_ne!(ordinary, root.path());
+    let store = WorldFileSystemStore::open(ordinary, FileSystemLimits::testing()).unwrap();
+    assert!(matches!(
+        WorldFileSystemStore::open(root.path(), FileSystemLimits::testing()),
+        Err(StoreOpenError::Locked)
+    ));
+    store.close().unwrap();
+    let reopened = WorldFileSystemStore::open(root.path(), FileSystemLimits::testing()).unwrap();
+    reopened.close().unwrap();
+}
+
+#[test]
+fn parent_traversal_world_root_is_rejected() {
+    let root = TestRoot::new();
+    std::fs::create_dir(root.path().join("child")).unwrap();
+    // PathBuf::push normalizes parent components for Windows verbatim paths.
+    // Use the ordinary spelling to pass an actual unresolved traversal to admission.
+    #[cfg(windows)]
+    let supplied_root = PathBuf::from(root.path().to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+    #[cfg(not(windows))]
+    let supplied_root = root.path().to_owned();
+    let traversal = supplied_root.join("child").join("..");
+    assert!(traversal
+        .components()
+        .any(|component| component == std::path::Component::ParentDir));
+    assert!(matches!(
+        WorldFileSystemStore::open(&traversal, FileSystemLimits::testing()),
+        Err(StoreOpenError::RootNotCanonical)
+    ));
+}
+
 #[test]
 fn queue_backpressure_and_store_close_precede_visible_mutation() {
     let root = TestRoot::new();
