@@ -407,3 +407,13 @@ reported only after parked terminal requests have been skipped, no other request
 and no runnable execution or request/reply preparation remains in the active session.
 External timer requests remain host-owned; the host must continue their server-tick deadlines
 while a different task waits for input. This changes no capability, C ABI, or checkpoint encoding.
+
+## Record response progress
+
+Each bounded slice that materializes an accepted record response reports `SliceExhausted`, including the
+slice that atomically publishes the completed record. This permits the host to advance the remaining
+response work and then resume Guest execution within its existing scheduling allowance, even when
+other tasks retain unanswered host requests. Materialization consumes the existing dynamic Guest and
+maintenance budgets without retiring Guest instructions; it must not be mistaken for a repeated
+zero-progress host wait. Ordinary parked request batches retain their existing wait behavior.
+No capability, ABI, quota, or checkpoint encoding changes.

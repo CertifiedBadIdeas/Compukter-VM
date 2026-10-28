@@ -1616,10 +1616,15 @@ fn other_task_responses_do_not_replace_an_incomplete_record_frame() {
             )
             .unwrap();
         if resume_during_materialization {
-            assert!(matches!(
-                session.advance(6, 0).unwrap(),
-                AdvanceOutcome::HostRequestBatch(_)
-            ));
+            let before = session.accounting();
+            assert!(
+                matches!(session.advance(6, 0).unwrap(), AdvanceOutcome::SliceExhausted),
+                "bounded response materialization must permit another slice even while another task waits for its host"
+            );
+            let after = session.accounting();
+            assert_eq!(before.executed_instructions, after.executed_instructions);
+            assert!(after.dynamic_guest_units > before.dynamic_guest_units);
+            assert!(after.dynamic_guest_units - before.dynamic_guest_units <= 6);
         }
         session
             .resume_for(

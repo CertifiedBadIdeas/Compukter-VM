@@ -357,7 +357,13 @@ impl Session {
                     return self.establish_fault(fault);
                 }
             }
-            // A record is published atomically; Guest execution resumes in the following ordinary slice.
+            // Materialization advances an accepted reply without retiring Guest instructions.
+            // Do not report unrelated parked requests as a zero-progress host wait: the caller
+            // must be able to continue the bounded response work and its following Guest slice.
+            // A record is published atomically; Guest execution resumes in the next ordinary slice.
+            if matches!(outcome, super::error::Outcome::SliceExhausted) {
+                return Ok(AdvanceOutcome::SliceExhausted);
+            }
             return self.map_machine_outcome(outcome, 0, 0, &mut remaining_retirements);
         }
         if !self.machine.has_active_task()
