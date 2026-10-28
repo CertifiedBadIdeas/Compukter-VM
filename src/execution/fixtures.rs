@@ -7640,6 +7640,44 @@ pub(super) fn record_and_scalar_tasks_artifact() -> VerifiedArtifact {
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
 
+pub(super) fn reference_and_scalar_tasks_artifact(byte_array: bool) -> VerifiedArtifact {
+    let base = record_and_scalar_tasks_artifact();
+    let mut artifact = crate::decode::records::decode_artifact(
+        base.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    artifact.header.runtime_minor = 14;
+    let module = &mut artifact.modules[0];
+    let nominal_type = if byte_array {
+        let id = TypeId(module.types.len() as u32);
+        module.types.push(NominalType::Array {
+            storage: 1,
+            name: 0,
+            element: primitive(1),
+            super_type: None,
+        });
+        module.declared_types = module.types.len() as u32;
+        id
+    } else {
+        TypeId(0x8000_0000)
+    };
+    module.functions[1].register_count = 1;
+    module.functions[1].values = crate::artifact::scalar_values(vec![ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type,
+    }]);
+    let instruction = Instruction::Return { value: u16::MAX };
+    let cost = instruction.fixed_cost().unwrap();
+    module.code[4].instructions = vec![instruction].into_boxed_slice();
+    module.code[4].fixed_cost = cost;
+    module.blocks[4].instruction_count = 1;
+    module.blocks[4].declared_fixed_cost = cost;
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
 pub(crate) fn inline_value_decoded(component: u16) -> crate::artifact::DecodedArtifact {
     let mut artifact = crate::decode::records::decode_artifact(
         Arc::from(crate::test_support::minimal_vector()),

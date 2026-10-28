@@ -1649,6 +1649,82 @@ fn other_task_responses_do_not_replace_an_incomplete_record_frame() {
     }
 }
 
+#[test]
+fn reference_response_progress_is_not_an_unrelated_parked_host_wait() {
+    for byte_array in [false, true] {
+        let operations = [
+            OperationSchema::asynchronous(
+                &[],
+                if byte_array {
+                    HostValueType::ByteArray
+                } else {
+                    HostValueType::String
+                },
+            ),
+            OperationSchema::asynchronous(&[], HostValueType::I32),
+        ];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut session = Session::admit(
+            fixtures::reference_and_scalar_tasks_artifact(byte_array),
+            profile(),
+            &[binding],
+        )
+        .unwrap();
+        session.start(&[]).unwrap();
+        let AdvanceOutcome::HostRequestBatch(batch) = session.advance(64, 0).unwrap() else {
+            panic!("no task requests")
+        };
+        assert_eq!(2, batch.len());
+        let reference = (batch.get(0).unwrap().task_id(), batch.get(0).unwrap().id());
+        let scalar = (batch.get(1).unwrap().task_id(), batch.get(1).unwrap().id());
+        let bytes = [0x80; 128];
+        let units = [0x1234; 128];
+        session
+            .resume_for(
+                reference.0,
+                reference.1,
+                HostResponse::Success(if byte_array {
+                    HostValueInput::ByteArray(&bytes)
+                } else {
+                    HostValueInput::String(&units)
+                }),
+            )
+            .unwrap();
+        let before = session.accounting();
+        assert!(
+            matches!(
+                session.advance(6, 0).unwrap(),
+                AdvanceOutcome::SliceExhausted
+            ),
+            "accepted reference materialization must permit another bounded slice"
+        );
+        let after = session.accounting();
+        assert_eq!(before.executed_instructions, after.executed_instructions);
+        assert!(after.dynamic_guest_units > before.dynamic_guest_units);
+        assert!(after.dynamic_guest_units - before.dynamic_guest_units <= 6);
+        session
+            .resume_for(
+                scalar.0,
+                scalar.1,
+                HostResponse::Success(HostValueInput::I32(42)),
+            )
+            .unwrap();
+        let mut halted = false;
+        for _ in 0..100 {
+            match session.advance(64, 64).unwrap() {
+                AdvanceOutcome::SliceExhausted => (),
+                AdvanceOutcome::Halted(None) => {
+                    halted = true;
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(halted);
+        assert_eq!(2, session.accounting().accepted_responses);
+    }
+}
+
 fn byte_array_operations() -> [OperationSchema<'static>; 2] {
     [
         OperationSchema::asynchronous(&[], HostValueType::ByteArray),

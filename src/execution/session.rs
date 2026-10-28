@@ -401,6 +401,11 @@ impl Session {
                     return self.establish_fault(fault);
                 }
             }
+            // Like record staging, accepted String/ByteArray replies make bounded progress
+            // without retiring Guest instructions or creating a fresh host request.
+            if matches!(outcome, super::error::Outcome::SliceExhausted) {
+                return Ok(AdvanceOutcome::SliceExhausted);
+            }
             return self.map_machine_outcome(
                 outcome,
                 guest_budget.saturating_sub(self.guest_units().saturating_sub(before_guest) as u32),

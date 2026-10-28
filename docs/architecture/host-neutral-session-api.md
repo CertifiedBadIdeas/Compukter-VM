@@ -408,10 +408,10 @@ and no runnable execution or request/reply preparation remains in the active ses
 External timer requests remain host-owned; the host must continue their server-tick deadlines
 while a different task waits for input. This changes no capability, C ABI, or checkpoint encoding.
 
-## Record response progress
+## Accepted response progress
 
-Each bounded slice that materializes an accepted record response reports `SliceExhausted`, including the
-slice that atomically publishes the completed record. This permits the host to advance the remaining
+Each bounded slice that materializes an accepted record, String or ByteArray response reports `SliceExhausted`, including the
+slice that atomically publishes the completed value. This permits the host to advance the remaining
 response work and then resume Guest execution within its existing scheduling allowance, even when
 other tasks retain unanswered host requests. Materialization consumes the existing dynamic Guest and
 maintenance budgets without retiring Guest instructions; it must not be mistaken for a repeated
