@@ -717,6 +717,35 @@ pub(crate) fn external_request_then_terminal_wait_artifact() -> VerifiedArtifact
     internal_wait_and_external_request_artifact(b"terminal", 2, 14, 3, None, false, false)
 }
 
+pub(crate) fn external_prefix_internal_and_fresh_request_artifact() -> VerifiedArtifact {
+    let base = external_request_then_terminal_wait_artifact();
+    let mut artifact = crate::decode::records::decode_artifact(
+        base.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let module = &mut artifact.modules[0];
+    *module.code[0].instructions.last_mut().unwrap() = Instruction::CapabilityCallAsync {
+        dst: u16::MAX,
+        capability: 0,
+        operation: 0,
+        args: Box::new([]),
+        resume_block: 1,
+    };
+    let cost = module.code[0]
+        .instructions
+        .iter()
+        .map(|instruction| instruction.fixed_cost().unwrap())
+        .sum();
+    module.code[0].fixed_cost = cost;
+    module.blocks[0].declared_fixed_cost = cost;
+    artifact.manifest.maximum_host_requests = 3;
+    artifact.manifest.maximum_block_cost = artifact.manifest.maximum_block_cost.max(cost);
+    artifact.manifest.minimum_slice_cost = artifact.manifest.maximum_block_cost;
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
 pub(crate) fn raw_terminal_wait_and_external_request_artifact() -> VerifiedArtifact {
     internal_wait_and_external_request_artifact(b"terminal", 2, 14, 3, None, true, false)
 }
