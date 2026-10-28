@@ -147,11 +147,18 @@ fn ordinary_windows_root_shares_the_canonical_store_lock() {
 fn parent_traversal_world_root_is_rejected() {
     let root = TestRoot::new();
     std::fs::create_dir(root.path().join("child")).unwrap();
+    // PathBuf::push normalizes parent components for Windows verbatim paths.
+    // Use the ordinary spelling to pass an actual unresolved traversal to admission.
+    #[cfg(windows)]
+    let supplied_root = PathBuf::from(root.path().to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+    #[cfg(not(windows))]
+    let supplied_root = root.path().to_owned();
+    let traversal = supplied_root.join("child").join("..");
+    assert!(traversal
+        .components()
+        .any(|component| component == std::path::Component::ParentDir));
     assert!(matches!(
-        WorldFileSystemStore::open(
-            &root.path().join("child").join(".."),
-            FileSystemLimits::testing()
-        ),
+        WorldFileSystemStore::open(&traversal, FileSystemLimits::testing()),
         Err(StoreOpenError::RootNotCanonical)
     ));
 }
