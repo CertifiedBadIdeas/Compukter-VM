@@ -713,6 +713,10 @@ pub(crate) fn external_request_then_redstone_wait_artifact() -> VerifiedArtifact
     internal_wait_and_external_request_artifact(b"redstone", 1, 8, 1, Some(0), false, false)
 }
 
+pub(crate) fn external_request_then_terminal_wait_artifact() -> VerifiedArtifact {
+    internal_wait_and_external_request_artifact(b"terminal", 2, 14, 3, None, false, false)
+}
+
 pub(crate) fn raw_terminal_wait_and_external_request_artifact() -> VerifiedArtifact {
     internal_wait_and_external_request_artifact(b"terminal", 2, 14, 3, None, true, false)
 }

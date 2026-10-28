@@ -417,3 +417,12 @@ other tasks retain unanswered host requests. Materialization consumes the existi
 maintenance budgets without retiring Guest instructions; it must not be mistaken for a repeated
 zero-progress host wait. Ordinary parked request batches retain their existing wait behavior.
 No capability, ABI, quota, or checkpoint encoding changes.
+
+## Internal work behind external waits
+
+Computer request selection scans past already exposed external waits to find internal terminal,
+filesystem and process work. Fresh external calls are still published before that internal work,
+so an internal writer cannot hide another task's first request. Existing opaque request routes
+distinguish published waits from fresh calls; no new state or checkpoint fields are required.
+Each advance retains its existing work and host-request allowances, including internal progress
+when the external request allowance is zero.
