@@ -3238,7 +3238,7 @@ mod tests {
 
     #[test]
     fn concurrent_admission_publishes_one_program_and_releases_last_owner() {
-        let artifact = fixtures::scalar_artifact();
+        let artifact = fixtures::scalar_hash_artifact(1, crate::artifact::Constant::I32(0x80501));
         let barrier = std::sync::Barrier::new(8);
         let images = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
@@ -3270,7 +3270,7 @@ mod tests {
     #[test]
     fn typed_code_is_shared_by_program_and_mode() {
         use super::super::prototype::ExecutionMode;
-        let artifact = fixtures::scalar_artifact();
+        let artifact = fixtures::scalar_hash_artifact(1, crate::artifact::Constant::I32(0x80502));
         let first = ExecutionImage::admit(artifact.clone(), fixtures::profile()).unwrap();
         let second = ExecutionImage::admit(artifact.clone(), fixtures::profile()).unwrap();
         let mut weak = Vec::new();

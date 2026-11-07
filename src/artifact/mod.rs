@@ -1,3 +1,4 @@
+mod interner;
 mod matrix;
 pub(crate) use matrix::MatrixOperation;
 mod math;
@@ -92,10 +93,10 @@ pub(crate) struct VerifiedArtifactInner {
 impl VerifiedArtifact {
     pub(crate) fn new(decoded: DecodedArtifact) -> Self {
         Self {
-            inner: Arc::new(VerifiedArtifactInner {
+            inner: interner::intern(Arc::new(VerifiedArtifactInner {
                 decoded,
                 prepared_program: std::sync::OnceLock::new(),
-            }),
+            })),
         }
     }
 
