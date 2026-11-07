@@ -26,6 +26,11 @@ use super::{
 use crate::VerifiedArtifact;
 use sha2::{Digest, Sha256};
 
+enum CallArguments<'a> {
+    Registers(&'a [u16]),
+    Prepared(&'a [super::prepared::ArgumentTransfer]),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Lifecycle {
     Pristine,
@@ -1434,7 +1439,12 @@ impl Machine {
                     ResolvedInstruction::StaticGet { field, .. }
                     | ResolvedInstruction::StaticSet { field, .. } => Some(field.owner),
                     ResolvedInstruction::NewObject { ty, .. } => Some(*ty),
-                    ResolvedInstruction::CallDirect { target, .. } => self
+                    ResolvedInstruction::CallDirect { target, .. }
+                    | ResolvedInstruction::PreparedCall {
+                        target,
+                        resume_block: usize::MAX,
+                        ..
+                    } => self
                         .image
                         .function(*target)
                         .and_then(|function| function.static_owner),
@@ -1460,7 +1470,8 @@ impl Machine {
                 };
                 self.executed_instructions = executed_instructions;
                 match instruction {
-                    ResolvedInstruction::Return { value } => {
+                    ResolvedInstruction::Return { value }
+                    | ResolvedInstruction::PreparedReturn { value, .. } => {
                         let returning_function = self
                             .image
                             .function(self.frames[frame_index].function)
@@ -1508,7 +1519,13 @@ impl Machine {
                         let returned = if *value == u16::MAX {
                             None
                         } else {
-                            match self.read_register(frame_index, *value) {
+                            let value = match instruction {
+                                ResolvedInstruction::PreparedReturn { access, .. } => self
+                                    .frame_arena
+                                    .read_access(self.frames[frame_index].base, *access),
+                                _ => self.read_register(frame_index, *value),
+                            };
+                            match value {
                                 Ok(value) => Some(value),
                                 Err(fault) => return Ok(self.fault(fault)),
                             }
@@ -1591,13 +1608,14 @@ impl Machine {
                     ResolvedInstruction::CallDirect { .. }
                     | ResolvedInstruction::CallVirtual { .. }
                     | ResolvedInstruction::CallInterface { .. }
-                    | ResolvedInstruction::CallSuspend { .. } => {
+                    | ResolvedInstruction::CallSuspend { .. }
+                    | ResolvedInstruction::PreparedCall { .. } => {
                         let (dst, target, args, caller_block, caller_instruction) =
                             match instruction {
                                 ResolvedInstruction::CallDirect { dst, target, args } => (
                                     *dst,
                                     *target,
-                                    args.as_ref(),
+                                    CallArguments::Registers(args.as_ref()),
                                     block_index,
                                     instruction_index + 1,
                                 ),
@@ -1606,7 +1624,13 @@ impl Machine {
                                     target,
                                     args,
                                     resume_block,
-                                } => (*dst, *target, args.as_ref(), *resume_block, 0),
+                                } => (
+                                    *dst,
+                                    *target,
+                                    CallArguments::Registers(args.as_ref()),
+                                    *resume_block,
+                                    0,
+                                ),
                                 ResolvedInstruction::CallVirtual {
                                     dst,
                                     declaration,
@@ -1646,9 +1670,39 @@ impl Machine {
                                     (
                                         *dst,
                                         target,
-                                        args.as_ref(),
+                                        CallArguments::Registers(args.as_ref()),
                                         block_index,
                                         instruction_index + 1,
+                                    )
+                                }
+                                ResolvedInstruction::PreparedCall {
+                                    dst,
+                                    target,
+                                    transfers_start,
+                                    transfers_count,
+                                    resume_block,
+                                } => {
+                                    let start = *transfers_start as usize;
+                                    let end = start
+                                        .checked_add(*transfers_count as usize)
+                                        .ok_or(RunError::NotRunnable)?;
+                                    let transfers = self
+                                        .image
+                                        .code()
+                                        .arguments
+                                        .get(start..end)
+                                        .ok_or(RunError::NotRunnable)?;
+                                    let (block, instruction) = if *resume_block == usize::MAX {
+                                        (block_index, instruction_index + 1)
+                                    } else {
+                                        (*resume_block, 0)
+                                    };
+                                    (
+                                        *dst,
+                                        *target,
+                                        CallArguments::Prepared(transfers),
+                                        block,
+                                        instruction,
                                     )
                                 }
                                 _ => unreachable!(),
@@ -1656,23 +1710,39 @@ impl Machine {
                         let Some(target_function) = self.image.function(target) else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));
                         };
-                        if target_function.parameter_count != args.len() {
-                            return Ok(self.fault(VmFault::InvalidValueType));
-                        }
-                        for source in args.iter() {
-                            let caller_function = self
-                                .image
-                                .function(self.frames[frame_index].function)
-                                .ok_or(RunError::NotRunnable)?;
-                            if caller_function
-                                .registers
-                                .get(*source as usize)
-                                .is_some_and(|value| value.kind == 8)
-                            {
-                                continue;
+                        if let CallArguments::Prepared(transfers) = &args {
+                            let caller = self.frames[frame_index];
+                            let source = FrameReservation {
+                                base: caller.base,
+                                byte_len: caller.byte_len,
+                            };
+                            for transfer in *transfers {
+                                if let Err(fault) =
+                                    self.frame_arena.validate_argument(source, *transfer)
+                                {
+                                    return Ok(self.fault(fault));
+                                }
                             }
-                            if let Err(fault) = self.read_register(frame_index, *source) {
-                                return Ok(self.fault(fault));
+                        }
+                        if let CallArguments::Registers(args) = &args {
+                            if target_function.parameter_count != args.len() {
+                                return Ok(self.fault(VmFault::InvalidValueType));
+                            }
+                            for source in args.iter() {
+                                let caller_function = self
+                                    .image
+                                    .function(self.frames[frame_index].function)
+                                    .ok_or(RunError::NotRunnable)?;
+                                if caller_function
+                                    .registers
+                                    .get(*source as usize)
+                                    .is_some_and(|value| value.kind == 8)
+                                {
+                                    continue;
+                                }
+                                if let Err(fault) = self.read_register(frame_index, *source) {
+                                    return Ok(self.fault(fault));
+                                }
                             }
                         }
                         if self.frame_depth >= self.image.maximum_call_depth() {
@@ -1700,54 +1770,73 @@ impl Machine {
                             destination: dst,
                             initializer: None,
                         };
-                        for (parameter, source) in args.iter().enumerate() {
+                        if let CallArguments::Prepared(transfers) = &args {
                             let caller = self.frames[frame_index];
-                            let caller_function = self
-                                .image
-                                .function(caller.function)
-                                .ok_or(RunError::NotRunnable)?;
-                            if caller_function
-                                .registers
-                                .get(*source as usize)
-                                .is_some_and(|value| value.kind == 8)
-                            {
-                                let source = caller_function
-                                    .frame_layout
-                                    .values
-                                    .get(*source as usize)
-                                    .ok_or(RunError::NotRunnable)?;
-                                let destination = target_function
-                                    .frame_layout
-                                    .values
-                                    .get(parameter)
-                                    .ok_or(RunError::NotRunnable)?;
-                                if let Err(fault) = self.frame_arena.copy_value(
-                                    caller.base,
+                            let source = FrameReservation {
+                                base: caller.base,
+                                byte_len: caller.byte_len,
+                            };
+                            for transfer in *transfers {
+                                if let Err(fault) = self.frame_arena.transfer_argument(
                                     source,
-                                    callee.base,
-                                    destination,
+                                    reservation,
+                                    *transfer,
                                 ) {
                                     let _ = self.frame_arena.pop(reservation);
                                     return Ok(self.fault(fault));
                                 }
-                                continue;
                             }
-                            let value = match self.read_register(frame_index, *source) {
-                                Ok(value) => value,
-                                Err(fault) => {
+                        }
+                        if let CallArguments::Registers(args) = &args {
+                            for (parameter, source) in args.iter().enumerate() {
+                                let caller = self.frames[frame_index];
+                                let caller_function = self
+                                    .image
+                                    .function(caller.function)
+                                    .ok_or(RunError::NotRunnable)?;
+                                if caller_function
+                                    .registers
+                                    .get(*source as usize)
+                                    .is_some_and(|value| value.kind == 8)
+                                {
+                                    let source = caller_function
+                                        .frame_layout
+                                        .values
+                                        .get(*source as usize)
+                                        .ok_or(RunError::NotRunnable)?;
+                                    let destination = target_function
+                                        .frame_layout
+                                        .values
+                                        .get(parameter)
+                                        .ok_or(RunError::NotRunnable)?;
+                                    if let Err(fault) = self.frame_arena.copy_value(
+                                        caller.base,
+                                        source,
+                                        callee.base,
+                                        destination,
+                                    ) {
+                                        let _ = self.frame_arena.pop(reservation);
+                                        return Ok(self.fault(fault));
+                                    }
+                                    continue;
+                                }
+                                let value = match self.read_register(frame_index, *source) {
+                                    Ok(value) => value,
+                                    Err(fault) => {
+                                        let _ = self.frame_arena.pop(reservation);
+                                        return Ok(self.fault(fault));
+                                    }
+                                };
+                                if let Err(fault) = write_frame_value(
+                                    &mut self.frame_arena,
+                                    callee,
+                                    target_function,
+                                    parameter as u16,
+                                    value,
+                                ) {
                                     let _ = self.frame_arena.pop(reservation);
                                     return Ok(self.fault(fault));
                                 }
-                            };
-                            if let Err(fault) = write_frame_value(
-                                &mut self.frame_arena,
-                                callee,
-                                target_function,
-                                parameter as u16,
-                                value,
-                            ) {
-                                let _ = self.frame_arena.pop(reservation);
-                                return Ok(self.fault(fault));
                             }
                         }
                         self.frames[callee_index] = callee;

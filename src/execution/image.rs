@@ -378,6 +378,18 @@ pub(super) enum ResolvedInstruction {
         target: usize,
         args: Box<[u16]>,
     },
+    PreparedCall {
+        dst: u16,
+        target: usize,
+        transfers_start: u32,
+        transfers_count: u32,
+        // usize::MAX means the next instruction in the current block.
+        resume_block: usize,
+    },
+    PreparedReturn {
+        value: u16,
+        access: FrameValueAccess,
+    },
     CallVirtual {
         dst: u16,
         declaration: usize,
@@ -1362,8 +1374,12 @@ pub(crate) fn prepare_program(
                 )?);
             }
             let instruction_count = instructions.len();
-            let code_start =
-                prepared_code.push_block(instructions, &functions[function], &constants)?;
+            let code_start = prepared_code.push_block(
+                instructions,
+                &functions[function],
+                &functions,
+                &constants,
+            )?;
             blocks.push(ResolvedBlock {
                 function,
                 fixed_cost: code.fixed_cost,

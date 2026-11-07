@@ -622,6 +622,50 @@ impl FrameArena {
         Ok(())
     }
 
+    pub(super) fn validate_argument(
+        &self,
+        frame: FrameReservation,
+        transfer: super::prepared::ArgumentTransfer,
+    ) -> Result<(), VmFault> {
+        if transfer.kind == 8 {
+            return Ok(());
+        }
+        match transfer.width {
+            4 => {
+                let bits = u32::from_le_bytes(self.read_prepared::<4>(frame, transfer.src)?);
+                if (transfer.kind == 5 && bits > 1)
+                    || (transfer.kind == 6 && bits > u16::MAX as u32)
+                {
+                    return Err(VmFault::InvalidValueType);
+                }
+            }
+            8 => {
+                self.read_prepared::<8>(frame, transfer.src)?;
+            }
+            _ => return Err(VmFault::InvalidStoragePlan),
+        }
+        Ok(())
+    }
+
+    pub(super) fn transfer_argument(
+        &mut self,
+        source: FrameReservation,
+        destination: FrameReservation,
+        transfer: super::prepared::ArgumentTransfer,
+    ) -> Result<(), VmFault> {
+        let source = self.prepared_range(source, transfer.src, transfer.width as usize)?;
+        let destination =
+            self.prepared_range(destination, transfer.dst, transfer.width as usize)?;
+        #[cfg(test)]
+        if transfer.kind == 8 && self.initialized[source.clone()].iter().any(|value| !value) {
+            return Err(VmFault::InvalidStoragePlan);
+        }
+        self.bytes.copy_within(source, destination.start);
+        #[cfg(test)]
+        self.initialized[destination].fill(true);
+        Ok(())
+    }
+
     pub(super) fn copy_value(
         &mut self,
         source_base: u32,

@@ -61,6 +61,196 @@ fn default_executor_matches_reference_at_instruction_and_checkpoint_boundaries()
 }
 
 #[test]
+fn prepared_calls_preserve_dispatch_stack_initialization_and_suspension_boundaries() {
+    for artifact in [
+        fixtures::dynamic_dispatch_artifact(),
+        fixtures::suspend_value_call_artifact(),
+        fixtures::recursive_artifact(3),
+        fixtures::recursive_suspend_artifact(3),
+        fixtures::lazy_type_initializer_artifact(),
+        fixtures::actively_used_failing_type_initializer_artifact(),
+        fixtures::inline_value_artifact(0),
+        fixtures::inline_reference_root_artifact(),
+        fixtures::inline_task_argument_artifact(),
+    ] {
+        compare(artifact, &[], 150);
+    }
+}
+
+#[test]
+fn argument_transfers_validate_canonical_values_and_frame_bounds() {
+    let mut arena = FrameArena::new(128).unwrap();
+    let source = FrameReservation {
+        base: 0,
+        byte_len: 16,
+    };
+    let destination = FrameReservation {
+        base: 32,
+        byte_len: 16,
+    };
+    for (kind, valid, invalid) in [(5, 1_u32, 2_u32), (6, 65535, 65536)] {
+        let transfer = ArgumentTransfer {
+            src: 4,
+            dst: 8,
+            kind,
+            width: 4,
+        };
+        arena
+            .write_prepared(source, 4, valid.to_le_bytes())
+            .unwrap();
+        arena.validate_argument(source, transfer).unwrap();
+        arena
+            .transfer_argument(source, destination, transfer)
+            .unwrap();
+        assert_eq!(
+            arena.read_prepared::<4>(destination, 8).unwrap(),
+            valid.to_le_bytes()
+        );
+        arena
+            .write_prepared(source, 4, invalid.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            arena.validate_argument(source, transfer),
+            Err(VmFault::InvalidValueType)
+        );
+    }
+    let transfer = ArgumentTransfer {
+        src: 12,
+        dst: 12,
+        kind: 2,
+        width: 8,
+    };
+    assert_eq!(
+        arena.validate_argument(source, transfer),
+        Err(VmFault::InvalidStoragePlan)
+    );
+    assert_eq!(
+        arena.transfer_argument(source, destination, transfer),
+        Err(VmFault::InvalidStoragePlan)
+    );
+}
+
+#[test]
+fn inline_argument_spans_preserve_bytes_initialization_and_reservation_bounds() {
+    let mut arena = FrameArena::new(128).unwrap();
+    let source = FrameReservation {
+        base: 0,
+        byte_len: 32,
+    };
+    let destination = FrameReservation {
+        base: 64,
+        byte_len: 32,
+    };
+    let transfer = ArgumentTransfer {
+        src: 4,
+        dst: 8,
+        kind: 8,
+        width: 24,
+    };
+    assert_eq!(
+        arena.transfer_argument(source, destination, transfer),
+        Err(VmFault::InvalidStoragePlan)
+    );
+    let bits: [u8; 24] = core::array::from_fn(|index| (index * 7) as u8);
+    arena.write_prepared(source, 4, bits).unwrap();
+    arena
+        .transfer_argument(source, destination, transfer)
+        .unwrap();
+    assert_eq!(arena.read_prepared::<24>(destination, 8).unwrap(), bits);
+    let short = FrameReservation {
+        byte_len: 24,
+        ..destination
+    };
+    assert_eq!(
+        arena.transfer_argument(source, short, transfer),
+        Err(VmFault::InvalidStoragePlan)
+    );
+}
+
+#[test]
+fn wide_inline_arguments_transfer_without_an_encoding_size_limit() {
+    use crate::execution::{
+        frame::{ComponentLayout, FrameLayout, ValueLayout},
+        image::ResolvedValueType,
+        FunctionKey, TypeKey,
+    };
+    let function = |index| {
+        let layout = FrameLayout {
+            byte_len: 320,
+            alignment: 8,
+            values: vec![ValueLayout {
+                components: (0..40)
+                    .map(|index| ComponentLayout {
+                        offset: index * 8,
+                        atom: PhysicalAtom::F64,
+                    })
+                    .collect(),
+            }]
+            .into_boxed_slice(),
+        };
+        ResolvedFunction {
+            key: FunctionKey {
+                module: 0,
+                function: index,
+            },
+            register_count: 1,
+            parameter_count: 1,
+            registers: vec![ResolvedValueType {
+                kind: 8,
+                nullable: false,
+                nominal: Some(TypeKey { module: 0, ty: 0 }),
+            }]
+            .into_boxed_slice(),
+            register_accesses: vec![layout.value_access(8, 0)].into_boxed_slice(),
+            frame_layout: layout,
+            safepoints: Box::new([]),
+            result: ResolvedValueType {
+                kind: 0,
+                nullable: false,
+                nominal: None,
+            },
+            first_block: 0,
+            block_count: 1,
+            static_owner: None,
+            handlers: Box::new([]),
+        }
+    };
+    let functions = [function(0), function(1)];
+    let mut builder = CodeBuilder::default();
+    builder
+        .push_block(
+            vec![ResolvedInstruction::CallDirect {
+                dst: u16::MAX,
+                target: 1,
+                args: vec![0].into_boxed_slice(),
+            }],
+            &functions[0],
+            &functions,
+            &[],
+        )
+        .unwrap();
+    let code = builder.finish().unwrap();
+    let mut arena = FrameArena::new(1024).unwrap();
+    let source = FrameReservation {
+        base: 0,
+        byte_len: 320,
+    };
+    let destination = FrameReservation {
+        base: 512,
+        byte_len: 320,
+    };
+    let bits: [u8; 320] = core::array::from_fn(|index| (index % 251) as u8);
+    arena.write_prepared(source, 0, bits).unwrap();
+    for transfer in &code.arguments {
+        arena.validate_argument(source, *transfer).unwrap();
+        arena
+            .transfer_argument(source, destination, *transfer)
+            .unwrap();
+    }
+    assert_eq!(arena.read_prepared::<320>(destination, 0).unwrap(), bits);
+}
+
+#[test]
 fn prepared_scalar_frame_bounds_remain_checked() {
     let mut arena = FrameArena::new(64).unwrap();
     let frame = FrameReservation {

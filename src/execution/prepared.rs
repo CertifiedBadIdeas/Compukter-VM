@@ -54,6 +54,15 @@ pub(super) struct Copy {
     pub width: u32,
 }
 
+// Physical component transfers are immutable and shared with the program.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ArgumentTransfer {
+    pub src: u32,
+    pub dst: u32,
+    pub kind: u8,
+    pub width: u8,
+}
+
 #[derive(Debug, Default)]
 struct Plans {
     copies: Vec<Copy>,
@@ -67,6 +76,7 @@ pub(super) struct PreparedCode {
     cold: Box<[ResolvedInstruction]>,
     pub copies: Box<[Copy]>,
     pub fields: Box<[ResolvedField]>,
+    pub arguments: Box<[ArgumentTransfer]>,
     #[cfg(any(test, feature = "execution-prototype"))]
     reference: Box<[ResolvedInstruction]>,
 }
@@ -76,6 +86,7 @@ pub(super) struct CodeBuilder {
     operations: Vec<Operation>,
     cold: Vec<ResolvedInstruction>,
     plans: Plans,
+    arguments: Vec<ArgumentTransfer>,
     #[cfg(any(test, feature = "execution-prototype"))]
     reference: Vec<ResolvedInstruction>,
 }
@@ -85,6 +96,7 @@ impl CodeBuilder {
         &mut self,
         instructions: Vec<ResolvedInstruction>,
         function: &ResolvedFunction,
+        functions: &[ResolvedFunction],
         constants: &[RuntimeValue],
     ) -> Result<usize, AdmissionError> {
         let start = self.operations.len();
@@ -107,20 +119,118 @@ impl CodeBuilder {
                 Some(operation) => Some(operation),
                 None => prepare_extra(&instruction, function, constants, &mut self.plans)?,
             };
-            self.operations.push(match operation {
+            let operation = match operation {
                 Some(operation) => operation,
                 None => {
                     let descriptor = u32::try_from(self.cold.len())
                         .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+                    let instruction = self.prepare_lifecycle(instruction, function, functions)?;
                     self.cold.push(instruction);
                     Operation {
                         dst: descriptor,
                         ..Operation::default()
                     }
                 }
-            });
+            };
+            self.operations.push(operation);
         }
         Ok(start)
+    }
+
+    fn prepare_lifecycle(
+        &mut self,
+        instruction: ResolvedInstruction,
+        caller: &ResolvedFunction,
+        functions: &[ResolvedFunction],
+    ) -> Result<ResolvedInstruction, AdmissionError> {
+        use ResolvedInstruction::*;
+        let (dst, target, args, resume_block) = match instruction {
+            CallDirect { dst, target, args } => (dst, target, args, usize::MAX),
+            CallSuspend {
+                dst,
+                target,
+                args,
+                resume_block,
+            } => (dst, target, args, resume_block),
+            Return { value } if value != u16::MAX && caller.result.kind != 8 => {
+                let access = *caller
+                    .register_accesses
+                    .get(value as usize)
+                    .ok_or(AdmissionError::InvalidEntry)?;
+                return Ok(PreparedReturn { value, access });
+            }
+            other => return Ok(other),
+        };
+        let callee = functions.get(target).ok_or(AdmissionError::InvalidEntry)?;
+        if callee.parameter_count != args.len() {
+            return Err(AdmissionError::InvalidEntry);
+        }
+        let start =
+            u32::try_from(self.arguments.len()).map_err(|_| AdmissionError::StoragePlanOverflow)?;
+        for (parameter, source) in args.iter().enumerate() {
+            let source_index = *source as usize;
+            let kind = caller
+                .registers
+                .get(source_index)
+                .ok_or(AdmissionError::InvalidEntry)?
+                .kind;
+            let source = caller
+                .frame_layout
+                .values
+                .get(source_index)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let destination = callee
+                .frame_layout
+                .values
+                .get(parameter)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            if source.components.len() != destination.components.len() {
+                return Err(AdmissionError::InvalidEntry);
+            }
+            self.arguments
+                .try_reserve(source.components.len())
+                .map_err(|_| AdmissionError::AllocationFailed)?;
+            let argument_start = self.arguments.len();
+            for (source, destination) in source.components.iter().zip(destination.components.iter())
+            {
+                if source.atom != destination.atom {
+                    return Err(AdmissionError::InvalidEntry);
+                }
+                let width = source.atom.byte_size() as u8;
+                // Call frames occupy disjoint reservations. Consecutive inline
+                // components can therefore transfer as one checked byte span.
+                if kind == 8 && self.arguments.len() > argument_start {
+                    let previous = self
+                        .arguments
+                        .last_mut()
+                        .ok_or(AdmissionError::InvalidEntry)?;
+                    if previous.src.checked_add(u32::from(previous.width)) == Some(source.offset)
+                        && previous.dst.checked_add(u32::from(previous.width))
+                            == Some(destination.offset)
+                    {
+                        if let Some(width) = previous.width.checked_add(width) {
+                            previous.width = width;
+                            continue;
+                        }
+                    }
+                }
+                self.arguments.push(ArgumentTransfer {
+                    src: source.offset,
+                    dst: destination.offset,
+                    kind,
+                    width,
+                });
+            }
+        }
+        let end =
+            u32::try_from(self.arguments.len()).map_err(|_| AdmissionError::StoragePlanOverflow)?;
+        Ok(PreparedCall {
+            dst,
+            target,
+            transfers_start: start,
+            transfers_count: end - start,
+            resume_block,
+        })
     }
 
     pub(super) fn finish(self) -> Result<PreparedCode, AdmissionError> {
@@ -140,6 +250,7 @@ impl CodeBuilder {
             cold: self.cold.into_boxed_slice(),
             copies: self.plans.copies.into_boxed_slice(),
             fields: self.plans.fields.into_boxed_slice(),
+            arguments: self.arguments.into_boxed_slice(),
             #[cfg(any(test, feature = "execution-prototype"))]
             reference: self.reference.into_boxed_slice(),
         })
@@ -157,7 +268,8 @@ impl PreparedCode {
             self.lines.len() * core::mem::size_of::<Line>(),
             core::mem::size_of_val(self.cold.as_ref()),
             core::mem::size_of_val(self.copies.as_ref())
-                + core::mem::size_of_val(self.fields.as_ref()),
+                + core::mem::size_of_val(self.fields.as_ref())
+                + core::mem::size_of_val(self.arguments.as_ref()),
         ]
     }
 
