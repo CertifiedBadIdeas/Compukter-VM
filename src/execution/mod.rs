@@ -16,6 +16,8 @@ mod machine;
 mod math;
 mod matrix;
 mod numeric;
+#[cfg(feature = "execution-prototype")]
+pub(crate) mod prototype;
 mod record;
 mod requests;
 mod session;

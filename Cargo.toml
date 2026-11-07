@@ -24,6 +24,7 @@ crate-type = ["rlib"]
 [features]
 persistence-crash-testing = []
 guest-benchmark = []
+execution-prototype = []
 
 [dependencies]
 libm = { version = "=0.2.16", default-features = false }

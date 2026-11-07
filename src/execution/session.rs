@@ -102,6 +102,14 @@ impl core::fmt::Debug for Session {
 }
 
 impl Session {
+    #[cfg(feature = "execution-prototype")]
+    pub(crate) fn prepare_execution(
+        &mut self,
+        mode: super::prototype::ExecutionMode,
+    ) -> Result<super::prototype::PreparationStats, AdmissionError> {
+        self.machine.prepare_execution(mode)
+    }
+
     pub(crate) fn failure_stack(&self) -> super::machine::FailureStack {
         self.machine.failure_stack()
     }

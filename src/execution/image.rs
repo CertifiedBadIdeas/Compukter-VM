@@ -527,6 +527,14 @@ struct ExecutionImageInner {
 }
 
 impl ExecutionImage {
+    #[cfg(feature = "execution-prototype")]
+    pub(super) fn prepare_execution(
+        &self,
+        mode: super::prototype::ExecutionMode,
+    ) -> Result<super::prototype::PreparedExecution, AdmissionError> {
+        super::prototype::PreparedExecution::new(&self.0.blocks, &self.0.functions, mode)
+    }
+
     pub(super) fn admit(
         artifact: VerifiedArtifact,
         profile: ExecutionProfile,

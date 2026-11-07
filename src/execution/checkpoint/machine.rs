@@ -159,6 +159,8 @@ impl Machine {
         }
         let mut machine = Self {
             image,
+            #[cfg(feature = "execution-prototype")]
+            prototype: None,
             lifecycle: Checkpoint::read(reader)?,
             frames: Checkpoint::read(reader)?,
             task_frames: Checkpoint::read(reader)?,
