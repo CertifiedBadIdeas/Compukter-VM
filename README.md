@@ -240,3 +240,42 @@ Computer terminal input reserves Ctrl+C (key 67, CONTROL) to forcibly terminate 
 Termination runs at the next advance, emits ordered ProcessExited events and returns status 130 to its parent.
 An idle shell receives Ctrl+C to cancel its input; the shell/root remains live; repeat events do not terminate another command. Existing terminal-key
 FFI/JNI calls and C ABI layouts are unchanged.
+
+## Shared immutable programs
+
+Live byte-identical artifacts normally share their decoded metadata and one immutable
+`PreparedProgram`: resolved instructions, function/frame/safepoint/dispatch tables,
+payload-relative fields, static layout, literals and type metadata. Every session still
+checks its own execution profile and capability/record schemas and derives heap-header-dependent
+allocation layouts and mutable resident charges. Heap, stack, statics, type-initialization
+state, tasks and host requests remain private to the machine.
+
+A fixed 128-entry weak index interns artifacts only after full verification with the caller's
+limits. It compares complete container bytes as well as the content digest. The index owns no
+strong program references; the last artifact/image owner releases the program. Eviction can
+reduce sharing for later admissions without changing running machines. Parsing/verification
+is still repeated for each incoming binary. Concurrent first preparation may build temporary
+candidates outside global locks, then publishes one canonical program via `OnceLock`.
+
+The opt-in typed representations are cached by shared program and execution mode. Each machine
+retains its private decode cache; production selection stays on the existing interpreter.
+Checkpoints contain logical state and rebuild admission against current profile/bindings;
+no cache addresses or native layout pointers are persisted.
+
+The separate `program-sharing-benchmark` feature enables a real `ComputerMachine` population
+harness and a counting system allocator in the benchmark executable only. Its `isolated` control
+performs exactly the same verification and admission while bypassing identity interning. Counts
+represent requested live allocation bytes, excluding allocator headers/fragmentation and RSS.
+
+```sh
+cargo build --release --locked --offline --features program-sharing-benchmark --bin guest-benchmark
+./target/release/guest-benchmark sharing SHELL.cpkt shared.tsv 64 shared shell reference 262144
+./target/release/guest-benchmark sharing SHELL.cpkt isolated.tsv 64 isolated shell reference 262144
+# Add execution-prototype to build features, then use offsets instead of reference for typed code.
+```
+
+Every process holds all population members, validates each shell prompt and an instance-specific
+`echo` response, compares deterministic work, counts unique program/typed-code identities and
+checks pool teardown. Arithmetic artifacts use their expected checksum instead of `shell`.
+The parent repository's `docs/benchmarks/shared-program-2026-11-07/` owns the paired runner,
+raw measurements and validator. These results do not measure Minecraft TPS or maximum capacity.
