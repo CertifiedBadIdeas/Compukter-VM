@@ -8,6 +8,28 @@ use crate::{
     },
 };
 
+#[test]
+fn simd_unpack_matches_scalar_for_all_operand_bytes_and_inactive_tail_lanes() {
+    for value in 0..=255u32 {
+        let words = [
+            value | (255 - value) << 8 | value << 16 | (value ^ 0xa5) << 24,
+            0,
+            u32::MAX,
+            0x0123_4567,
+        ];
+        let mut expected = [Operation::default(); 4];
+        let mut actual = [Operation::default(); 4];
+        unpack_scalar(&words, &mut expected);
+        unpack_four(&words, &mut actual);
+        for (expected, actual) in expected.iter().zip(actual) {
+            assert_eq!(
+                (expected.opcode, expected.dst, expected.lhs, expected.rhs),
+                (actual.opcode, actual.dst, actual.lhs, actual.rhs)
+            );
+        }
+    }
+}
+
 fn bytes(machine: &super::super::machine::Machine) -> Vec<u8> {
     let mut writer = Writer::new(8 * 1024 * 1024);
     machine.write_checkpoint_state(&mut writer).unwrap();
@@ -62,7 +84,12 @@ fn compare(
 
 #[test]
 fn reference_and_candidates_preserve_scalar_results_and_every_instruction_boundary() {
-    for mode in [ExecutionMode::Packed, ExecutionMode::Offsets] {
+    for mode in [
+        ExecutionMode::Packed,
+        ExecutionMode::PackedBatch,
+        ExecutionMode::PackedSimd,
+        ExecutionMode::Offsets,
+    ] {
         for case in fixtures::scalar_cases() {
             compare(case.artifact, &case.args, mode, 6);
         }
@@ -197,7 +224,12 @@ fn all_numeric_opcodes_match_reference_for_overflow_zero_nan_infinity_and_signed
         for group in (0..5).chain(7..13) {
             let kinds = [kind, kind, if group >= 7 { 5 } else { kind }];
             let artifact = fixtures::unsigned_operation_artifact(&kinds, 2, binary(group, form));
-            for mode in [ExecutionMode::Packed, ExecutionMode::Offsets] {
+            for mode in [
+                ExecutionMode::Packed,
+                ExecutionMode::PackedBatch,
+                ExecutionMode::PackedSimd,
+                ExecutionMode::Offsets,
+            ] {
                 for lhs in values(kind) {
                     for rhs in values(kind) {
                         let args = [EntryArgument::unowned(lhs), EntryArgument::unowned(rhs)];
@@ -245,7 +277,12 @@ fn unary_numeric_operations_preserve_raw_moves_and_canonical_negation() {
             };
             let artifact = fixtures::unsigned_operation_artifact(&[kind, kind], 1, instruction);
             for value in values(kind) {
-                for mode in [ExecutionMode::Packed, ExecutionMode::Offsets] {
+                for mode in [
+                    ExecutionMode::Packed,
+                    ExecutionMode::PackedBatch,
+                    ExecutionMode::PackedSimd,
+                    ExecutionMode::Offsets,
+                ] {
                     let args = [EntryArgument::unowned(value)];
                     let mut reference = started(artifact.clone(), &args);
                     let mut candidate = started(artifact.clone(), &args);
@@ -263,7 +300,12 @@ fn unary_numeric_operations_preserve_raw_moves_and_canonical_negation() {
 #[test]
 fn candidate_execution_preserves_reference_trace_digests() {
     for case in fixtures::trace_cases() {
-        for mode in [ExecutionMode::Packed, ExecutionMode::Offsets] {
+        for mode in [
+            ExecutionMode::Packed,
+            ExecutionMode::PackedBatch,
+            ExecutionMode::PackedSimd,
+            ExecutionMode::Offsets,
+        ] {
             let mut reference = fixtures::started(case.artifact.clone(), &case.args);
             let mut candidate = fixtures::started(case.artifact.clone(), &case.args);
             candidate.prepare_execution(mode).unwrap();
@@ -295,7 +337,12 @@ fn wide_registers_use_reference_exit_in_packed_and_direct_offsets_in_prepared() 
             rhs: 1,
         },
     );
-    for mode in [ExecutionMode::Packed, ExecutionMode::Offsets] {
+    for mode in [
+        ExecutionMode::Packed,
+        ExecutionMode::PackedBatch,
+        ExecutionMode::PackedSimd,
+        ExecutionMode::Offsets,
+    ] {
         let mut machine = fixtures::started_zero_arg(fixtures::nested_call_artifact());
         let image =
             super::super::image::ExecutionImage::admit(artifact.clone(), fixtures::profile())

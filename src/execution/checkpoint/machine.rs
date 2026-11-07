@@ -161,6 +161,8 @@ impl Machine {
             image,
             #[cfg(feature = "execution-prototype")]
             prototype: None,
+            #[cfg(feature = "execution-prototype")]
+            prototype_cache: crate::execution::prototype::DecodeCache::default(),
             lifecycle: Checkpoint::read(reader)?,
             frames: Checkpoint::read(reader)?,
             task_frames: Checkpoint::read(reader)?,

@@ -122,6 +122,8 @@ pub(super) struct Machine {
     image: ExecutionImage,
     #[cfg(feature = "execution-prototype")]
     prototype: Option<super::prototype::PreparedExecution>,
+    #[cfg(feature = "execution-prototype")]
+    prototype_cache: super::prototype::DecodeCache,
     lifecycle: Lifecycle,
     frames: Box<[Frame]>,
     task_frames: Box<[Frame]>,
@@ -313,6 +315,7 @@ impl Machine {
         let prepared = self.image.prepare_execution(mode)?;
         let stats = prepared.stats();
         self.prototype = Some(prepared);
+        self.prototype_cache = super::prototype::DecodeCache::default();
         Ok(stats)
     }
 
@@ -432,6 +435,8 @@ impl Machine {
             image,
             #[cfg(feature = "execution-prototype")]
             prototype: None,
+            #[cfg(feature = "execution-prototype")]
+            prototype_cache: super::prototype::DecodeCache::default(),
             lifecycle: Lifecycle::Pristine,
             frames: frames.into_boxed_slice(),
             task_frames: task_frames.into_boxed_slice(),
@@ -1304,7 +1309,11 @@ impl Machine {
                 let instruction_index = self.frames[frame_index].instruction;
                 #[cfg(feature = "execution-prototype")]
                 if let Some(prepared) = &self.prototype {
-                    if let Some(operation) = prepared.operation(block_index, instruction_index) {
+                    if let Some(operation) = prepared.operation(
+                        block_index,
+                        instruction_index,
+                        &mut self.prototype_cache,
+                    ) {
                         let frame = self.frames[frame_index];
                         let function = self
                             .image

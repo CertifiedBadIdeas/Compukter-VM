@@ -19,6 +19,8 @@ use crate::artifact::PhysicalAtom;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutionMode {
     Packed,
+    PackedBatch,
+    PackedSimd,
     Offsets,
 }
 
@@ -85,6 +87,29 @@ pub(super) struct PreparedExecution {
     code: Code,
     block_starts: Box<[usize]>,
     stats: PreparationStats,
+    batch_decode: bool,
+    simd_decode: bool,
+}
+
+// Mutable decode state belongs to the instance, separately from immutable code.
+pub(super) struct DecodeCache {
+    block: usize,
+    first: usize,
+    operations: [Operation; 4],
+}
+
+pub(crate) fn decode_cache_bytes() -> usize {
+    core::mem::size_of::<DecodeCache>()
+}
+
+impl Default for DecodeCache {
+    fn default() -> Self {
+        Self {
+            block: usize::MAX,
+            first: usize::MAX,
+            operations: [Operation::default(); 4],
+        }
+    }
 }
 
 impl PreparedExecution {
@@ -124,7 +149,7 @@ impl PreparedExecution {
         }
         starts.push(operations.len());
         let code = match mode {
-            ExecutionMode::Packed => {
+            ExecutionMode::Packed | ExecutionMode::PackedBatch | ExecutionMode::PackedSimd => {
                 let mut words = Vec::new();
                 words
                     .try_reserve_exact(count)
@@ -152,6 +177,8 @@ impl PreparedExecution {
             code,
             block_starts: starts.into_boxed_slice(),
             stats,
+            batch_decode: matches!(mode, ExecutionMode::PackedBatch | ExecutionMode::PackedSimd),
+            simd_decode: mode == ExecutionMode::PackedSimd,
         })
     }
 
@@ -160,12 +187,38 @@ impl PreparedExecution {
     }
 
     #[inline(always)]
-    pub(super) fn operation(&self, block: usize, pc: usize) -> Option<Operation> {
+    pub(super) fn operation(
+        &self,
+        block: usize,
+        pc: usize,
+        cache: &mut DecodeCache,
+    ) -> Option<Operation> {
         let start = *self.block_starts.get(block)?;
         let end = *self.block_starts.get(block.checked_add(1)?)?;
         let index = start.checked_add(pc).filter(|index| *index < end)?;
         let op = match &self.code {
             Code::Packed(code) => {
+                if self.batch_decode {
+                    let first = pc / 4 * 4;
+                    if cache.block != block || cache.first != first {
+                        let mut words = [0u32; 4];
+                        for (lane, word) in words.iter_mut().enumerate() {
+                            let position = start.checked_add(first)?.checked_add(lane)?;
+                            if position < end {
+                                *word = code.get(position)?;
+                            }
+                        }
+                        if self.simd_decode {
+                            unpack_four(&words, &mut cache.operations);
+                        } else {
+                            unpack_scalar(&words, &mut cache.operations);
+                        }
+                        cache.block = block;
+                        cache.first = first;
+                    }
+                    let op = cache.operations[pc - first];
+                    return (op.opcode != 0).then_some(op);
+                }
                 let word = code.get(index)?;
                 Operation {
                     opcode: word & 255,
@@ -208,6 +261,50 @@ impl PreparedExecution {
                 byte_len: frame.byte_len,
             },
         )
+    }
+}
+
+fn unpack_scalar(words: &[u32; 4], output: &mut [Operation; 4]) {
+    for (word, op) in words.iter().zip(output) {
+        *op = Operation {
+            opcode: word & 255,
+            dst: word >> 8 & 255,
+            lhs: word >> 16 & 255,
+            rhs: word >> 24,
+        };
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn unpack_four(words: &[u32; 4], output: &mut [Operation; 4]) {
+    unpack_scalar(words, output);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn unpack_four(words: &[u32; 4], output: &mut [Operation; 4]) {
+    use std::arch::x86_64::*;
+    const {
+        assert!(core::mem::size_of::<Operation>() == 16);
+    }
+    // SAFETY: SSE2 is part of the x86-64 baseline. Both arrays contain exactly
+    // 16 input / 64 output bytes, cannot alias, and unaligned loads/stores are used.
+    // repr(C) Operation consists of four u32 fields and accepts every bit pattern.
+    unsafe {
+        let input = _mm_loadu_si128(words.as_ptr().cast());
+        let mask = _mm_set1_epi32(255);
+        let opcode = _mm_and_si128(input, mask);
+        let dst = _mm_and_si128(_mm_srli_epi32::<8>(input), mask);
+        let lhs = _mm_and_si128(_mm_srli_epi32::<16>(input), mask);
+        let rhs = _mm_srli_epi32::<24>(input);
+        let low_ab = _mm_unpacklo_epi32(opcode, dst);
+        let high_ab = _mm_unpackhi_epi32(opcode, dst);
+        let low_cd = _mm_unpacklo_epi32(lhs, rhs);
+        let high_cd = _mm_unpackhi_epi32(lhs, rhs);
+        let target = output.as_mut_ptr().cast();
+        _mm_storeu_si128(target, _mm_unpacklo_epi64(low_ab, low_cd));
+        _mm_storeu_si128(target.add(1), _mm_unpackhi_epi64(low_ab, low_cd));
+        _mm_storeu_si128(target.add(2), _mm_unpacklo_epi64(high_ab, high_cd));
+        _mm_storeu_si128(target.add(3), _mm_unpackhi_epi64(high_ab, high_cd));
     }
 }
 
@@ -337,13 +434,17 @@ fn prepare(
     let physical_rhs = offset(function, u32::from(rhs), kind)?;
     let opcode = group * 4 + u32::from(kind);
     match mode {
-        ExecutionMode::Packed if [dst, lhs, rhs].iter().all(|r| *r <= 255) => Some(Operation {
-            opcode,
-            dst: u32::from(dst),
-            lhs: u32::from(lhs),
-            rhs: u32::from(rhs),
-        }),
-        ExecutionMode::Packed => None,
+        ExecutionMode::Packed | ExecutionMode::PackedBatch | ExecutionMode::PackedSimd
+            if [dst, lhs, rhs].iter().all(|r| *r <= 255) =>
+        {
+            Some(Operation {
+                opcode,
+                dst: u32::from(dst),
+                lhs: u32::from(lhs),
+                rhs: u32::from(rhs),
+            })
+        }
+        ExecutionMode::Packed | ExecutionMode::PackedBatch | ExecutionMode::PackedSimd => None,
         ExecutionMode::Offsets => Some(Operation {
             opcode,
             dst: physical_dst,
