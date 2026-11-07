@@ -120,6 +120,10 @@ pub(super) fn write_frame_value(
 
 pub(super) struct Machine {
     image: ExecutionImage,
+    #[cfg(feature = "execution-prototype")]
+    prototype: Option<super::prototype::PreparedExecution>,
+    #[cfg(feature = "execution-prototype")]
+    prototype_cache: super::prototype::DecodeCache,
     lifecycle: Lifecycle,
     frames: Box<[Frame]>,
     task_frames: Box<[Frame]>,
@@ -303,6 +307,18 @@ impl AllocationRetry {
 }
 
 impl Machine {
+    #[cfg(feature = "execution-prototype")]
+    pub(super) fn prepare_execution(
+        &mut self,
+        mode: super::prototype::ExecutionMode,
+    ) -> Result<super::prototype::PreparationStats, AdmissionError> {
+        let prepared = self.image.prepare_execution(mode)?;
+        let stats = prepared.stats();
+        self.prototype = Some(prepared);
+        self.prototype_cache = super::prototype::DecodeCache::default();
+        Ok(stats)
+    }
+
     #[cfg(test)]
     pub(super) fn test_has_staged_record_reference(&self) -> bool {
         self.pending_record
@@ -417,6 +433,10 @@ impl Machine {
         }
         Ok(Self {
             image,
+            #[cfg(feature = "execution-prototype")]
+            prototype: None,
+            #[cfg(feature = "execution-prototype")]
+            prototype_cache: super::prototype::DecodeCache::default(),
             lifecycle: Lifecycle::Pristine,
             frames: frames.into_boxed_slice(),
             task_frames: task_frames.into_boxed_slice(),
@@ -1287,6 +1307,30 @@ impl Machine {
                     return Ok(Outcome::SliceExhausted);
                 }
                 let instruction_index = self.frames[frame_index].instruction;
+                #[cfg(feature = "execution-prototype")]
+                if let Some(prepared) = &self.prototype {
+                    if let Some(operation) = prepared.operation(
+                        block_index,
+                        instruction_index,
+                        &mut self.prototype_cache,
+                    ) {
+                        let frame = self.frames[frame_index];
+                        let function = self
+                            .image
+                            .function(frame.function)
+                            .ok_or(RunError::NotRunnable)?;
+                        let Some(attempts) = self.executed_instructions.checked_add(1) else {
+                            return Ok(self.fault(VmFault::AccountingOverflow));
+                        };
+                        self.executed_instructions = attempts;
+                        match prepared.execute(operation, &mut self.frame_arena, frame, function) {
+                            Ok(()) => self.frames[frame_index].instruction += 1,
+                            Err(InstructionFailure::Trap(trap)) => return Ok(self.guest_trap(trap)),
+                            Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
+                        }
+                        continue;
+                    }
+                }
                 let active_type = match &self
                     .image
                     .block(block_index)
@@ -4671,7 +4715,7 @@ fn trace_register(
     Ok(())
 }
 
-enum InstructionFailure {
+pub(super) enum InstructionFailure {
     Trap(GuestTrap),
     Fault(VmFault),
 }

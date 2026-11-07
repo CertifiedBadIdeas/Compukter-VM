@@ -163,7 +163,7 @@ fn request(session: &mut Session) -> (RequestId, TaskId, String) {
     panic!("benchmark exceeded bounded slice count");
 }
 
-fn run(case: &Case, heap: u32, traced: bool) -> Measurement {
+fn admit(case: &Case, heap: u32, traced: bool) -> Session {
     let arguments = [HostValueType::String];
     let operations = [
         OperationSchema::asynchronous(&[], HostValueType::String),
@@ -177,12 +177,16 @@ fn run(case: &Case, heap: u32, traced: bool) -> Measurement {
         0,
         &operations,
     )];
-    let mut session = if traced {
+    if traced {
         Session::admit(case.artifact.clone(), profile(heap), &bindings)
     } else {
         Session::admit_untraced(case.artifact.clone(), profile(heap), &bindings)
     }
-    .expect("benchmark admission");
+    .expect("benchmark admission")
+}
+
+fn run(case: &Case, heap: u32, traced: bool) -> Measurement {
+    let mut session = admit(case, heap, traced);
     session.start(&[]).expect("benchmark start");
     let before = session.accounting();
     let cpu_start = thread_cpu_ns();
@@ -234,8 +238,17 @@ fn median(values: impl Iterator<Item = u128>) -> u128 {
     values[values.len() / 2]
 }
 
+#[cfg(feature = "execution-prototype")]
+#[path = "guest_benchmark/prototype.rs"]
+mod prototype_benchmark;
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(feature = "execution-prototype")]
+    if args.first().is_some_and(|arg| arg == "compare") {
+        prototype_benchmark::main(&args[1..]);
+        return;
+    }
     assert!(
         (5..=6).contains(&args.len()),
         "usage: guest-benchmark ARTIFACT_DIR REPORT_DIR SAMPLES HEAP_BYTES traced|untraced [ID_PREFIX,...]"

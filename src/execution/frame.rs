@@ -35,6 +35,14 @@ pub(super) struct FrameValueAccess {
     component: Option<ComponentLayout>,
 }
 
+impl FrameValueAccess {
+    // Candidate preparation already proves scalar kind and component width.
+    #[cfg(feature = "execution-prototype")]
+    pub(super) fn prepared_offset(self) -> Option<u32> {
+        self.component.map(|component| component.offset)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ValueLayout {
     pub components: Box<[ComponentLayout]>,
@@ -97,6 +105,59 @@ pub(super) struct StaticArena {
 }
 
 impl FrameArena {
+    // Preparation proves the atom and offset against the verified layout.
+    // Keep both frame and allocation bounds checked without constructing RuntimeValue.
+    #[cfg(feature = "execution-prototype")]
+    fn prepared_range(
+        &self,
+        frame: FrameReservation,
+        offset: u32,
+        width: usize,
+    ) -> Result<core::ops::Range<usize>, VmFault> {
+        let relative_end = offset
+            .checked_add(width as u32)
+            .ok_or(VmFault::InvalidStoragePlan)?;
+        if relative_end > frame.byte_len {
+            return Err(VmFault::InvalidStoragePlan);
+        }
+        let start = frame
+            .base
+            .checked_add(offset)
+            .ok_or(VmFault::InvalidStoragePlan)? as usize;
+        let end = start
+            .checked_add(width)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(VmFault::InvalidStoragePlan)?;
+        Ok(start..end)
+    }
+
+    #[cfg(feature = "execution-prototype")]
+    #[inline(always)]
+    pub(super) fn read_prepared<const N: usize>(
+        &self,
+        frame: FrameReservation,
+        offset: u32,
+    ) -> Result<[u8; N], VmFault> {
+        self.bytes[self.prepared_range(frame, offset, N)?]
+            .try_into()
+            .map_err(|_| VmFault::InvalidStoragePlan)
+    }
+
+    #[cfg(feature = "execution-prototype")]
+    #[inline(always)]
+    pub(super) fn write_prepared<const N: usize>(
+        &mut self,
+        frame: FrameReservation,
+        offset: u32,
+        value: [u8; N],
+    ) -> Result<(), VmFault> {
+        let range = self.prepared_range(frame, offset, N)?;
+        self.bytes[range.clone()].copy_from_slice(&value);
+        #[cfg(test)]
+        self.initialized[range].fill(true);
+        Ok(())
+    }
+
     pub(super) fn new(capacity: u32) -> Result<Self, VmFault> {
         let length = usize::try_from(capacity).map_err(|_| VmFault::InvalidStoragePlan)?;
         let mut bytes = Vec::new();
