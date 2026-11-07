@@ -19,6 +19,7 @@ use crate::artifact::PhysicalAtom;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutionMode {
     Packed,
+    Slots,
     PackedBatch,
     PackedSimd,
     Offsets,
@@ -89,6 +90,7 @@ pub(super) struct PreparedExecution {
     stats: PreparationStats,
     batch_decode: bool,
     simd_decode: bool,
+    direct_slots: bool,
 }
 
 // Mutable decode state belongs to the instance, separately from immutable code.
@@ -149,7 +151,10 @@ impl PreparedExecution {
         }
         starts.push(operations.len());
         let code = match mode {
-            ExecutionMode::Packed | ExecutionMode::PackedBatch | ExecutionMode::PackedSimd => {
+            ExecutionMode::Packed
+            | ExecutionMode::Slots
+            | ExecutionMode::PackedBatch
+            | ExecutionMode::PackedSimd => {
                 let mut words = Vec::new();
                 words
                     .try_reserve_exact(count)
@@ -179,6 +184,7 @@ impl PreparedExecution {
             stats,
             batch_decode: matches!(mode, ExecutionMode::PackedBatch | ExecutionMode::PackedSimd),
             simd_decode: mode == ExecutionMode::PackedSimd,
+            direct_slots: mode == ExecutionMode::Slots,
         })
     }
 
@@ -240,7 +246,11 @@ impl PreparedExecution {
         frame: Frame,
         function: &ResolvedFunction,
     ) -> Result<(), InstructionFailure> {
-        if matches!(self.code, Code::Packed(_)) {
+        if self.direct_slots {
+            op.dst *= 4;
+            op.lhs *= 4;
+            op.rhs *= 4;
+        } else if matches!(self.code, Code::Packed(_)) {
             let unary = (21..=28).contains(&op.opcode);
             op.dst = register_offset(function, op.dst)
                 .ok_or(InstructionFailure::Fault(VmFault::InvalidStoragePlan))?;
@@ -445,6 +455,18 @@ fn prepare(
             })
         }
         ExecutionMode::Packed | ExecutionMode::PackedBatch | ExecutionMode::PackedSimd => None,
+        ExecutionMode::Slots => {
+            let offsets = [physical_dst, physical_lhs, physical_rhs];
+            offsets
+                .iter()
+                .all(|offset| offset.is_multiple_of(4) && *offset / 4 <= 255)
+                .then_some(Operation {
+                    opcode,
+                    dst: physical_dst / 4,
+                    lhs: physical_lhs / 4,
+                    rhs: physical_rhs / 4,
+                })
+        }
         ExecutionMode::Offsets => Some(Operation {
             opcode,
             dst: physical_dst,

@@ -86,6 +86,7 @@ fn compare(
 fn reference_and_candidates_preserve_scalar_results_and_every_instruction_boundary() {
     for mode in [
         ExecutionMode::Packed,
+        ExecutionMode::Slots,
         ExecutionMode::PackedBatch,
         ExecutionMode::PackedSimd,
         ExecutionMode::Offsets,
@@ -226,6 +227,7 @@ fn all_numeric_opcodes_match_reference_for_overflow_zero_nan_infinity_and_signed
             let artifact = fixtures::unsigned_operation_artifact(&kinds, 2, binary(group, form));
             for mode in [
                 ExecutionMode::Packed,
+                ExecutionMode::Slots,
                 ExecutionMode::PackedBatch,
                 ExecutionMode::PackedSimd,
                 ExecutionMode::Offsets,
@@ -279,6 +281,7 @@ fn unary_numeric_operations_preserve_raw_moves_and_canonical_negation() {
             for value in values(kind) {
                 for mode in [
                     ExecutionMode::Packed,
+                    ExecutionMode::Slots,
                     ExecutionMode::PackedBatch,
                     ExecutionMode::PackedSimd,
                     ExecutionMode::Offsets,
@@ -302,6 +305,7 @@ fn candidate_execution_preserves_reference_trace_digests() {
     for case in fixtures::trace_cases() {
         for mode in [
             ExecutionMode::Packed,
+            ExecutionMode::Slots,
             ExecutionMode::PackedBatch,
             ExecutionMode::PackedSimd,
             ExecutionMode::Offsets,
@@ -339,6 +343,7 @@ fn wide_registers_use_reference_exit_in_packed_and_direct_offsets_in_prepared() 
     );
     for mode in [
         ExecutionMode::Packed,
+        ExecutionMode::Slots,
         ExecutionMode::PackedBatch,
         ExecutionMode::PackedSimd,
         ExecutionMode::Offsets,
@@ -391,4 +396,36 @@ fn prepared_access_rejects_cross_frame_and_overflowing_offsets() {
             0
         )
         .is_err());
+}
+
+#[test]
+fn physical_slot_encoding_falls_back_when_small_register_ids_have_large_offsets() {
+    let artifact = fixtures::unsigned_operation_artifact(
+        &vec![4; 130],
+        2,
+        Instruction::Add {
+            form: 4,
+            dst: 129,
+            lhs: 0,
+            rhs: 1,
+        },
+    );
+    let args = [
+        EntryArgument::unowned(RuntimeValue::F64(20f64.to_bits())),
+        EntryArgument::unowned(RuntimeValue::F64(22f64.to_bits())),
+    ];
+    for mode in [
+        ExecutionMode::Packed,
+        ExecutionMode::Slots,
+        ExecutionMode::Offsets,
+    ] {
+        let mut machine = started(artifact.clone(), &args);
+        let stats = machine.prepare_execution(mode).unwrap();
+        assert_eq!(stats.eligible, usize::from(mode != ExecutionMode::Slots));
+        assert_eq!(
+            machine.run_slice(128, 8).unwrap(),
+            crate::execution::error::Outcome::Halted(Some(RuntimeValue::F64(42f64.to_bits())))
+        );
+        compare(artifact.clone(), &args, mode, 5);
+    }
 }
