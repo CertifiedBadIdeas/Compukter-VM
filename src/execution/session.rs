@@ -110,6 +110,11 @@ impl Session {
         self.machine.prepare_execution(mode)
     }
 
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(crate) fn shared_code_identity(&self) -> (usize, Option<usize>) {
+        self.machine.shared_code_identity()
+    }
+
     pub(crate) fn failure_stack(&self) -> super::machine::FailureStack {
         self.machine.failure_stack()
     }

@@ -23,20 +23,41 @@
 // implementation or benchmark-only public Session entrypoint is needed.
 mod artifact;
 mod bytes;
+#[cfg(feature = "program-sharing-benchmark")]
+mod computer;
 mod decode;
+#[cfg(feature = "program-sharing-benchmark")]
+mod deployment;
 mod diagnostic;
 mod execution;
+#[cfg(feature = "program-sharing-benchmark")]
+mod filesystem;
 mod limits;
+#[cfg(feature = "program-sharing-benchmark")]
+mod process;
+#[cfg(feature = "program-sharing-benchmark")]
+mod redstone;
+#[cfg(feature = "program-sharing-benchmark")]
+mod stdio;
+#[cfg(feature = "program-sharing-benchmark")]
+mod terminal;
 mod verify;
 
-use artifact::{EntryArguments, VerifiedArtifact};
-use execution::{
-    AccountingSnapshot, AdvanceOutcome, CapabilityBinding, EntryArgumentLimits, ExecutionProfile,
-    HostResponse, HostValueInput, HostValueType, HostValueView, OperationSchema, RequestId,
-    Session, TaskId,
-};
+use artifact::{EntryArguments, EntryPoint, VerifiedArtifact};
+#[cfg(feature = "program-sharing-benchmark")]
+use computer::*;
+#[cfg(feature = "program-sharing-benchmark")]
+use deployment::*;
+use diagnostic::DiagnosticSet;
+use execution::*;
+#[cfg(feature = "program-sharing-benchmark")]
+use filesystem::*;
 use limits::ArtifactLimits;
+#[cfg(feature = "program-sharing-benchmark")]
+use process::*;
 use std::{fs, path::Path, sync::Arc, time::Instant};
+#[cfg(feature = "program-sharing-benchmark")]
+use terminal::*;
 use verify::verify_artifact;
 
 const SLICE: u32 = 4096;
@@ -242,8 +263,20 @@ fn median(values: impl Iterator<Item = u128>) -> u128 {
 #[path = "guest_benchmark/prototype.rs"]
 mod prototype_benchmark;
 
+#[cfg(feature = "program-sharing-benchmark")]
+#[path = "guest_benchmark/allocator.rs"]
+mod allocation_counter;
+#[cfg(feature = "program-sharing-benchmark")]
+#[path = "guest_benchmark/sharing.rs"]
+mod sharing_benchmark;
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(feature = "program-sharing-benchmark")]
+    if args.first().is_some_and(|arg| arg == "sharing") {
+        sharing_benchmark::main(&args[1..]);
+        return;
+    }
     #[cfg(feature = "execution-prototype")]
     if args.first().is_some_and(|arg| arg == "compare") {
         prototype_benchmark::main(&args[1..]);

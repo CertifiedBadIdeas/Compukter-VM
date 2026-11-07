@@ -717,6 +717,11 @@ impl ExecutionImage {
         })))
     }
 
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(super) fn shared_program_identity(&self) -> usize {
+        Arc::as_ptr(&self.0.program) as usize
+    }
+
     pub(super) fn entry(&self) -> FunctionKey {
         self.0.program.functions[self.0.program.entry].key
     }

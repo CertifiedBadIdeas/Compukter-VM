@@ -100,6 +100,16 @@ impl VerifiedArtifact {
         }
     }
 
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(crate) fn new_unshared(decoded: DecodedArtifact) -> Self {
+        Self {
+            inner: Arc::new(VerifiedArtifactInner {
+                decoded,
+                prepared_program: std::sync::OnceLock::new(),
+            }),
+        }
+    }
+
     pub(crate) fn prepared_program(
         &self,
     ) -> Result<Arc<crate::execution::PreparedProgram>, crate::execution::AdmissionError> {

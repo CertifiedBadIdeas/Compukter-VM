@@ -24,6 +24,7 @@ crate-type = ["rlib"]
 [features]
 persistence-crash-testing = []
 guest-benchmark = []
+program-sharing-benchmark = ["guest-benchmark"]
 execution-prototype = []
 
 [dependencies]

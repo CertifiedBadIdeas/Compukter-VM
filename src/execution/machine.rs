@@ -356,6 +356,18 @@ impl Machine {
         core::mem::size_of::<Self>() as u64 - Self::pending_state_bytes()
     }
 
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(super) fn shared_code_identity(&self) -> (usize, Option<usize>) {
+        #[cfg(feature = "execution-prototype")]
+        let typed = self
+            .prototype
+            .as_ref()
+            .map(|code| std::sync::Arc::as_ptr(code) as usize);
+        #[cfg(not(feature = "execution-prototype"))]
+        let typed = None;
+        (self.image.shared_program_identity(), typed)
+    }
+
     pub(super) fn new(image: ExecutionImage) -> Result<Self, AdmissionError> {
         Self::new_with_trace(image, true)
     }
