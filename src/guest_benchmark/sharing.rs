@@ -62,7 +62,7 @@ fn work(snapshot: ComputerResourceSnapshot) -> [u64; 6] {
 }
 
 pub(super) fn main(args: &[String]) {
-    assert_eq!(7, args.len(), "usage: guest-benchmark sharing ARTIFACT OUTPUT POPULATION shared|isolated shell|CHECKSUM reference|offsets HEAP_BYTES");
+    assert_eq!(7, args.len(), "usage: guest-benchmark sharing ARTIFACT OUTPUT POPULATION shared|isolated shell|CHECKSUM prepared|offsets HEAP_BYTES");
     let input = Path::new(&args[0]);
     let output = Path::new(&args[1]);
     let population: usize = args[2].parse().unwrap();
@@ -74,7 +74,7 @@ pub(super) fn main(args: &[String]) {
     };
     let shell = args[4] == "shell";
     let offsets = match args[5].as_str() {
-        "reference" => false,
+        "reference" | "prepared" => false,
         "offsets" => true,
         _ => panic!("engine"),
     };

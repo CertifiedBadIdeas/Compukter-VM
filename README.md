@@ -244,7 +244,7 @@ FFI/JNI calls and C ABI layouts are unchanged.
 ## Shared immutable programs
 
 Live byte-identical artifacts normally share their decoded metadata and one immutable
-`PreparedProgram`: resolved instructions, function/frame/safepoint/dispatch tables,
+`PreparedProgram`: prepared operations and lifecycle descriptors, function/frame/safepoint/dispatch tables,
 payload-relative fields, static layout, literals and type metadata. Every session still
 checks its own execution profile and capability/record schemas and derives heap-header-dependent
 allocation layouts and mutable resident charges. Heap, stack, statics, type-initialization
@@ -257,25 +257,34 @@ reduce sharing for later admissions without changing running machines. Parsing/v
 is still repeated for each incoming binary. Concurrent first preparation may build temporary
 candidates outside global locks, then publishes one canonical program via `OnceLock`.
 
-The opt-in typed representations are cached by shared program and execution mode. Each machine
-retains its private decode cache; production selection stays on the existing interpreter.
+Ordinary execution uses the shared typed prepared stream described below. Optional experimental
+representations are cached by shared program/mode; their mutable decode cache stays machine-owned.
 Checkpoints contain logical state and rebuild admission against current profile/bindings;
 no cache addresses or native layout pointers are persisted.
 
-The separate `program-sharing-benchmark` feature enables a real `ComputerMachine` population
-harness and a counting system allocator in the benchmark executable only. Its `isolated` control
-performs exactly the same verification and admission while bypassing identity interning. Counts
-represent requested live allocation bytes, excluding allocator headers/fragmentation and RSS.
+## Default prepared execution
+
+Verification still reads the existing portable artifact. Shared program preparation lowers its instructions
+into one program-wide, dense stream of 16-byte operations with checked physical frame offsets. Only the
+allocation boundary is 64-byte aligned; short blocks occupy ranges in the same stream without per-block
+padding or separate code allocations. Lifecycle operations index a sparse resolved-descriptor table.
+Prepared operations do not retain an additional resolved instruction descriptor in ordinary builds.
+Decoded verified metadata remains available for source/type/verification identity.
+
+The default path prepares signed/unsigned arithmetic and comparisons, integer bit/shift operations,
+scalar constants and moves, inline component construction/extraction/copies, jumps/Boolean branches,
+and scalar/reference field and array access. It reuses canonical numeric semantics and retains heap
+reference/type/null/bounds checks. Static initialization, calls, allocation/GC, text/matrix work, switches,
+exceptions, tasks, channels and capability suspension retain their existing lifecycle handlers where
+not covered by these operations. Every operation preserves one logical instruction and its original
+block cost, attempt/retirement, safepoint, source position and checkpoint boundary. No code fusion,
+native JIT, SIMD data kernel or artifact/checkpoint/C ABI change is introduced.
+
+The benchmark-only inspection command reports logical/prepared/cold counts, aligned operation bytes,
+cold enum slot bytes, copy/field plan bytes and block-table bytes. These are code-storage components,
+not total program memory; variable lifecycle payloads and other program metadata are excluded.
 
 ```sh
-cargo build --release --locked --offline --features program-sharing-benchmark --bin guest-benchmark
-./target/release/guest-benchmark sharing SHELL.cpkt shared.tsv 64 shared shell reference 262144
-./target/release/guest-benchmark sharing SHELL.cpkt isolated.tsv 64 isolated shell reference 262144
-# Add execution-prototype to build features, then use offsets instead of reference for typed code.
+cargo build --release --locked --offline --features guest-benchmark --bin guest-benchmark
+./target/release/guest-benchmark inspect PROGRAM.cpkt
 ```
-
-Every process holds all population members, validates each shell prompt and an instance-specific
-`echo` response, compares deterministic work, counts unique program/typed-code identities and
-checks pool teardown. Arithmetic artifacts use their expected checksum instead of `shell`.
-The parent repository's `docs/benchmarks/shared-program-2026-11-07/` owns the paired runner,
-raw measurements and validator. These results do not measure Minecraft TPS or maximum capacity.

@@ -101,7 +101,7 @@ struct DispatchEntry {
     implementation: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum ResolvedInstruction {
     InlineConstruct {
         dst: u16,
@@ -456,7 +456,8 @@ pub(super) enum ResolvedInstruction {
 pub(super) struct ResolvedBlock {
     pub function: usize,
     pub fixed_cost: u32,
-    pub instructions: Box<[ResolvedInstruction]>,
+    pub code_start: usize,
+    pub instruction_count: usize,
 }
 
 #[derive(Debug)]
@@ -512,6 +513,7 @@ pub(crate) struct PreparedProgram {
     dispatch_entries: Box<[DispatchEntry]>,
     dispatch_offsets: Box<[usize]>,
     blocks: Box<[ResolvedBlock]>,
+    code: super::prepared::PreparedCode,
     constants: Box<[RuntimeValue]>,
     type_offsets: Box<[usize]>,
     type_keys: Box<[TypeKey]>,
@@ -541,6 +543,16 @@ pub(crate) struct PreparedProgram {
     prototypes: [std::sync::OnceLock<Arc<super::prototype::PreparedExecution>>; 5],
 }
 
+#[cfg(feature = "guest-benchmark")]
+impl PreparedProgram {
+    pub(crate) fn code_statistics(&self) -> [usize; 7] {
+        let mut statistics = [0; 7];
+        statistics[..6].copy_from_slice(&self.code.statistics());
+        statistics[6] = core::mem::size_of_val(self.blocks.as_ref());
+        statistics
+    }
+}
+
 impl ExecutionImage {
     #[cfg(feature = "execution-prototype")]
     pub(super) fn prepare_execution(
@@ -562,6 +574,7 @@ impl ExecutionImage {
         let prepared = Arc::new(PreparedExecution::new(
             &self.program.blocks,
             &self.program.functions,
+            &self.program.code,
             mode,
         )?);
         let _ = slot.set(prepared);
@@ -676,7 +689,11 @@ impl ExecutionImage {
         };
         for &(block, instruction) in &program.host_calls {
             let block = &program.blocks[block];
-            match &block.instructions[instruction] {
+            match program
+                .code
+                .get(block.code_start + instruction)
+                .ok_or(AdmissionError::InvalidEntry)?
+            {
                 ResolvedInstruction::CapabilityCallSync {
                     dst,
                     capability,
@@ -756,6 +773,47 @@ impl ExecutionImage {
             .binary_search_by_key(&declaration, |entry| entry.declaration)
             .ok()
             .map(|index| entries[index].implementation)
+    }
+
+    pub(super) fn code(&self) -> &super::prepared::PreparedCode {
+        &self.program.code
+    }
+
+    #[inline(always)]
+    pub(super) fn operation(
+        &self,
+        block: usize,
+        instruction: usize,
+    ) -> Option<super::prepared::Operation> {
+        let block = self.block(block)?;
+        (instruction < block.instruction_count)
+            .then(|| self.program.code.operation(block.code_start + instruction))
+            .flatten()
+    }
+
+    pub(super) fn instruction(
+        &self,
+        block: usize,
+        instruction: usize,
+    ) -> Option<&ResolvedInstruction> {
+        self.instruction_for_execution(block, instruction, false)
+    }
+
+    #[inline]
+    pub(super) fn instruction_for_execution(
+        &self,
+        block: usize,
+        instruction: usize,
+        reference: bool,
+    ) -> Option<&ResolvedInstruction> {
+        let block = self.block(block)?;
+        (instruction < block.instruction_count)
+            .then(|| {
+                self.program
+                    .code
+                    .get_for_execution(block.code_start + instruction, reference)
+            })
+            .flatten()
     }
 
     pub(super) fn block(&self, index: usize) -> Option<&ResolvedBlock> {
@@ -1274,6 +1332,7 @@ pub(crate) fn prepare_program(
         field_offsets: &field_offsets,
     };
     let mut host_calls = Vec::new();
+    let mut prepared_code = super::prepared::CodeBuilder::default();
     for (module_id, module) in decoded.modules.iter().enumerate() {
         for (block_id, block) in module.blocks.iter().enumerate() {
             let function = function_offsets[module_id]
@@ -1302,10 +1361,14 @@ pub(crate) fn prepare_program(
                     instruction,
                 )?);
             }
+            let instruction_count = instructions.len();
+            let code_start =
+                prepared_code.push_block(instructions, &functions[function], &constants)?;
             blocks.push(ResolvedBlock {
                 function,
                 fixed_cost: code.fixed_cost,
-                instructions: instructions.into_boxed_slice(),
+                code_start,
+                instruction_count,
             });
         }
     }
@@ -1361,6 +1424,7 @@ pub(crate) fn prepare_program(
         dispatch_entries,
         dispatch_offsets,
         blocks: blocks.into_boxed_slice(),
+        code: prepared_code.finish()?,
         constants: constants.into_boxed_slice(),
         type_offsets,
         type_keys,
@@ -3558,7 +3622,7 @@ mod tests {
             component: 0,
         }];
         let image = ExecutionImage::admit(
-            crate::artifact::VerifiedArtifact::new(decoded),
+            crate::artifact::VerifiedArtifact::new_unshared(decoded),
             fixtures::profile(),
         )
         .unwrap();
@@ -3595,7 +3659,7 @@ mod tests {
         assert_eq!(
             Err(AdmissionError::InvalidEntry),
             ExecutionImage::admit(
-                crate::artifact::VerifiedArtifact::new(missing),
+                crate::artifact::VerifiedArtifact::new_unshared(missing),
                 fixtures::profile(),
             )
             .map(|_| ())
@@ -3613,7 +3677,7 @@ mod tests {
         assert_eq!(
             Err(AdmissionError::InvalidEntry),
             ExecutionImage::admit(
-                crate::artifact::VerifiedArtifact::new(duplicate),
+                crate::artifact::VerifiedArtifact::new_unshared(duplicate),
                 fixtures::profile(),
             )
             .map(|_| ())
@@ -3628,7 +3692,7 @@ mod tests {
         assert_eq!(
             Err(AdmissionError::InvalidEntry),
             ExecutionImage::admit(
-                crate::artifact::VerifiedArtifact::new(wrong_atom),
+                crate::artifact::VerifiedArtifact::new_unshared(wrong_atom),
                 fixtures::profile(),
             )
             .map(|_| ())

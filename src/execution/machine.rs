@@ -1,3 +1,6 @@
+#[path = "machine/prepared.rs"]
+mod prepared_execution;
+
 use super::{
     array_copy::PendingArrayCopy,
     channel::{ChannelArena, ChannelError, ReceiveResult, SendResult},
@@ -120,6 +123,8 @@ pub(super) fn write_frame_value(
 
 pub(super) struct Machine {
     image: ExecutionImage,
+    #[cfg(any(test, feature = "execution-prototype"))]
+    reference_execution: bool,
     #[cfg(feature = "execution-prototype")]
     prototype: Option<std::sync::Arc<super::prototype::PreparedExecution>>,
     #[cfg(feature = "execution-prototype")]
@@ -315,6 +320,7 @@ impl Machine {
         let prepared = self.image.prepare_execution(mode)?;
         let stats = prepared.stats();
         self.prototype = Some(prepared);
+        self.reference_execution = true;
         self.prototype_cache = super::prototype::DecodeCache::default();
         Ok(stats)
     }
@@ -350,6 +356,23 @@ impl Machine {
             + core::mem::size_of::<Option<text::PendingHostReference>>()
             + core::mem::size_of::<Option<StringCollectionTarget>>()) as u64
             + core::mem::size_of::<Option<(TaskId, RequestId, Option<TaskId>)>>() as u64
+    }
+
+    #[inline(always)]
+    fn reference_execution(&self) -> bool {
+        #[cfg(any(test, feature = "execution-prototype"))]
+        {
+            self.reference_execution
+        }
+        #[cfg(not(any(test, feature = "execution-prototype")))]
+        {
+            false
+        }
+    }
+
+    #[cfg(any(test, feature = "execution-prototype"))]
+    pub(super) fn use_reference_execution(&mut self) {
+        self.reference_execution = true;
     }
 
     pub(super) const fn fixed_state_bytes() -> u64 {
@@ -445,6 +468,8 @@ impl Machine {
         }
         Ok(Self {
             image,
+            #[cfg(any(test, feature = "execution-prototype"))]
+            reference_execution: false,
             #[cfg(feature = "execution-prototype")]
             prototype: None,
             #[cfg(feature = "execution-prototype")]
@@ -789,11 +814,7 @@ impl Machine {
             .frames
             .get(frame_index)
             .ok_or(VmFault::CorruptLifecycle)?;
-        let destination = match self
-            .image
-            .block(frame.block)
-            .and_then(|block| block.instructions.get(frame.instruction))
-        {
+        let destination = match self.image.instruction(frame.block, frame.instruction) {
             Some(ResolvedInstruction::CapabilityCallAsync { dst, .. }) if *dst != u16::MAX => *dst,
             _ => return Err(VmFault::CorruptLifecycle),
         };
@@ -1307,18 +1328,76 @@ impl Machine {
                 self.entered_blocks = entered_blocks;
                 self.trace_block_entry(frame_index, block_index, remaining)?;
             }
-            let block_len = self
-                .image
-                .block(block_index)
-                .ok_or(RunError::NotRunnable)?
-                .instructions
-                .len();
+            let block = self.image.block(block_index).ok_or(RunError::NotRunnable)?;
+            let block_len = block.instruction_count;
+            let code_start = block.code_start;
 
             while self.frames[frame_index].instruction < block_len {
                 if self.executed_instructions - attempts_before >= attempt_limit {
                     return Ok(Outcome::SliceExhausted);
                 }
                 let instruction_index = self.frames[frame_index].instruction;
+                if !self.reference_execution() {
+                    let operation = self
+                        .image
+                        .code()
+                        .operation(code_start + instruction_index)
+                        .ok_or(RunError::NotRunnable)?;
+                    if operation.opcode != 0 {
+                        let frame = self.frames[frame_index];
+                        let Some(attempts) = self.executed_instructions.checked_add(1) else {
+                            return Ok(self.fault(VmFault::AccountingOverflow));
+                        };
+                        self.executed_instructions = attempts;
+                        // Numeric operations have no control effect. Keep their result
+                        // contract small instead of routing them through the branch/data dispatcher.
+                        if operation.opcode < super::prepared::COPY32
+                            || (105..=142).contains(&operation.opcode)
+                        {
+                            match super::prepared::execute_numeric(
+                                operation,
+                                &mut self.frame_arena,
+                                FrameReservation {
+                                    base: frame.base,
+                                    byte_len: frame.byte_len,
+                                },
+                            ) {
+                                Ok(()) => self.frames[frame_index].instruction += 1,
+                                Err(InstructionFailure::Trap(trap)) => {
+                                    return Ok(self.guest_trap(trap))
+                                }
+                                Err(InstructionFailure::Fault(fault)) => {
+                                    return Ok(self.fault(fault))
+                                }
+                            }
+                            continue;
+                        }
+                        let result = if operation.opcode < super::prepared::FIELD_GET {
+                            super::prepared::execute_frame(
+                                operation,
+                                &mut self.frame_arena,
+                                FrameReservation {
+                                    base: frame.base,
+                                    byte_len: frame.byte_len,
+                                },
+                                &self.image.code().copies,
+                            )
+                        } else {
+                            self.execute_prepared_data(operation, frame)
+                        };
+                        match result {
+                            Ok(None) => self.frames[frame_index].instruction += 1,
+                            Ok(Some(target)) => {
+                                self.frames[frame_index].block = target;
+                                self.frames[frame_index].instruction = 0;
+                                break;
+                            }
+                            Err(InstructionFailure::Trap(trap)) => return Ok(self.guest_trap(trap)),
+                            Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
+                        }
+                        continue;
+                    }
+                }
                 #[cfg(feature = "execution-prototype")]
                 if let Some(prepared) = &self.prototype {
                     if let Some(operation) = prepared.operation(
@@ -1343,11 +1422,14 @@ impl Machine {
                         continue;
                     }
                 }
-                let active_type = match &self
+                let active_type = match self
                     .image
-                    .block(block_index)
+                    .instruction_for_execution(
+                        block_index,
+                        instruction_index,
+                        self.reference_execution(),
+                    )
                     .ok_or(RunError::NotRunnable)?
-                    .instructions[instruction_index]
                 {
                     ResolvedInstruction::StaticGet { field, .. }
                     | ResolvedInstruction::StaticSet { field, .. } => Some(field.owner),
@@ -1365,11 +1447,14 @@ impl Machine {
                         Err(outcome) => return Ok(outcome),
                     }
                 }
-                let instruction = &self
+                let instruction = self
                     .image
-                    .block(block_index)
-                    .ok_or(RunError::NotRunnable)?
-                    .instructions[instruction_index];
+                    .instruction_for_execution(
+                        block_index,
+                        instruction_index,
+                        self.reference_execution(),
+                    )
+                    .ok_or(RunError::NotRunnable)?;
                 let Some(executed_instructions) = self.executed_instructions.checked_add(1) else {
                     return Ok(self.fault(VmFault::AccountingOverflow));
                 };
@@ -3756,8 +3841,7 @@ impl Machine {
             .ok_or(VmFault::CorruptLifecycle)?;
         let instruction = self
             .image
-            .block(frame.block)
-            .and_then(|block| block.instructions.get(frame.instruction))
+            .instruction(frame.block, frame.instruction)
             .ok_or(VmFault::CorruptLifecycle)?;
         let (capability, operation, arguments) = match instruction {
             ResolvedInstruction::CapabilityCallSync {
@@ -3897,17 +3981,14 @@ impl Machine {
             .frames
             .get(frame_index)
             .ok_or(VmFault::CorruptLifecycle)?;
-        let (destination, continuation) = match self
-            .image
-            .block(frame.block)
-            .and_then(|block| block.instructions.get(frame.instruction))
-        {
-            Some(ResolvedInstruction::CapabilityCallAsync {
-                dst, resume_block, ..
-            }) => (*dst, Some(*resume_block)),
-            Some(ResolvedInstruction::CapabilityCallSync { dst, .. }) => (*dst, None),
-            _ => return Err(VmFault::CorruptLifecycle),
-        };
+        let (destination, continuation) =
+            match self.image.instruction(frame.block, frame.instruction) {
+                Some(ResolvedInstruction::CapabilityCallAsync {
+                    dst, resume_block, ..
+                }) => (*dst, Some(*resume_block)),
+                Some(ResolvedInstruction::CapabilityCallSync { dst, .. }) => (*dst, None),
+                _ => return Err(VmFault::CorruptLifecycle),
+            };
         if (destination == u16::MAX) != value.is_none() {
             return Err(VmFault::InvalidValueType);
         }
@@ -3944,11 +4025,7 @@ impl Machine {
             .checked_sub(1)
             .ok_or(VmFault::CorruptLifecycle)?;
         let frame = self.frames[index];
-        let (destination, resume) = match self
-            .image
-            .block(frame.block)
-            .and_then(|b| b.instructions.get(frame.instruction))
-        {
+        let (destination, resume) = match self.image.instruction(frame.block, frame.instruction) {
             Some(ResolvedInstruction::CapabilityCallAsync {
                 dst, resume_block, ..
             }) => (*dst, *resume_block),
@@ -4028,11 +4105,7 @@ impl Machine {
             .frames
             .get(frame_index)
             .ok_or(VmFault::CorruptLifecycle)?;
-        let destination = match self
-            .image
-            .block(frame.block)
-            .and_then(|block| block.instructions.get(frame.instruction))
-        {
+        let destination = match self.image.instruction(frame.block, frame.instruction) {
             Some(ResolvedInstruction::CapabilityCallAsync { dst, .. })
             | Some(ResolvedInstruction::CapabilityCallSync { dst, .. })
                 if *dst != u16::MAX =>
@@ -4065,11 +4138,7 @@ impl Machine {
             .frames
             .get(frame_index)
             .ok_or(VmFault::CorruptLifecycle)?;
-        let destination = match self
-            .image
-            .block(frame.block)
-            .and_then(|block| block.instructions.get(frame.instruction))
-        {
+        let destination = match self.image.instruction(frame.block, frame.instruction) {
             Some(ResolvedInstruction::CapabilityCallAsync { dst, .. })
             | Some(ResolvedInstruction::CapabilityCallSync { dst, .. })
                 if *dst != u16::MAX =>

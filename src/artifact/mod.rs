@@ -100,7 +100,9 @@ impl VerifiedArtifact {
         }
     }
 
-    #[cfg(feature = "program-sharing-benchmark")]
+    // Synthetic admission tests mutate decoded metadata without changing bytes.
+    // They must never enter the content-addressed index of verified containers.
+    #[cfg(any(test, feature = "program-sharing-benchmark"))]
     pub(crate) fn new_unshared(decoded: DecodedArtifact) -> Self {
         Self {
             inner: Arc::new(VerifiedArtifactInner {

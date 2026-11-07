@@ -46,6 +46,7 @@ impl PerfControl {
 #[derive(Clone, Copy, Debug)]
 enum Engine {
     Reference,
+    Prepared,
     Packed,
     Slots,
     PackedBatch,
@@ -57,6 +58,7 @@ impl Engine {
     fn name(self) -> &'static str {
         match self {
             Self::Reference => "reference",
+            Self::Prepared => "prepared",
             Self::Packed => "packed",
             Self::Slots => "slots",
             Self::PackedBatch => "packed-batch",
@@ -66,7 +68,7 @@ impl Engine {
     }
     fn mode(self) -> Option<ExecutionMode> {
         match self {
-            Self::Reference => None,
+            Self::Reference | Self::Prepared => None,
             Self::Packed => Some(ExecutionMode::Packed),
             Self::Slots => Some(ExecutionMode::Slots),
             Self::PackedBatch => Some(ExecutionMode::PackedBatch),
@@ -140,6 +142,9 @@ fn trial(
         let cpu = thread_cpu_ns();
         let start = Instant::now();
         let mut session = admit(case, heap, false);
+        if matches!(engine, Engine::Reference) {
+            session.use_reference_execution();
+        }
         result.admit_ns += start.elapsed().as_nanos();
         add_cpu(&mut result.admit_cpu, cpu_elapsed(cpu));
         if let Some(mode) = engine.mode() {
@@ -320,7 +325,7 @@ fn record(case: &Case, engine: Engine, population: usize, sample: usize, result:
 }
 
 pub(super) fn main(args: &[String]) {
-    assert!((5..=7).contains(&args.len()), "usage: guest-benchmark compare INPUT OUTPUT SAMPLES HEAP_BYTES POPULATION [ID_PREFIX|-] [reference,packed,slots,packed-batch,packed-simd,offsets]");
+    assert!((5..=7).contains(&args.len()), "usage: guest-benchmark compare INPUT OUTPUT SAMPLES HEAP_BYTES POPULATION [ID_PREFIX|-] [reference,prepared,packed,slots,packed-batch,packed-simd,offsets]");
     let inputs = Path::new(&args[0]);
     let outputs = Path::new(&args[1]);
     let samples: usize = args[2].parse().unwrap();
@@ -331,13 +336,14 @@ pub(super) fn main(args: &[String]) {
     assert!((1..=4096).contains(&population));
     let prefix = args.get(5).map_or("-", String::as_str);
     let selection = args.get(6).map_or(
-        "reference,packed,slots,packed-batch,packed-simd,offsets",
+        "reference,prepared,packed,slots,packed-batch,packed-simd,offsets",
         String::as_str,
     );
     let mut engines = Vec::new();
     for value in selection.split(',') {
         let engine = match value {
             "reference" => Engine::Reference,
+            "prepared" => Engine::Prepared,
             "packed" => Engine::Packed,
             "slots" => Engine::Slots,
             "packed-batch" => Engine::PackedBatch,

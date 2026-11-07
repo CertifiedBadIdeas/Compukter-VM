@@ -159,6 +159,8 @@ impl Machine {
         }
         let mut machine = Self {
             image,
+            #[cfg(any(test, feature = "execution-prototype"))]
+            reference_execution: false,
             #[cfg(feature = "execution-prototype")]
             prototype: None,
             #[cfg(feature = "execution-prototype")]
@@ -271,11 +273,7 @@ impl Machine {
             slot.checked_mul(self.image.maximum_call_depth())?
                 .checked_add(depth.checked_sub(1)?)?,
         )?;
-        let instruction = self
-            .image
-            .block(frame.block)?
-            .instructions
-            .get(frame.instruction)?;
+        let instruction = self.image.instruction(frame.block, frame.instruction)?;
         match instruction {
             ResolvedInstruction::CapabilityCallSync {
                 capability,
@@ -397,7 +395,7 @@ impl Machine {
                 let function = self.image.function(frame.function).ok_or_else(invalid)?;
                 let block = self.image.block(frame.block).ok_or_else(invalid)?;
                 if block.function != frame.function
-                    || frame.instruction > block.instructions.len()
+                    || frame.instruction > block.instruction_count
                     || function.frame_layout.byte_len.checked_next_multiple_of(8)
                         != Some(frame.byte_len)
                     || frame
@@ -417,7 +415,7 @@ impl Machine {
                         .ok_or_else(invalid)?;
                     let continuation = self.image.block(frame.caller_block).ok_or_else(invalid)?;
                     if continuation.function != frames[index - 1].function
-                        || frame.caller_instruction > continuation.instructions.len()
+                        || frame.caller_instruction > continuation.instruction_count
                         || frame.destination != u16::MAX
                             && frame.destination as usize >= caller.register_count
                     {

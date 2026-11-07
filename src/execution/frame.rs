@@ -107,7 +107,6 @@ pub(super) struct StaticArena {
 impl FrameArena {
     // Preparation proves the atom and offset against the verified layout.
     // Keep both frame and allocation bounds checked without constructing RuntimeValue.
-    #[cfg(feature = "execution-prototype")]
     fn prepared_range(
         &self,
         frame: FrameReservation,
@@ -131,7 +130,6 @@ impl FrameArena {
         Ok(start..end)
     }
 
-    #[cfg(feature = "execution-prototype")]
     #[inline(always)]
     pub(super) fn read_prepared<const N: usize>(
         &self,
@@ -143,7 +141,6 @@ impl FrameArena {
             .map_err(|_| VmFault::InvalidStoragePlan)
     }
 
-    #[cfg(feature = "execution-prototype")]
     #[inline(always)]
     pub(super) fn write_prepared<const N: usize>(
         &mut self,

@@ -272,6 +272,20 @@ mod sharing_benchmark;
 
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|argument| argument == "inspect") {
+        assert_eq!(args.len(), 2, "usage: guest-benchmark inspect ARTIFACT");
+        let artifact = verify_artifact(
+            Arc::from(fs::read(&args[1]).unwrap()),
+            ArtifactLimits::default(),
+        )
+        .unwrap();
+        let program = artifact.prepared_program().unwrap();
+        println!("logical\tprepared\tcold\toperation_bytes\tcold_slot_bytes\tplan_bytes\tblock_table_bytes");
+        let counts = program.code_statistics();
+        println!("{}", counts.map(|count| count.to_string()).join("\t"));
+        return;
+    }
+
     #[cfg(feature = "program-sharing-benchmark")]
     if args.first().is_some_and(|arg| arg == "sharing") {
         sharing_benchmark::main(&args[1..]);
