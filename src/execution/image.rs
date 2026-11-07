@@ -485,13 +485,16 @@ pub(super) struct ResolvedLiteral {
 type ResolvedLiterals = (Box<[ResolvedLiteral]>, Box<[usize]>);
 
 #[derive(Clone, Debug)]
-pub(super) struct ExecutionImage(Arc<ExecutionImageInner>);
+pub(super) struct ExecutionImage {
+    // Keep the immutable hot-code handle direct: admission adds no pointer hop.
+    program: Arc<PreparedProgram>,
+    admission: Arc<ExecutionImageInner>,
+}
 
 #[derive(Debug)]
 struct ExecutionImageInner {
     // Keeps the canonical verification identity and its derived program alive.
     artifact: VerifiedArtifact,
-    program: Arc<PreparedProgram>,
     host_references: Box<[ResolvedHostReference]>,
     type_layouts: Box<[RuntimeTypeLayout]>,
     record_layouts: std::collections::HashMap<TypeKey, super::record::RecordLayout>,
@@ -552,13 +555,13 @@ impl ExecutionImage {
             ExecutionMode::PackedSimd => 3,
             ExecutionMode::Offsets => 4,
         };
-        let slot = &self.0.program.prototypes[index];
+        let slot = &self.program.prototypes[index];
         if let Some(prepared) = slot.get() {
             return Ok(Arc::clone(prepared));
         }
         let prepared = Arc::new(PreparedExecution::new(
-            &self.0.program.blocks,
-            &self.0.program.functions,
+            &self.program.blocks,
+            &self.program.functions,
             mode,
         )?);
         let _ = slot.set(prepared);
@@ -706,47 +709,49 @@ impl ExecutionImage {
                 _ => return Err(AdmissionError::InvalidEntry),
             }
         }
-        Ok(Self(Arc::new(ExecutionImageInner {
-            artifact,
+        Ok(Self {
             program,
-            host_references: host_references.into_boxed_slice(),
-            type_layouts,
-            record_layouts: record_layouts.into_inner(),
-            storage_plan,
-            maximum_slice_budget: profile.maximum_slice_budget,
-        })))
+            admission: Arc::new(ExecutionImageInner {
+                artifact,
+                host_references: host_references.into_boxed_slice(),
+                type_layouts,
+                record_layouts: record_layouts.into_inner(),
+                storage_plan,
+                maximum_slice_budget: profile.maximum_slice_budget,
+            }),
+        })
     }
 
     #[cfg(feature = "program-sharing-benchmark")]
     pub(super) fn shared_program_identity(&self) -> usize {
-        Arc::as_ptr(&self.0.program) as usize
+        Arc::as_ptr(&self.program) as usize
     }
 
     pub(super) fn entry(&self) -> FunctionKey {
-        self.0.program.functions[self.0.program.entry].key
+        self.program.functions[self.program.entry].key
     }
 
     pub(super) fn functions(&self) -> &[ResolvedFunction] {
-        &self.0.program.functions
+        &self.program.functions
     }
 
     pub(super) fn registers_per_frame(&self) -> usize {
-        self.0.program.registers_per_frame
+        self.program.registers_per_frame
     }
 
     pub(super) fn entry_index(&self) -> usize {
-        self.0.program.entry
+        self.program.entry
     }
 
     pub(super) fn function(&self, index: usize) -> Option<&ResolvedFunction> {
-        self.0.program.functions.get(index)
+        self.program.functions.get(index)
     }
 
     pub(super) fn dispatch_target(&self, actual: TypeKey, declaration: usize) -> Option<usize> {
         let actual_type = self.type_index(actual)?;
-        let start = *self.0.program.dispatch_offsets.get(actual_type)?;
-        let end = *self.0.program.dispatch_offsets.get(actual_type + 1)?;
-        let entries = self.0.program.dispatch_entries.get(start..end)?;
+        let start = *self.program.dispatch_offsets.get(actual_type)?;
+        let end = *self.program.dispatch_offsets.get(actual_type + 1)?;
+        let entries = self.program.dispatch_entries.get(start..end)?;
         entries
             .binary_search_by_key(&declaration, |entry| entry.declaration)
             .ok()
@@ -754,7 +759,7 @@ impl ExecutionImage {
     }
 
     pub(super) fn block(&self, index: usize) -> Option<&ResolvedBlock> {
-        self.0.program.blocks.get(index)
+        self.program.blocks.get(index)
     }
 
     pub(super) fn safepoint_map(
@@ -763,8 +768,7 @@ impl ExecutionImage {
         block: usize,
         instruction_boundary: u32,
     ) -> Option<&SafepointMap> {
-        self.0
-            .program
+        self.program
             .functions
             .get(function)?
             .safepoints
@@ -772,7 +776,7 @@ impl ExecutionImage {
                 (safepoint.block, safepoint.instruction_boundary)
             })
             .ok()
-            .map(|index| &self.0.program.functions[function].safepoints[index].map)
+            .map(|index| &self.program.functions[function].safepoints[index].map)
     }
 
     #[cfg(test)]
@@ -783,7 +787,7 @@ impl ExecutionImage {
         instruction_boundary: u32,
         offsets: Box<[u32]>,
     ) {
-        let inner = Arc::get_mut(&mut self.0).expect("test image must be uniquely owned");
+        let inner = Arc::get_mut(&mut self.admission).expect("test image must be uniquely owned");
         let mut program = prepare_program(&inner.artifact).expect("test program preparation");
         let safepoint = program.functions[function]
             .safepoints
@@ -793,55 +797,55 @@ impl ExecutionImage {
             })
             .expect("test safepoint must exist");
         safepoint.map.reference_offsets = offsets;
-        inner.program = Arc::new(program);
+        self.program = Arc::new(program);
     }
 
     #[cfg(test)]
     pub(super) fn test_remove_safepoints(&mut self, function: usize) {
-        let inner = Arc::get_mut(&mut self.0).expect("test image must be uniquely owned");
+        let inner = Arc::get_mut(&mut self.admission).expect("test image must be uniquely owned");
         let mut program = prepare_program(&inner.artifact).expect("test program preparation");
         program.functions[function].safepoints = Box::default();
-        inner.program = Arc::new(program);
+        self.program = Arc::new(program);
     }
 
     pub(super) fn constant(&self, index: usize) -> Option<RuntimeValue> {
-        self.0.program.constants.get(index).copied()
+        self.program.constants.get(index).copied()
     }
 
     pub(super) fn content_hash(&self) -> [u8; 32] {
-        self.0.program.content_hash
+        self.program.content_hash
     }
 
     pub(super) fn maximum_call_depth(&self) -> usize {
-        self.0.program.maximum_call_depth
+        self.program.maximum_call_depth
     }
 
     pub(super) fn maximum_coroutines(&self) -> usize {
-        self.0.program.maximum_coroutines
+        self.program.maximum_coroutines
     }
 
     pub(super) fn maximum_channels(&self) -> usize {
-        self.0.program.maximum_channels
+        self.program.maximum_channels
     }
 
     pub(super) fn maximum_channel_values(&self) -> usize {
-        self.0.program.maximum_channel_values
+        self.program.maximum_channel_values
     }
 
     pub(super) fn external_root_capacity(&self) -> u32 {
-        self.0.program.external_root_capacity
+        self.program.external_root_capacity
     }
 
     pub(super) fn minimum_slice_cost(&self) -> u32 {
-        self.0.program.minimum_slice_cost
+        self.program.minimum_slice_cost
     }
 
     pub(super) fn maximum_slice_budget(&self) -> u32 {
-        self.0.maximum_slice_budget
+        self.admission.maximum_slice_budget
     }
 
     pub(super) fn host_reference(&self, value: Ref32) -> Option<&ResolvedHostReference> {
-        self.0
+        self.admission
             .host_references
             .iter()
             .find(|reference| reference.value == value)
@@ -853,9 +857,9 @@ impl ExecutionImage {
                 .host_reference(value)
                 .filter(|entry| entry.live)
                 .map(|entry| entry.ty),
-            super::value::ReferenceDomain::Image => self
-                .literal_reference(value)
-                .and(self.0.program.string_type),
+            super::value::ReferenceDomain::Image => {
+                self.literal_reference(value).and(self.program.string_type)
+            }
             super::value::ReferenceDomain::Managed | super::value::ReferenceDomain::Reserved => {
                 None
             }
@@ -863,29 +867,28 @@ impl ExecutionImage {
     }
 
     pub(super) fn storage_plan(&self) -> StoragePlan {
-        self.0.storage_plan
+        self.admission.storage_plan
     }
 
     pub(super) fn type_name(&self, index: usize) -> Option<&[u16]> {
-        let name = *self.0.program.type_name_indices.get(index)?;
-        self.0
-            .program
+        let name = *self.program.type_name_indices.get(index)?;
+        self.program
             .type_names
             .get(name)
             .map(|units| units.as_ref())
     }
 
     pub(super) fn type_layout(&self, key: TypeKey) -> Option<&RuntimeTypeLayout> {
-        let index = checked_global_index(&self.0.program.type_offsets, key)?;
-        self.0.type_layouts.get(index)
+        let index = checked_global_index(&self.program.type_offsets, key)?;
+        self.admission.type_layouts.get(index)
     }
 
     pub(super) fn type_count(&self) -> usize {
-        self.0.type_layouts.len()
+        self.admission.type_layouts.len()
     }
 
     pub(super) fn type_index(&self, key: TypeKey) -> Option<usize> {
-        checked_global_index(&self.0.program.type_offsets, key)
+        checked_global_index(&self.program.type_offsets, key)
     }
 
     pub(super) fn type_id(&self, key: TypeKey) -> Option<u32> {
@@ -893,46 +896,35 @@ impl ExecutionImage {
     }
 
     pub(super) fn type_key(&self, index: usize) -> Option<TypeKey> {
-        self.0.program.type_keys.get(index).copied()
+        self.program.type_keys.get(index).copied()
     }
 
     pub(super) fn is_class(&self, key: TypeKey) -> bool {
         self.type_index(key)
-            .and_then(|index| self.0.program.class_types.get(index))
+            .and_then(|index| self.program.class_types.get(index))
             .copied()
             .unwrap_or(false)
     }
 
     pub(super) fn type_initializer(&self, key: TypeKey) -> Option<usize> {
         let index = self.type_index(key)?;
-        self.0
-            .program
-            .type_initializers
-            .get(index)
-            .copied()
-            .flatten()
+        self.program.type_initializers.get(index).copied().flatten()
     }
 
     pub(super) fn type_superclass(&self, key: TypeKey) -> Option<TypeKey> {
         let index = self.type_index(key)?;
-        self.0
-            .program
-            .type_superclasses
-            .get(index)
-            .copied()
-            .flatten()
+        self.program.type_superclasses.get(index).copied().flatten()
     }
 
     pub(super) fn is_assignable(&self, actual: TypeKey, target: TypeKey) -> bool {
-        checked_global_index(&self.0.program.type_offsets, actual)
-            .and_then(|index| self.0.program.assignable_types.get(index))
+        checked_global_index(&self.program.type_offsets, actual)
+            .and_then(|index| self.program.assignable_types.get(index))
             .is_some_and(|types| types.contains(&target))
     }
 
     pub(super) fn array_element_type(&self, array: TypeKey) -> Option<ResolvedValueType> {
-        let index = checked_global_index(&self.0.program.type_offsets, array)?;
-        self.0
-            .program
+        let index = checked_global_index(&self.program.type_offsets, array)?;
+        self.program
             .array_element_types
             .get(index)
             .copied()
@@ -940,49 +932,42 @@ impl ExecutionImage {
     }
 
     pub(super) fn field(&self, index: usize) -> Option<&ResolvedField> {
-        self.0.program.fields.get(index)
+        self.program.fields.get(index)
     }
 
     pub(super) fn record_layout(&self, ty: TypeKey) -> Option<&super::record::RecordLayout> {
-        self.0.record_layouts.get(&ty)
+        self.admission.record_layouts.get(&ty)
     }
 
     pub(super) fn fields(&self) -> &[ResolvedField] {
-        &self.0.program.fields
+        &self.program.fields
     }
 
     pub(super) fn static_layout(&self) -> &FrameLayout {
-        &self.0.program.static_layout
+        &self.program.static_layout
     }
 
     pub(super) fn literal(&self, index: usize) -> Option<&ResolvedLiteral> {
-        let canonical = *self.0.program.literal_ids.get(index)?;
-        self.0.program.literals.get(canonical)
+        let canonical = *self.program.literal_ids.get(index)?;
+        self.program.literals.get(canonical)
     }
 
     pub(super) fn literal_bytes(&self, literal: ResolvedLiteral) -> &[u8] {
-        literal.bytes.slice(&self.0.program.artifact_bytes)
+        literal.bytes.slice(&self.program.artifact_bytes)
     }
 
     pub(super) fn literal_reference(&self, value: Ref32) -> Option<ResolvedLiteral> {
         (value.domain() == super::value::ReferenceDomain::Image)
-            .then(|| {
-                self.0
-                    .program
-                    .literals
-                    .get(value.payload() as usize)
-                    .copied()
-            })
+            .then(|| self.program.literals.get(value.payload() as usize).copied())
             .flatten()
     }
 
     pub(super) fn string_type(&self) -> Option<TypeKey> {
-        self.0.program.string_type
+        self.program.string_type
     }
 
     pub(super) fn runtime_exception_type(&self, tag: u8) -> Option<TypeKey> {
-        self.0
-            .program
+        self.program
             .runtime_exception_types
             .get(tag.checked_sub(1)? as usize)
             .copied()
@@ -991,7 +976,6 @@ impl ExecutionImage {
 
     pub(super) fn empty_string(&self) -> Option<RuntimeValue> {
         let index = self
-            .0
             .program
             .literals
             .iter()
@@ -3227,8 +3211,8 @@ mod tests {
         large.heap_bytes = 1 << 31;
         large.maximum_slice_budget -= 1;
         let second = ExecutionImage::admit(artifact.clone(), large).unwrap();
-        assert!(Arc::ptr_eq(&first.0.program, &second.0.program));
-        assert!(!Arc::ptr_eq(&first.0, &second.0));
+        assert!(Arc::ptr_eq(&first.program, &second.program));
+        assert!(!Arc::ptr_eq(&first.admission, &second.admission));
         assert!(std::ptr::eq(first.functions(), second.functions()));
         assert!(std::ptr::eq(first.fields(), second.fields()));
         assert_eq!(8, first.storage_plan().header_format.bytes());
@@ -3261,9 +3245,9 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
         });
-        let weak = Arc::downgrade(&images[0].0.program);
+        let weak = Arc::downgrade(&images[0].program);
         for image in &images {
-            assert!(Arc::ptr_eq(&images[0].0.program, &image.0.program));
+            assert!(Arc::ptr_eq(&images[0].program, &image.program));
         }
         drop(artifact);
         assert!(weak.upgrade().is_some());
@@ -3365,10 +3349,10 @@ mod tests {
             fixtures::profile(),
         )
         .unwrap();
-        for id in 0..image.0.type_layouts.len() {
+        for id in 0..image.admission.type_layouts.len() {
             assert_eq!(Some(id), image.type_index(image.type_key(id).unwrap()));
         }
-        assert_eq!(None, image.type_key(image.0.type_layouts.len()));
+        assert_eq!(None, image.type_key(image.admission.type_layouts.len()));
         assert_eq!(None, image.type_key(usize::MAX));
     }
 
@@ -3377,12 +3361,11 @@ mod tests {
         let image =
             ExecutionImage::admit(fixtures::dynamic_dispatch_artifact(), fixtures::profile())
                 .unwrap();
-        assert!(!image.0.program.dispatch_entries.is_empty());
+        assert!(!image.program.dispatch_entries.is_empty());
         for actual_type in 0..image.type_count() {
             let key = image.type_key(actual_type).unwrap();
             for declaration in 0..image.functions().len() {
                 let expected = image
-                    .0
                     .program
                     .dispatch_entries
                     .iter()
