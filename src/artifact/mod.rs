@@ -1,3 +1,4 @@
+mod interner;
 mod matrix;
 pub(crate) use matrix::MatrixOperation;
 mod math;
@@ -86,13 +87,43 @@ impl std::fmt::Debug for VerifiedArtifact {
 #[derive(Debug)]
 pub(crate) struct VerifiedArtifactInner {
     decoded: DecodedArtifact,
+    prepared_program: std::sync::OnceLock<Arc<crate::execution::PreparedProgram>>,
 }
 
 impl VerifiedArtifact {
     pub(crate) fn new(decoded: DecodedArtifact) -> Self {
         Self {
-            inner: Arc::new(VerifiedArtifactInner { decoded }),
+            inner: interner::intern(Arc::new(VerifiedArtifactInner {
+                decoded,
+                prepared_program: std::sync::OnceLock::new(),
+            })),
         }
+    }
+
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(crate) fn new_unshared(decoded: DecodedArtifact) -> Self {
+        Self {
+            inner: Arc::new(VerifiedArtifactInner {
+                decoded,
+                prepared_program: std::sync::OnceLock::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn prepared_program(
+        &self,
+    ) -> Result<Arc<crate::execution::PreparedProgram>, crate::execution::AdmissionError> {
+        if let Some(program) = self.inner.prepared_program.get() {
+            return Ok(Arc::clone(program));
+        }
+        let program = Arc::new(crate::execution::prepare_program(self)?);
+        let _ = self.inner.prepared_program.set(program);
+        Ok(Arc::clone(
+            self.inner
+                .prepared_program
+                .get()
+                .expect("program was published"),
+        ))
     }
 
     pub fn content_hash(&self) -> [u8; 32] {

@@ -391,6 +391,26 @@ struct CompilationTransaction {
 }
 
 impl ComputerMachine {
+    #[cfg(feature = "program-sharing-benchmark")]
+    #[allow(dead_code)]
+    pub(crate) fn shared_code_identity(&self) -> (usize, Option<usize>) {
+        assert_eq!(
+            1,
+            self.sessions.len(),
+            "population benchmark expects one root process"
+        );
+        self.sessions[0].session.shared_code_identity()
+    }
+
+    #[cfg(all(feature = "program-sharing-benchmark", feature = "execution-prototype"))]
+    #[allow(dead_code)]
+    pub(crate) fn prepare_execution_benchmark(
+        &mut self,
+        mode: crate::execution::prototype::ExecutionMode,
+    ) -> Result<crate::execution::prototype::PreparationStats, AdmissionError> {
+        self.sessions[0].session.prepare_execution(mode)
+    }
+
     pub fn boot_in_filesystem(
         profile: ExecutionProfile,
         process_limits: ProcessLimits,
