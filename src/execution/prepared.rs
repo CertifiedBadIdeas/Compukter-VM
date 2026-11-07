@@ -506,7 +506,7 @@ fn prepare_extra(
                 .map_err(|_| AdmissionError::StoragePlanOverflow)?;
             plans
                 .copies
-                .try_reserve_exact(components.len())
+                .try_reserve(components.len())
                 .map_err(|_| AdmissionError::AllocationFailed)?;
             for (source, destination) in components.iter().zip(destination.components.iter()) {
                 let source = function
@@ -551,7 +551,7 @@ fn prepare_extra(
                 .map_err(|_| AdmissionError::StoragePlanOverflow)?;
             plans
                 .copies
-                .try_reserve_exact(source.components.len())
+                .try_reserve(source.components.len())
                 .map_err(|_| AdmissionError::AllocationFailed)?;
             for (source, destination) in source.components.iter().zip(destination.components.iter())
             {
