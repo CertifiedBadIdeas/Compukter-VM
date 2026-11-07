@@ -44,6 +44,7 @@ fn started(
     profile.heap_bytes = 16 * 1024;
     let image = super::super::image::ExecutionImage::admit(artifact, profile).unwrap();
     let mut machine = super::super::machine::Machine::new_untraced(image).unwrap();
+    machine.use_reference_execution();
     machine.start(args).unwrap();
     machine
 }
@@ -110,113 +111,7 @@ fn reference_and_candidates_preserve_scalar_results_and_every_instruction_bounda
     }
 }
 
-fn binary(group: u32, form: u8) -> Instruction {
-    match group {
-        0 => Instruction::Add {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        1 => Instruction::Sub {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        2 => Instruction::Mul {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        3 => Instruction::Div {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        4 => Instruction::Rem {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        7 => Instruction::Equal {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        8 => Instruction::NotEqual {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        9 => Instruction::Less {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        10 => Instruction::LessEqual {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        11 => Instruction::Greater {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        12 => Instruction::GreaterEqual {
-            form,
-            dst: 2,
-            lhs: 0,
-            rhs: 1,
-        },
-        _ => unreachable!(),
-    }
-}
-
-fn values(kind: u8) -> Vec<RuntimeValue> {
-    match kind {
-        1 => [0, 1, -1, i32::MIN, i32::MAX]
-            .into_iter()
-            .map(RuntimeValue::I32)
-            .collect(),
-        2 => [0, 1, -1, i64::MIN, i64::MAX]
-            .into_iter()
-            .map(RuntimeValue::I64)
-            .collect(),
-        3 => [
-            0,
-            0x8000_0000,
-            0x3fc0_0000,
-            0x7f80_0000,
-            0xff80_0000,
-            0x7fc0_1234,
-        ]
-        .into_iter()
-        .map(RuntimeValue::F32)
-        .collect(),
-        4 => [
-            0,
-            0x8000_0000_0000_0000,
-            0x3ff8_0000_0000_0000,
-            0x7ff0_0000_0000_0000,
-            0xfff0_0000_0000_0000,
-            0x7ff8_0000_0000_1234,
-        ]
-        .into_iter()
-        .map(RuntimeValue::F64)
-        .collect(),
-        _ => unreachable!(),
-    }
-}
+use crate::execution::prepared::tests::{binary, values};
 
 #[test]
 fn all_numeric_opcodes_match_reference_for_overflow_zero_nan_infinity_and_signed_zero() {

@@ -12,7 +12,7 @@ use super::{
     frame::{FrameArena, FrameReservation},
     image::{ResolvedBlock, ResolvedFunction, ResolvedInstruction},
     machine::{Frame, InstructionFailure},
-    numeric,
+    prepared::{execute_numeric as execute, Operation},
 };
 use crate::artifact::PhysicalAtom;
 
@@ -32,15 +32,6 @@ pub(crate) struct PreparationStats {
     pub code_bytes: usize,
     pub index_bytes: usize,
     pub reference_enum_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub(super) struct Operation {
-    opcode: u32,
-    dst: u32,
-    lhs: u32,
-    rhs: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -121,11 +112,12 @@ impl PreparedExecution {
     pub(super) fn new(
         blocks: &[ResolvedBlock],
         functions: &[ResolvedFunction],
+        reference: &super::prepared::PreparedCode,
         mode: ExecutionMode,
     ) -> Result<Self, AdmissionError> {
         let count = blocks
             .iter()
-            .try_fold(0usize, |n, b| n.checked_add(b.instructions.len()))
+            .try_fold(0usize, |n, b| n.checked_add(b.instruction_count))
             .ok_or(AdmissionError::StoragePlanOverflow)?;
         let mut starts = Vec::new();
         starts
@@ -146,7 +138,7 @@ impl PreparedExecution {
             let function = functions
                 .get(block.function)
                 .ok_or(AdmissionError::InvalidEntry)?;
-            for instruction in &block.instructions {
+            for instruction in reference.reference(block.code_start, block.instruction_count) {
                 let operation = prepare(instruction, function, mode).unwrap_or_default();
                 eligible += usize::from(operation.opcode != 0);
                 operations.push(operation);
@@ -476,118 +468,6 @@ fn prepare(
             lhs: physical_lhs,
             rhs: physical_rhs,
         }),
-    }
-}
-
-#[inline]
-fn execute(
-    op: Operation,
-    arena: &mut FrameArena,
-    frame: FrameReservation,
-) -> Result<(), InstructionFailure> {
-    macro_rules! read {
-        ($ty:ty, $src:expr) => {
-            <$ty>::from_le_bytes(
-                arena
-                    .read_prepared(frame, $src)
-                    .map_err(InstructionFailure::Fault)?,
-            )
-        };
-    }
-    macro_rules! write {
-        ($value:expr) => {
-            arena
-                .write_prepared(frame, op.dst, ($value).to_le_bytes())
-                .map_err(InstructionFailure::Fault)
-        };
-    }
-    macro_rules! binary {
-        ($ty:ty, $fun:path) => {{
-            let lhs = read!($ty, op.lhs);
-            let rhs = read!($ty, op.rhs);
-            write!($fun(lhs, rhs))
-        }};
-    }
-    macro_rules! fallible {
-        ($ty:ty, $fun:path) => {{
-            let lhs = read!($ty, op.lhs);
-            let rhs = read!($ty, op.rhs);
-            write!($fun(lhs, rhs).map_err(InstructionFailure::Trap)?)
-        }};
-    }
-    macro_rules! comparison {
-        ($ty:ty, $fun:expr) => {{
-            let lhs = read!($ty, op.lhs);
-            let rhs = read!($ty, op.rhs);
-            write!(i32::from(($fun)(lhs, rhs)))
-        }};
-    }
-    match op.opcode {
-        1 => binary!(i32, numeric::add_i32),
-        2 => binary!(i64, numeric::add_i64),
-        3 => binary!(f32, numeric::add_f32),
-        4 => binary!(f64, numeric::add_f64),
-        5 => binary!(i32, numeric::sub_i32),
-        6 => binary!(i64, numeric::sub_i64),
-        7 => binary!(f32, numeric::sub_f32),
-        8 => binary!(f64, numeric::sub_f64),
-        9 => binary!(i32, numeric::mul_i32),
-        10 => binary!(i64, numeric::mul_i64),
-        11 => binary!(f32, numeric::mul_f32),
-        12 => binary!(f64, numeric::mul_f64),
-        13 => fallible!(i32, numeric::div_i32),
-        14 => fallible!(i64, numeric::div_i64),
-        15 => binary!(f32, numeric::div_f32),
-        16 => binary!(f64, numeric::div_f64),
-        17 => fallible!(i32, numeric::rem_i32),
-        18 => fallible!(i64, numeric::rem_i64),
-        19 => binary!(f32, numeric::rem_f32),
-        20 => binary!(f64, numeric::rem_f64),
-        21 => write!(numeric::neg_i32(read!(i32, op.lhs))),
-        22 => write!(numeric::neg_i64(read!(i64, op.lhs))),
-        23 => write!(numeric::neg_f32(read!(f32, op.lhs))),
-        24 => write!(numeric::neg_f64(read!(f64, op.lhs))),
-        25 => write!(read!(i32, op.lhs)),
-        26 => write!(read!(i64, op.lhs)),
-        27 => write!(read!(f32, op.lhs)),
-        28 => write!(read!(f64, op.lhs)),
-        29 => comparison!(i32, |a, b| a == b),
-        30 => comparison!(i64, |a, b| a == b),
-        31 => comparison!(f32, numeric::eq_f32),
-        32 => comparison!(f64, numeric::eq_f64),
-        33 => comparison!(i32, |a, b| a != b),
-        34 => comparison!(i64, |a, b| a != b),
-        35 => comparison!(f32, numeric::ne_f32),
-        36 => comparison!(f64, numeric::ne_f64),
-        37 => comparison!(i32, |a, b| a < b),
-        38 => comparison!(i64, |a, b| a < b),
-        39 => comparison!(f32, numeric::lt_f32),
-        40 => comparison!(f64, numeric::lt_f64),
-        41 => comparison!(i32, |a, b| a <= b),
-        42 => comparison!(i64, |a, b| a <= b),
-        43 => comparison!(f32, numeric::le_f32),
-        44 => comparison!(f64, numeric::le_f64),
-        45 => comparison!(i32, |a, b| a > b),
-        46 => comparison!(i64, |a, b| a > b),
-        47 => comparison!(f32, numeric::gt_f32),
-        48 => comparison!(f64, numeric::gt_f64),
-        49 => comparison!(i32, |a, b| a >= b),
-        50 => comparison!(i64, |a, b| a >= b),
-        51 => comparison!(f32, numeric::ge_f32),
-        52 => comparison!(f64, numeric::ge_f64),
-        53 => comparison!(u32, |a, b| a == b),
-        54 => comparison!(u64, |a, b| a == b),
-        57 => comparison!(u32, |a, b| a != b),
-        58 => comparison!(u64, |a, b| a != b),
-        61 => comparison!(u32, |a, b| a < b),
-        62 => comparison!(u64, |a, b| a < b),
-        65 => comparison!(u32, |a, b| a <= b),
-        66 => comparison!(u64, |a, b| a <= b),
-        69 => comparison!(u32, |a, b| a > b),
-        70 => comparison!(u64, |a, b| a > b),
-        73 => comparison!(u32, |a, b| a >= b),
-        74 => comparison!(u64, |a, b| a >= b),
-        _ => Err(InstructionFailure::Fault(VmFault::UnsupportedInstruction)),
     }
 }
 

@@ -103,6 +103,11 @@ impl core::fmt::Debug for Session {
 
 impl Session {
     #[cfg(feature = "execution-prototype")]
+    pub(crate) fn use_reference_execution(&mut self) {
+        self.machine.use_reference_execution();
+    }
+
+    #[cfg(feature = "execution-prototype")]
     pub(crate) fn prepare_execution(
         &mut self,
         mode: super::prototype::ExecutionMode,
