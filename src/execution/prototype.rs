@@ -43,10 +43,11 @@ pub(super) struct Operation {
     rhs: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C, align(64))]
 struct CacheLine<T, const N: usize>([T; N]);
 
+#[derive(Debug)]
 struct Dense<T, const N: usize> {
     lines: Box<[CacheLine<T, N>]>,
     len: usize,
@@ -79,11 +80,13 @@ impl<T: Copy + Default, const N: usize> Dense<T, N> {
     }
 }
 
+#[derive(Debug)]
 enum Code {
     Packed(Dense<u32, 16>),
     Offsets(Dense<Operation, 4>),
 }
 
+#[derive(Debug)]
 pub(super) struct PreparedExecution {
     code: Code,
     block_starts: Box<[usize]>,

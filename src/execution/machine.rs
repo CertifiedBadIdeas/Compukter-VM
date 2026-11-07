@@ -121,7 +121,7 @@ pub(super) fn write_frame_value(
 pub(super) struct Machine {
     image: ExecutionImage,
     #[cfg(feature = "execution-prototype")]
-    prototype: Option<super::prototype::PreparedExecution>,
+    prototype: Option<std::sync::Arc<super::prototype::PreparedExecution>>,
     #[cfg(feature = "execution-prototype")]
     prototype_cache: super::prototype::DecodeCache,
     lifecycle: Lifecycle,

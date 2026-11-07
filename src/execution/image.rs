@@ -489,6 +489,19 @@ pub(super) struct ExecutionImage(Arc<ExecutionImageInner>);
 
 #[derive(Debug)]
 struct ExecutionImageInner {
+    // Keeps the canonical verification identity and its derived program alive.
+    artifact: VerifiedArtifact,
+    program: Arc<PreparedProgram>,
+    host_references: Box<[ResolvedHostReference]>,
+    type_layouts: Box<[RuntimeTypeLayout]>,
+    record_layouts: std::collections::HashMap<TypeKey, super::record::RecordLayout>,
+    storage_plan: StoragePlan,
+    maximum_slice_budget: u32,
+}
+
+/// Artifact-derived immutable code. No capabilities, heap profile or machine state.
+#[derive(Debug)]
+pub(crate) struct PreparedProgram {
     content_hash: [u8; 32],
     artifact_bytes: Arc<[u8]>,
     entry: usize,
@@ -497,10 +510,8 @@ struct ExecutionImageInner {
     dispatch_offsets: Box<[usize]>,
     blocks: Box<[ResolvedBlock]>,
     constants: Box<[RuntimeValue]>,
-    host_references: Box<[ResolvedHostReference]>,
     type_offsets: Box<[usize]>,
     type_keys: Box<[TypeKey]>,
-    type_layouts: Box<[RuntimeTypeLayout]>,
     type_name_indices: Box<[usize]>,
     type_names: Box<[Box<[u16]>]>,
     type_initializers: Box<[Option<usize>]>,
@@ -508,14 +519,10 @@ struct ExecutionImageInner {
     class_types: Box<[bool]>,
     assignable_types: Box<[Box<[TypeKey]>]>,
     array_element_types: Box<[Option<ResolvedValueType>]>,
-    fields: Box<[ResolvedField]>,
-    record_layouts: std::collections::HashMap<TypeKey, super::record::RecordLayout>,
-    static_layout: FrameLayout,
     literals: Box<[ResolvedLiteral]>,
     literal_ids: Box<[usize]>,
     string_type: Option<TypeKey>,
     runtime_exception_types: [Option<TypeKey>; 8],
-    storage_plan: StoragePlan,
     registers_per_frame: usize,
     maximum_call_depth: usize,
     maximum_coroutines: usize,
@@ -523,7 +530,12 @@ struct ExecutionImageInner {
     maximum_channel_values: usize,
     external_root_capacity: u32,
     minimum_slice_cost: u32,
-    maximum_slice_budget: u32,
+    fields: Box<[ResolvedField]>,
+    static_layout: FrameLayout,
+    field_offsets: Box<[usize]>,
+    host_calls: Box<[(usize, usize)]>,
+    #[cfg(feature = "execution-prototype")]
+    prototypes: [std::sync::OnceLock<Arc<super::prototype::PreparedExecution>>; 5],
 }
 
 impl ExecutionImage {
@@ -531,8 +543,26 @@ impl ExecutionImage {
     pub(super) fn prepare_execution(
         &self,
         mode: super::prototype::ExecutionMode,
-    ) -> Result<super::prototype::PreparedExecution, AdmissionError> {
-        super::prototype::PreparedExecution::new(&self.0.blocks, &self.0.functions, mode)
+    ) -> Result<Arc<super::prototype::PreparedExecution>, AdmissionError> {
+        use super::prototype::{ExecutionMode, PreparedExecution};
+        let index = match mode {
+            ExecutionMode::Packed => 0,
+            ExecutionMode::Slots => 1,
+            ExecutionMode::PackedBatch => 2,
+            ExecutionMode::PackedSimd => 3,
+            ExecutionMode::Offsets => 4,
+        };
+        let slot = &self.0.program.prototypes[index];
+        if let Some(prepared) = slot.get() {
+            return Ok(Arc::clone(prepared));
+        }
+        let prepared = Arc::new(PreparedExecution::new(
+            &self.0.program.blocks,
+            &self.0.program.functions,
+            mode,
+        )?);
+        let _ = slot.set(prepared);
+        Ok(Arc::clone(slot.get().expect("prepared code was published")))
     }
 
     pub(super) fn admit(
@@ -549,288 +579,15 @@ impl ExecutionImage {
     ) -> Result<Self, AdmissionError> {
         let decoded = artifact.decoded();
         check_profile(decoded, &profile)?;
-        let function_offsets =
-            offsets(decoded.modules.iter().map(|module| module.functions.len()))?;
-        let block_offsets = offsets(decoded.modules.iter().map(|module| module.blocks.len()))?;
-        let constant_offsets =
-            offsets(decoded.modules.iter().map(|module| module.constants.len()))?;
-        let type_offsets = offsets(decoded.modules.iter().map(|module| module.types.len()))?;
-        let type_keys = resolve_type_keys(&type_offsets)?;
-        let header_format = HeaderFormat::select(
-            profile.heap_bytes,
-            *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?,
-        );
-        let field_offsets = offsets(decoded.modules.iter().map(|module| module.fields.len()))?;
-        let literal_offsets = offsets(
-            decoded
-                .modules
-                .iter()
-                .map(|module| module.utf16_literals.len()),
-        )?;
+        let program = artifact.prepared_program()?;
+        let type_offsets = &program.type_offsets;
+        let field_offsets = &program.field_offsets;
+        let header_format = HeaderFormat::select(profile.heap_bytes, program.type_keys.len());
         let type_layouts =
-            derive_type_layouts(decoded, &type_offsets, &field_offsets, header_format)?;
-        let total_types = *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?;
-        let mut type_initializers = reserved(total_types)?;
-        let mut type_superclasses = reserved(total_types)?;
-        let mut class_types = reserved(total_types)?;
-        for (module_id, module) in decoded.modules.iter().enumerate() {
-            for nominal in &module.types {
-                if let NominalType::Class {
-                    super_type,
-                    initializer,
-                    ..
-                } = nominal
-                {
-                    type_initializers.push(
-                        initializer
-                            .map(|initializer| {
-                                function_offsets[module_id]
-                                    .checked_add(initializer.0 as usize)
-                                    .filter(|index| *index < function_offsets[module_id + 1])
-                                    .ok_or(AdmissionError::InvalidEntry)
-                            })
-                            .transpose()?,
-                    );
-                    type_superclasses.push(resolve_type(decoded, module_id, *super_type));
-                    class_types.push(true);
-                } else {
-                    type_initializers.push(None);
-                    type_superclasses.push(None);
-                    class_types.push(false);
-                }
-            }
-        }
-        let mut assignable_type_sets =
-            reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
-        for (module, nominal_types) in decoded.modules.iter().enumerate() {
-            for ty in 0..nominal_types.types.len() {
-                assignable_type_sets.push(assignable_types(
-                    decoded,
-                    TypeKey {
-                        module: checked_u32(module)?,
-                        ty: checked_u32(ty)?,
-                    },
-                )?);
-            }
-        }
-        let mut array_element_types =
-            reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
-        for (module, nominal_types) in decoded.modules.iter().enumerate() {
-            for nominal in &nominal_types.types {
-                array_element_types.push(match nominal {
-                    NominalType::Array { element, .. } => {
-                        Some(resolve_value_type(decoded, module, *element)?)
-                    }
-                    _ => None,
-                });
-            }
-        }
-        let (fields, _static_slot_count) =
-            resolve_fields(decoded, &type_offsets, &field_offsets, &type_layouts)?;
-        let static_atoms = fields
-            .iter()
-            .filter(|field| field.static_slot.is_some())
-            .map(|field| physical_atom(field.value_type))
-            .collect::<Result<Vec<_>, _>>()?;
-        let static_layout = FrameLayout::derive_scalars(&static_atoms)
-            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
-        let string_type = resolve_standard_string_type(decoded)?;
-        let mut runtime_exception_types = [None; 8];
-        for (module_id, module) in decoded.modules.iter().enumerate() {
-            for (type_id, nominal) in module.types.iter().enumerate() {
-                if let NominalType::Class { flags, .. } = nominal {
-                    let tag = flags >> 3;
-                    if tag != 0 {
-                        runtime_exception_types[tag as usize - 1] = Some(TypeKey {
-                            module: module_id as u32,
-                            ty: type_id as u32,
-                        });
-                    }
-                }
-            }
-        }
-        let (mut literals, literal_ids) = resolve_literals(decoded, &literal_offsets)?;
-        if string_type.is_some() && !literals.iter().any(|literal| literal.code_units == 0) {
-            let mut with_empty = literals.into_vec();
-            with_empty
-                .try_reserve_exact(1)
-                .map_err(|_| AdmissionError::AllocationFailed)?;
-            with_empty.push(ResolvedLiteral {
-                bytes: ByteRange { start: 0, end: 0 },
-                code_units: 0,
-            });
-            literals = with_empty.into_boxed_slice();
-        }
-        let mut constants = reserved(
-            *constant_offsets
-                .last()
-                .ok_or(AdmissionError::InvalidEntry)?,
-        )?;
-        for (module_id, module) in decoded.modules.iter().enumerate() {
-            for constant in &module.constants {
-                constants.push(resolve_constant(
-                    constant,
-                    module_id,
-                    &literal_offsets,
-                    &literal_ids,
-                )?);
-            }
-        }
-
-        let total_functions = *function_offsets
-            .last()
-            .ok_or(AdmissionError::InvalidEntry)?;
-        let mut functions = reserved(total_functions)?;
-        let mut registers_per_frame = 0_usize;
-        for (module_id, module) in decoded.modules.iter().enumerate() {
-            for (function_id, function) in module.functions.iter().enumerate() {
-                let signature_key = resolve_type(decoded, module_id, function.signature)
-                    .ok_or(AdmissionError::InvalidEntry)?;
-                let NominalType::Function { result, .. } = &decoded.modules
-                    [signature_key.module as usize]
-                    .types[signature_key.ty as usize]
-                else {
-                    return Err(AdmissionError::InvalidEntry);
-                };
-                let mut registers = reserved(function.values.len())?;
-                for value in &function.values {
-                    registers.push(resolve_value_type(decoded, module_id, value.semantic_type)?);
-                }
-                let frame_layout = FrameLayout::derive(&function.values)
-                    .map_err(|_| AdmissionError::StoragePlanOverflow)?;
-                let mut register_accesses = reserved(registers.len())?;
-                for (register, value_type) in registers.iter().enumerate() {
-                    register_accesses.push(frame_layout.value_access(value_type.kind, register));
-                }
-                let local_roots = module
-                    .safepoint_roots
-                    .iter()
-                    .filter(|roots| roots.function.0 as usize == function_id);
-                let mut safepoints = Vec::new();
-                let first_block = function.first_block.0 as usize;
-                let block_end = first_block
-                    .checked_add(function.block_count as usize)
-                    .ok_or(AdmissionError::StoragePlanOverflow)?;
-                let expected_safepoints = (first_block..block_end)
-                    .try_fold(0_usize, |total, block| {
-                        total.checked_add(module.code.get(block)?.instructions.len())
-                    })
-                    .ok_or(AdmissionError::InvalidEntry)?;
-                safepoints
-                    .try_reserve_exact(expected_safepoints)
-                    .map_err(|_| AdmissionError::AllocationFailed)?;
-                for roots in local_roots {
-                    let local_block = roots.block.0 as usize;
-                    let code = module
-                        .code
-                        .get(local_block)
-                        .ok_or(AdmissionError::InvalidEntry)?;
-                    if module
-                        .blocks
-                        .get(local_block)
-                        .is_none_or(|block| block.owner_function.0 as usize != function_id)
-                        || roots.instruction_boundary as usize >= code.instructions.len()
-                    {
-                        return Err(AdmissionError::InvalidEntry);
-                    }
-                    let block = block_offsets[module_id]
-                        .checked_add(local_block)
-                        .ok_or(AdmissionError::StoragePlanOverflow)?;
-                    if safepoints
-                        .last()
-                        .is_some_and(|previous: &ResolvedSafepoint| {
-                            (previous.block, previous.instruction_boundary)
-                                >= (block, roots.instruction_boundary)
-                        })
-                    {
-                        return Err(AdmissionError::InvalidEntry);
-                    }
-                    safepoints.push(ResolvedSafepoint {
-                        block,
-                        instruction_boundary: roots.instruction_boundary,
-                        map: SafepointMap::derive(&frame_layout, &roots.references)
-                            .map_err(|_| AdmissionError::InvalidEntry)?,
-                    });
-                }
-                if safepoints.len() != expected_safepoints {
-                    return Err(AdmissionError::InvalidEntry);
-                }
-                registers_per_frame = registers_per_frame.max(registers.len());
-                let exception_start = function.first_exception as usize;
-                let exception_end = exception_start
-                    .checked_add(function.exception_count as usize)
-                    .ok_or(AdmissionError::InvalidEntry)?;
-                let entries = module
-                    .exceptions
-                    .get(exception_start..exception_end)
-                    .ok_or(AdmissionError::InvalidEntry)?;
-                let mut handlers = reserved(entries.len())?;
-                for entry in entries {
-                    let protected_start = block_offsets[module_id]
-                        .checked_add(entry.first_protected_block.0 as usize)
-                        .ok_or(AdmissionError::StoragePlanOverflow)?;
-                    handlers.push(ResolvedExceptionHandler {
-                        protected_start,
-                        protected_end: protected_start
-                            .checked_add(entry.protected_block_count as usize)
-                            .ok_or(AdmissionError::StoragePlanOverflow)?,
-                        catch_type: if entry.catch_type.0 == u32::MAX {
-                            None
-                        } else {
-                            Some(
-                                resolve_type(decoded, module_id, entry.catch_type)
-                                    .ok_or(AdmissionError::InvalidEntry)?,
-                            )
-                        },
-                        handler_block: block_offsets[module_id]
-                            .checked_add(entry.handler_block.0 as usize)
-                            .ok_or(AdmissionError::StoragePlanOverflow)?,
-                        exception_register: entry.exception_register,
-                    });
-                }
-                // Stable ordering preserves source order for catches of the same region.
-                handlers.sort_by_key(|handler| handler.protected_end - handler.protected_start);
-                functions.push(ResolvedFunction {
-                    key: FunctionKey {
-                        module: module_id as u32,
-                        function: function_id as u32,
-                    },
-                    register_count: function.register_count as usize,
-                    parameter_count: function.parameter_count as usize,
-                    registers: registers.into_boxed_slice(),
-                    register_accesses: register_accesses.into_boxed_slice(),
-                    frame_layout,
-                    safepoints: safepoints.into_boxed_slice(),
-                    handlers: handlers.into_boxed_slice(),
-                    result: resolve_value_type(decoded, signature_key.module as usize, *result)?,
-                    first_block: block_offsets[module_id]
-                        .checked_add(function.first_block.0 as usize)
-                        .ok_or(AdmissionError::StoragePlanOverflow)?,
-                    block_count: function.block_count as usize,
-                    static_owner: if function.flags & (1 << 1) != 0 {
-                        resolve_type(decoded, module_id, function.owner).filter(|owner| {
-                            matches!(
-                                decoded.modules[owner.module as usize].types[owner.ty as usize],
-                                NominalType::Class { .. }
-                            )
-                        })
-                    } else {
-                        None
-                    },
-                });
-            }
-        }
-
-        let dispatch_entries = resolve_dispatch_entries(
-            decoded,
-            &function_offsets,
-            &type_offsets,
-            &assignable_type_sets,
-            &functions,
-        )?;
-
-        let dispatch_offsets = resolve_dispatch_offsets(&dispatch_entries, type_keys.len())?;
-
+            derive_type_layouts(decoded, type_offsets, field_offsets, header_format)?;
+        let fields = &program.fields;
+        let static_layout = &program.static_layout;
+        let runtime_exception_types = program.runtime_exception_types;
         let maximum_call_depth = u64::from(decoded.manifest.maximum_call_depth);
         let frame_arena_bytes = u64::from(decoded.manifest.required_stack_bytes);
         let maximum_coroutines = u64::from(decoded.manifest.maximum_coroutines);
@@ -882,49 +639,6 @@ impl ExecutionImage {
         })?
         .with_header_format(header_format);
 
-        let mut blocks = reserved(*block_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
-        let record_layouts = std::cell::RefCell::new(std::collections::HashMap::new());
-        let instruction_resolution = InstructionResolution {
-            function_offsets: &function_offsets,
-            block_offsets: &block_offsets,
-            constant_offsets: &constant_offsets,
-            field_offsets: &field_offsets,
-            fields: &fields,
-            functions: &functions,
-            capabilities,
-            string_type,
-            artifact: decoded,
-            type_offsets: &type_offsets,
-            type_layouts: &type_layouts,
-            record_layouts: &record_layouts,
-        };
-        for (module_id, module) in decoded.modules.iter().enumerate() {
-            for (block_id, block) in module.blocks.iter().enumerate() {
-                let function = function_offsets[module_id]
-                    .checked_add(block.owner_function.0 as usize)
-                    .ok_or(AdmissionError::StoragePlanOverflow)?;
-                let code = module
-                    .code
-                    .get(block_id)
-                    .ok_or(AdmissionError::InvalidEntry)?;
-                let mut instructions = reserved(code.instructions.len())?;
-                for instruction in code.instructions.iter() {
-                    instructions.push(resolve_instruction(
-                        decoded,
-                        module_id,
-                        function,
-                        &instruction_resolution,
-                        instruction,
-                    )?);
-                }
-                blocks.push(ResolvedBlock {
-                    function,
-                    fixed_cost: code.fixed_cost,
-                    instructions: instructions.into_boxed_slice(),
-                });
-            }
-        }
-
         let mut host_references = reserved(profile.host_references.len())?;
         for (index, reference) in profile.host_references.iter().enumerate() {
             if !type_exists(decoded, reference.ty)
@@ -945,114 +659,89 @@ impl ExecutionImage {
             });
         }
 
-        // Deduplicate by the verified metadata identity, so repeated type names do not amplify storage.
-        // The shared UTF-16 pool is bounded by twice the source metadata bytes plus one index per type.
-        let mut name_ids = std::collections::HashMap::new();
-        name_ids
-            .try_reserve(type_layouts.len())
-            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
-        let mut type_names = reserved(type_layouts.len())?;
-        let mut type_name_indices = reserved(type_layouts.len())?;
-        for (module_id, module) in decoded.modules.iter().enumerate() {
-            for ty in &module.types {
-                let name = match ty {
-                    NominalType::Class { name, .. }
-                    | NominalType::Interface { name, .. }
-                    | NominalType::Array { name, .. }
-                    | NominalType::Function { name, .. }
-                    | NominalType::InlineValue { name, .. } => *name,
-                };
-                let index = if let Some(index) = name_ids.get(&(module_id, name)) {
-                    *index
-                } else {
-                    let bytes = module
-                        .strings
-                        .get(name as usize)
-                        .ok_or(AdmissionError::InvalidEntry)?
-                        .slice(&decoded.bytes);
-                    let text =
-                        std::str::from_utf8(bytes).map_err(|_| AdmissionError::InvalidEntry)?;
-                    let index = type_names.len();
-                    let mut units = reserved(text.encode_utf16().count())?;
-                    units.extend(text.encode_utf16());
-                    type_names.push(units.into_boxed_slice());
-                    name_ids.insert((module_id, name), index);
-                    index
-                };
-                type_name_indices.push(index);
+        let record_layouts = std::cell::RefCell::new(std::collections::HashMap::new());
+        let resolution = CapabilityResolution {
+            artifact: decoded,
+            functions: &program.functions,
+            capabilities,
+            fields,
+            field_offsets,
+            type_offsets,
+            type_layouts: &type_layouts,
+            string_type: program.string_type,
+            record_layouts: &record_layouts,
+        };
+        for &(block, instruction) in &program.host_calls {
+            let block = &program.blocks[block];
+            match &block.instructions[instruction] {
+                ResolvedInstruction::CapabilityCallSync {
+                    dst,
+                    capability,
+                    operation,
+                    args,
+                } => validate_capability_call(
+                    &resolution,
+                    block.function,
+                    *dst,
+                    *capability,
+                    *operation,
+                    args,
+                    false,
+                )?,
+                ResolvedInstruction::CapabilityCallAsync {
+                    dst,
+                    capability,
+                    operation,
+                    args,
+                    ..
+                } => validate_capability_call(
+                    &resolution,
+                    block.function,
+                    *dst,
+                    *capability,
+                    *operation,
+                    args,
+                    true,
+                )?,
+                _ => return Err(AdmissionError::InvalidEntry),
             }
         }
-
-        let entry_key = artifact.entry();
-        let entry = function_offsets
-            .get(entry_key.module as usize)
-            .and_then(|offset| offset.checked_add(entry_key.function as usize))
-            .filter(|entry| *entry < functions.len())
-            .ok_or(AdmissionError::InvalidEntry)?;
         Ok(Self(Arc::new(ExecutionImageInner {
-            content_hash: artifact.content_hash(),
-            artifact_bytes: decoded.bytes.clone(),
-            entry,
-            functions: functions.into_boxed_slice(),
-            dispatch_entries,
-            dispatch_offsets,
-            blocks: blocks.into_boxed_slice(),
-            constants: constants.into_boxed_slice(),
+            artifact,
+            program,
             host_references: host_references.into_boxed_slice(),
-            type_offsets,
-            type_keys,
             type_layouts,
-            type_name_indices: type_name_indices.into_boxed_slice(),
-            type_names: type_names.into_boxed_slice(),
-            type_initializers: type_initializers.into_boxed_slice(),
-            type_superclasses: type_superclasses.into_boxed_slice(),
-            class_types: class_types.into_boxed_slice(),
-            assignable_types: assignable_type_sets.into_boxed_slice(),
-            array_element_types: array_element_types.into_boxed_slice(),
-            fields,
             record_layouts: record_layouts.into_inner(),
-            static_layout,
-            literals,
-            literal_ids,
-            string_type,
             storage_plan,
-            runtime_exception_types,
-            registers_per_frame,
-            maximum_call_depth: decoded.manifest.maximum_call_depth as usize,
-            maximum_coroutines: decoded.manifest.maximum_coroutines as usize,
-            maximum_channels: decoded.manifest.maximum_channels as usize,
-            maximum_channel_values: decoded.manifest.maximum_channel_values as usize,
-            external_root_capacity: decoded.manifest.maximum_host_requests,
-            minimum_slice_cost: decoded.manifest.minimum_slice_cost,
             maximum_slice_budget: profile.maximum_slice_budget,
         })))
     }
 
     pub(super) fn entry(&self) -> FunctionKey {
-        self.0.functions[self.0.entry].key
+        self.0.program.functions[self.0.program.entry].key
     }
 
     pub(super) fn functions(&self) -> &[ResolvedFunction] {
-        &self.0.functions
+        &self.0.program.functions
     }
 
     pub(super) fn registers_per_frame(&self) -> usize {
-        self.0.registers_per_frame
+        self.0.program.registers_per_frame
     }
 
     pub(super) fn entry_index(&self) -> usize {
-        self.0.entry
+        self.0.program.entry
     }
 
     pub(super) fn function(&self, index: usize) -> Option<&ResolvedFunction> {
-        self.0.functions.get(index)
+        self.0.program.functions.get(index)
     }
 
     pub(super) fn dispatch_target(&self, actual: TypeKey, declaration: usize) -> Option<usize> {
         let actual_type = self.type_index(actual)?;
-        let start = *self.0.dispatch_offsets.get(actual_type)?;
-        let end = *self.0.dispatch_offsets.get(actual_type + 1)?;
-        let entries = self.0.dispatch_entries.get(start..end)?;
+        let start = *self.0.program.dispatch_offsets.get(actual_type)?;
+        let end = *self.0.program.dispatch_offsets.get(actual_type + 1)?;
+        let entries = self.0.program.dispatch_entries.get(start..end)?;
         entries
             .binary_search_by_key(&declaration, |entry| entry.declaration)
             .ok()
@@ -1060,7 +749,7 @@ impl ExecutionImage {
     }
 
     pub(super) fn block(&self, index: usize) -> Option<&ResolvedBlock> {
-        self.0.blocks.get(index)
+        self.0.program.blocks.get(index)
     }
 
     pub(super) fn safepoint_map(
@@ -1070,6 +759,7 @@ impl ExecutionImage {
         instruction_boundary: u32,
     ) -> Option<&SafepointMap> {
         self.0
+            .program
             .functions
             .get(function)?
             .safepoints
@@ -1077,7 +767,7 @@ impl ExecutionImage {
                 (safepoint.block, safepoint.instruction_boundary)
             })
             .ok()
-            .map(|index| &self.0.functions[function].safepoints[index].map)
+            .map(|index| &self.0.program.functions[function].safepoints[index].map)
     }
 
     #[cfg(test)]
@@ -1089,7 +779,8 @@ impl ExecutionImage {
         offsets: Box<[u32]>,
     ) {
         let inner = Arc::get_mut(&mut self.0).expect("test image must be uniquely owned");
-        let safepoint = inner.functions[function]
+        let mut program = prepare_program(&inner.artifact).expect("test program preparation");
+        let safepoint = program.functions[function]
             .safepoints
             .iter_mut()
             .find(|safepoint| {
@@ -1097,44 +788,47 @@ impl ExecutionImage {
             })
             .expect("test safepoint must exist");
         safepoint.map.reference_offsets = offsets;
+        inner.program = Arc::new(program);
     }
 
     #[cfg(test)]
     pub(super) fn test_remove_safepoints(&mut self, function: usize) {
         let inner = Arc::get_mut(&mut self.0).expect("test image must be uniquely owned");
-        inner.functions[function].safepoints = Box::default();
+        let mut program = prepare_program(&inner.artifact).expect("test program preparation");
+        program.functions[function].safepoints = Box::default();
+        inner.program = Arc::new(program);
     }
 
     pub(super) fn constant(&self, index: usize) -> Option<RuntimeValue> {
-        self.0.constants.get(index).copied()
+        self.0.program.constants.get(index).copied()
     }
 
     pub(super) fn content_hash(&self) -> [u8; 32] {
-        self.0.content_hash
+        self.0.program.content_hash
     }
 
     pub(super) fn maximum_call_depth(&self) -> usize {
-        self.0.maximum_call_depth
+        self.0.program.maximum_call_depth
     }
 
     pub(super) fn maximum_coroutines(&self) -> usize {
-        self.0.maximum_coroutines
+        self.0.program.maximum_coroutines
     }
 
     pub(super) fn maximum_channels(&self) -> usize {
-        self.0.maximum_channels
+        self.0.program.maximum_channels
     }
 
     pub(super) fn maximum_channel_values(&self) -> usize {
-        self.0.maximum_channel_values
+        self.0.program.maximum_channel_values
     }
 
     pub(super) fn external_root_capacity(&self) -> u32 {
-        self.0.external_root_capacity
+        self.0.program.external_root_capacity
     }
 
     pub(super) fn minimum_slice_cost(&self) -> u32 {
-        self.0.minimum_slice_cost
+        self.0.program.minimum_slice_cost
     }
 
     pub(super) fn maximum_slice_budget(&self) -> u32 {
@@ -1154,9 +848,9 @@ impl ExecutionImage {
                 .host_reference(value)
                 .filter(|entry| entry.live)
                 .map(|entry| entry.ty),
-            super::value::ReferenceDomain::Image => {
-                self.literal_reference(value).and(self.0.string_type)
-            }
+            super::value::ReferenceDomain::Image => self
+                .literal_reference(value)
+                .and(self.0.program.string_type),
             super::value::ReferenceDomain::Managed | super::value::ReferenceDomain::Reserved => {
                 None
             }
@@ -1168,12 +862,16 @@ impl ExecutionImage {
     }
 
     pub(super) fn type_name(&self, index: usize) -> Option<&[u16]> {
-        let name = *self.0.type_name_indices.get(index)?;
-        self.0.type_names.get(name).map(|units| units.as_ref())
+        let name = *self.0.program.type_name_indices.get(index)?;
+        self.0
+            .program
+            .type_names
+            .get(name)
+            .map(|units| units.as_ref())
     }
 
     pub(super) fn type_layout(&self, key: TypeKey) -> Option<&RuntimeTypeLayout> {
-        let index = checked_global_index(&self.0.type_offsets, key)?;
+        let index = checked_global_index(&self.0.program.type_offsets, key)?;
         self.0.type_layouts.get(index)
     }
 
@@ -1182,7 +880,7 @@ impl ExecutionImage {
     }
 
     pub(super) fn type_index(&self, key: TypeKey) -> Option<usize> {
-        checked_global_index(&self.0.type_offsets, key)
+        checked_global_index(&self.0.program.type_offsets, key)
     }
 
     pub(super) fn type_id(&self, key: TypeKey) -> Option<u32> {
@@ -1190,39 +888,54 @@ impl ExecutionImage {
     }
 
     pub(super) fn type_key(&self, index: usize) -> Option<TypeKey> {
-        self.0.type_keys.get(index).copied()
+        self.0.program.type_keys.get(index).copied()
     }
 
     pub(super) fn is_class(&self, key: TypeKey) -> bool {
         self.type_index(key)
-            .and_then(|index| self.0.class_types.get(index))
+            .and_then(|index| self.0.program.class_types.get(index))
             .copied()
             .unwrap_or(false)
     }
 
     pub(super) fn type_initializer(&self, key: TypeKey) -> Option<usize> {
         let index = self.type_index(key)?;
-        self.0.type_initializers.get(index).copied().flatten()
+        self.0
+            .program
+            .type_initializers
+            .get(index)
+            .copied()
+            .flatten()
     }
 
     pub(super) fn type_superclass(&self, key: TypeKey) -> Option<TypeKey> {
         let index = self.type_index(key)?;
-        self.0.type_superclasses.get(index).copied().flatten()
+        self.0
+            .program
+            .type_superclasses
+            .get(index)
+            .copied()
+            .flatten()
     }
 
     pub(super) fn is_assignable(&self, actual: TypeKey, target: TypeKey) -> bool {
-        checked_global_index(&self.0.type_offsets, actual)
-            .and_then(|index| self.0.assignable_types.get(index))
+        checked_global_index(&self.0.program.type_offsets, actual)
+            .and_then(|index| self.0.program.assignable_types.get(index))
             .is_some_and(|types| types.contains(&target))
     }
 
     pub(super) fn array_element_type(&self, array: TypeKey) -> Option<ResolvedValueType> {
-        let index = checked_global_index(&self.0.type_offsets, array)?;
-        self.0.array_element_types.get(index).copied().flatten()
+        let index = checked_global_index(&self.0.program.type_offsets, array)?;
+        self.0
+            .program
+            .array_element_types
+            .get(index)
+            .copied()
+            .flatten()
     }
 
     pub(super) fn field(&self, index: usize) -> Option<&ResolvedField> {
-        self.0.fields.get(index)
+        self.0.program.fields.get(index)
     }
 
     pub(super) fn record_layout(&self, ty: TypeKey) -> Option<&super::record::RecordLayout> {
@@ -1230,34 +943,41 @@ impl ExecutionImage {
     }
 
     pub(super) fn fields(&self) -> &[ResolvedField] {
-        &self.0.fields
+        &self.0.program.fields
     }
 
     pub(super) fn static_layout(&self) -> &FrameLayout {
-        &self.0.static_layout
+        &self.0.program.static_layout
     }
 
     pub(super) fn literal(&self, index: usize) -> Option<&ResolvedLiteral> {
-        let canonical = *self.0.literal_ids.get(index)?;
-        self.0.literals.get(canonical)
+        let canonical = *self.0.program.literal_ids.get(index)?;
+        self.0.program.literals.get(canonical)
     }
 
     pub(super) fn literal_bytes(&self, literal: ResolvedLiteral) -> &[u8] {
-        literal.bytes.slice(&self.0.artifact_bytes)
+        literal.bytes.slice(&self.0.program.artifact_bytes)
     }
 
     pub(super) fn literal_reference(&self, value: Ref32) -> Option<ResolvedLiteral> {
         (value.domain() == super::value::ReferenceDomain::Image)
-            .then(|| self.0.literals.get(value.payload() as usize).copied())
+            .then(|| {
+                self.0
+                    .program
+                    .literals
+                    .get(value.payload() as usize)
+                    .copied()
+            })
             .flatten()
     }
 
     pub(super) fn string_type(&self) -> Option<TypeKey> {
-        self.0.string_type
+        self.0.program.string_type
     }
 
     pub(super) fn runtime_exception_type(&self, tag: u8) -> Option<TypeKey> {
         self.0
+            .program
             .runtime_exception_types
             .get(tag.checked_sub(1)? as usize)
             .copied()
@@ -1267,11 +987,419 @@ impl ExecutionImage {
     pub(super) fn empty_string(&self) -> Option<RuntimeValue> {
         let index = self
             .0
+            .program
             .literals
             .iter()
             .position(|literal| literal.code_units == 0)?;
         Some(RuntimeValue::Reference(Ref32::image(index as u32)?))
     }
+}
+
+pub(crate) fn prepare_program(
+    artifact: &VerifiedArtifact,
+) -> Result<PreparedProgram, AdmissionError> {
+    let decoded = artifact.decoded();
+    let function_offsets = offsets(decoded.modules.iter().map(|module| module.functions.len()))?;
+    let block_offsets = offsets(decoded.modules.iter().map(|module| module.blocks.len()))?;
+    let constant_offsets = offsets(decoded.modules.iter().map(|module| module.constants.len()))?;
+    let type_offsets = offsets(decoded.modules.iter().map(|module| module.types.len()))?;
+    let type_keys = resolve_type_keys(&type_offsets)?;
+    let field_offsets = offsets(decoded.modules.iter().map(|module| module.fields.len()))?;
+    let literal_offsets = offsets(
+        decoded
+            .modules
+            .iter()
+            .map(|module| module.utf16_literals.len()),
+    )?;
+    // Only payload-relative offsets are retained. Header size affects allocation
+    // charges, which are independently derived for each admitted machine.
+    let field_layouts =
+        derive_type_layouts(decoded, &type_offsets, &field_offsets, HeaderFormat::Legacy)?;
+    let (fields, _static_slot_count) =
+        resolve_fields(decoded, &type_offsets, &field_offsets, &field_layouts)?;
+    let static_atoms = fields
+        .iter()
+        .filter(|field| field.static_slot.is_some())
+        .map(|field| physical_atom(field.value_type))
+        .collect::<Result<Vec<_>, _>>()?;
+    let static_layout = FrameLayout::derive_scalars(&static_atoms)
+        .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+    let total_types = *type_offsets.last().ok_or(AdmissionError::InvalidEntry)?;
+    let mut type_initializers = reserved(total_types)?;
+    let mut type_superclasses = reserved(total_types)?;
+    let mut class_types = reserved(total_types)?;
+    for (module_id, module) in decoded.modules.iter().enumerate() {
+        for nominal in &module.types {
+            if let NominalType::Class {
+                super_type,
+                initializer,
+                ..
+            } = nominal
+            {
+                type_initializers.push(
+                    initializer
+                        .map(|initializer| {
+                            function_offsets[module_id]
+                                .checked_add(initializer.0 as usize)
+                                .filter(|index| *index < function_offsets[module_id + 1])
+                                .ok_or(AdmissionError::InvalidEntry)
+                        })
+                        .transpose()?,
+                );
+                type_superclasses.push(resolve_type(decoded, module_id, *super_type));
+                class_types.push(true);
+            } else {
+                type_initializers.push(None);
+                type_superclasses.push(None);
+                class_types.push(false);
+            }
+        }
+    }
+    let mut assignable_type_sets =
+        reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+    for (module, nominal_types) in decoded.modules.iter().enumerate() {
+        for ty in 0..nominal_types.types.len() {
+            assignable_type_sets.push(assignable_types(
+                decoded,
+                TypeKey {
+                    module: checked_u32(module)?,
+                    ty: checked_u32(ty)?,
+                },
+            )?);
+        }
+    }
+    let mut array_element_types =
+        reserved(*type_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+    for (module, nominal_types) in decoded.modules.iter().enumerate() {
+        for nominal in &nominal_types.types {
+            array_element_types.push(match nominal {
+                NominalType::Array { element, .. } => {
+                    Some(resolve_value_type(decoded, module, *element)?)
+                }
+                _ => None,
+            });
+        }
+    }
+    let string_type = resolve_standard_string_type(decoded)?;
+    let mut runtime_exception_types = [None; 8];
+    for (module_id, module) in decoded.modules.iter().enumerate() {
+        for (type_id, nominal) in module.types.iter().enumerate() {
+            if let NominalType::Class { flags, .. } = nominal {
+                let tag = flags >> 3;
+                if tag != 0 {
+                    runtime_exception_types[tag as usize - 1] = Some(TypeKey {
+                        module: module_id as u32,
+                        ty: type_id as u32,
+                    });
+                }
+            }
+        }
+    }
+    let (mut literals, literal_ids) = resolve_literals(decoded, &literal_offsets)?;
+    if string_type.is_some() && !literals.iter().any(|literal| literal.code_units == 0) {
+        let mut with_empty = literals.into_vec();
+        with_empty
+            .try_reserve_exact(1)
+            .map_err(|_| AdmissionError::AllocationFailed)?;
+        with_empty.push(ResolvedLiteral {
+            bytes: ByteRange { start: 0, end: 0 },
+            code_units: 0,
+        });
+        literals = with_empty.into_boxed_slice();
+    }
+    let mut constants = reserved(
+        *constant_offsets
+            .last()
+            .ok_or(AdmissionError::InvalidEntry)?,
+    )?;
+    for (module_id, module) in decoded.modules.iter().enumerate() {
+        for constant in &module.constants {
+            constants.push(resolve_constant(
+                constant,
+                module_id,
+                &literal_offsets,
+                &literal_ids,
+            )?);
+        }
+    }
+
+    let total_functions = *function_offsets
+        .last()
+        .ok_or(AdmissionError::InvalidEntry)?;
+    let mut functions = reserved(total_functions)?;
+    let mut registers_per_frame = 0_usize;
+    for (module_id, module) in decoded.modules.iter().enumerate() {
+        for (function_id, function) in module.functions.iter().enumerate() {
+            let signature_key = resolve_type(decoded, module_id, function.signature)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let NominalType::Function { result, .. } =
+                &decoded.modules[signature_key.module as usize].types[signature_key.ty as usize]
+            else {
+                return Err(AdmissionError::InvalidEntry);
+            };
+            let mut registers = reserved(function.values.len())?;
+            for value in &function.values {
+                registers.push(resolve_value_type(decoded, module_id, value.semantic_type)?);
+            }
+            let frame_layout = FrameLayout::derive(&function.values)
+                .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+            let mut register_accesses = reserved(registers.len())?;
+            for (register, value_type) in registers.iter().enumerate() {
+                register_accesses.push(frame_layout.value_access(value_type.kind, register));
+            }
+            let local_roots = module
+                .safepoint_roots
+                .iter()
+                .filter(|roots| roots.function.0 as usize == function_id);
+            let mut safepoints = Vec::new();
+            let first_block = function.first_block.0 as usize;
+            let block_end = first_block
+                .checked_add(function.block_count as usize)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            let expected_safepoints = (first_block..block_end)
+                .try_fold(0_usize, |total, block| {
+                    total.checked_add(module.code.get(block)?.instructions.len())
+                })
+                .ok_or(AdmissionError::InvalidEntry)?;
+            safepoints
+                .try_reserve_exact(expected_safepoints)
+                .map_err(|_| AdmissionError::AllocationFailed)?;
+            for roots in local_roots {
+                let local_block = roots.block.0 as usize;
+                let code = module
+                    .code
+                    .get(local_block)
+                    .ok_or(AdmissionError::InvalidEntry)?;
+                if module
+                    .blocks
+                    .get(local_block)
+                    .is_none_or(|block| block.owner_function.0 as usize != function_id)
+                    || roots.instruction_boundary as usize >= code.instructions.len()
+                {
+                    return Err(AdmissionError::InvalidEntry);
+                }
+                let block = block_offsets[module_id]
+                    .checked_add(local_block)
+                    .ok_or(AdmissionError::StoragePlanOverflow)?;
+                if safepoints
+                    .last()
+                    .is_some_and(|previous: &ResolvedSafepoint| {
+                        (previous.block, previous.instruction_boundary)
+                            >= (block, roots.instruction_boundary)
+                    })
+                {
+                    return Err(AdmissionError::InvalidEntry);
+                }
+                safepoints.push(ResolvedSafepoint {
+                    block,
+                    instruction_boundary: roots.instruction_boundary,
+                    map: SafepointMap::derive(&frame_layout, &roots.references)
+                        .map_err(|_| AdmissionError::InvalidEntry)?,
+                });
+            }
+            if safepoints.len() != expected_safepoints {
+                return Err(AdmissionError::InvalidEntry);
+            }
+            registers_per_frame = registers_per_frame.max(registers.len());
+            let exception_start = function.first_exception as usize;
+            let exception_end = exception_start
+                .checked_add(function.exception_count as usize)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let entries = module
+                .exceptions
+                .get(exception_start..exception_end)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let mut handlers = reserved(entries.len())?;
+            for entry in entries {
+                let protected_start = block_offsets[module_id]
+                    .checked_add(entry.first_protected_block.0 as usize)
+                    .ok_or(AdmissionError::StoragePlanOverflow)?;
+                handlers.push(ResolvedExceptionHandler {
+                    protected_start,
+                    protected_end: protected_start
+                        .checked_add(entry.protected_block_count as usize)
+                        .ok_or(AdmissionError::StoragePlanOverflow)?,
+                    catch_type: if entry.catch_type.0 == u32::MAX {
+                        None
+                    } else {
+                        Some(
+                            resolve_type(decoded, module_id, entry.catch_type)
+                                .ok_or(AdmissionError::InvalidEntry)?,
+                        )
+                    },
+                    handler_block: block_offsets[module_id]
+                        .checked_add(entry.handler_block.0 as usize)
+                        .ok_or(AdmissionError::StoragePlanOverflow)?,
+                    exception_register: entry.exception_register,
+                });
+            }
+            // Stable ordering preserves source order for catches of the same region.
+            handlers.sort_by_key(|handler| handler.protected_end - handler.protected_start);
+            functions.push(ResolvedFunction {
+                key: FunctionKey {
+                    module: module_id as u32,
+                    function: function_id as u32,
+                },
+                register_count: function.register_count as usize,
+                parameter_count: function.parameter_count as usize,
+                registers: registers.into_boxed_slice(),
+                register_accesses: register_accesses.into_boxed_slice(),
+                frame_layout,
+                safepoints: safepoints.into_boxed_slice(),
+                handlers: handlers.into_boxed_slice(),
+                result: resolve_value_type(decoded, signature_key.module as usize, *result)?,
+                first_block: block_offsets[module_id]
+                    .checked_add(function.first_block.0 as usize)
+                    .ok_or(AdmissionError::StoragePlanOverflow)?,
+                block_count: function.block_count as usize,
+                static_owner: if function.flags & (1 << 1) != 0 {
+                    resolve_type(decoded, module_id, function.owner).filter(|owner| {
+                        matches!(
+                            decoded.modules[owner.module as usize].types[owner.ty as usize],
+                            NominalType::Class { .. }
+                        )
+                    })
+                } else {
+                    None
+                },
+            });
+        }
+    }
+
+    let dispatch_entries = resolve_dispatch_entries(
+        decoded,
+        &function_offsets,
+        &type_offsets,
+        &assignable_type_sets,
+        &functions,
+    )?;
+
+    let dispatch_offsets = resolve_dispatch_offsets(&dispatch_entries, type_keys.len())?;
+
+    let mut blocks = reserved(*block_offsets.last().ok_or(AdmissionError::InvalidEntry)?)?;
+    let instruction_resolution = InstructionResolution {
+        function_offsets: &function_offsets,
+        block_offsets: &block_offsets,
+        constant_offsets: &constant_offsets,
+        fields: &fields,
+        field_offsets: &field_offsets,
+    };
+    let mut host_calls = Vec::new();
+    for (module_id, module) in decoded.modules.iter().enumerate() {
+        for (block_id, block) in module.blocks.iter().enumerate() {
+            let function = function_offsets[module_id]
+                .checked_add(block.owner_function.0 as usize)
+                .ok_or(AdmissionError::StoragePlanOverflow)?;
+            let code = module
+                .code
+                .get(block_id)
+                .ok_or(AdmissionError::InvalidEntry)?;
+            let mut instructions = reserved(code.instructions.len())?;
+            for (instruction_id, instruction) in code.instructions.iter().enumerate() {
+                if matches!(
+                    instruction,
+                    Instruction::CapabilityCallSync { .. }
+                        | Instruction::CapabilityCallAsync { .. }
+                ) {
+                    host_calls
+                        .try_reserve(1)
+                        .map_err(|_| AdmissionError::AllocationFailed)?;
+                    host_calls.push((blocks.len(), instruction_id));
+                }
+                instructions.push(resolve_instruction(
+                    decoded,
+                    module_id,
+                    &instruction_resolution,
+                    instruction,
+                )?);
+            }
+            blocks.push(ResolvedBlock {
+                function,
+                fixed_cost: code.fixed_cost,
+                instructions: instructions.into_boxed_slice(),
+            });
+        }
+    }
+
+    // Deduplicate by the verified metadata identity, so repeated type names do not amplify storage.
+    // The shared UTF-16 pool is bounded by twice the source metadata bytes plus one index per type.
+    let mut name_ids = std::collections::HashMap::new();
+    name_ids
+        .try_reserve(type_keys.len())
+        .map_err(|_| AdmissionError::StoragePlanOverflow)?;
+    let mut type_names = reserved(type_keys.len())?;
+    let mut type_name_indices = reserved(type_keys.len())?;
+    for (module_id, module) in decoded.modules.iter().enumerate() {
+        for ty in &module.types {
+            let name = match ty {
+                NominalType::Class { name, .. }
+                | NominalType::Interface { name, .. }
+                | NominalType::Array { name, .. }
+                | NominalType::Function { name, .. }
+                | NominalType::InlineValue { name, .. } => *name,
+            };
+            let index = if let Some(index) = name_ids.get(&(module_id, name)) {
+                *index
+            } else {
+                let bytes = module
+                    .strings
+                    .get(name as usize)
+                    .ok_or(AdmissionError::InvalidEntry)?
+                    .slice(&decoded.bytes);
+                let text = std::str::from_utf8(bytes).map_err(|_| AdmissionError::InvalidEntry)?;
+                let index = type_names.len();
+                let mut units = reserved(text.encode_utf16().count())?;
+                units.extend(text.encode_utf16());
+                type_names.push(units.into_boxed_slice());
+                name_ids.insert((module_id, name), index);
+                index
+            };
+            type_name_indices.push(index);
+        }
+    }
+
+    let entry_key = artifact.entry();
+    let entry = function_offsets
+        .get(entry_key.module as usize)
+        .and_then(|offset| offset.checked_add(entry_key.function as usize))
+        .filter(|entry| *entry < functions.len())
+        .ok_or(AdmissionError::InvalidEntry)?;
+    Ok(PreparedProgram {
+        content_hash: artifact.content_hash(),
+        artifact_bytes: decoded.bytes.clone(),
+        entry,
+        functions: functions.into_boxed_slice(),
+        dispatch_entries,
+        dispatch_offsets,
+        blocks: blocks.into_boxed_slice(),
+        constants: constants.into_boxed_slice(),
+        type_offsets,
+        type_keys,
+        type_name_indices: type_name_indices.into_boxed_slice(),
+        type_names: type_names.into_boxed_slice(),
+        type_initializers: type_initializers.into_boxed_slice(),
+        type_superclasses: type_superclasses.into_boxed_slice(),
+        class_types: class_types.into_boxed_slice(),
+        assignable_types: assignable_type_sets.into_boxed_slice(),
+        array_element_types: array_element_types.into_boxed_slice(),
+        literals,
+        literal_ids,
+        string_type,
+        runtime_exception_types,
+        registers_per_frame,
+        maximum_call_depth: decoded.manifest.maximum_call_depth as usize,
+        maximum_coroutines: decoded.manifest.maximum_coroutines as usize,
+        maximum_channels: decoded.manifest.maximum_channels as usize,
+        maximum_channel_values: decoded.manifest.maximum_channel_values as usize,
+        external_root_capacity: decoded.manifest.maximum_host_requests,
+        minimum_slice_cost: decoded.manifest.minimum_slice_cost,
+        fields,
+        static_layout,
+        field_offsets,
+        host_calls: host_calls.into_boxed_slice(),
+        #[cfg(feature = "execution-prototype")]
+        prototypes: std::array::from_fn(|_| std::sync::OnceLock::new()),
+    })
 }
 
 fn resolve_standard_string_type(
@@ -1995,11 +2123,16 @@ fn resolve_field_index(
 }
 
 struct InstructionResolution<'a> {
+    fields: &'a [ResolvedField],
     function_offsets: &'a [usize],
     block_offsets: &'a [usize],
     constant_offsets: &'a [usize],
     field_offsets: &'a [usize],
+}
+
+struct CapabilityResolution<'a> {
     fields: &'a [ResolvedField],
+    field_offsets: &'a [usize],
     functions: &'a [ResolvedFunction],
     capabilities: &'a [Option<ResolvedCapability>],
     string_type: Option<TypeKey>,
@@ -2013,7 +2146,6 @@ struct InstructionResolution<'a> {
 fn resolve_instruction(
     artifact: &DecodedArtifact,
     module: usize,
-    function: usize,
     resolution: &InstructionResolution<'_>,
     instruction: &Instruction,
 ) -> Result<ResolvedInstruction, AdmissionError> {
@@ -2521,47 +2653,25 @@ fn resolve_instruction(
             capability,
             operation,
             args,
-        } => {
-            validate_capability_call(
-                resolution,
-                function,
-                *dst,
-                *capability,
-                *operation,
-                args,
-                false,
-            )?;
-            ResolvedInstruction::CapabilityCallSync {
-                dst: *dst,
-                capability: *capability,
-                operation: *operation,
-                args: args.clone(),
-            }
-        }
+        } => ResolvedInstruction::CapabilityCallSync {
+            dst: *dst,
+            capability: *capability,
+            operation: *operation,
+            args: args.clone(),
+        },
         Instruction::CapabilityCallAsync {
             dst,
             capability,
             operation,
             args,
             resume_block,
-        } => {
-            validate_capability_call(
-                resolution,
-                function,
-                *dst,
-                *capability,
-                *operation,
-                args,
-                true,
-            )?;
-            ResolvedInstruction::CapabilityCallAsync {
-                dst: *dst,
-                capability: *capability,
-                operation: *operation,
-                args: args.clone(),
-                resume_block: block(*resume_block)?,
-            }
-        }
+        } => ResolvedInstruction::CapabilityCallAsync {
+            dst: *dst,
+            capability: *capability,
+            operation: *operation,
+            args: args.clone(),
+            resume_block: block(*resume_block)?,
+        },
         Instruction::Jump { target } => ResolvedInstruction::Jump {
             target: block(*target)?,
         },
@@ -2602,7 +2712,7 @@ fn resolve_instruction(
 }
 
 fn validate_capability_call(
-    resolution: &InstructionResolution<'_>,
+    resolution: &CapabilityResolution<'_>,
     function: usize,
     destination: u16,
     capability: u32,
@@ -2663,7 +2773,7 @@ fn validate_capability_call(
                             )?;
                             fn physical(
                                 layout: &super::record::RecordLayout,
-                                resolution: &InstructionResolution<'_>,
+                                resolution: &CapabilityResolution<'_>,
                             ) -> Option<()> {
                                 let index =
                                     checked_global_index(resolution.type_offsets, layout.ty)?;
@@ -2714,7 +2824,7 @@ fn validate_capability_call(
 fn host_type_matches(
     actual: ResolvedValueType,
     expected: HostValueType,
-    resolution: &InstructionResolution<'_>,
+    resolution: &CapabilityResolution<'_>,
 ) -> bool {
     match expected {
         HostValueType::Unit | HostValueType::Record => false,
@@ -3105,6 +3215,84 @@ mod tests {
     use crate::execution::{error::AdmissionError, fixtures, FunctionKey};
 
     #[test]
+    fn shared_program_keeps_heap_layout_and_limits_per_admission() {
+        let artifact = fixtures::field_roundtrip_artifact();
+        let first = ExecutionImage::admit(artifact.clone(), fixtures::profile()).unwrap();
+        let mut large = fixtures::profile();
+        large.heap_bytes = 1 << 31;
+        large.maximum_slice_budget -= 1;
+        let second = ExecutionImage::admit(artifact.clone(), large).unwrap();
+        assert!(Arc::ptr_eq(&first.0.program, &second.0.program));
+        assert!(!Arc::ptr_eq(&first.0, &second.0));
+        assert!(std::ptr::eq(first.functions(), second.functions()));
+        assert!(std::ptr::eq(first.fields(), second.fields()));
+        assert_eq!(8, first.storage_plan().header_format.bytes());
+        assert_eq!(12, second.storage_plan().header_format.bytes());
+        assert_eq!(1 << 20, first.storage_plan().heap_arena_bytes);
+        assert_eq!(1 << 31, second.storage_plan().heap_arena_bytes);
+        assert_ne!(first.maximum_slice_budget(), second.maximum_slice_budget());
+        for rejected in fixtures::profiles_below_each_manifest_limit() {
+            assert!(ExecutionImage::admit(artifact.clone(), rejected).is_err());
+        }
+    }
+
+    #[test]
+    fn concurrent_admission_publishes_one_program_and_releases_last_owner() {
+        let artifact = fixtures::scalar_artifact();
+        let barrier = std::sync::Barrier::new(8);
+        let images = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let artifact = artifact.clone();
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        ExecutionImage::admit(artifact, fixtures::profile()).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let weak = Arc::downgrade(&images[0].0.program);
+        for image in &images {
+            assert!(Arc::ptr_eq(&images[0].0.program, &image.0.program));
+        }
+        drop(artifact);
+        assert!(weak.upgrade().is_some());
+        drop(images);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[cfg(feature = "execution-prototype")]
+    #[test]
+    fn typed_code_is_shared_by_program_and_mode() {
+        use super::super::prototype::ExecutionMode;
+        let artifact = fixtures::scalar_artifact();
+        let first = ExecutionImage::admit(artifact.clone(), fixtures::profile()).unwrap();
+        let second = ExecutionImage::admit(artifact.clone(), fixtures::profile()).unwrap();
+        let mut weak = Vec::new();
+        for mode in [
+            ExecutionMode::Packed,
+            ExecutionMode::Slots,
+            ExecutionMode::PackedBatch,
+            ExecutionMode::PackedSimd,
+            ExecutionMode::Offsets,
+        ] {
+            let a = first.prepare_execution(mode).unwrap();
+            let b = second.prepare_execution(mode).unwrap();
+            assert!(Arc::ptr_eq(&a, &b));
+            weak.push(Arc::downgrade(&a));
+        }
+        drop(artifact);
+        drop(first);
+        drop(second);
+        assert!(weak.iter().all(|entry| entry.upgrade().is_none()));
+    }
+
+    #[test]
     fn method_results_allow_only_assignable_reference_covariance() {
         let base = TypeKey { module: 0, ty: 0 };
         let child = TypeKey { module: 0, ty: 1 };
@@ -3184,12 +3372,13 @@ mod tests {
         let image =
             ExecutionImage::admit(fixtures::dynamic_dispatch_artifact(), fixtures::profile())
                 .unwrap();
-        assert!(!image.0.dispatch_entries.is_empty());
+        assert!(!image.0.program.dispatch_entries.is_empty());
         for actual_type in 0..image.type_count() {
             let key = image.type_key(actual_type).unwrap();
             for declaration in 0..image.functions().len() {
                 let expected = image
                     .0
+                    .program
                     .dispatch_entries
                     .iter()
                     .find(|entry| {

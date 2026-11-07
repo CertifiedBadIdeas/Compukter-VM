@@ -2056,3 +2056,27 @@ fn inline_records_copy_nested_values_without_snapshot_or_vector_allocations() {
     assert_eq!(0, session.resource_snapshot().machine.heap_used_bytes);
     assert_eq!(0, session.resource_snapshot().machine.live_objects);
 }
+
+#[test]
+fn shared_program_revalidates_each_capability_and_record_schema() {
+    let artifact = fixtures::record_response_artifact(13, false);
+    let schema = record_schema();
+    let operations = [OperationSchema::asynchronous_record(&[], &schema)];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let valid = Session::admit(artifact.clone(), profile(), &[binding]).unwrap();
+    let mut wrong = record_schema();
+    wrong.fields[0].value_type = HostValueType::F64;
+    let operations = [OperationSchema::asynchronous_record(&[], &wrong)];
+    let wrong_binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    assert!(matches!(
+        Session::admit(artifact.clone(), profile(), &[wrong_binding]),
+        Err(AdmissionError::CapabilitySchema { .. })
+    ));
+    assert!(matches!(
+        Session::admit(artifact.clone(), profile(), &[]),
+        Err(AdmissionError::MissingCapability { .. })
+    ));
+    drop(valid);
+    // A failed binding must not poison either the program cache or later admission.
+    Session::admit(artifact, profile(), &[binding]).unwrap();
+}

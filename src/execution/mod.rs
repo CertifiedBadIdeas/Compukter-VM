@@ -38,6 +38,7 @@ pub use host::{
     OperationSchema, OwnedHostFailure, QuotaExhaustion, QuotaKind, RequestId, ResumeError, TaskId,
     MAXIMUM_HOST_BYTE_ARRAY_BYTES, MAXIMUM_HOST_FAILURE_DETAIL_BYTES,
 };
+pub(crate) use image::{prepare_program, PreparedProgram};
 pub(crate) use machine::FailureStack;
 pub use session::Session;
 
