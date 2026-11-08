@@ -396,6 +396,50 @@ impl Machine {
         (self.image.shared_program_identity(), typed)
     }
 
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(crate) fn allocation_layout_identity(&self) -> usize {
+        self.image.allocation_layout_statistics().0
+    }
+
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(crate) fn write_memory_statistics(
+        &self,
+        process: usize,
+        output: &mut dyn core::fmt::Write,
+    ) -> core::fmt::Result {
+        let plan = self.image.storage_plan();
+        let used = self.resource_snapshot();
+        let (layout_identity, layout_bytes, header_bytes) =
+            self.image.allocation_layout_statistics();
+        for (name, bytes) in [
+            ("allocation_layout_identity", layout_identity as u64),
+            ("allocation_layout_content_bytes", layout_bytes as u64),
+            ("allocation_header_bytes", u64::from(header_bytes)),
+            ("heap_capacity", plan.heap_arena_bytes),
+            ("heap_used", used.heap_used_bytes),
+            ("heap_allocator", plan.heap_allocator_bytes),
+            ("frame_arena", plan.frame_arena_bytes),
+            ("frame_records", plan.frame_record_bytes),
+            ("task_scheduler", plan.task_scheduler_bytes),
+            ("channels", plan.channel_bytes),
+            ("statics", plan.static_bytes),
+            ("type_initialization", plan.type_initialization_bytes),
+            ("external_roots", plan.external_root_bytes),
+            ("pending_state", plan.pending_state_bytes),
+            ("machine_fixed", plan.machine_fixed_bytes),
+            ("admitted_mutable_total", plan.mutable_resident_bytes()),
+            ("task_capacity", used.task_capacity),
+            ("live_tasks", used.live_tasks),
+        ] {
+            writeln!(
+                output,
+                "{process}\t{}\t{name}\t{bytes}",
+                self.image.shared_program_identity()
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn new(image: ExecutionImage) -> Result<Self, AdmissionError> {
         Self::new_with_trace(image, true)
     }

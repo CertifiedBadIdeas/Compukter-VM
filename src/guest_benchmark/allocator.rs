@@ -8,6 +8,12 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn added(bytes: usize) {
+    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK.fetch_max(live, Ordering::Relaxed);
+}
 struct CountedSystem;
 #[global_allocator]
 static ALLOCATOR: CountedSystem = CountedSystem;
@@ -19,7 +25,7 @@ unsafe impl GlobalAlloc for CountedSystem {
         // SAFETY: caller provides the GlobalAlloc layout contract unchanged.
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            added(layout.size());
         }
         pointer
     }
@@ -27,7 +33,7 @@ unsafe impl GlobalAlloc for CountedSystem {
         // SAFETY: same contract as System::alloc_zeroed.
         let pointer = unsafe { System.alloc_zeroed(layout) };
         if !pointer.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            added(layout.size());
         }
         pointer
     }
@@ -41,7 +47,7 @@ unsafe impl GlobalAlloc for CountedSystem {
         let replacement = unsafe { System.realloc(pointer, layout, size) };
         if !replacement.is_null() {
             if size >= layout.size() {
-                LIVE.fetch_add(size - layout.size(), Ordering::Relaxed);
+                added(size - layout.size());
             } else {
                 LIVE.fetch_sub(layout.size() - size, Ordering::Relaxed);
             }
@@ -51,4 +57,12 @@ unsafe impl GlobalAlloc for CountedSystem {
 }
 pub(super) fn live_bytes() -> usize {
     LIVE.load(Ordering::Relaxed)
+}
+
+pub(super) fn reset_peak() {
+    PEAK.store(live_bytes(), Ordering::Relaxed);
+}
+
+pub(super) fn peak_bytes() -> usize {
+    PEAK.load(Ordering::Relaxed)
 }

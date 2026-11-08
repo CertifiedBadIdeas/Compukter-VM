@@ -270,8 +270,17 @@ mod allocation_counter;
 #[path = "guest_benchmark/sharing.rs"]
 mod sharing_benchmark;
 
+#[cfg(feature = "program-sharing-benchmark")]
+#[path = "guest_benchmark/memory.rs"]
+mod memory_benchmark;
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(feature = "program-sharing-benchmark")]
+    if args.first().is_some_and(|arg| arg == "memory") {
+        memory_benchmark::main(&args[1..]);
+        return;
+    }
     if args.first().is_some_and(|argument| argument == "inspect") {
         assert_eq!(args.len(), 2, "usage: guest-benchmark inspect ARTIFACT");
         let artifact = verify_artifact(

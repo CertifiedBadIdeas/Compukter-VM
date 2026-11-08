@@ -402,6 +402,34 @@ impl ComputerMachine {
         self.sessions[0].session.shared_code_identity()
     }
 
+    #[cfg(feature = "program-sharing-benchmark")]
+    #[allow(dead_code)]
+    pub(crate) fn write_memory_statistics(
+        &self,
+        output: &mut dyn core::fmt::Write,
+    ) -> core::fmt::Result {
+        for (index, frame) in self.sessions.iter().enumerate() {
+            frame.session.write_memory_statistics(index, output)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "program-sharing-benchmark")]
+    #[allow(dead_code)]
+    pub(crate) fn process_layout_identities(&self) -> impl Iterator<Item = usize> + '_ {
+        self.sessions
+            .iter()
+            .map(|frame| frame.session.allocation_layout_identity())
+    }
+
+    #[cfg(feature = "program-sharing-benchmark")]
+    #[allow(dead_code)]
+    pub(crate) fn process_program_identities(&self) -> impl Iterator<Item = usize> + '_ {
+        self.sessions
+            .iter()
+            .map(|frame| frame.session.shared_code_identity().0)
+    }
+
     #[cfg(all(feature = "program-sharing-benchmark", feature = "execution-prototype"))]
     #[allow(dead_code)]
     pub(crate) fn prepare_execution_benchmark(

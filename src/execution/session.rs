@@ -120,6 +120,20 @@ impl Session {
         self.machine.shared_code_identity()
     }
 
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(crate) fn allocation_layout_identity(&self) -> usize {
+        self.machine.allocation_layout_identity()
+    }
+
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(crate) fn write_memory_statistics(
+        &self,
+        process: usize,
+        output: &mut dyn core::fmt::Write,
+    ) -> core::fmt::Result {
+        self.machine.write_memory_statistics(process, output)
+    }
+
     pub(crate) fn failure_stack(&self) -> super::machine::FailureStack {
         self.machine.failure_stack()
     }

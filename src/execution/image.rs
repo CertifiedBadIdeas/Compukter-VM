@@ -566,6 +566,27 @@ impl PreparedProgram {
 }
 
 impl ExecutionImage {
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(super) fn allocation_layout_statistics(&self) -> (usize, usize, u32) {
+        let layouts = &self.admission.type_layouts;
+        let bytes = core::mem::size_of_val(layouts.as_ref())
+            + layouts
+                .iter()
+                .map(|layout| match layout {
+                    RuntimeTypeLayout::Object(object) => {
+                        core::mem::size_of_val(object.fields.as_ref())
+                            + core::mem::size_of_val(object.reference_offsets.as_ref())
+                    }
+                    _ => 0,
+                })
+                .sum::<usize>();
+        (
+            layouts.as_ptr() as usize,
+            bytes,
+            self.admission.storage_plan.header_format.bytes(),
+        )
+    }
+
     #[cfg(feature = "execution-prototype")]
     pub(super) fn prepare_execution(
         &self,

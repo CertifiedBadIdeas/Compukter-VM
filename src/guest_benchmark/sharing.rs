@@ -8,7 +8,7 @@
 use super::*;
 use std::collections::HashSet;
 
-fn text(machine: &mut ComputerMachine) -> String {
+pub(super) fn text(machine: &mut ComputerMachine) -> String {
     let mut result = String::new();
     for row in machine
         .terminal_mut()
@@ -26,7 +26,7 @@ fn text(machine: &mut ComputerMachine) -> String {
     format!("{}\n", result.trim_end_matches('\n'))
 }
 
-fn settle(machines: &mut [ComputerMachine], shell: bool) {
+pub(super) fn settle(machines: &mut [ComputerMachine], shell: bool) {
     let mut finished = vec![false; machines.len()];
     for _ in 0..100_000 {
         for (machine, finished) in machines.iter_mut().zip(&mut finished) {
@@ -37,7 +37,9 @@ fn settle(machines: &mut [ComputerMachine], shell: bool) {
                 .advance(SLICE, SLICE, 64)
                 .expect("population advance")
             {
-                ComputerAdvanceOutcome::SliceExhausted => {}
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::WaitingForTerminalEvent if shell => *finished = true,
                 ComputerAdvanceOutcome::Halted(None) if !shell => *finished = true,
                 other => panic!("unexpected population outcome: {other:?}"),
@@ -50,7 +52,7 @@ fn settle(machines: &mut [ComputerMachine], shell: bool) {
     panic!("population exceeded bounded advance count");
 }
 
-fn work(snapshot: ComputerResourceSnapshot) -> [u64; 6] {
+pub(super) fn work(snapshot: ComputerResourceSnapshot) -> [u64; 6] {
     [
         snapshot.fixed_guest_units,
         snapshot.dynamic_guest_units,
