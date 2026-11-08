@@ -575,6 +575,12 @@ pub(crate) fn encode_outcome(outcome: OwnedOutcome) -> Vec<u8> {
             encoder.u64(id);
             encoder
         }
+        OwnedOutcome::ProcessReplaced { previous, current } => {
+            let mut encoder = Encoder::new(15);
+            encoder.u64(previous);
+            encoder.u64(current);
+            encoder
+        }
         OwnedOutcome::WaitingForHostQuota => Encoder::new(11),
         OwnedOutcome::HostRequestBatch(requests) => {
             let mut encoder = Encoder::new(1);
@@ -1498,6 +1504,13 @@ mod tests {
         assert_eq!(
             vec![14, 8, 7, 6, 5, 4, 3, 2, 1],
             encode_outcome(OwnedOutcome::ProcessExited(id))
+        );
+        assert_eq!(
+            vec![15, 0, 0, 0, 0, 0, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1],
+            encode_outcome(OwnedOutcome::ProcessReplaced {
+                previous: 0,
+                current: id
+            })
         );
     }
 

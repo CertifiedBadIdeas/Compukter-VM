@@ -12,7 +12,7 @@ use crate::filesystem::{
 use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 
-fn rom(inputs: &Path) -> SystemImage {
+fn image_bytes(inputs: &Path) -> Arc<[u8]> {
     use sha2::{Digest, Sha256};
     let mut bytes = b"CPKTSYS\0".to_vec();
     bytes.extend_from_slice(&1_u16.to_le_bytes());
@@ -32,7 +32,7 @@ fn rom(inputs: &Path) -> SystemImage {
     }
     let digest = Sha256::digest(&bytes);
     bytes.extend_from_slice(&digest);
-    SystemImage::admit(bytes.into(), &FileSystemLimits::default()).unwrap()
+    bytes.into()
 }
 
 fn resident() -> [u64; 3] {
@@ -117,24 +117,28 @@ pub(super) fn main(args: &[String]) {
     assert_eq!(
         4,
         args.len(),
-        "usage: guest-benchmark memory INPUT_DIR REPORT_DIR POPULATION boot|root-shell"
+        "usage: guest-benchmark memory INPUT_DIR REPORT_DIR POPULATION boot|boot-exec|root-shell"
     );
     let inputs = Path::new(&args[0]);
     let directory = Path::new(&args[1]);
     let population: usize = args[2].parse().unwrap();
     assert!((1..=1000).contains(&population));
     let boot = match args[3].as_str() {
-        "boot" => true,
+        "boot" | "boot-exec" => true,
         "root-shell" => false,
         _ => panic!("mode"),
     };
     fs::create_dir_all(directory).unwrap();
-    let image = rom(inputs);
+    let bytes = image_bytes(inputs);
+    let independent = std::env::var_os("CPKT_BENCH_INDEPENDENT_IMAGE").is_some();
+    let image = (!independent)
+        .then(|| SystemImage::admit(bytes.clone(), &FileSystemLimits::default()).unwrap());
     let mut output = BufWriter::new(fs::File::create(directory.join("memory.tsv")).unwrap());
     writeln!(output, "phase\tpopulation\tprocess_depth\tunique_programs\tunique_allocation_layouts\tlive_requested\tpeak_requested\trss_kib\tpss_kib\tprivate_kib\tphase_cpu_ns\theap_capacity_per_computer\theap_used_per_computer\tadmitted_mutable_per_computer\tfixed\tdynamic\tmaintenance\tblocks\texecuted\tretired").unwrap();
     let mut machines = Vec::new();
     let _ = thread_cpu_ns();
-    // Input ROM/template and report buffers are outside the requested-byte baseline.
+    // Encoded distribution and report buffers are outside the requested-byte baseline.
+    // Independent mode includes per-computer admission; the control shares an admitted template.
     // ComputerMachine carrier storage is allocated after it and included in live bytes.
     let _ = resident();
     allocation_counter::reset_peak();
@@ -143,6 +147,9 @@ pub(super) fn main(args: &[String]) {
     let start = thread_cpu_ns();
     machines.try_reserve_exact(population).unwrap();
     for _ in 0..population {
+        let image = image.clone().unwrap_or_else(|| {
+            SystemImage::admit(bytes.clone(), &FileSystemLimits::default()).unwrap()
+        });
         let mut selected = profile(256 * 1024);
         selected.maximum_coroutines = 64;
         selected.maximum_channels = 64;
@@ -194,7 +201,7 @@ pub(super) fn main(args: &[String]) {
     }
     assert_eq!(
         machines[0].process_program_identities().count(),
-        if boot { 2 } else { 1 }
+        if args[3] == "boot" { 2 } else { 1 }
     );
     observe(
         &mut output,
@@ -209,14 +216,15 @@ pub(super) fn main(args: &[String]) {
     for machine in &mut machines {
         for _ in 0..1000 {
             let outcome = machine.advance(SLICE, SLICE, 64).unwrap();
-            if machine.process_program_identities().count() == if boot { 3 } else { 2 } {
+            if machine.process_program_identities().count() == if args[3] == "boot" { 3 } else { 2 }
+            {
                 break;
             }
             assert_eq!(outcome, ComputerAdvanceOutcome::SliceExhausted);
         }
         assert_eq!(
             machine.process_program_identities().count(),
-            if boot { 3 } else { 2 }
+            if args[3] == "boot" { 3 } else { 2 }
         );
     }
     observe(
@@ -233,7 +241,7 @@ pub(super) fn main(args: &[String]) {
         assert!(sharing_benchmark::text(machine).contains("ready\n20000100000\n>\n"));
         assert_eq!(
             machine.process_program_identities().count(),
-            if boot { 2 } else { 1 }
+            if args[3] == "boot" { 2 } else { 1 }
         );
     }
     command(&mut machines, |i| format!("echo vm-{i:04}"));

@@ -84,6 +84,7 @@ pub(crate) enum OwnedOutcome {
     SliceExhausted,
     ProcessEntered(u64),
     ProcessExited(u64),
+    ProcessReplaced { previous: u64, current: u64 },
     WaitingForHostQuota,
     HostRequestBatch(Vec<OwnedRequest>),
     AllocationExhausted(ManagedAllocationFailure, String),
@@ -993,6 +994,9 @@ fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
         ComputerAdvanceOutcome::SliceExhausted => OwnedOutcome::SliceExhausted,
         ComputerAdvanceOutcome::ProcessEntered(id) => OwnedOutcome::ProcessEntered(id),
         ComputerAdvanceOutcome::ProcessExited(id) => OwnedOutcome::ProcessExited(id),
+        ComputerAdvanceOutcome::ProcessReplaced { previous, current } => {
+            OwnedOutcome::ProcessReplaced { previous, current }
+        }
         ComputerAdvanceOutcome::WaitingForHostQuota => OwnedOutcome::WaitingForHostQuota,
         ComputerAdvanceOutcome::WaitingForTerminalEvent => OwnedOutcome::WaitingForTerminalEvent,
         ComputerAdvanceOutcome::HostRequestBatch(batch) => OwnedOutcome::HostRequestBatch(

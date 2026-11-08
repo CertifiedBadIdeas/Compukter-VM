@@ -53,6 +53,7 @@ use guest_filesystem::{FileSystemV2Operation, FileTransfers};
 const PROCESS_NAME: &str = "process";
 const PROCESS_ABI_MAJOR: u16 = 2;
 const PROCESS_ABI_MINOR: u16 = 0;
+const PROCESS_V3_ABI_MAJOR: u16 = 3;
 const COMPILER_NAME: &str = "compiler";
 const COMPILER_ABI_MAJOR: u16 = 1;
 const COMPILER_V2_ABI_MAJOR: u16 = 2;
@@ -166,6 +167,7 @@ pub enum ComputerAdvanceOutcome {
     SliceExhausted,
     ProcessEntered(u64),
     ProcessExited(u64),
+    ProcessReplaced { previous: u64, current: u64 },
     WaitingForHostQuota,
     WaitingForTerminalEvent,
     HostRequestBatch(ComputerHostRequestBatch),
@@ -2038,7 +2040,12 @@ impl ComputerMachine {
         id: RequestId,
         operation: ProcessOperation,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
-        let ProcessOperation::Run { path, encoded_args } = operation else {
+        let ProcessOperation::Run {
+            path,
+            encoded_args,
+            replace,
+        } = operation
+        else {
             return match operation {
                 ProcessOperation::TakeFailureDiagnostic => {
                     let diagnostic = self.take_process_diagnostic(task).unwrap_or_default();
@@ -2117,7 +2124,7 @@ impl ComputerMachine {
                 )
             }
         };
-        if self.sessions.len() >= self.process_limits.maximum_depth as usize {
+        if !replace && self.sessions.len() >= self.process_limits.maximum_depth as usize {
             return self.resume_process_failure(
                 task,
                 id,
@@ -2135,10 +2142,11 @@ impl ComputerMachine {
                 "process start limit exceeded",
             );
         }
-        let Some(reserved_heap_bytes) = self
-            .reserved_heap_bytes
-            .checked_add(u64::from(self.profile.heap_bytes))
-        else {
+        let Some(reserved_heap_bytes) = self.reserved_heap_bytes.checked_add(if replace {
+            0
+        } else {
+            u64::from(self.profile.heap_bytes)
+        }) else {
             return self.resume_process_failure(
                 task,
                 id,
@@ -2146,9 +2154,12 @@ impl ComputerMachine {
                 "process heap reservation overflow",
             );
         };
-        let Some(reserved_frame_storage_bytes) = self
-            .reserved_frame_storage_bytes
-            .checked_add(self.profile.frame_storage_bytes)
+        let Some(reserved_frame_storage_bytes) =
+            self.reserved_frame_storage_bytes.checked_add(if replace {
+                0
+            } else {
+                self.profile.frame_storage_bytes
+            })
         else {
             return self.resume_process_failure(
                 task,
@@ -2208,23 +2219,40 @@ impl ComputerMachine {
             };
             return self.resume_process_failure(task, id, reason, diagnostic);
         }
-        self.active_frame_mut().pending_process = Some((task, id));
+        if !replace {
+            self.active_frame_mut().pending_process = Some((task, id));
+        }
         let scope_id = self.process_starts;
         self.process_starts += 1;
         self.reserved_heap_bytes = reserved_heap_bytes;
         self.reserved_frame_storage_bytes = reserved_frame_storage_bytes;
-        self.sessions.push(ProcessFrame {
+        let root = replace && self.sessions.len() == 1;
+        if root {
+            self.root_artifact = artifact.clone();
+        }
+        let frame = ProcessFrame {
             scope_id,
             session: child,
-            executable: Some((path, artifact)),
+            executable: (!root).then_some((path, artifact)),
             process_diagnostics: Vec::new(),
             compiler_diagnostics: Box::new([]),
             pending_terminal_event: None,
             pending_stdio_read: None,
             pending_process: None,
             file_transfers: FileTransfers::default(),
-        });
-        Ok(ComputerAdvanceOutcome::ProcessEntered(scope_id))
+        };
+        if replace {
+            let depth = self.sessions.len();
+            let mut previous = std::mem::replace(self.active_frame_mut(), frame);
+            self.retire_frame_resources(&mut previous, depth);
+            Ok(ComputerAdvanceOutcome::ProcessReplaced {
+                previous: previous.scope_id,
+                current: scope_id,
+            })
+        } else {
+            self.sessions.push(frame);
+            Ok(ComputerAdvanceOutcome::ProcessEntered(scope_id))
+        }
     }
 
     fn handle_compiler_request(
@@ -2495,25 +2523,43 @@ impl ComputerMachine {
         message
     }
 
+    fn retire_frame_resources(&mut self, frame: &mut ProcessFrame, depth: usize) {
+        self.external_requests
+            .retain(|request| request.scope_id != frame.scope_id);
+        self.retired_execution.add(frame.session.accounting());
+        frame.file_transfers.release_all();
+        self.redstone.cancel_requests(|task, request| {
+            frame
+                .session
+                .pending_host_request_for(task, request)
+                .is_some_and(|request| is_redstone(request) && matches!(request.operation(), 1..=4))
+        });
+        if self
+            .pending_compilation
+            .as_ref()
+            .is_some_and(|pending| pending.owner_depth == depth)
+        {
+            self.pending_compilation = None;
+        }
+        if self
+            .active_terminal_event_owner
+            .is_some_and(|owner| owner.frame() == depth)
+        {
+            self.active_terminal_event = None;
+            self.active_terminal_event_owner = None;
+        }
+        self.standard_streams.cancel_frame(depth);
+    }
+
     fn finish_child(
         &mut self,
         completion: ProcessCompletion,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
         let child_depth = self.sessions.len();
-        let child = self.sessions.pop().expect("a child session is active");
-        self.external_requests
-            .retain(|request| request.scope_id != child.scope_id);
-        self.retired_execution.add(child.session.accounting());
+        let mut child = self.sessions.pop().expect("a child session is active");
+        self.retire_frame_resources(&mut child, child_depth);
         self.reserved_heap_bytes -= u64::from(self.profile.heap_bytes);
         self.reserved_frame_storage_bytes -= self.profile.frame_storage_bytes;
-        if self
-            .active_terminal_event_owner
-            .is_some_and(|owner| owner.frame() == child_depth)
-        {
-            self.active_terminal_event = None;
-            self.active_terminal_event_owner = None;
-        }
-        self.standard_streams.cancel_frame(child_depth);
         let (task, request) = self
             .active_frame_mut()
             .pending_process
@@ -2712,6 +2758,7 @@ enum ProcessOperation {
     Run {
         path: Vec<u16>,
         encoded_args: Box<[u16]>,
+        replace: bool,
     },
     TakeFailureDiagnostic,
     Exit(i32),
@@ -2811,6 +2858,7 @@ fn admit_session(
         OperationSchema::asynchronous(&process_arguments, HostValueType::I32),
         OperationSchema::synchronous(&[], HostValueType::String),
         OperationSchema::synchronous(&process_exit_arguments, HostValueType::Unit),
+        OperationSchema::asynchronous(&process_arguments, HostValueType::I32),
     ];
     let compiler_operations = [
         OperationSchema::asynchronous(&compiler_arguments, HostValueType::I32),
@@ -2869,7 +2917,7 @@ fn admit_session(
         })
         .collect::<Box<[_]>>();
     let filesystem_v2_operations = guest_filesystem::operations();
-    let mut bindings = Vec::with_capacity(addon_bindings.len() + 9);
+    let mut bindings = Vec::with_capacity(addon_bindings.len() + 10);
     for (index, binding) in addon_bindings.iter().enumerate() {
         bindings.push(CapabilityBinding::new(
             binding.namespace(),
@@ -2912,6 +2960,13 @@ fn admit_session(
         PROCESS_NAME,
         PROCESS_ABI_MAJOR,
         PROCESS_ABI_MINOR,
+        &process_operations[..3],
+    ));
+    bindings.push(CapabilityBinding::new(
+        TERMINAL_NAMESPACE,
+        PROCESS_NAME,
+        PROCESS_V3_ABI_MAJOR,
+        0,
         &process_operations,
     ));
     bindings.push(CapabilityBinding::new(
@@ -2976,7 +3031,10 @@ fn is_filesystem(request: HostRequestView<'_>) -> bool {
 fn is_process(request: HostRequestView<'_>) -> bool {
     request.namespace() == TERMINAL_NAMESPACE
         && request.name() == PROCESS_NAME
-        && request.abi_major() == PROCESS_ABI_MAJOR
+        && matches!(
+            request.abi_major(),
+            PROCESS_ABI_MAJOR | PROCESS_V3_ABI_MAJOR
+        )
 }
 
 fn is_compiler(request: HostRequestView<'_>) -> bool {
@@ -3060,7 +3118,7 @@ fn redstone_request_error(_: RedstoneError) -> ComputerError {
 fn copy_process_request(request: HostRequestView<'_>) -> Result<TerminalRequest, ComputerError> {
     let arguments = request.arguments();
     let operation = match (request.operation(), request.asynchronous(), arguments.len()) {
-        (0, true, 2) => {
+        (operation @ (0 | 3), true, 2) => {
             let Some(HostValueView::String(path)) = arguments.get(0) else {
                 return Err(ComputerError::InvalidProcessRequest);
             };
@@ -3070,6 +3128,7 @@ fn copy_process_request(request: HostRequestView<'_>) -> Result<TerminalRequest,
             ProcessOperation::Run {
                 path: path.to_vec(),
                 encoded_args: encoded_args.into(),
+                replace: operation == 3,
             }
         }
         (1, false, 0) => ProcessOperation::TakeFailureDiagnostic,
@@ -3795,6 +3854,7 @@ mod tests {
                 computer.advance(64, 64, u32::MAX).unwrap(),
                 ComputerAdvanceOutcome::SliceExhausted
                     | ComputerAdvanceOutcome::ProcessEntered(_)
+                    | ComputerAdvanceOutcome::ProcessReplaced { .. }
                     | ComputerAdvanceOutcome::ProcessExited(_)
             ));
         }
@@ -3815,7 +3875,9 @@ mod tests {
                 computer
                     .advance_with_retirement_limit(64, 64, u32::MAX, 1)
                     .unwrap(),
-                ComputerAdvanceOutcome::SliceExhausted | ComputerAdvanceOutcome::ProcessExited(_)
+                ComputerAdvanceOutcome::SliceExhausted
+                    | ComputerAdvanceOutcome::ProcessReplaced { .. }
+                    | ComputerAdvanceOutcome::ProcessExited(_)
             ));
             let after = computer.resource_snapshot();
             assert!(after.executed_instructions >= before.executed_instructions);
@@ -3886,6 +3948,7 @@ mod tests {
             computer.advance(64, 64, u32::MAX).unwrap(),
             ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_)
         ));
         computer.submit_redstone_input(2 | (3 << 10)).unwrap();
@@ -3893,6 +3956,7 @@ mod tests {
             computer.advance(64, 64, u32::MAX).unwrap(),
             ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_)
         ));
         computer
@@ -3918,6 +3982,7 @@ mod tests {
             computer.advance(64, 64, u32::MAX).unwrap(),
             ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_)
         ));
         let request = match computer.advance(64, 64, u32::MAX).unwrap() {
@@ -3954,6 +4019,7 @@ mod tests {
             computer.advance(64, 64, u32::MAX).unwrap(),
             ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_)
         ));
         computer.submit_redstone_input(1 | (13 << 6)).unwrap();
@@ -4130,6 +4196,7 @@ mod tests {
                     computer.advance(64, 64, u32::MAX).unwrap(),
                     ComputerAdvanceOutcome::SliceExhausted
                         | ComputerAdvanceOutcome::ProcessEntered(_)
+                        | ComputerAdvanceOutcome::ProcessReplaced { .. }
                         | ComputerAdvanceOutcome::ProcessExited(_)
                 ));
                 assert_eq!(None, halt(&mut computer));
@@ -4603,6 +4670,7 @@ mod tests {
             match computer.advance(64, 64, 0).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected raw terminal outcome: {other:?}"),
@@ -4850,6 +4918,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::UncaughtException(diagnostic) => break diagnostic,
                 other => panic!("unexpected conflicting stdio outcome: {other:?}"),
@@ -4905,6 +4974,7 @@ mod tests {
                 computer.advance(64, 64, u32::MAX).unwrap(),
                 ComputerAdvanceOutcome::SliceExhausted
                     | ComputerAdvanceOutcome::ProcessEntered(_)
+                    | ComputerAdvanceOutcome::ProcessReplaced { .. }
                     | ComputerAdvanceOutcome::ProcessExited(_)
             ));
         }
@@ -4916,6 +4986,7 @@ mod tests {
                 computer.advance(64, 64, u32::MAX).unwrap(),
                 ComputerAdvanceOutcome::SliceExhausted
                     | ComputerAdvanceOutcome::ProcessEntered(_)
+                    | ComputerAdvanceOutcome::ProcessReplaced { .. }
                     | ComputerAdvanceOutcome::ProcessExited(_)
             ));
         }
@@ -4966,6 +5037,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(None) => break,
                 other => panic!("unexpected positional terminal outcome: {other:?}"),
@@ -4995,6 +5067,180 @@ mod tests {
         }
     }
 
+    pub(super) fn exec_fixture(nested: bool) -> ComputerMachine {
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        let replacement = crate::execution::fixtures::process_v2_exit_artifact(37);
+        let launcher = crate::execution::fixtures::process_v3_exec_artifact(
+            &"/home/replacement".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        for (name, artifact) in [
+            ("/home/replacement", replacement),
+            ("/home/launcher", launcher.clone()),
+        ] {
+            let bytes = crate::test_encode::encode_artifact(artifact.decoded()).unwrap();
+            filesystem
+                .write_file(&owner, &path(name, &limits), &bytes, true)
+                .unwrap();
+        }
+        let root = if nested {
+            crate::execution::fixtures::process_v2_run_artifact(
+                &"/home/launcher".encode_utf16().collect::<Vec<_>>(),
+                &[0, 0],
+            )
+        } else {
+            launcher
+        };
+        ComputerMachine::start_in_filesystem(root, profile(), &[], &[], filesystem, owner).unwrap()
+    }
+
+    pub(super) fn advance_to_replacement(computer: &mut ComputerMachine) -> (u64, u64) {
+        for _ in 0..128 {
+            match computer.advance(64, 64, u32::MAX).unwrap() {
+                ComputerAdvanceOutcome::SliceExhausted
+                | ComputerAdvanceOutcome::ProcessEntered(_) => {}
+                ComputerAdvanceOutcome::ProcessReplaced { previous, current } => {
+                    return (previous, current)
+                }
+                other => panic!("unexpected launch outcome {other:?}"),
+            }
+        }
+        panic!("replacement did not publish");
+    }
+
+    #[test]
+    fn exec_replaces_root_at_depth_and_reservation_limit_and_retires_accounting() {
+        let mut computer = exec_fixture(false);
+        let before = computer.resource_snapshot();
+        computer.process_limits.maximum_depth = 1;
+        computer.process_limits.maximum_aggregate_heap_bytes = computer.reserved_heap_bytes;
+        computer
+            .process_limits
+            .maximum_aggregate_frame_storage_bytes = computer.reserved_frame_storage_bytes;
+        let old_identity =
+            Arc::as_ptr(&computer.root_artifact.prepared_program().unwrap()) as usize;
+        assert_eq!((0, 1), advance_to_replacement(&mut computer));
+        assert_eq!(1, computer.sessions.len());
+        assert_eq!(2, computer.process_starts);
+        assert_ne!(
+            old_identity,
+            Arc::as_ptr(&computer.root_artifact.prepared_program().unwrap()) as usize
+        );
+        assert_eq!(
+            before.heap_capacity_bytes,
+            computer.resource_snapshot().heap_capacity_bytes
+        );
+        assert!(computer.retired_execution.retired_instructions > 0);
+        assert_eq!(None, halt(&mut computer));
+    }
+
+    #[test]
+    fn exec_nested_replacement_completes_the_original_parent_request() {
+        let mut computer = exec_fixture(true);
+        assert_eq!((1, 2), advance_to_replacement(&mut computer));
+        assert_eq!(
+            vec![0, 2],
+            computer
+                .sessions
+                .iter()
+                .map(|f| f.scope_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(Some(ComputerValue::I32(37)), halt(&mut computer));
+        assert_eq!(1, computer.sessions.len());
+    }
+
+    #[test]
+    fn retiring_execution_discards_internal_waits_external_routes_and_terminal_ownership() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let bindings = [CapabilityBinding::new("app", "entry", 1, 0, &operations)];
+        for redstone in [false, true] {
+            let artifact = if redstone {
+                crate::execution::fixtures::redstone_wait_and_external_request_artifact()
+            } else {
+                crate::execution::fixtures::raw_terminal_wait_and_external_request_artifact()
+            };
+            let mut computer = ComputerMachine::start(artifact, profile(), &bindings, &[]).unwrap();
+            let request = external_request(&mut computer);
+            let mut replacement = ComputerMachine::start(
+                crate::execution::fixtures::two_block_artifact(1, 1),
+                profile(),
+                &[],
+                &[],
+            )
+            .unwrap();
+            let mut frame = replacement.sessions.pop().unwrap();
+            frame.scope_id = 1;
+            let mut old = std::mem::replace(computer.active_frame_mut(), frame);
+            computer.retire_frame_resources(&mut old, 1);
+            assert!(computer.external_requests.is_empty());
+            assert_eq!(None, computer.standard_streams.checkpoint_input_owner());
+            assert_eq!(0, computer.redstone.checkpoint_waiters().count());
+            assert_eq!(
+                ComputerError::InvalidRequestId,
+                computer
+                    .resume_host_request_for(
+                        request.task_id,
+                        request.id,
+                        HostResponse::Success(HostValueInput::Unit)
+                    )
+                    .unwrap_err()
+            );
+            computer.submit_redstone_input(1 | (13 << 6)).unwrap();
+            assert_eq!(None, halt(&mut computer));
+        }
+    }
+
+    #[test]
+    fn exec_rejection_keeps_the_caller_and_diagnostic_without_consuming_a_start() {
+        for reason in [
+            ProcessFailureReason::NotFound,
+            ProcessFailureReason::InvalidProgram,
+            ProcessFailureReason::Incompatible,
+            ProcessFailureReason::LimitExceeded,
+        ] {
+            let mut computer = exec_fixture(false);
+            let limits = *computer.filesystem.limits();
+            let target = path("/home/replacement", &limits);
+            match reason {
+                ProcessFailureReason::NotFound => {
+                    computer
+                        .filesystem
+                        .remove(&computer.initial_file_capability, &target)
+                        .unwrap();
+                }
+                ProcessFailureReason::InvalidProgram => {
+                    computer
+                        .filesystem
+                        .write_file(&computer.initial_file_capability, &target, b"bad", true)
+                        .unwrap();
+                }
+                ProcessFailureReason::Incompatible => computer.profile.maximum_host_requests = 0,
+                ProcessFailureReason::LimitExceeded => computer.process_limits.maximum_starts = 1,
+                _ => unreachable!(),
+            }
+            let old_identity =
+                Arc::as_ptr(&computer.root_artifact.prepared_program().unwrap()) as usize;
+            assert_eq!(
+                Some(ComputerValue::I32(reason.status())),
+                halt(&mut computer)
+            );
+            assert_eq!(1, computer.sessions.len());
+            assert_eq!(0, computer.sessions[0].scope_id);
+            assert_eq!(1, computer.process_starts);
+            assert_eq!(
+                old_identity,
+                Arc::as_ptr(&computer.root_artifact.prepared_program().unwrap()) as usize
+            );
+            assert!(!computer
+                .take_process_diagnostic(TaskId::ROOT)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
     #[test]
     fn process_run_suspends_parent_until_child_halts() {
         let limits = FileSystemLimits::testing();
@@ -5019,6 +5265,7 @@ mod tests {
                 computer.advance(64, 64, u32::MAX).unwrap(),
                 ComputerAdvanceOutcome::SliceExhausted
                     | ComputerAdvanceOutcome::ProcessEntered(_)
+                    | ComputerAdvanceOutcome::ProcessReplaced { .. }
                     | ComputerAdvanceOutcome::ProcessExited(_)
             ));
         }
@@ -5027,6 +5274,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected process outcome: {other:?}"),
@@ -5384,6 +5632,7 @@ mod tests {
             computer.advance(64, 64, u32::MAX).unwrap(),
             ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_)
         ));
         let oversized = "λ".repeat(computer.maximum_text_code_units + 1);
@@ -5428,6 +5677,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(value) => break value,
                 other => panic!("unexpected ROM installer outcome: {other:?}"),
@@ -5538,6 +5788,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::HostRequestBatch(batch) => {
                     assert_eq!(1, batch.requests.len());
@@ -5588,6 +5839,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(status))) => break status,
                 other => panic!("unexpected process-v2 exit outcome: {other:?}"),
@@ -5615,6 +5867,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(result))) => break result,
                 other => panic!("unexpected filesystem text outcome: {other:?}"),
@@ -5896,6 +6149,7 @@ mod tests {
             match computer.advance(128, 128, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(value))) => break value,
                 other => panic!("unexpected filesystem conformance outcome: {other:?}"),
@@ -5943,6 +6197,7 @@ mod tests {
             match computer.advance(128, 128, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::UncaughtException(diagnostic) => {
                     assert!(diagnostic.contains("Filesystem quota was exceeded"));
@@ -6117,6 +6372,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::CompilationRequested(request) => return request,
                 other => panic!("unexpected compiler outcome: {other:?}"),
@@ -6129,6 +6385,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::WaitingForTerminalEvent => return,
                 other => panic!("unexpected canonical input outcome: {other:?}"),
@@ -6425,6 +6682,7 @@ mod tests {
             match computer.advance(64, 64, u32::MAX).unwrap() {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::Halted(value) => return value,
                 other => panic!("unexpected compiler completion outcome: {other:?}"),

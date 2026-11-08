@@ -4582,6 +4582,14 @@ pub(crate) fn process_copy_executable_artifact() -> VerifiedArtifact {
 }
 
 pub(crate) fn process_v2_run_artifact(path: &[u16], encoded_args: &[u16]) -> VerifiedArtifact {
+    process_launch_artifact(path, encoded_args, false)
+}
+
+pub(crate) fn process_v3_exec_artifact(path: &[u16], encoded_args: &[u16]) -> VerifiedArtifact {
+    process_launch_artifact(path, encoded_args, true)
+}
+
+fn process_launch_artifact(path: &[u16], encoded_args: &[u16], replace: bool) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
         flags: 0,
@@ -4605,7 +4613,7 @@ pub(crate) fn process_v2_run_artifact(path: &[u16], encoded_args: &[u16]) -> Ver
                 Instruction::CapabilityCallAsync {
                     dst: 2,
                     capability: 0,
-                    operation: 0,
+                    operation: if replace { 3 } else { 0 },
                     args: Box::new([0, 1]),
                     resume_block: 1,
                 },
@@ -4666,10 +4674,10 @@ pub(crate) fn process_v2_run_artifact(path: &[u16], encoded_args: &[u16]) -> Ver
             artifact.capabilities.push(crate::artifact::Capability {
                 namespace: 0,
                 name: 1,
-                abi_major: 2,
+                abi_major: if replace { 3 } else { 2 },
                 minimum_abi_minor: 0,
                 flags: 1,
-                operation_count: 3,
+                operation_count: if replace { 4 } else { 3 },
             });
             artifact.manifest.required_capabilities = 1;
             artifact.manifest.maximum_host_requests = 1;

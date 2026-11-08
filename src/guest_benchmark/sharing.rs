@@ -39,6 +39,7 @@ pub(super) fn settle(machines: &mut [ComputerMachine], shell: bool) {
             {
                 ComputerAdvanceOutcome::SliceExhausted
                 | ComputerAdvanceOutcome::ProcessEntered(_)
+                | ComputerAdvanceOutcome::ProcessReplaced { .. }
                 | ComputerAdvanceOutcome::ProcessExited(_) => {}
                 ComputerAdvanceOutcome::WaitingForTerminalEvent if shell => *finished = true,
                 ComputerAdvanceOutcome::Halted(None) if !shell => *finished = true,

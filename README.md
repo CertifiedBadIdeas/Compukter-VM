@@ -30,7 +30,7 @@ quotas still charge each file independently. The registries keep every live iden
 and remove their entries at final-owner release. Hash matches require byte equality.
 
 This development change intentionally breaks old storage: namespace checkpoint and
-journal version 2 persist all root descendants, logical computer checkpoint schema 6
+journal version 2 persist all root descendants, logical computer checkpoint schema 7
 includes the whole tree, and C ABI 25 adds `compukter_store_install_system`. Previous
 ROM images, namespace versions and logical checkpoints are rejected explicitly.
 
@@ -258,6 +258,16 @@ commit.
 
 The VM must remain independent of Minecraft, NeoForge, Kotlin compiler
 internals, and files outside its repository checkout.
+
+Process capability ABI 3 adds asynchronous selector 3 `(String path, String encodedArgs) -> I32`
+for explicit replacement. Success discards every task in the current frame and publishes one
+`ProcessReplaced { previous, current }` outcome before any replacement instruction. Failure returns
+an ordinary negative process status with a task-owned diagnostic and keeps the old execution alive.
+Replacement receives a fresh scope, consumes the lifetime start budget, preserves stack depth and
+steady aggregate reservations, and temporarily admits an extra session for rollback. Root replacement
+updates the root artifact; nested replacement preserves the original parent's pending run. Native
+C ABI 26 encodes tag 15 followed by old/new little-endian u64 scopes. ABI 2's three operations remain
+admitted. Boot can replace itself with a shell instead of retaining a suspended boot heap.
 
 Computer terminal input reserves Ctrl+C (key 67, CONTROL) to forcibly terminate the foreground command tree.
 Termination runs at the next advance, emits ordered ProcessExited events and returns status 130 to its parent.

@@ -89,6 +89,11 @@ impl RedstoneDevice {
         self.confirmed_output
     }
 
+    pub(crate) fn cancel_requests(&mut self, mut matches: impl FnMut(TaskId, RequestId) -> bool) {
+        self.waiters
+            .retain(|waiter| !matches(waiter.task, waiter.request));
+    }
+
     pub(crate) fn contains_waiter(&self, task: TaskId, request: RequestId) -> bool {
         self.waiters
             .iter()

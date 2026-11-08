@@ -272,7 +272,7 @@ impl ComputerMachine {
             } else {
                 None
             };
-            if (index == 0) != executable.is_none() || (index == 0) != (scope_id == 0) {
+            if (index == 0) != executable.is_none() {
                 return Err(CheckpointError::InvalidState);
             }
             let artifact = executable
@@ -425,6 +425,7 @@ impl ComputerMachine {
         let mut scopes = std::collections::BTreeSet::new();
         for (frame_index, frame) in self.sessions.iter().enumerate() {
             if frame.scope_id >= self.process_starts
+                || (frame_index > 0 && self.sessions[frame_index - 1].scope_id >= frame.scope_id)
                 || !scopes.insert(frame.scope_id)
                 || frame.compiler_diagnostics.len()
                     > self.process_limits.maximum_diagnostic_utf16_code_units
@@ -517,7 +518,7 @@ impl ComputerMachine {
         }
         if self
             .pending_termination
-            .is_some_and(|scope| !scopes.contains(&scope))
+            .is_some_and(|scope| !scopes.contains(&scope) || self.sessions[0].scope_id == scope)
         {
             return Err(invalid());
         }
@@ -1148,6 +1149,48 @@ mod tests {
             Err(CheckpointError::InvalidState),
             original.validate_checkpoint_state()
         );
+    }
+
+    #[test]
+    fn checkpoint_restores_replaced_root_and_nested_scope_without_reviving_the_caller() {
+        use crate::computer::tests::{advance_to_replacement, exec_fixture};
+        for nested in [false, true] {
+            let mut original = exec_fixture(nested);
+            advance_to_replacement(&mut original);
+            original.pending_termination = Some(original.sessions[0].scope_id);
+            assert_eq!(
+                Err(CheckpointError::InvalidState),
+                original.validate_checkpoint_state()
+            );
+            original.pending_termination = None;
+            let mut halted = false;
+            for _ in 0..128 {
+                let mut restored = round_trip(&original);
+                let expected = original
+                    .advance_with_retirement_limit(64, 64, 64, 1)
+                    .unwrap();
+                assert_eq!(
+                    expected,
+                    restored
+                        .advance_with_retirement_limit(64, 64, 64, 1)
+                        .unwrap()
+                );
+                assert_same_state(&original, &restored);
+                if let ComputerAdvanceOutcome::Halted(value) = expected {
+                    assert_eq!(
+                        if nested {
+                            Some(ComputerValue::I32(37))
+                        } else {
+                            None
+                        },
+                        value
+                    );
+                    halted = true;
+                    break;
+                }
+            }
+            assert!(halted, "restored replacement did not complete");
+        }
     }
 
     #[test]
