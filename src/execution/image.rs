@@ -509,7 +509,7 @@ struct ExecutionImageInner {
     // Keeps the canonical verification identity and its derived program alive.
     artifact: VerifiedArtifact,
     host_references: Box<[ResolvedHostReference]>,
-    type_layouts: Box<[RuntimeTypeLayout]>,
+    type_layouts: Arc<[RuntimeTypeLayout]>,
     record_layouts: std::collections::HashMap<TypeKey, super::record::RecordLayout>,
     storage_plan: StoragePlan,
     maximum_slice_budget: u32,
@@ -551,8 +551,39 @@ pub(crate) struct PreparedProgram {
     static_layout: FrameLayout,
     field_offsets: Box<[usize]>,
     host_calls: Box<[(usize, usize)]>,
+    // Allocation layouts depend on header width, not the heap's compact bit packing.
+    // Keep both variants bounded by this program's lifetime, with no admission state.
+    allocation_layouts: [std::sync::OnceLock<Arc<[RuntimeTypeLayout]>>; 2],
     #[cfg(feature = "execution-prototype")]
     prototypes: [std::sync::OnceLock<Arc<super::prototype::PreparedExecution>>; 5],
+}
+
+impl PreparedProgram {
+    fn allocation_layouts(
+        &self,
+        decoded: &DecodedArtifact,
+        header_format: HeaderFormat,
+    ) -> Result<Arc<[RuntimeTypeLayout]>, AdmissionError> {
+        let index = match header_format {
+            HeaderFormat::Legacy => 0,
+            HeaderFormat::Compact { .. } => 1,
+        };
+        let slot = &self.allocation_layouts[index];
+        if let Some(layouts) = slot.get() {
+            return Ok(Arc::clone(layouts));
+        }
+        let layouts = derive_type_layouts(
+            decoded,
+            &self.type_offsets,
+            &self.field_offsets,
+            header_format,
+        )?;
+        // A racing admission can prepare a candidate; all readers use the winner.
+        let _ = slot.set(Arc::from(layouts));
+        Ok(Arc::clone(
+            slot.get().expect("allocation layouts were published"),
+        ))
+    }
 }
 
 #[cfg(feature = "guest-benchmark")]
@@ -632,8 +663,7 @@ impl ExecutionImage {
         let type_offsets = &program.type_offsets;
         let field_offsets = &program.field_offsets;
         let header_format = HeaderFormat::select(profile.heap_bytes, program.type_keys.len());
-        let type_layouts =
-            derive_type_layouts(decoded, type_offsets, field_offsets, header_format)?;
+        let type_layouts = program.allocation_layouts(decoded, header_format)?;
         let fields = &program.fields;
         let static_layout = &program.static_layout;
         let runtime_exception_types = program.runtime_exception_types;
@@ -1487,6 +1517,7 @@ pub(crate) fn prepare_program(
         static_layout,
         field_offsets,
         host_calls: host_calls.into_boxed_slice(),
+        allocation_layouts: std::array::from_fn(|_| std::sync::OnceLock::new()),
         #[cfg(feature = "execution-prototype")]
         prototypes: std::array::from_fn(|_| std::sync::OnceLock::new()),
     })
@@ -3305,6 +3336,94 @@ mod tests {
     use crate::execution::{error::AdmissionError, fixtures, FunctionKey};
 
     #[test]
+    fn allocation_layouts_share_header_width_without_sharing_heap_packing() {
+        let artifact = fixtures::object_allocation_artifact(2);
+        let mut small = fixtures::profile();
+        small.heap_bytes = 512;
+        let first = ExecutionImage::admit(artifact.clone(), small).unwrap();
+        let mut larger = fixtures::profile();
+        larger.heap_bytes = 1024;
+        let second = ExecutionImage::admit(artifact, larger).unwrap();
+        assert!(Arc::ptr_eq(
+            &first.admission.type_layouts,
+            &second.admission.type_layouts
+        ));
+        assert_ne!(
+            first.storage_plan().header_format,
+            second.storage_plan().header_format
+        );
+        for image in [first, second] {
+            let mut machine = Machine::new(image).unwrap();
+            machine.start(&[]).unwrap();
+            assert!(matches!(
+                machine.run_slice(64, 0).unwrap(),
+                super::super::error::Outcome::Halted(Some(RuntimeValue::Reference(_)))
+            ));
+            assert_eq!(16, machine.resource_snapshot().heap_used_bytes);
+        }
+    }
+
+    #[test]
+    fn allocation_layouts_separate_header_widths_and_preserve_field_execution() {
+        let artifact = fixtures::field_roundtrip_artifact();
+        let mut compact = ExecutionImage::admit(artifact.clone(), fixtures::profile()).unwrap();
+        let mut large = fixtures::profile();
+        large.heap_bytes = 1 << 31;
+        let mut legacy = ExecutionImage::admit(artifact, large).unwrap();
+        assert!(!Arc::ptr_eq(
+            &compact.admission.type_layouts,
+            &legacy.admission.type_layouts
+        ));
+        for image in [&mut compact, &mut legacy] {
+            let expected = derive_type_layouts(
+                image.admission.artifact.decoded(),
+                &image.program.type_offsets,
+                &image.program.field_offsets,
+                image.storage_plan().header_format,
+            )
+            .unwrap();
+            assert_eq!(&*expected, &*image.admission.type_layouts);
+            // Exercise legacy execution without allocating the 2 GiB admission profile.
+            let admission = Arc::get_mut(&mut image.admission).unwrap();
+            admission.storage_plan = admission.storage_plan.with_heap_arena_bytes(1024);
+            let mut machine = Machine::new(image.clone()).unwrap();
+            machine.start(&[]).unwrap();
+            assert_eq!(
+                super::super::error::Outcome::Halted(Some(RuntimeValue::I32(42))),
+                machine.run_slice(64, 0).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_layouts_do_not_alias_distinct_programs_with_the_same_type_keys() {
+        let first = ExecutionImage::admit(
+            fixtures::object_allocation_artifact(37),
+            fixtures::profile(),
+        )
+        .unwrap();
+        let second = ExecutionImage::admit(
+            fixtures::object_allocation_artifact(38),
+            fixtures::profile(),
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&first.program, &second.program));
+        assert!(!Arc::ptr_eq(
+            &first.admission.type_layouts,
+            &second.admission.type_layouts
+        ));
+        let key = TypeKey { module: 0, ty: 1 };
+        let Some(RuntimeTypeLayout::Object(first)) = first.type_layout(key) else {
+            panic!("object")
+        };
+        let Some(RuntimeTypeLayout::Object(second)) = second.type_layout(key) else {
+            panic!("object")
+        };
+        assert_eq!(148, first.payload_bytes);
+        assert_eq!(152, second.payload_bytes);
+    }
+
+    #[test]
     fn shared_program_keeps_heap_layout_and_limits_per_admission() {
         let artifact = fixtures::field_roundtrip_artifact();
         let first = ExecutionImage::admit(artifact.clone(), fixtures::profile()).unwrap();
@@ -3347,13 +3466,19 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         let weak = Arc::downgrade(&images[0].program);
+        let weak_layouts = Arc::downgrade(&images[0].admission.type_layouts);
         for image in &images {
             assert!(Arc::ptr_eq(&images[0].program, &image.program));
+            assert!(Arc::ptr_eq(
+                &images[0].admission.type_layouts,
+                &image.admission.type_layouts
+            ));
         }
         drop(artifact);
         assert!(weak.upgrade().is_some());
         drop(images);
         assert!(weak.upgrade().is_none());
+        assert!(weak_layouts.upgrade().is_none());
     }
 
     #[cfg(feature = "execution-prototype")]
