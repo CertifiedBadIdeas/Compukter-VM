@@ -46,6 +46,7 @@ pub mod diagnostic;
 mod execution;
 pub mod filesystem;
 pub mod limits;
+mod live_registry;
 mod process;
 mod redstone;
 mod stdio;

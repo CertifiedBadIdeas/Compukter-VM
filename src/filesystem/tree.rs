@@ -109,7 +109,7 @@ impl Node {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StoredObject {
-    bytes: Arc<[u8]>,
+    bytes: super::blob::SharedBlob,
     references: u32,
 }
 
@@ -130,7 +130,7 @@ impl ObjectStore {
             return;
         }
         let stored = self.0.entry(next).or_insert(StoredObject {
-            bytes,
+            bytes: super::blob::SharedBlob::new(bytes),
             references: 0,
         });
         stored.references = stored
@@ -371,11 +371,12 @@ impl ComputerFileSystem {
         ))
     }
 
+    /// Pins executable contents without making a second artifact-sized buffer.
     pub fn read_executable(
         &mut self,
         capability: &FileCapability,
         path: &VirtualPath,
-    ) -> Result<Vec<u8>, FileSystemError> {
+    ) -> Result<Arc<[u8]>, FileSystemError> {
         require(
             capability,
             path,
@@ -385,37 +386,15 @@ impl ComputerFileSystem {
         if metadata.kind != NodeKind::File || !metadata.executable {
             return Err(FileSystemError::NotExecutable);
         }
-        let length =
-            usize::try_from(metadata.logical_size).map_err(|_| FileSystemError::QuotaExceeded)?;
         if metadata.logical_size > self.limits.maximum_file_bytes {
             return Err(FileSystemError::QuotaExceeded);
         }
+        // Preserve handle admission limits even though the internal snapshot
+        // needs no chunked reads or temporary byte buffer.
         let handle = self.open(capability, path, OpenMode::Read)?;
-        let result = (|| {
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(length)
-                .map_err(|_| FileSystemError::QuotaExceeded)?;
-            let mut offset = 0_u64;
-            while offset < metadata.logical_size {
-                let remaining = usize::try_from(metadata.logical_size - offset)
-                    .map_err(|_| FileSystemError::QuotaExceeded)?;
-                let chunk = self.read(handle, offset, remaining)?;
-                if chunk.is_empty() {
-                    return Err(FileSystemError::StorageFaulted);
-                }
-                offset = offset
-                    .checked_add(chunk.len() as u64)
-                    .ok_or(FileSystemError::StorageFaulted)?;
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(bytes)
-        })();
-        let close = self.close(handle);
-        match (result, close) {
-            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-            (Ok(bytes), Ok(())) => Ok(bytes),
-        }
+        let result = self.read_snapshot(capability, path);
+        self.close(handle)?;
+        result
     }
 
     pub fn create_directory(
@@ -1022,6 +1001,41 @@ mod tests {
 
     fn path(value: &str, limits: &FileSystemLimits) -> VirtualPath {
         VirtualPath::parse_utf8(value, limits).unwrap()
+    }
+
+    #[test]
+    fn independent_computers_share_contents_with_private_mutation_and_executable_snapshots() {
+        let mut first = ComputerFileSystem::testing();
+        let mut second = ComputerFileSystem::testing();
+        let root = path("/", first.limits());
+        let owner = FileCapability::new(
+            root,
+            FileRights::INSPECT
+                | FileRights::READ
+                | FileRights::WRITE
+                | FileRights::CREATE
+                | FileRights::EXECUTE,
+        );
+        let file = path("/home/shared", first.limits());
+        first
+            .write_file(&owner, &file, b"shared executable contents", true)
+            .unwrap();
+        second
+            .write_file(&owner, &file, b"shared executable contents", true)
+            .unwrap();
+        let running = first.read_executable(&owner, &file).unwrap();
+        let copied = second.read_executable(&owner, &file).unwrap();
+        assert!(Arc::ptr_eq(&running, &copied));
+        first.write_file(&owner, &file, b"edited", true).unwrap();
+        assert_eq!(
+            second.read_snapshot(&owner, &file).unwrap().as_ref(),
+            running.as_ref()
+        );
+        assert_eq!(b"shared executable contents", running.as_ref());
+        assert_eq!(
+            b"edited",
+            first.read_snapshot(&owner, &file).unwrap().as_ref()
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+mod blob;
 mod capability;
 mod error;
 mod handle;

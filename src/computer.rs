@@ -5439,14 +5439,15 @@ mod tests {
 
         assert_eq!(Some(ComputerValue::I32(0)), halted);
         assert_eq!(
-            child_bytes,
+            child_bytes.as_slice(),
             computer
                 .filesystem
                 .read_executable(
                     &computer.initial_file_capability,
                     &path("/home/hello", &limits),
                 )
-                .unwrap(),
+                .unwrap()
+                .as_ref(),
         );
         assert_eq!(
             Err(FileSystemError::AlreadyExists),
