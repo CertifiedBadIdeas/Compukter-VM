@@ -33,7 +33,6 @@ mod execution;
 #[cfg(feature = "program-sharing-benchmark")]
 mod filesystem;
 mod limits;
-#[cfg(feature = "program-sharing-benchmark")]
 mod live_registry;
 mod process;
 #[cfg(feature = "program-sharing-benchmark")]
