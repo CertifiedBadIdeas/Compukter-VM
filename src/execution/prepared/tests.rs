@@ -79,7 +79,7 @@ fn prepared_calls_preserve_dispatch_stack_initialization_and_suspension_boundari
 
 #[test]
 fn argument_transfers_validate_canonical_values_and_frame_bounds() {
-    let mut arena = FrameArena::new(128).unwrap();
+    let mut arena = backed_arena(128);
     let source = FrameReservation {
         base: 0,
         byte_len: 16,
@@ -132,7 +132,7 @@ fn argument_transfers_validate_canonical_values_and_frame_bounds() {
 
 #[test]
 fn inline_argument_spans_preserve_bytes_initialization_and_reservation_bounds() {
-    let mut arena = FrameArena::new(128).unwrap();
+    let mut arena = backed_arena(128);
     let source = FrameReservation {
         base: 0,
         byte_len: 32,
@@ -230,7 +230,7 @@ fn wide_inline_arguments_transfer_without_an_encoding_size_limit() {
         )
         .unwrap();
     let code = builder.finish().unwrap();
-    let mut arena = FrameArena::new(1024).unwrap();
+    let mut arena = backed_arena(1024);
     let source = FrameReservation {
         base: 0,
         byte_len: 320,
@@ -252,7 +252,7 @@ fn wide_inline_arguments_transfer_without_an_encoding_size_limit() {
 
 #[test]
 fn prepared_scalar_frame_bounds_remain_checked() {
-    let mut arena = FrameArena::new(64).unwrap();
+    let mut arena = backed_arena(64);
     let frame = FrameReservation {
         base: 16,
         byte_len: 16,
@@ -466,4 +466,16 @@ fn default_numeric_operations_match_reference_on_integer_and_float_edges() {
             }
         }
     }
+}
+
+fn backed_arena(capacity: u32) -> FrameArena {
+    let mut arena = FrameArena::new(capacity).unwrap();
+    arena
+        .push(&crate::execution::frame::FrameLayout {
+            byte_len: capacity,
+            alignment: 8,
+            values: Box::new([]),
+        })
+        .unwrap();
+    arena
 }

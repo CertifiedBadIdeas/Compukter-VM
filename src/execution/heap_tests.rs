@@ -819,7 +819,8 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
     assert_eq!(
         core::mem::size_of::<Frame>() as u64
             * image.maximum_call_depth() as u64
-            * (image.maximum_coroutines() as u64 + 1),
+            * (image.maximum_coroutines() as u64 + 1)
+            + image.maximum_coroutines() as u64 * core::mem::size_of::<Vec<Frame>>() as u64,
         plan.frame_record_bytes,
     );
     assert_eq!(
@@ -859,7 +860,8 @@ fn portable_admission_publishes_exact_layout_metadata() -> Result<(), AdmissionE
     );
     let machine = Machine::new(image.clone())?;
     assert_eq!(
-        plan.mutable_resident_bytes(),
+        plan.mutable_resident_bytes() - plan.frame_record_bytes
+            + image.maximum_coroutines() as u64 * core::mem::size_of::<Vec<Frame>>() as u64,
         machine.test_reserved_bytes() as u64
     );
 
@@ -913,7 +915,11 @@ fn call_depth_only_grows_compact_frame_storage() -> Result<(), AdmissionError> {
     assert_eq!(shallow.pending_state_bytes, deep.pending_state_bytes);
     assert_eq!(shallow.machine_fixed_bytes, deep.machine_fixed_bytes);
     assert_eq!(shallow.frame_arena_bytes * 4, deep.frame_arena_bytes);
-    assert_eq!(shallow.frame_record_bytes * 4, deep.frame_record_bytes);
+    let descriptors = core::mem::size_of::<Vec<Frame>>() as u64;
+    assert_eq!(
+        (shallow.frame_record_bytes - descriptors) * 4 + descriptors,
+        deep.frame_record_bytes
+    );
     Ok(())
 }
 

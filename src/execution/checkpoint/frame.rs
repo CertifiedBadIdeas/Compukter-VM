@@ -31,7 +31,7 @@ checkpoint_struct!(ValueLayout { components });
 
 checkpoint_struct!(FrameReservation { base, byte_len });
 
-checkpoint_struct!(FrameArena { bytes, free_head } defaults { #[cfg(test)] active_bytes: 0, #[cfg(test)] peak_active_bytes: 0, #[cfg(test)] initialized: vec![true; <Box<[u8]> as AsRef<[u8]>>::as_ref(&bytes).len()].into_boxed_slice() });
+checkpoint_struct!(FrameArena { bytes, capacity, free_head } defaults { #[cfg(test)] active_bytes: 0, #[cfg(test)] peak_active_bytes: 0, #[cfg(test)] initialized: vec![true; <Vec<u8> as AsRef<[u8]>>::as_ref(&bytes).len()] });
 
 checkpoint_struct!(StaticArena {
     arena,
@@ -47,7 +47,10 @@ impl FrameArena {
         capacity: usize,
         live: &[FrameReservation],
     ) -> Result<()> {
-        if self.bytes.len() != capacity {
+        if self.capacity as usize != capacity
+            || self.bytes.len() > capacity
+            || (capacity >= 8 && self.bytes.len() < 8)
+        {
             return Err(CheckpointError::InvalidState);
         }
         let mut ranges = Vec::new();
@@ -62,7 +65,7 @@ impl FrameArena {
                 .ok_or(CheckpointError::InvalidState)?;
             if !frame.base.is_multiple_of(8)
                 || !frame.byte_len.is_multiple_of(8)
-                || end as usize > capacity
+                || end as usize > self.bytes.len()
             {
                 return Err(CheckpointError::InvalidState);
             }
@@ -83,7 +86,11 @@ impl FrameArena {
             let end = base
                 .checked_add(length)
                 .ok_or(CheckpointError::InvalidState)?;
-            if length < 8 || !length.is_multiple_of(8) || end as usize > capacity {
+            if length < 8
+                || !length.is_multiple_of(8)
+                || end as usize > capacity
+                || (end as usize > self.bytes.len() && (end as usize != capacity || next.is_some()))
+            {
                 return Err(CheckpointError::InvalidState);
             }
             ranges.push((base, end));
@@ -145,6 +152,32 @@ mod tests {
             }]
             .into_boxed_slice(),
         }
+    }
+
+    #[test]
+    fn checkpoint_retains_small_prefix_and_rejects_unbacked_live_data() {
+        let mut arena = FrameArena::new(4096).unwrap();
+        let frame = arena.push(&layout()).unwrap();
+        let mut writer = Writer::new(4096);
+        arena.write(&mut writer).unwrap();
+        let bytes = writer.finish();
+        assert!(bytes.len() < 1024);
+        let mut reader = Reader::new(&bytes, 4096, 4096).unwrap();
+        let mut restored = FrameArena::read(&mut reader).unwrap();
+        restored.validate_checkpoint(4096, &[frame]).unwrap();
+        assert_eq!(arena.bytes.len(), restored.bytes.len());
+        restored.bytes.truncate(8);
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            restored.validate_checkpoint(4096, &[frame])
+        );
+        restored.bytes.resize(256, 0);
+        restored.write_free(8, None, 4088).unwrap();
+        restored.capacity = 8192;
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            restored.validate_checkpoint(4096, &[frame])
+        );
     }
 
     #[test]

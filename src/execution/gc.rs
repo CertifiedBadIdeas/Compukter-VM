@@ -22,7 +22,7 @@ pub(super) enum CollectorPhase {
 pub(super) struct RootSet<'a> {
     pub statics: &'a StaticArena,
     pub frames: &'a [Frame],
-    pub saved_frames: &'a [Frame],
+    pub saved_frames: &'a [Vec<Frame>],
     pub task_failures: &'a [Option<TaskFailure>],
     pub frame_arena: &'a FrameArena,
     pub frame_depth: usize,
@@ -242,11 +242,12 @@ impl Collector {
             self.frame += 1;
             self.register = 0;
         }
-        while self.saved_frame < roots.saved_frames.len() {
+        while self.saved_frame < roots.saved_frames.len() * image.maximum_call_depth() {
             let frame = roots
                 .saved_frames
-                .get(self.saved_frame)
-                .ok_or(VmFault::CorruptLifecycle)?;
+                .get(self.saved_frame / image.maximum_call_depth())
+                .and_then(|frames| frames.get(self.saved_frame % image.maximum_call_depth()))
+                .unwrap_or(&Frame::EMPTY);
             if frame.function == usize::MAX {
                 self.saved_frame += 1;
                 self.register = 0;

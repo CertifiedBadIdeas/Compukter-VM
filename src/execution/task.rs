@@ -122,7 +122,7 @@ impl TaskScheduler {
         Ok(())
     }
 
-    pub(super) fn spawn(&mut self) -> Result<TaskId, TaskError> {
+    pub(super) fn next_spawn_slot(&self) -> Result<usize, TaskError> {
         self.active.ok_or(TaskError::NoRunningTask)?;
         let slot = self
             .tasks
@@ -132,6 +132,11 @@ impl TaskScheduler {
         if self.next_id > i32::MAX as u32 {
             return Err(TaskError::IdExhausted);
         }
+        Ok(slot)
+    }
+
+    pub(super) fn spawn(&mut self) -> Result<TaskId, TaskError> {
+        let slot = self.next_spawn_slot()?;
         let id = TaskId::new(self.next_id).ok_or(TaskError::IdExhausted)?;
         self.next_id = self.next_id.checked_add(1).ok_or(TaskError::IdExhausted)?;
         self.tasks[slot] = TaskRecord {

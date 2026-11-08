@@ -674,6 +674,11 @@ impl ExecutionImage {
         let frame_record_bytes = (core::mem::size_of::<Frame>() as u64)
             .checked_mul(maximum_call_depth)
             .and_then(|bytes| bytes.checked_mul(maximum_coroutines.checked_add(1)?))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    maximum_coroutines.checked_mul(core::mem::size_of::<Vec<Frame>>() as u64)?,
+                )
+            })
             .ok_or(AdmissionError::ResidentStorageOverflow {
                 component: ResidentStorageComponent::FrameRecords,
             })?;

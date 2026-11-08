@@ -269,10 +269,7 @@ impl Machine {
         }
         let slot = self.tasks.slot_of(task)?;
         let depth = *self.task_frame_depths.get(slot)?;
-        let frame = self.task_frames.get(
-            slot.checked_mul(self.image.maximum_call_depth())?
-                .checked_add(depth.checked_sub(1)?)?,
-        )?;
+        let frame = self.task_frames.get(slot)?.get(depth.checked_sub(1)?)?;
         let instruction = self.image.instruction(frame.block, frame.instruction)?;
         match instruction {
             ResolvedInstruction::CapabilityCallSync {
@@ -293,8 +290,15 @@ impl Machine {
         let invalid = || CheckpointError::InvalidState;
         let width = self.image.maximum_call_depth();
         let tasks = self.image.maximum_coroutines();
-        if self.frames.len() != width
-            || Some(self.task_frames.len()) != width.checked_mul(tasks)
+        if self.frames.len() > width
+            || self.frame_depth > self.frames.len()
+            || self.task_frames.len() != tasks
+            || self.task_frames.iter().any(|frames| frames.len() > width)
+            || self
+                .task_frames
+                .iter()
+                .zip(&self.task_frame_depths)
+                .any(|(frames, depth)| *depth > frames.len())
             || self.task_frame_depths.len() != tasks
             || self.task_failures.len() != tasks
             || self.task_host_failures.len()
@@ -357,7 +361,7 @@ impl Machine {
                     None | Some((_, TaskState::Completed)) if depth == 0 => {}
                     _ => return Err(invalid()),
                 }
-                if self.task_frames[slot * width + depth..(slot + 1) * width]
+                if self.task_frames[slot][depth..]
                     .iter()
                     .any(|frame| frame.function != usize::MAX)
                 {
@@ -387,7 +391,7 @@ impl Machine {
         };
         for frames in core::iter::once(&self.frames[..retained_depth]).chain(
             self.task_frames
-                .chunks(width)
+                .iter()
                 .zip(&self.task_frame_depths)
                 .map(|(frames, depth)| &frames[..*depth]),
         ) {
@@ -560,6 +564,7 @@ impl Machine {
         for frame in self.frames[..retained_depth].iter().chain(
             self.task_frames
                 .iter()
+                .flatten()
                 .filter(|frame| frame.function != usize::MAX),
         ) {
             let boundary = u32::try_from(frame.instruction).map_err(|_| invalid())?;
@@ -697,6 +702,74 @@ mod tests {
         let restored = Machine::read_checkpoint_state(original.image.clone(), &mut reader).unwrap();
         reader.finish().unwrap();
         restored
+    }
+
+    #[test]
+    fn lazy_task_buffers_switch_without_allocating_and_restore_small() {
+        use crate::execution::tests::allocation_counter;
+        let mut machine = fixtures::started_zero_arg_untraced(fixtures::task_spawn_join_artifact());
+        let root = machine.tasks.current().unwrap();
+        assert!(machine.task_frames.iter().all(Vec::is_empty));
+        let pointer = machine.frames.as_ptr();
+        allocation_counter::reset_and_enable();
+        machine.save_task(root).unwrap();
+        machine.restore_task(root).unwrap();
+        assert_eq!(0, allocation_counter::disable_and_read());
+        assert_eq!(pointer, machine.frames.as_ptr());
+        let restored = round_trip(&machine);
+        assert_eq!(machine.frames.len(), restored.frames.len());
+        assert!(restored.task_frames.iter().all(Vec::is_empty));
+        machine.task_frame_depths[0] = machine.image.maximum_call_depth();
+        assert_eq!(
+            Err(CheckpointError::InvalidState),
+            machine.validate_checkpoint_storage()
+        );
+    }
+
+    #[test]
+    fn failed_record_growth_preserves_existing_frames() {
+        use crate::execution::tests::allocation_counter::fail_allocations_at_least;
+        let mut frames = Vec::new();
+        ensure_frame_records(&mut frames, 1, 64).unwrap();
+        frames[0] = Frame::test_entry(0);
+        {
+            let _failure = fail_allocations_at_least(
+                8 * core::mem::size_of::<Frame>(),
+                core::mem::align_of::<Frame>(),
+            );
+            assert_eq!(
+                Err(VmFault::InvalidStoragePlan),
+                ensure_frame_records(&mut frames, 5, 64)
+            );
+        }
+        assert_eq!(4, frames.len());
+        assert_eq!(0, frames[0].function);
+        ensure_frame_records(&mut frames, 64, 64).unwrap();
+        assert_eq!(
+            Err(VmFault::InvalidStoragePlan),
+            ensure_frame_records(&mut frames, 65, 64)
+        );
+        assert_eq!(64, frames.len());
+    }
+
+    #[test]
+    fn checkpoint_resumes_after_multiple_frame_record_growths() {
+        let mut original = fixtures::started_zero_arg_untraced(fixtures::recursive_artifact(64));
+        while original.frame_depth < 17 {
+            assert_eq!(
+                Outcome::SliceExhausted,
+                original.run_slice_with_retirement_limit(128, 8, 1).unwrap()
+            );
+        }
+        let mut restored = round_trip(&original);
+        let expected = original.run_slice(4096, 8).unwrap();
+        assert_eq!(Outcome::Crashed(GuestTrap::StackOverflow), expected);
+        assert_eq!(expected, restored.run_slice(4096, 8).unwrap());
+        assert_eq!(64, restored.frame_depth);
+        assert_eq!(
+            original.retired_instructions(),
+            restored.retired_instructions()
+        );
     }
 
     #[test]

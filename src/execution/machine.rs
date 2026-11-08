@@ -67,7 +67,7 @@ pub(super) struct CapabilitySuspension<'a> {
 }
 
 impl Frame {
-    const EMPTY: Self = Self {
+    pub(super) const EMPTY: Self = Self {
         function: usize::MAX,
         base: 0,
         byte_len: 0,
@@ -135,8 +135,8 @@ pub(super) struct Machine {
     #[cfg(feature = "execution-prototype")]
     prototype_cache: super::prototype::DecodeCache,
     lifecycle: Lifecycle,
-    frames: Box<[Frame]>,
-    task_frames: Box<[Frame]>,
+    frames: Vec<Frame>,
+    task_frames: Box<[Vec<Frame>]>,
     task_frame_depths: Box<[usize]>,
     task_failures: Box<[Option<TaskFailure>]>,
     task_host_failures: Box<[Option<PendingHostFailure>]>,
@@ -402,6 +402,13 @@ impl Machine {
     }
 
     #[cfg(feature = "program-sharing-benchmark")]
+    fn frame_record_backing(&self) -> u64 {
+        ((self.frames.capacity() + self.task_frames.iter().map(Vec::capacity).sum::<usize>())
+            * core::mem::size_of::<Frame>()
+            + self.task_frames.len() * core::mem::size_of::<Vec<Frame>>()) as u64
+    }
+
+    #[cfg(feature = "program-sharing-benchmark")]
     pub(crate) fn write_memory_statistics(
         &self,
         process: usize,
@@ -421,6 +428,19 @@ impl Machine {
             ("heap_allocator", plan.heap_allocator_bytes),
             ("frame_arena", plan.frame_arena_bytes),
             ("frame_records", plan.frame_record_bytes),
+            ("frame_backing", self.frame_arena.bytes_len_for_benchmark()),
+            ("frame_record_backing", self.frame_record_backing()),
+            (
+                "frame_active_bytes",
+                self.frames
+                    .iter()
+                    .chain(self.task_frames.iter().flatten())
+                    .filter(|f| f.function != usize::MAX)
+                    .map(|f| u64::from(f.byte_len))
+                    .sum(),
+            ),
+            ("frame_depth", self.frame_depth as u64),
+            ("frame_peak_depth", self.maximum_observed_frame_depth as u64),
             ("task_scheduler", plan.task_scheduler_bytes),
             ("channels", plan.channel_bytes),
             ("statics", plan.static_bytes),
@@ -431,7 +451,11 @@ impl Machine {
             ("admitted_mutable_total", plan.mutable_resident_bytes()),
             (
                 "allocated_mutable_total",
-                plan.mutable_resident_bytes() - plan.heap_arena_bytes + self.heap.backing_bytes(),
+                plan.mutable_resident_bytes() - plan.heap_arena_bytes + self.heap.backing_bytes()
+                    - plan.frame_arena_bytes
+                    + self.frame_arena.bytes_len_for_benchmark()
+                    - plan.frame_record_bytes
+                    + self.frame_record_backing(),
             ),
             ("task_capacity", used.task_capacity),
             ("live_tasks", used.live_tasks),
@@ -456,7 +480,6 @@ impl Machine {
     fn new_with_trace(image: ExecutionImage, trace_enabled: bool) -> Result<Self, AdmissionError> {
         let heap = Heap::new(&image.storage_plan())?;
         let external_roots = ExternalRootTable::new(image.external_root_capacity())?;
-        let frame_count = image.maximum_call_depth();
         let task_count = image.maximum_coroutines();
         let frame_arena_bytes =
             u32::try_from(image.storage_plan().frame_arena_bytes).map_err(|_| {
@@ -466,19 +489,12 @@ impl Machine {
             })?;
         let frame_arena =
             FrameArena::new(frame_arena_bytes).map_err(|_| AdmissionError::AllocationFailed)?;
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(frame_count)
-            .map_err(|_| AdmissionError::AllocationFailed)?;
-        frames.resize(frame_count, Frame::EMPTY);
-        let saved_frame_count = frame_count
-            .checked_mul(task_count)
-            .ok_or(AdmissionError::StoragePlanOverflow)?;
+        let frames = Vec::new();
         let mut task_frames = Vec::new();
         task_frames
-            .try_reserve_exact(saved_frame_count)
+            .try_reserve_exact(task_count)
             .map_err(|_| AdmissionError::AllocationFailed)?;
-        task_frames.resize(saved_frame_count, Frame::EMPTY);
+        task_frames.resize_with(task_count, Vec::new);
         let mut task_frame_depths = Vec::new();
         task_frame_depths
             .try_reserve_exact(task_count)
@@ -529,7 +545,7 @@ impl Machine {
             #[cfg(feature = "execution-prototype")]
             prototype_cache: super::prototype::DecodeCache::default(),
             lifecycle: Lifecycle::Pristine,
-            frames: frames.into_boxed_slice(),
+            frames,
             task_frames: task_frames.into_boxed_slice(),
             task_frame_depths: task_frame_depths.into_boxed_slice(),
             task_failures: task_failures.into_boxed_slice(),
@@ -595,6 +611,8 @@ impl Machine {
             self.validate_argument(parameter as u16, *argument, *expected)?;
         }
 
+        ensure_frame_records(&mut self.frames, 1, self.image.maximum_call_depth())
+            .map_err(|_| RunError::NotRunnable)?;
         let entry = self
             .image
             .function(entry_index)
@@ -643,19 +661,11 @@ impl Machine {
 
     fn save_task(&mut self, task: TaskId) -> Result<(), VmFault> {
         let slot = self.tasks.slot_of(task).ok_or(VmFault::CorruptLifecycle)?;
-        let width = self.image.maximum_call_depth();
-        let start = slot.checked_mul(width).ok_or(VmFault::InvalidStoragePlan)?;
-        let end = start
-            .checked_add(width)
-            .ok_or(VmFault::InvalidStoragePlan)?;
-        let saved = self
-            .task_frames
-            .get_mut(start..end)
-            .ok_or(VmFault::InvalidStoragePlan)?;
-        saved.fill(Frame::EMPTY);
-        saved[..self.frame_depth].copy_from_slice(&self.frames[..self.frame_depth]);
+        if self.task_frame_depths[slot] != 0 {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        core::mem::swap(&mut self.frames, &mut self.task_frames[slot]);
         self.task_frame_depths[slot] = self.frame_depth;
-        self.frames[..self.frame_depth].fill(Frame::EMPTY);
         self.frame_depth = 0;
         Ok(())
     }
@@ -666,17 +676,10 @@ impl Machine {
             .task_frame_depths
             .get(slot)
             .ok_or(VmFault::InvalidStoragePlan)?;
-        let width = self.image.maximum_call_depth();
-        let start = slot.checked_mul(width).ok_or(VmFault::InvalidStoragePlan)?;
-        let end = start
-            .checked_add(width)
-            .ok_or(VmFault::InvalidStoragePlan)?;
-        let saved = self
-            .task_frames
-            .get_mut(start..end)
-            .ok_or(VmFault::InvalidStoragePlan)?;
-        self.frames[..depth].copy_from_slice(&saved[..depth]);
-        saved[..depth].fill(Frame::EMPTY);
+        if self.frame_depth != 0 || depth > self.task_frames[slot].len() {
+            return Err(VmFault::CorruptLifecycle);
+        }
+        core::mem::swap(&mut self.frames, &mut self.task_frames[slot]);
         self.task_frame_depths[slot] = 0;
         self.frame_depth = depth;
         Ok(())
@@ -695,14 +698,8 @@ impl Machine {
             .get(slot)
             .filter(|depth| **depth != 0)
             .ok_or(VmFault::CorruptLifecycle)?;
-        let start = slot
-            .checked_mul(self.image.maximum_call_depth())
-            .ok_or(VmFault::InvalidStoragePlan)?;
-        let frame_index = start
-            .checked_add(depth - 1)
-            .ok_or(VmFault::InvalidStoragePlan)?;
-        let frame = *self
-            .task_frames
+        let frame_index = depth - 1;
+        let frame = *self.task_frames[slot]
             .get(frame_index)
             .filter(|frame| frame.function != usize::MAX)
             .ok_or(VmFault::CorruptLifecycle)?;
@@ -719,8 +716,8 @@ impl Machine {
                 RuntimeValue::I32(value),
             )?;
         }
-        self.task_frames[frame_index].block = resume_block;
-        self.task_frames[frame_index].instruction = 0;
+        self.task_frames[slot][frame_index].block = resume_block;
+        self.task_frames[slot][frame_index].instruction = 0;
         self.tasks
             .complete_channel(task, channel)
             .map_err(task_fault)
@@ -1800,8 +1797,12 @@ impl Machine {
                             return Ok(outcome);
                         }
                         let callee_index = self.frame_depth;
-                        if callee_index >= self.frames.len() {
-                            return Ok(self.fault(VmFault::InvalidStoragePlan));
+                        if let Err(fault) = ensure_frame_records(
+                            &mut self.frames,
+                            callee_index + 1,
+                            self.image.maximum_call_depth(),
+                        ) {
+                            return Ok(self.fault(fault));
                         }
                         let reservation = match self.frame_arena.push(&target_function.frame_layout)
                         {
@@ -2627,6 +2628,18 @@ impl Machine {
                         self.frames[frame_index].instruction += 1;
                     }
                     ResolvedInstruction::TaskSpawn { dst, target, args } => {
+                        let slot = match self.tasks.next_spawn_slot() {
+                            Ok(slot) => slot,
+                            Err(error) => return Ok(self.fault(task_fault(error))),
+                        };
+                        if let Err(fault) = ensure_frame_records(
+                            &mut self.task_frames[slot],
+                            1,
+                            self.image.maximum_call_depth(),
+                        ) {
+                            return Ok(self.fault(fault));
+                        }
+
                         let Some(target_function) = self.image.function(*target) else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));
                         };
@@ -2706,11 +2719,7 @@ impl Machine {
                         let Some(slot) = self.tasks.slot_of(task) else {
                             return Ok(self.fault(VmFault::CorruptLifecycle));
                         };
-                        let start = match slot.checked_mul(self.image.maximum_call_depth()) {
-                            Some(start) => start,
-                            None => return Ok(self.fault(VmFault::InvalidStoragePlan)),
-                        };
-                        self.task_frames[start] = child_frame;
+                        self.task_frames[slot][0] = child_frame;
                         self.task_frame_depths[slot] = 1;
                         if let Err(fault) = self.write_register(
                             frame_index,
@@ -3399,8 +3408,12 @@ impl Machine {
             return Err(self.fault(VmFault::InvalidResolvedId));
         };
         let callee_index = self.frame_depth;
-        if callee_index >= self.frames.len() {
-            return Err(self.fault(VmFault::InvalidStoragePlan));
+        if let Err(fault) = ensure_frame_records(
+            &mut self.frames,
+            callee_index + 1,
+            self.image.maximum_call_depth(),
+        ) {
+            return Err(self.fault(fault));
         }
         let reservation = match self.frame_arena.push(&function.frame_layout) {
             Ok(reservation) => reservation,
@@ -4803,8 +4816,13 @@ impl Machine {
     #[cfg(test)]
     pub(super) fn test_reserved_bytes(&self) -> usize {
         core::mem::size_of::<Self>()
-            + self.frames.len() * core::mem::size_of::<Frame>()
-            + self.task_frames.len() * core::mem::size_of::<Frame>()
+            + self.frames.capacity() * core::mem::size_of::<Frame>()
+            + self.task_frames.len() * core::mem::size_of::<Vec<Frame>>()
+            + self
+                .task_frames
+                .iter()
+                .map(|frames| frames.capacity() * core::mem::size_of::<Frame>())
+                .sum::<usize>()
             + self.task_frame_depths.len() * core::mem::size_of::<usize>()
             + self.task_failures.len() * core::mem::size_of::<Option<TaskFailure>>()
             + self.task_host_failures.len() * core::mem::size_of::<Option<PendingHostFailure>>()
@@ -5641,3 +5659,25 @@ fn convert_with_signedness(
 
 #[path = "checkpoint/machine.rs"]
 mod checkpoint_state;
+
+fn ensure_frame_records(
+    frames: &mut Vec<Frame>,
+    required: usize,
+    limit: usize,
+) -> Result<(), VmFault> {
+    if required > limit {
+        return Err(VmFault::InvalidStoragePlan);
+    }
+    if required <= frames.len() {
+        return Ok(());
+    }
+    let target = required
+        .max(frames.len().saturating_mul(2))
+        .max(4)
+        .min(limit);
+    frames
+        .try_reserve_exact(target - frames.len())
+        .map_err(|_| VmFault::InvalidStoragePlan)?;
+    frames.resize(target, Frame::EMPTY);
+    Ok(())
+}

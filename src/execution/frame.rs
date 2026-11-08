@@ -92,10 +92,11 @@ pub(super) struct FrameArena {
     active_bytes: u32,
     #[cfg(test)]
     peak_active_bytes: u32,
-    bytes: Box<[u8]>,
+    bytes: Vec<u8>,
+    capacity: u32,
     free_head: Option<u32>,
     #[cfg(test)]
-    initialized: Box<[bool]>,
+    initialized: Vec<bool>,
 }
 
 pub(super) struct StaticArena {
@@ -105,6 +106,11 @@ pub(super) struct StaticArena {
 }
 
 impl FrameArena {
+    #[cfg(feature = "program-sharing-benchmark")]
+    pub(super) fn bytes_len_for_benchmark(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
     // Preparation proves the atom and offset against the verified layout.
     // Keep both frame and allocation bounds checked without constructing RuntimeValue.
     fn prepared_range(
@@ -156,7 +162,7 @@ impl FrameArena {
     }
 
     pub(super) fn new(capacity: u32) -> Result<Self, VmFault> {
-        let length = usize::try_from(capacity).map_err(|_| VmFault::InvalidStoragePlan)?;
+        let length = capacity.min(8) as usize;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(length)
@@ -167,15 +173,40 @@ impl FrameArena {
             active_bytes: 0,
             #[cfg(test)]
             peak_active_bytes: 0,
-            bytes: bytes.into_boxed_slice(),
+            bytes,
+            capacity,
             free_head: (capacity >= 8).then_some(0),
             #[cfg(test)]
-            initialized: vec![false; length].into_boxed_slice(),
+            initialized: vec![false; length],
         };
         if capacity >= 8 {
             arena.write_free(0, None, capacity)?;
         }
         Ok(arena)
+    }
+
+    fn ensure_backing(&mut self, required: u32) -> Result<(), VmFault> {
+        if required > self.capacity {
+            return Err(VmFault::InvalidStoragePlan);
+        }
+        if required as usize <= self.bytes.len() {
+            return Ok(());
+        }
+        let target = (required as usize)
+            .max(self.bytes.len().saturating_mul(2))
+            .max(256)
+            .min(self.capacity as usize);
+        self.bytes
+            .try_reserve_exact(target - self.bytes.len())
+            .map_err(|_| VmFault::InvalidStoragePlan)?;
+        #[cfg(test)]
+        self.initialized
+            .try_reserve_exact(target - self.initialized.len())
+            .map_err(|_| VmFault::InvalidStoragePlan)?;
+        self.bytes.resize(target, 0);
+        #[cfg(test)]
+        self.initialized.resize(target, false);
+        Ok(())
     }
 
     pub(super) fn push(&mut self, layout: &FrameLayout) -> Result<FrameReservation, VmFault> {
@@ -190,6 +221,12 @@ impl FrameArena {
             let (next, available) = self.read_free(region)?;
             if available >= byte_len {
                 let remaining = available - byte_len;
+                // Back payload and any remainder header before changing allocator metadata.
+                let required = region
+                    .checked_add(byte_len)
+                    .and_then(|end| end.checked_add(if remaining == 0 { 0 } else { 8 }))
+                    .ok_or(VmFault::InvalidStoragePlan)?;
+                self.ensure_backing(required)?;
                 let replacement = if remaining == 0 {
                     next
                 } else {
@@ -1133,6 +1170,71 @@ mod tests {
             },
             components,
         }
+    }
+
+    fn sized_layout(byte_len: u32) -> FrameLayout {
+        FrameLayout {
+            byte_len,
+            alignment: 8,
+            values: Box::new([]),
+        }
+    }
+
+    #[test]
+    fn growing_arena_preserves_values_offsets_holes_and_full_grant() {
+        let mut arena = FrameArena::new(4088).unwrap();
+        assert_eq!(8, arena.reserved_bytes());
+        let first = arena.push(&sized_layout(248)).unwrap();
+        arena
+            .write_prepared(first, 0, 42_i64.to_le_bytes())
+            .unwrap();
+        let second = arena.push(&sized_layout(512)).unwrap();
+        assert!(arena.reserved_bytes() < 4088);
+        assert_eq!(
+            42,
+            i64::from_le_bytes(arena.read_prepared(first, 0).unwrap())
+        );
+        arena.pop(first).unwrap();
+        let reused = arena.push(&sized_layout(248)).unwrap();
+        assert_eq!(first, reused);
+        assert_eq!([0; 8], arena.read_prepared::<8>(reused, 0).unwrap());
+        arena.pop(second).unwrap();
+        arena.pop(reused).unwrap();
+        let entire = arena.push(&sized_layout(4088)).unwrap();
+        assert_eq!(0, entire.base);
+        assert_eq!(4088, arena.reserved_bytes());
+        assert_eq!(
+            Err(VmFault::InvalidStoragePlan),
+            arena.push(&sized_layout(8))
+        );
+        arena.pop(entire).unwrap();
+        assert_eq!(entire, arena.push(&sized_layout(4088)).unwrap());
+    }
+
+    #[test]
+    fn failed_arena_growth_preserves_free_list_and_live_payload() {
+        use crate::execution::tests::allocation_counter::fail_allocations_at_least;
+        let mut arena = FrameArena::new(4096).unwrap();
+        let first = arena.push(&sized_layout(248)).unwrap();
+        arena
+            .write_prepared(first, 0, 42_i64.to_le_bytes())
+            .unwrap();
+        let before = arena.bytes.clone();
+        let head = arena.free_head;
+        {
+            let _failure = fail_allocations_at_least(512, 1);
+            assert_eq!(
+                Err(VmFault::InvalidStoragePlan),
+                arena.push(&sized_layout(512))
+            );
+        }
+        assert_eq!(head, arena.free_head);
+        assert_eq!(before, arena.bytes);
+        assert_eq!(
+            42,
+            i64::from_le_bytes(arena.read_prepared(first, 0).unwrap())
+        );
+        assert_eq!(248, arena.push(&sized_layout(512)).unwrap().base);
     }
 
     #[test]

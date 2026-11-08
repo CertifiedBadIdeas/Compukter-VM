@@ -1,10 +1,10 @@
 # Logical computer checkpoints
 
-The Rust checkpoint API and C ABI 27 expose bounded logical capture and restoration through both JNI and FFM. World-store methods provide atomic publication and consumption; host integrations own freeze, world-action settlement, resource rebinding and activation.
+The Rust checkpoint API and C ABI 28 expose bounded logical capture and restoration through both JNI and FFM. World-store methods provide atomic publication and consumption; host integrations own freeze, world-action settlement, resource rebinding and activation.
 
 Rust owns the logical execution payload. It stores verified executable bytes for the root and every live child, execution profiles and process limits, admitted capability identities, machine and session state, terminal and canonical input, redstone waits, exact writable-root namespace generation and immutable file bytes, and open handle generations. Admission rebuilds execution images from verified artifacts and checks state against those images and trusted host configuration. Rust layouts, addresses, allocation capacities, and process-local machine identity are not persisted.
 
-The execution envelope has a fixed 84-byte little-endian header: `CPKTHIB\0` (8 bytes), format version (u32, currently 8), runtime/schema identity (SHA-256, 32 bytes), computer ID (16 bytes), filesystem generation (u64), execution length (u64), and host descriptor length (u64). Execution and opaque host descriptor bytes follow, then SHA-256 over the complete header and both payloads. Runtime identity hashes the schema identity, a zero byte, and the native C ABI as a little-endian u32. The ABI comes from the canonical Runtime minor component; `cargo xtask check` verifies agreement with the exported FFI ABI. Package revisions do not participate in identity. The earlier development identity based on the full package version is rejected; no legacy fallback is admitted. Any incompatible constituent codec or meaning change requires an ABI increment and an appropriate format/schema version change before persisted admission is exposed. A revision must preserve checkpoint compatibility in both directions.
+The execution envelope has a fixed 84-byte little-endian header: `CPKTHIB\0` (8 bytes), format version (u32, currently 9), runtime/schema identity (SHA-256, 32 bytes), computer ID (16 bytes), filesystem generation (u64), execution length (u64), and host descriptor length (u64). Execution and opaque host descriptor bytes follow, then SHA-256 over the complete header and both payloads. Runtime identity hashes the schema identity, a zero byte, and the native C ABI as a little-endian u32. The ABI comes from the canonical Runtime minor component; `cargo xtask check` verifies agreement with the exported FFI ABI. Package revisions do not participate in identity. The earlier development identity based on the full package version is rejected; no legacy fallback is admitted. Any incompatible constituent codec or meaning change requires an ABI increment and an appropriate format/schema version change before persisted admission is exposed. A revision must preserve checkpoint compatibility in both directions.
 
 Readers reject unsupported identity/version, another computer ID, checksum failure, truncation, trailing bytes, inconsistent filesystem generation, oversized payloads, and allocation budget exhaustion. The execution decoder also applies depth limits and contextual validation. Host descriptor interpretation and resource rebinding remain host responsibilities; native decoding alone never authorizes dispatching saved external requests.
 
@@ -16,7 +16,7 @@ Pending compilation retains the exact validated source bytes captured when the r
 
 `ComputerMachine::checkpoint` captures execution and opaque host descriptor bytes within `ComputerCheckpointLimits`. `restore_checkpoint` requires a `ComputerRestoreEnvironment` containing the expected computer ID, profile, process limits, freshly resolved capability schemas, filesystem and initial file capability. It returns a machine and host descriptors without executing Guest code. The caller must freeze and settle host actions before capture, validate/rebind restored descriptors, and durably consume the snapshot before advancing restored execution. Native admission does not enforce those host lifecycle obligations.
 
-## Native transport (C ABI 26)
+## Native transport (C ABI 28)
 
 Five exports are appended to the existing transport: `compukter_checkpoint_save`, `compukter_checkpoint_restore`, `compukter_checkpoint_discard`, `compukter_checkpoint_host_size`, and `compukter_checkpoint_host_copy`. There are 50 exported functions, including explicit system installation. JNI uses Java 21 arrays; FFM uses caller-owned native buffers. Both check the exact ABI version before calls. No input pointer is retained.
 
@@ -59,3 +59,21 @@ free-list links and allocated payloads, including incomplete reservations, must 
 Restore rejects violations and preserves the saved prefix length. Subsequent allocation can
 grow the buffer without changing logical Ref32 offsets. Allocation capacity is not serialized.
 C ABI 27 marks the incompatible persisted-state contract; older execution envelopes use filesystem-preserving cold boot.
+
+## Demand-grown frames (Runtime 0.28.0)
+
+Envelope/schema 9 stores the frame arena's logical quota and initialized byte prefix separately,
+plus lazy record vectors for the active stack and each task slot. Restore preserves the prefix
+and initialized record lengths, checks every depth against its buffer and admitted call limit,
+and validates scheduler ownership and EMPTY tails. All live frame bytes and free-list headers
+must be backed. Only the terminal free region may span unbacked bytes. Partition, overlap,
+quota and header bounds remain mandatory. Static storage uses the same allocator but backs its
+entire reservation.
+
+Arenas initially back only an eight-byte free header. Growth precedes allocator mutation and
+uses max(required bytes, twice the previous prefix, 256), capped by the quota. Frame offsets stay
+stable. Record buffers grow geometrically within the call limit. Cooperative switches exchange
+owned vectors without allocation or copies; suspended-task GC scans retain logical task/depth
+order. Storage-plan counters remain admitted upper bounds, including task-vector descriptors;
+benchmark-only counters distinguish backing from capacity. Neither arena nor record buffers
+shrink during execution. C ABI 28 marks this incompatible persisted-state encoding.

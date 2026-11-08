@@ -55,7 +55,7 @@ impl Collector {
                 || self.external_root > roots.external.len()
                 || self.static_field > image.fields().len()
                 || self.frame > roots.frame_depth
-                || self.saved_frame > roots.saved_frames.len())
+                || self.saved_frame > roots.saved_frames.len() * image.maximum_call_depth())
         {
             return Err(invalid());
         }

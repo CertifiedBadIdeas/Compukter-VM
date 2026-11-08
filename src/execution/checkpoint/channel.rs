@@ -139,7 +139,7 @@ impl ChannelArena {
         &self,
         scheduler: &crate::execution::task::TaskScheduler,
         image: &crate::execution::image::ExecutionImage,
-        frames: &[crate::execution::machine::Frame],
+        frames: &[Vec<crate::execution::machine::Frame>],
         depths: &[usize],
     ) -> Result<()> {
         use crate::execution::{
@@ -165,7 +165,10 @@ impl ChannelArena {
                         .get(slot)
                         .filter(|depth| **depth > 0 && **depth <= width)
                         .ok_or(InvalidState)?;
-                    let frame = frames.get(slot * width + depth - 1).ok_or(InvalidState)?;
+                    let frame = frames
+                        .get(slot)
+                        .and_then(|frames| frames.get(depth - 1))
+                        .ok_or(InvalidState)?;
                     let (destination, resume) = match waiter.kind {
                         WaitKind::Send { resume_block, .. } => (None, resume_block),
                         WaitKind::Receive {
@@ -293,7 +296,7 @@ mod tests {
         let handle = channels.create(1).unwrap();
         channels.send(handle, 0, TaskId::ROOT, 1, 0).unwrap();
         channels.send(handle, 0, TaskId::ROOT, 2, 0).unwrap();
-        let frames = [Frame::test_entry(0), Frame::test_entry(0)];
+        let frames = [vec![Frame::test_entry(0)], vec![Frame::test_entry(0)]];
         let depths = [1, 0];
         assert_eq!(
             Err(CheckpointError::InvalidState),
