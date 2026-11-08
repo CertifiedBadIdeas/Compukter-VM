@@ -28,7 +28,7 @@ checkpoint_struct!(FileSystemLimits {
     maximum_directory_entries,
     maximum_open_handles,
     maximum_io_bytes,
-    maximum_rom_bytes,
+    maximum_system_image_bytes,
     maximum_journal_record_bytes,
     maximum_journal_payload_bytes,
     maximum_checkpoint_bytes,

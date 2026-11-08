@@ -37,7 +37,10 @@ fn checkpoint(computer: ComputerId, generation: u64) -> Checkpoint {
     Checkpoint::new(
         computer,
         generation,
-        vec![CheckpointNode::directory(path("/home/project"), generation)],
+        vec![
+            CheckpointNode::directory(path("/home"), 0),
+            CheckpointNode::directory(path("/home/project"), generation),
+        ],
     )
     .unwrap()
 }
@@ -104,6 +107,7 @@ fn journal_and_checkpoint_codecs_are_exact_and_deterministic() {
         computer,
         4,
         vec![
+            CheckpointNode::directory(path("/home"), 0),
             CheckpointNode::directory(path("/home/project"), 2),
             CheckpointNode::file(path("/home/project/old"), 4, 3, [3; 32], false),
         ],
@@ -271,4 +275,51 @@ fn recovery_work_is_bounded_before_decoding_untrusted_records() {
     let mut limits = normal;
     limits.maximum_recovery_records = 0;
     assert_eq!(recover(&input, &limits), Err(RecoveryError::LimitExceeded));
+}
+
+#[test]
+fn root_transactions_reject_nested_batches_and_legacy_versions() {
+    let limits = FileSystemLimits::testing();
+    let batch = JournalOperation::Batch {
+        operations: vec![
+            JournalOperation::create_directory(path("/boot"), 1),
+            JournalOperation::put_file(path("/boot/init"), 1, 4, [7; 32], true),
+        ],
+    };
+    let journal = JournalRecord::new(id(99), 1, 0, batch).unwrap();
+    let bytes = journal.encode(&limits).unwrap();
+    let input = RecoveryInput::new(id(99), 1)
+        .with_journal(RecoveryJournalRecord::new(1, Arc::clone(&bytes)));
+    let restored = recover(&input, &limits).unwrap();
+    assert!(restored.node(&path("/boot/init")).is_some());
+    let mut legacy = bytes.to_vec();
+    legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    let end = legacy.len() - 32;
+    let digest = Sha256::digest(&legacy[..end]);
+    legacy[end..].copy_from_slice(&digest);
+    assert_eq!(
+        Err(PersistenceCodecError::UnsupportedVersion),
+        JournalRecord::decode(legacy.into(), &limits)
+    );
+    assert!(JournalRecord::new(
+        id(99),
+        1,
+        0,
+        JournalOperation::Batch {
+            operations: vec![JournalOperation::Batch {
+                operations: vec![JournalOperation::remove(path("/boot/init"))]
+            }]
+        }
+    )
+    .is_err());
+    let checkpoint = Checkpoint::new(id(99), 1, restored.nodes().cloned().collect()).unwrap();
+    let mut legacy = checkpoint.encode(&limits).unwrap().to_vec();
+    legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    let end = legacy.len() - 32;
+    let digest = Sha256::digest(&legacy[..end]);
+    legacy[end..].copy_from_slice(&digest);
+    assert_eq!(
+        Err(PersistenceCodecError::UnsupportedVersion),
+        Checkpoint::decode(legacy.into(), &limits)
+    );
 }

@@ -25,31 +25,7 @@ use crate::filesystem::{
 };
 
 impl ComputerFileSystem {
-    fn checkpoint_rom_identity(&self) -> Result<[u8; 32]> {
-        fn write(directory: &Directory, writer: &mut Writer) -> Result<()> {
-            directory.len().write(writer)?;
-            for (name, node) in directory {
-                name.write(writer)?;
-                node.metadata.executable.write(writer)?;
-                match &node.contents {
-                    NodeContents::File(object) => {
-                        0_u8.write(writer)?;
-                        object.write(writer)?;
-                    }
-                    NodeContents::Directory(directory) => {
-                        1_u8.write(writer)?;
-                        write(directory, writer)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        let mut writer = Writer::new(self.limits.maximum_checkpoint_bytes);
-        write(&self.rom, &mut writer)?;
-        Ok(Sha256::digest(writer.finish()).into())
-    }
-
-    fn checkpoint_home_nodes(&self) -> Result<Vec<CheckpointNode>> {
+    fn checkpoint_root_nodes(&self) -> Result<Vec<CheckpointNode>> {
         fn visit(
             directory: &Directory,
             prefix: &str,
@@ -82,7 +58,7 @@ impl ComputerFileSystem {
             Ok(())
         }
         let mut nodes = Vec::new();
-        visit(&self.home, "/home", &self.limits, &mut nodes)?;
+        visit(&self.root, "", &self.limits, &mut nodes)?;
         nodes.sort_unstable_by(|left, right| left.path().cmp(right.path()));
         Ok(nodes)
     }
@@ -96,8 +72,7 @@ impl ComputerFileSystem {
             return Err(CheckpointError::Incompatible);
         }
         self.limits.write(writer)?;
-        self.checkpoint_rom_identity()?.write(writer)?;
-        let nodes = self.checkpoint_home_nodes()?;
+        let nodes = self.checkpoint_root_nodes()?;
         let objects = nodes
             .iter()
             .filter_map(CheckpointNode::object)
@@ -125,7 +100,7 @@ impl ComputerFileSystem {
         Ok(())
     }
 
-    /// Rebuild logical state using a trusted ROM and persistence attachment. A
+    /// Rebuild logical state using a durable namespace and persistence attachment. A
     /// live store may only attach to the exact already-published generation.
     pub(crate) fn read_checkpoint_state(
         mut expected: Self,
@@ -140,8 +115,7 @@ impl ComputerFileSystem {
             return Err(CheckpointError::Incompatible);
         }
         let limits = FileSystemLimits::read(reader)?;
-        let rom: [u8; 32] = LogicalCheckpoint::read(reader)?;
-        if limits != expected.limits || rom != expected.checkpoint_rom_identity()? {
+        if limits != expected.limits {
             return Err(CheckpointError::Incompatible);
         }
         let namespace_bytes = reader.arc_bytes(limits.maximum_checkpoint_bytes)?;
@@ -184,31 +158,6 @@ impl ComputerFileSystem {
         );
         let recovered = recover(&input, &limits).map_err(|_| CheckpointError::InvalidState)?;
         let mut filesystem = Self::with_limits(limits);
-        filesystem.rom = expected.rom.clone();
-        fn copy_rom(
-            directory: &Directory,
-            source: &ObjectStore,
-            target: &mut ObjectStore,
-        ) -> Result<()> {
-            for node in directory.values() {
-                match &node.contents {
-                    NodeContents::File(object) => target.replace(
-                        None,
-                        *object,
-                        Arc::clone(
-                            &source
-                                .0
-                                .get(object)
-                                .ok_or(CheckpointError::InvalidState)?
-                                .bytes,
-                        ),
-                    ),
-                    NodeContents::Directory(directory) => copy_rom(directory, source, target)?,
-                }
-            }
-            Ok(())
-        }
-        copy_rom(&expected.rom, &expected.objects, &mut filesystem.objects)?;
         filesystem
             .restore_recovered(&recovered, &objects)
             .map_err(|_| CheckpointError::InvalidState)?;
@@ -216,7 +165,7 @@ impl ComputerFileSystem {
             || filesystem.quota.nodes() != nodes
             || expected.persistence.is_some()
                 && (filesystem.generation != expected.generation
-                    || filesystem.home != expected.home)
+                    || filesystem.root != expected.root)
         {
             return Err(CheckpointError::Incompatible);
         }
@@ -241,6 +190,30 @@ mod tests {
         filesystem.write_checkpoint_state(ID, &mut writer).unwrap();
         writer.finish()
     }
+    #[test]
+    fn checkpoint_restores_writable_handles_at_root_and_system_paths() {
+        let mut original = ComputerFileSystem::testing();
+        let owner = FileCapability::new(VirtualPath::root(), FileRights::OWNER);
+        let root_file = VirtualPath::parse_utf8("/status", original.limits()).unwrap();
+        original
+            .write_file(&owner, &root_file, b"saved", false)
+            .unwrap();
+        let handle = original
+            .open(&owner, &root_file, OpenMode::ReadWrite)
+            .unwrap();
+        let bytes = encoded(&original);
+        let mut reader = Reader::new(&bytes, 4 * 1024 * 1024, 4 * 1024 * 1024).unwrap();
+        let mut restored = ComputerFileSystem::read_checkpoint_state(
+            ComputerFileSystem::testing(),
+            ID,
+            &mut reader,
+        )
+        .unwrap();
+        reader.finish().unwrap();
+        restored.write(handle, 0, b"other").unwrap();
+        assert_eq!(b"other", restored.read(handle, 0, 16).unwrap().as_slice());
+    }
+
     #[test]
     fn checkpoint_restores_namespace_generation_objects_and_handle_generations() {
         let mut original = ComputerFileSystem::testing();
@@ -360,12 +333,12 @@ mod tests {
     fn checkpoint_reopens_persistent_generation_and_rejects_newer_files() {
         use crate::WorldFileSystemStore;
         let limits = FileSystemLimits::testing();
-        let mut rom = b"CPKTROM\0".to_vec();
+        let mut rom = b"CPKTSYS\0".to_vec();
         rom.extend_from_slice(&1_u16.to_le_bytes());
         rom.extend_from_slice(&0_u16.to_le_bytes());
         rom.extend_from_slice(&0_u32.to_le_bytes());
         rom.extend_from_slice(&Sha256::digest(&rom));
-        let rom = Arc::new(RomImage::admit(rom.into(), &limits).unwrap());
+        let rom = Arc::new(SystemImage::admit(rom.into(), &limits).unwrap());
         let root = std::env::temp_dir().join(format!(
             "compukters-hibernation-{}-{}",
             std::process::id(),

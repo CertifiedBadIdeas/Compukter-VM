@@ -7,21 +7,21 @@
 //! Real boot/shell/child trees; observations never enter the product ABI.
 use super::*;
 use crate::filesystem::{
-    ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, RomImage, VirtualPath,
+    ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, SystemImage, VirtualPath,
 };
 use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 
-fn rom(inputs: &Path) -> RomImage {
+fn rom(inputs: &Path) -> SystemImage {
     use sha2::{Digest, Sha256};
-    let mut bytes = b"CPKTROM\0".to_vec();
+    let mut bytes = b"CPKTSYS\0".to_vec();
     bytes.extend_from_slice(&1_u16.to_le_bytes());
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     bytes.extend_from_slice(&3_u32.to_le_bytes());
     for (path, file) in [
-        ("/rom/boot", "boot.cpkt"),
-        ("/rom/child", "child.cpkt"),
-        ("/rom/shell", "shell.cpkt"),
+        ("/bin/child", "child.cpkt"),
+        ("/bin/shell", "shell.cpkt"),
+        ("/boot/init", "boot.cpkt"),
     ] {
         let content = fs::read(inputs.join(file)).unwrap();
         bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
@@ -32,7 +32,7 @@ fn rom(inputs: &Path) -> RomImage {
     }
     let digest = Sha256::digest(&bytes);
     bytes.extend_from_slice(&digest);
-    RomImage::admit(bytes.into(), &FileSystemLimits::default()).unwrap()
+    SystemImage::admit(bytes.into(), &FileSystemLimits::default()).unwrap()
 }
 
 fn resident() -> [u64; 3] {
@@ -149,7 +149,8 @@ pub(super) fn main(args: &[String]) {
         selected.maximum_channel_values = 4096;
         selected.maximum_events = 64;
         let filesystem =
-            ComputerFileSystem::with_rom(FileSystemLimits::default(), image.clone()).unwrap();
+            ComputerFileSystem::with_system_image(FileSystemLimits::default(), image.clone())
+                .unwrap();
         let owner = FileCapability::new(VirtualPath::root(), FileRights::OWNER);
         let machine = if boot {
             ComputerMachine::boot_in_filesystem(
@@ -204,7 +205,7 @@ pub(super) fn main(args: &[String]) {
     );
     allocation_counter::reset_peak();
     let start = thread_cpu_ns();
-    command(&mut machines, |_| "/rom/child".to_owned());
+    command(&mut machines, |_| "/bin/child".to_owned());
     for machine in &mut machines {
         for _ in 0..1000 {
             let outcome = machine.advance(SLICE, SLICE, 64).unwrap();

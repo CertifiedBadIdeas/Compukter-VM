@@ -23,8 +23,16 @@ impl Drop for Blob {
     }
 }
 #[derive(Clone, Debug)]
-pub(super) struct SharedBlob(Arc<Blob>);
-impl SharedBlob {
+pub(crate) struct SharedBytes(Arc<Blob>);
+impl SharedBytes {
+    #[cfg(any(test, feature = "program-sharing-benchmark"))]
+    pub fn new_unshared(bytes: Arc<[u8]>) -> Self {
+        Self(Arc::new(Blob {
+            key: Sha256::digest(&bytes).into(),
+            bytes,
+        }))
+    }
+
     pub fn new(bytes: Arc<[u8]>) -> Self {
         let key = Sha256::digest(&bytes).into();
         Self(BLOBS.intern(key, Arc::new(Blob { key, bytes }), |a, b| {
@@ -32,26 +40,26 @@ impl SharedBlob {
         }))
     }
 }
-impl Deref for SharedBlob {
+impl Deref for SharedBytes {
     type Target = Arc<[u8]>;
     fn deref(&self) -> &Self::Target {
         &self.0.bytes
     }
 }
-impl PartialEq for SharedBlob {
+impl PartialEq for SharedBytes {
     fn eq(&self, other: &Self) -> bool {
         self.0.bytes == other.0.bytes
     }
 }
-impl Eq for SharedBlob {}
+impl Eq for SharedBytes {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn identical_contents_share_and_final_release_removes_the_index() {
-        let first = SharedBlob::new(Arc::from(&b"unique shared filesystem blob test"[..]));
-        let second = SharedBlob::new(Arc::from(first.to_vec()));
+        let first = SharedBytes::new(Arc::from(&b"unique shared filesystem blob test"[..]));
+        let second = SharedBytes::new(Arc::from(first.to_vec()));
         assert!(Arc::ptr_eq(&first, &second));
         let key = first.0.key;
         let weak = Arc::downgrade(&first.0);

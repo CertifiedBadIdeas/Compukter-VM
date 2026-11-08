@@ -520,6 +520,7 @@ struct ExecutionImageInner {
 pub(crate) struct PreparedProgram {
     content_hash: [u8; 32],
     artifact_bytes: Arc<[u8]>,
+    _bytes_owner: crate::shared_bytes::SharedBytes,
     entry: usize,
     functions: Box<[ResolvedFunction]>,
     dispatch_entries: Box<[DispatchEntry]>,
@@ -1486,6 +1487,7 @@ pub(crate) fn prepare_program(
     Ok(PreparedProgram {
         content_hash: artifact.content_hash(),
         artifact_bytes: decoded.bytes.clone(),
+        _bytes_owner: crate::shared_bytes::SharedBytes::new(Arc::clone(&decoded.bytes)),
         entry,
         functions: functions.into_boxed_slice(),
         dispatch_entries,

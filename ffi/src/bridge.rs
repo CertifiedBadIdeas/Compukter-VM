@@ -11,7 +11,7 @@ use compukter_vm::{
     FileSystemError, FileSystemLimits, GuestTrap, HostDeployError, HostFailure, HostFailureKind,
     HostMergeSchema, HostResponse, HostValueInput, HostVerifyError, ManagedAllocationFailure,
     OperationSchema, OwnedHostFailure, ProcessFailureReason, ProcessLimits, QuotaExhaustion,
-    ResumeError, RomImage, RunError, StoreError, StoreHealth, StoreOpenError, TerminalDevice,
+    ResumeError, RunError, StoreError, StoreHealth, StoreOpenError, SystemImage, TerminalDevice,
     TerminalInputError, TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers,
     TerminalUpdate, VirtualPath, VmFault, WorldFileSystemStore,
 };
@@ -226,14 +226,14 @@ pub(crate) fn create_in_store(
     let computer = stores()
         .with(store_handle, |store| {
             let limits = *store.limits();
-            let rom = RomImage::admit(Arc::from(rom_bytes), &limits)
+            let rom = SystemImage::admit(Arc::from(rom_bytes), &limits)
                 .map(Arc::new)
                 .map_err(|_| CreateInStoreError::Rom)?;
             let filesystem = store
                 .open_computer(id, rom)
                 .map_err(|error| CreateInStoreError::Store(StoreBridgeError::Store(error)))?;
             let initial_capability = FileCapability::new(
-                VirtualPath::parse_utf8("/home", &limits)
+                VirtualPath::parse_utf8("/", &limits)
                     .expect("fixed initial filesystem capability path"),
                 FileRights::OWNER,
             );
@@ -273,7 +273,7 @@ pub(crate) fn create_boot_in_store(
     let computer = stores()
         .with(store_handle, |store| {
             let limits = *store.limits();
-            let rom = RomImage::admit(Arc::from(rom_bytes), &limits)
+            let rom = SystemImage::admit(Arc::from(rom_bytes), &limits)
                 .map(Arc::new)
                 .map_err(|_| CreateInStoreError::Rom)?;
             let filesystem = store
@@ -752,7 +752,6 @@ pub(crate) fn checkpoint_save(
 
 pub(crate) fn checkpoint_restore(
     store_handle: u64,
-    boot: bool,
     id: ComputerId,
     rom_bytes: Vec<u8>,
     schemas: &[DecodedCapabilitySchema],
@@ -770,15 +769,14 @@ pub(crate) fn checkpoint_restore(
                 .map_err(CheckpointBridgeError::Store)?
                 .ok_or(CheckpointBridgeError::Absent)?;
             let filesystem_limits = *store.limits();
-            let rom = RomImage::admit(Arc::from(rom_bytes), &filesystem_limits)
+            let rom = SystemImage::admit(Arc::from(rom_bytes), &filesystem_limits)
                 .map(Arc::new)
                 .map_err(|_| CheckpointBridgeError::Rom)?;
             let filesystem = store
                 .open_computer(id, rom)
                 .map_err(CheckpointBridgeError::Store)?;
             let initial_file_capability = FileCapability::new(
-                VirtualPath::parse_utf8(if boot { "/" } else { "/home" }, &filesystem_limits)
-                    .expect("fixed capability path"),
+                VirtualPath::parse_utf8("/", &filesystem_limits).expect("fixed capability path"),
                 FileRights::OWNER,
             );
             let (computer, host) = with_capability_bindings(schemas, |bindings| {
@@ -867,6 +865,22 @@ pub(crate) fn store_recover(handle: u64, id: ComputerId) -> Result<(), StoreBrid
         .with(handle, |store| store.recover_tombstone(id))
         .map_err(StoreBridgeError::Handle)?
         .map_err(StoreBridgeError::Store)
+}
+
+pub(crate) fn store_install_system(
+    handle: u64,
+    id: ComputerId,
+    image: Vec<u8>,
+) -> Result<(), StoreBridgeError> {
+    stores()
+        .with(handle, |store| {
+            let image = SystemImage::admit(image.into(), store.limits())
+                .map_err(|_| StoreBridgeError::Store(StoreError::Io))?;
+            store
+                .install_system(id, Arc::new(image))
+                .map_err(StoreBridgeError::Store)
+        })
+        .map_err(StoreBridgeError::Handle)?
 }
 
 pub(crate) fn store_close(handle: u64) -> Result<(), StoreBridgeError> {
@@ -1104,7 +1118,7 @@ fn profile() -> ExecutionProfile {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use compukter_vm::{FileCapability, FileRights, FileSystemError, RomImage, VirtualPath};
+    use compukter_vm::{FileCapability, FileRights, FileSystemError, SystemImage, VirtualPath};
     use sha2::{Digest, Sha256};
 
     use super::*;
@@ -1164,14 +1178,14 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn empty_rom(limits: &FileSystemLimits) -> RomImage {
+    fn empty_rom(limits: &FileSystemLimits) -> SystemImage {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"CPKTROM\0");
+        bytes.extend_from_slice(b"CPKTSYS\0");
         bytes.extend_from_slice(&1_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         let digest = Sha256::digest(&bytes);
         bytes.extend_from_slice(&digest);
-        RomImage::admit(bytes.into(), limits).unwrap()
+        SystemImage::admit(bytes.into(), limits).unwrap()
     }
 }

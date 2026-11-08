@@ -4505,19 +4505,19 @@ pub(crate) fn process_terminal_child_artifact() -> VerifiedArtifact {
     )
 }
 
-pub(crate) fn process_install_rom_executable_artifact() -> VerifiedArtifact {
+pub(crate) fn process_copy_executable_artifact() -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,
         flags: 0,
         nominal_type: TypeId(0x8000_0000),
     };
     let destination = "/home/hello".encode_utf16().collect::<Vec<_>>();
-    let source = "/rom/hello".encode_utf16().collect::<Vec<_>>();
+    let source = "/bin/hello".encode_utf16().collect::<Vec<_>>();
     literal_string_program_blocks_configured(
         primitive(1),
         vec![string, string, primitive(1)],
         Vec::new(),
-        &destination,
+        &source,
         vec![vec![
             Instruction::Const {
                 dst: 0,
@@ -4531,7 +4531,7 @@ pub(crate) fn process_install_rom_executable_artifact() -> VerifiedArtifact {
                 dst: 2,
                 capability: 0,
                 operation: 7,
-                args: Box::new([1, 0]),
+                args: Box::new([0, 1]),
             },
             Instruction::Return { value: 2 },
         ]],
@@ -4544,7 +4544,7 @@ pub(crate) fn process_install_rom_executable_artifact() -> VerifiedArtifact {
             bytes.extend_from_slice(b"filesystem");
             let name_end = bytes.len();
             let source_start = bytes.len();
-            for unit in &source {
+            for unit in &destination {
                 bytes.extend_from_slice(&unit.to_le_bytes());
             }
             let source_end = bytes.len();

@@ -188,7 +188,6 @@ impl<'a> Cursor<'a> {
     }
 }
 
-pub(crate) fn home_descendant(path: &VirtualPath) -> bool {
-    let mut components = path.components();
-    components.next() == Some("home") && components.next().is_some()
+pub(crate) fn root_descendant(path: &VirtualPath) -> bool {
+    path.components().next().is_some()
 }

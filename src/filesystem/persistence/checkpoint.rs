@@ -19,7 +19,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use super::codec::{home_descendant, path_record_len, Cursor, Writer, DIGEST_BYTES};
+use super::codec::{path_record_len, root_descendant, Cursor, Writer, DIGEST_BYTES};
 use super::{ComputerId, PersistenceCodecError};
 use crate::filesystem::{FileSystemLimits, VirtualPath};
 
@@ -192,7 +192,7 @@ impl Checkpoint {
     }
 
     pub fn encode(&self, limits: &FileSystemLimits) -> Result<Arc<[u8]>, PersistenceCodecError> {
-        if self.nodes.len() > limits.maximum_nodes.saturating_sub(2) as usize {
+        if self.nodes.len() > limits.maximum_nodes as usize {
             return Err(PersistenceCodecError::LimitExceeded);
         }
         let mut encoded_without_digest = 40_usize;
@@ -217,7 +217,7 @@ impl Checkpoint {
         }
         let mut writer = Writer::with_capacity(encoded_without_digest)?;
         writer.bytes(MAGIC);
-        writer.u16(1);
+        writer.u16(2);
         writer.u16(0);
         writer.bytes(&self.computer_id.into_bytes());
         writer.u64(self.generation);
@@ -238,7 +238,7 @@ impl Checkpoint {
         if cursor.exact(8)? != MAGIC {
             return Err(PersistenceCodecError::Malformed);
         }
-        if cursor.u16()? != 1 {
+        if cursor.u16()? != 2 {
             return Err(PersistenceCodecError::UnsupportedVersion);
         }
         if cursor.u16()? != 0 {
@@ -248,7 +248,7 @@ impl Checkpoint {
             ComputerId::from_bytes(cursor.exact(16)?.try_into().expect("exact width"));
         let generation = cursor.u64()?;
         let count = cursor.u32()?;
-        if count > limits.maximum_nodes.saturating_sub(2) {
+        if count > limits.maximum_nodes {
             return Err(PersistenceCodecError::LimitExceeded);
         }
         let mut nodes = Vec::new();
@@ -281,7 +281,7 @@ fn validate_nodes(
 ) -> Result<(), PersistenceCodecError> {
     let mut directories = BTreeSet::new();
     for (index, node) in nodes.iter().enumerate() {
-        if !home_descendant(node.path())
+        if !root_descendant(node.path())
             || index > 0 && nodes[index - 1].path() >= node.path()
             || node_generation(node) > checkpoint_generation
         {
@@ -291,7 +291,7 @@ fn validate_nodes(
             .path()
             .parent()
             .ok_or(PersistenceCodecError::NonCanonical)?;
-        if parent.to_string() != "/home" && !directories.contains(&parent) {
+        if parent.to_string() != "/" && !directories.contains(&parent) {
             return Err(PersistenceCodecError::NonCanonical);
         }
         if node.is_directory() {

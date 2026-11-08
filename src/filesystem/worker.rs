@@ -126,7 +126,7 @@ pub(crate) struct ComputerPersistence {
 struct MutationCommand {
     computer_id: ComputerId,
     generation: u64,
-    object: Option<([u8; 32], Arc<[u8]>)>,
+    objects: Vec<([u8; 32], Arc<[u8]>)>,
     journal: Arc<[u8]>,
 }
 
@@ -189,9 +189,11 @@ impl Command {
     fn byte_cost(&self) -> usize {
         match self {
             Self::Mutation(command) => command
-                .object
-                .as_ref()
-                .map_or(0, |(_, bytes)| bytes.len())
+                .objects
+                .iter()
+                .fold(0_usize, |total, (_, bytes)| {
+                    total.saturating_add(bytes.len())
+                })
                 .saturating_add(command.journal.len()),
             Self::Tombstone(_) => 0,
             Self::Collect(command) => command.objects.len().saturating_mul(32),
@@ -541,13 +543,22 @@ impl ComputerPersistence {
         object: Option<([u8; 32], Arc<[u8]>)>,
         operation: JournalOperation,
     ) -> Result<PersistenceMutation, FileSystemError> {
+        self.prepare_batch(generation, object.into_iter().collect(), operation)
+    }
+
+    pub fn prepare_batch(
+        &self,
+        generation: u64,
+        objects: Vec<([u8; 32], Arc<[u8]>)>,
+        operation: JournalOperation,
+    ) -> Result<PersistenceMutation, FileSystemError> {
         let journal = JournalRecord::new(self.computer_id, generation, generation - 1, operation)
             .and_then(|record| record.encode(&self.limits))
             .map_err(codec_to_filesystem)?;
         let command = Command::Mutation(MutationCommand {
             computer_id: self.computer_id,
             generation,
-            object,
+            objects,
             journal,
         });
         let reservation = self.gate.reserve(command.byte_cost())?;
@@ -683,7 +694,7 @@ fn persist_mutation(
     command: &MutationCommand,
     crash_injector: PersistenceCrashInjector,
 ) -> io::Result<()> {
-    if let Some((object_id, object)) = &command.object {
+    for (object_id, object) in &command.objects {
         if Sha256::digest(object).as_slice() != object_id {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "object digest"));
         }

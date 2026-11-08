@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use super::codec::{home_descendant, path_record_len, Cursor, Writer, DIGEST_BYTES};
+use super::codec::{path_record_len, root_descendant, Cursor, Writer, DIGEST_BYTES};
 use super::{ComputerId, PersistenceCodecError};
 use crate::filesystem::{FileSystemLimits, VirtualPath};
 
@@ -26,6 +26,10 @@ const MAGIC: &[u8; 8] = b"CPKTJNL\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JournalOperation {
+    /// One flat, bounded transaction, published as a single journal record.
+    Batch {
+        operations: Vec<JournalOperation>,
+    },
     CreateDirectory {
         path: VirtualPath,
         node_generation: u64,
@@ -93,6 +97,20 @@ impl JournalOperation {
         }
         let mut writer = Writer::with_capacity(length)?;
         match self {
+            Self::Batch { operations } => {
+                writer.u8(5);
+                writer.u8(0);
+                writer.u16(0);
+                writer.u32(
+                    u32::try_from(operations.len())
+                        .map_err(|_| PersistenceCodecError::LimitExceeded)?,
+                );
+                for operation in operations {
+                    let bytes = operation.encode(limits)?;
+                    writer.u32(bytes.len() as u32);
+                    writer.bytes(&bytes);
+                }
+            }
             Self::CreateDirectory {
                 path,
                 node_generation,
@@ -140,6 +158,20 @@ impl JournalOperation {
     }
 
     fn encoded_len(&self, limits: &FileSystemLimits) -> Result<usize, PersistenceCodecError> {
+        if let Self::Batch { operations } = self {
+            if operations.is_empty()
+                || operations.len() > limits.maximum_nodes as usize
+                || operations.iter().any(|op| matches!(op, Self::Batch { .. }))
+            {
+                return Err(PersistenceCodecError::NonCanonical);
+            }
+            return operations.iter().try_fold(8_usize, |length, op| {
+                length
+                    .checked_add(4)
+                    .and_then(|length| length.checked_add(op.encoded_len(limits).ok()?))
+                    .ok_or(PersistenceCodecError::LimitExceeded)
+            });
+        }
         let mut length = 4_usize;
         let mut add_path = |path: &VirtualPath| -> Result<(), PersistenceCodecError> {
             if path.encoded_len() > limits.maximum_path_bytes {
@@ -151,6 +183,7 @@ impl JournalOperation {
             Ok(())
         };
         match self {
+            Self::Batch { .. } => unreachable!(),
             Self::CreateDirectory { path, .. }
             | Self::PutFile { path, .. }
             | Self::Remove { path } => add_path(path)?,
@@ -165,6 +198,7 @@ impl JournalOperation {
         }
         length = length
             .checked_add(match self {
+                Self::Batch { .. } => unreachable!(),
                 Self::CreateDirectory { .. } => 8,
                 Self::PutFile { .. } => 8 + 8 + 32,
                 Self::Remove { .. } | Self::Rename { .. } => 0,
@@ -181,6 +215,28 @@ impl JournalOperation {
             return Err(PersistenceCodecError::Malformed);
         }
         let result = match operation {
+            5 if flags == 0 => {
+                let count = cursor.u32()? as usize;
+                if count == 0
+                    || count > limits.maximum_nodes as usize
+                    || count > cursor.remaining() / 8
+                {
+                    return Err(PersistenceCodecError::LimitExceeded);
+                }
+                let mut operations = Vec::new();
+                operations
+                    .try_reserve_exact(count)
+                    .map_err(|_| PersistenceCodecError::LimitExceeded)?;
+                for _ in 0..count {
+                    let length = cursor.u32()? as usize;
+                    let bytes = cursor.exact(length)?;
+                    if bytes.first() == Some(&5) {
+                        return Err(PersistenceCodecError::NonCanonical);
+                    }
+                    operations.push(Self::decode(bytes, limits)?);
+                }
+                Self::Batch { operations }
+            }
             1 if flags == 0 => Self::create_directory(cursor.path(limits)?, cursor.u64()?),
             2 if flags & !1 == 0 => {
                 let path = cursor.path(limits)?;
@@ -205,27 +261,36 @@ impl JournalOperation {
             _ => return Err(PersistenceCodecError::Malformed),
         };
         cursor.finish()?;
-        if !result.paths_are_home_descendants() {
+        if !result.paths_are_root_descendants() {
             return Err(PersistenceCodecError::NonCanonical);
         }
         Ok(result)
     }
 
-    fn paths_are_home_descendants(&self) -> bool {
+    fn paths_are_root_descendants(&self) -> bool {
         match self {
+            Self::Batch { operations } => {
+                !operations.is_empty()
+                    && operations.iter().all(|op| {
+                        !matches!(op, Self::Batch { .. }) && op.paths_are_root_descendants()
+                    })
+            }
             Self::CreateDirectory { path, .. }
             | Self::PutFile { path, .. }
-            | Self::Remove { path } => home_descendant(path),
+            | Self::Remove { path } => root_descendant(path),
             Self::Rename {
                 source,
                 destination,
                 ..
-            } => home_descendant(source) && home_descendant(destination) && source != destination,
+            } => root_descendant(source) && root_descendant(destination) && source != destination,
         }
     }
 
     fn generation_is_canonical(&self, sequence: u64) -> bool {
         match self {
+            Self::Batch { operations } => operations
+                .iter()
+                .all(|op| op.generation_is_canonical(sequence)),
             Self::CreateDirectory {
                 node_generation, ..
             }
@@ -254,7 +319,7 @@ impl JournalRecord {
     ) -> Result<Self, PersistenceCodecError> {
         if sequence == 0
             || previous_sequence.checked_add(1) != Some(sequence)
-            || !operation.paths_are_home_descendants()
+            || !operation.paths_are_root_descendants()
             || !operation.generation_is_canonical(sequence)
         {
             return Err(PersistenceCodecError::NonCanonical);
@@ -280,7 +345,7 @@ impl JournalRecord {
         }
         let mut writer = Writer::with_capacity(encoded_without_digest)?;
         writer.bytes(MAGIC);
-        writer.u16(1);
+        writer.u16(2);
         writer.u16(0);
         writer.bytes(&self.computer_id.into_bytes());
         writer.u64(self.sequence);
@@ -298,7 +363,7 @@ impl JournalRecord {
         if cursor.exact(8)? != MAGIC {
             return Err(PersistenceCodecError::Malformed);
         }
-        if cursor.u16()? != 1 {
+        if cursor.u16()? != 2 {
             return Err(PersistenceCodecError::UnsupportedVersion);
         }
         if cursor.u16()? != 0 {

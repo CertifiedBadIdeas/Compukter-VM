@@ -25,9 +25,13 @@ fn main() {
     let root = PathBuf::from(arguments.next().expect("missing store root"));
     let point = arguments.next().expect("missing crash point");
     assert!(arguments.next().is_none(), "unexpected argument");
-    let point = point
-        .to_str()
-        .and_then(parse_point)
-        .expect("invalid crash point");
-    run_scenario(&root, point);
+    let text = point.to_str().expect("UTF-8 crash point");
+    let system = text.starts_with("system:");
+    let point =
+        parse_point(text.strip_prefix("system:").unwrap_or(text)).expect("invalid crash point");
+    if system {
+        persistence_crash_fixture::run_system_update(&root, point);
+    } else {
+        run_scenario(&root, point);
+    }
 }

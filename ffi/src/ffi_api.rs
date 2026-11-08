@@ -336,6 +336,37 @@ pub unsafe extern "C" fn compukter_store_recover(store_handle: u64, id: *const u
 }
 
 #[unsafe(no_mangle)]
+/// Explicitly installs packaged system paths after the caller closes the active
+/// computer. This operation may block for persistence; never call on a tick thread.
+///
+/// # Safety
+/// `id` names 16 readable bytes; `image` names `image_len` readable bytes.
+pub unsafe extern "C" fn compukter_store_install_system(
+    store_handle: u64,
+    id: *const u8,
+    image: *const u8,
+    image_len: usize,
+) -> FfiStatus {
+    ffi_status(|| {
+        if id.is_null()
+            || image.is_null()
+            || image_len == 0
+            || image_len > compukter_vm::FileSystemLimits::default().maximum_system_image_bytes
+        {
+            return FfiStatus::InvalidArgument;
+        }
+        // SAFETY: The validated C ABI contract provides readable input regions.
+        let (id, image) = unsafe {
+            (
+                copy_computer_id(id),
+                core::slice::from_raw_parts(image, image_len).to_vec(),
+            )
+        };
+        store_status_result(bridge::store_install_system(store_handle, id, image))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn compukter_store_close(store_handle: u64) -> FfiStatus {
     ffi_status(|| store_status_result(bridge::store_close(store_handle)))
 }
@@ -444,7 +475,6 @@ pub unsafe extern "C" fn compukter_checkpoint_save(
 /// declared widths, and `written_out` names one writable `usize`.
 pub unsafe extern "C" fn compukter_checkpoint_restore(
     store_handle: u64,
-    boot: u32,
     id: *const u8,
     rom: *const u8,
     rom_len: usize,
@@ -455,8 +485,7 @@ pub unsafe extern "C" fn compukter_checkpoint_restore(
     written_out: *mut usize,
 ) -> FfiStatus {
     ffi_status(|| {
-        if boot > 1
-            || id.is_null()
+        if id.is_null()
             || written_out.is_null()
             || rom_len > MAXIMUM_ROM_BYTES
             || schemas_len > MAXIMUM_CAPABILITY_SCHEMA_BYTES
@@ -486,7 +515,7 @@ pub unsafe extern "C" fn compukter_checkpoint_restore(
         let Some(schemas) = crate::wire::decode_capability_schemas(schemas) else {
             return FfiStatus::InvalidArgument;
         };
-        let handle = match bridge::checkpoint_restore(store_handle, boot != 0, id, rom, &schemas) {
+        let handle = match bridge::checkpoint_restore(store_handle, id, rom, &schemas) {
             Ok(handle) => handle,
             Err(error) => return checkpoint_status(error),
         };
@@ -657,7 +686,7 @@ pub unsafe extern "C" fn compukter_create_in_store(
 }
 
 #[unsafe(no_mangle)]
-/// Creates a persistent VM session from executable `/rom/boot`.
+/// Creates a persistent VM session from executable `/boot/init`.
 ///
 /// # Safety
 ///

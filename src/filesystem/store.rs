@@ -33,7 +33,7 @@ use super::worker::{
 };
 use super::{
     recover, ComputerFileSystem, ComputerId, FileSystemLimits, RecoveryCheckpoint, RecoveryInput,
-    RecoveryJournalRecord, RomImage, StoreHealth,
+    RecoveryJournalRecord, StoreHealth, SystemImage,
 };
 
 type ObjectMap = BTreeMap<[u8; 32], Arc<[u8]>>;
@@ -137,7 +137,7 @@ impl WorldFileSystemStore {
     pub fn open_computer(
         &self,
         id: ComputerId,
-        rom: Arc<RomImage>,
+        rom: Arc<SystemImage>,
     ) -> Result<ComputerFileSystem, StoreError> {
         match self.health() {
             StoreHealth::Active => {}
@@ -166,15 +166,40 @@ impl WorldFileSystemStore {
                 return Err(StoreError::StorageFaulted);
             }
         }
-        let mut filesystem = ComputerFileSystem::with_rom(self.limits, (*rom).clone())
-            .map_err(|_| StoreError::Io)?;
+        let mut filesystem = ComputerFileSystem::empty(self.limits);
         filesystem
             .restore_recovered(&recovered.state, &recovered.objects)
             .map_err(|_| StoreError::StorageFaulted)?;
         self.persistence
             .register_computer(id, recovered.state.generation())?;
         filesystem.attach_persistence(self.persistence.computer(id, self.limits));
+        if recovered.state.generation() == 0 {
+            filesystem
+                .install_system(&rom)
+                .map_err(|error| match error {
+                    super::FileSystemError::Busy => StoreError::Busy,
+                    _ => StoreError::Io,
+                })?;
+        }
         Ok(filesystem)
+    }
+
+    /// Explicit recovery/update. The caller must first close the computer's
+    /// active machine. Packaged paths are replaced, user files are retained.
+    pub fn install_system(
+        &self,
+        id: ComputerId,
+        image: Arc<SystemImage>,
+    ) -> Result<(), StoreError> {
+        let mut filesystem = self.open_computer(id, Arc::clone(&image))?;
+        filesystem
+            .install_system(&image)
+            .map_err(|error| match error {
+                super::FileSystemError::Busy => StoreError::Busy,
+                super::FileSystemError::StorageFaulted => StoreError::StorageFaulted,
+                _ => StoreError::Io,
+            })?;
+        self.flush(id, filesystem.generation())
     }
 
     /// Publishes a native checkpoint after its filesystem generation is durable.

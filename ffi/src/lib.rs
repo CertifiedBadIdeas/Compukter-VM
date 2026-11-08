@@ -21,7 +21,7 @@ mod ffi_api;
 mod handle_table;
 mod wire;
 
-pub const COMPUKTER_FFI_ABI_VERSION: u32 = 24;
+pub const COMPUKTER_FFI_ABI_VERSION: u32 = 25;
 
 pub use ffi_api::{
     compukter_abi_version, compukter_advance, compukter_advance_with_retirement_limit,
@@ -37,8 +37,8 @@ pub use ffi_api::{
     compukter_resume_f32_bits, compukter_resume_failure, compukter_resume_i32,
     compukter_resume_string, compukter_resume_unit, compukter_resume_value, compukter_store_close,
     compukter_store_durable_generation, compukter_store_flush, compukter_store_health,
-    compukter_store_open, compukter_store_recover, compukter_store_tombstone,
-    compukter_submit_canonical_line, compukter_terminal_changes_since, compukter_terminal_commit,
-    compukter_terminal_full_state, compukter_terminal_key, compukter_terminal_text,
-    compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
+    compukter_store_install_system, compukter_store_open, compukter_store_recover,
+    compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
+    compukter_terminal_commit, compukter_terminal_full_state, compukter_terminal_key,
+    compukter_terminal_text, compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
 };

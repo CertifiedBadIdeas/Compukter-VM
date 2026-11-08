@@ -30,10 +30,10 @@ use compukter_ffi::{
     compukter_resume_f32_bits, compukter_resume_failure, compukter_resume_i32,
     compukter_resume_string, compukter_resume_unit, compukter_resume_value, compukter_store_close,
     compukter_store_durable_generation, compukter_store_flush, compukter_store_health,
-    compukter_store_open, compukter_store_recover, compukter_store_tombstone,
-    compukter_submit_canonical_line, compukter_terminal_changes_since, compukter_terminal_commit,
-    compukter_terminal_full_state, compukter_terminal_key, compukter_terminal_text,
-    compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
+    compukter_store_install_system, compukter_store_open, compukter_store_recover,
+    compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
+    compukter_terminal_commit, compukter_terminal_full_state, compukter_terminal_key,
+    compukter_terminal_text, compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
 };
 use jni::{
     errors::{Result, ThrowRuntimeExAndDefault},
@@ -236,6 +236,28 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_stor
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_storeInstallSystem<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    id: JByteArray<'caller>,
+    image: JByteArray<'caller>,
+) -> jint {
+    status(&mut env, |env| {
+        let id = bytes(env, &id)?;
+        let image = bytes(env, &image)?;
+        if id.len() != 16 {
+            return Ok(INVALID_ARGUMENT);
+        }
+        Ok(unsafe {
+            compukter_store_install_system(handle as u64, id.as_ptr(), image.as_ptr(), image.len())
+        } as jint)
+    })
+}
+
 macro_rules! handle_id_status {
     ($name:ident, $call:path) => {
         #[unsafe(no_mangle)]
@@ -356,7 +378,6 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_chec
     mut env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     store_handle: jlong,
-    boot: jint,
     id: JByteArray<'caller>,
     rom: JByteArray<'caller>,
     schemas: JByteArray<'caller>,
@@ -373,7 +394,6 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_chec
         output_call(env, &output, &written, |out, capacity, count| unsafe {
             compukter_checkpoint_restore(
                 store_handle as u64,
-                boot as u32,
                 id.as_ptr(),
                 rom.as_ptr(),
                 rom.len(),

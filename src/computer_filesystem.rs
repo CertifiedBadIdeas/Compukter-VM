@@ -42,7 +42,7 @@ impl Default for FileTransfers {
 enum FileTransfer {
     Read {
         path: VirtualPath,
-        bytes: Arc<[u8]>,
+        bytes: crate::shared_bytes::SharedBytes,
         position: usize,
     },
     Write {
@@ -675,7 +675,7 @@ impl FileTransfers {
                     }
                     FileTransfer::Read {
                         path,
-                        bytes: bytes.into(),
+                        bytes: crate::shared_bytes::SharedBytes::new(bytes.into()),
                         position,
                     }
                 }
@@ -773,7 +773,7 @@ impl FileTransfers {
                     path,
                     ..
                 } => {
-                    if path.components().next() != Some("home")
+                    if path.components().next().is_none()
                         || matches!(revision, ExecutableRevision::Present(0))
                     {
                         return Err(CheckpointError::InvalidState);
@@ -1088,15 +1088,19 @@ mod tests {
     fn computer_checkpoint_restores_snapshot_positions_and_unpublished_draft() {
         let id = ComputerId::from_bytes([4; 16]);
         let mut c = computer(FileSystemLimits::default());
-        put(&mut c, "/home/note", b"original");
-        let reader = c.open_read_transfer(path("/home/note")).unwrap();
+        c.initial_file_capability = FileCapability::new(VirtualPath::root(), FileRights::OWNER);
+        c.filesystem
+            .create_directory(&c.initial_file_capability, &path("/bin"))
+            .unwrap();
+        put(&mut c, "/bin/note", b"original");
+        let reader = c.open_read_transfer(path("/bin/note")).unwrap();
         assert_eq!(
             [0, b'o', b'r'],
             c.read_transfer(reader, 2).unwrap().as_slice()
         );
-        let draft = c.open_write_transfer(path("/home/note")).unwrap();
+        let draft = c.open_write_transfer(path("/bin/note")).unwrap();
         c.append_transfer(draft, b"first ").unwrap();
-        let directory = c.open_directory_transfer(path("/home")).unwrap();
+        let directory = c.open_directory_transfer(path("/bin")).unwrap();
         let limits = ComputerCheckpointLimits::default();
         let encoded = c.checkpoint(id, b"", limits).unwrap();
         let (mut restored, _) = ComputerMachine::restore_checkpoint(
@@ -1112,10 +1116,10 @@ mod tests {
             limits,
         )
         .unwrap();
-        assert_eq!(b"original", bytes(&restored, "/home/note").as_slice());
+        assert_eq!(b"original", bytes(&restored, "/bin/note").as_slice());
         restored.append_transfer(draft, b"second").unwrap();
         restored.commit_transfer(draft).unwrap();
-        assert_eq!(b"first second", bytes(&restored, "/home/note").as_slice());
+        assert_eq!(b"first second", bytes(&restored, "/bin/note").as_slice());
         assert_eq!(
             [0, b'i', b'g', b'i', b'n', b'a', b'l'],
             restored.read_transfer(reader, 4095).unwrap().as_slice()

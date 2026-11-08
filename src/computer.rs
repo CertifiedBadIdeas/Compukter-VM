@@ -446,12 +446,12 @@ impl ComputerMachine {
         mut filesystem: ComputerFileSystem,
         initial_capability: FileCapability,
     ) -> Result<Self, ComputerStartError> {
-        let path = VirtualPath::parse_utf8("/rom/boot", filesystem.limits())
+        let path = VirtualPath::parse_utf8("/boot/init", filesystem.limits())
             .expect("the fixed boot path is canonical");
         let bytes = filesystem
             .read_executable(&initial_capability, &path)
             .map_err(|error| ComputerStartError::Process(process_filesystem_reason(error)))?;
-        let artifact = verify_artifact(bytes.into(), ArtifactLimits::default())
+        let artifact = verify_artifact(bytes, ArtifactLimits::default())
             .map_err(|_| ComputerStartError::Process(ProcessFailureReason::InvalidProgram))?;
         Self::start_in_filesystem_with_process_limits(
             artifact,
@@ -793,12 +793,9 @@ impl ComputerMachine {
         if directory.metadata.kind != ComputerFileKind::Directory {
             return Err(FileSystemError::NotDirectory.into());
         }
-        let names = if path.components().len() == 0 {
-            vec![Box::<str>::from("home"), Box::<str>::from("rom")]
-        } else {
-            self.filesystem
-                .list(&self.inspection_file_capability, path)?
-        };
+        let names = self
+            .filesystem
+            .list(&self.inspection_file_capability, path)?;
         if let Some(cursor) = start_after {
             child_path(path, cursor, self.filesystem.limits())?;
         }
@@ -1011,7 +1008,7 @@ impl ComputerMachine {
                     frame
                         .executable
                         .as_ref()
-                        .is_some_and(|(path, _)| path.to_string() == "/rom/shell")
+                        .is_some_and(|(path, _)| path.to_string() == "/bin/shell")
                 });
                 let index = shell.map_or(1, |index| index + 1);
                 self.pending_termination = self.sessions.get(index).map(|frame| frame.scope_id);
@@ -1883,10 +1880,10 @@ impl ComputerMachine {
                     HostResponse::Success(HostValueInput::I32(status_code(result))),
                 )?;
             }
-            FileSystemOperation::InstallExecutableFromRom(source, destination) => {
+            FileSystemOperation::CopyExecutable(source, destination) => {
                 let result = self.parse_path(&source).and_then(|source| {
                     self.parse_path(&destination).and_then(|destination| {
-                        self.filesystem.install_executable_from_rom(
+                        self.filesystem.copy_executable(
                             &self.initial_file_capability,
                             &source,
                             &destination,
@@ -2109,7 +2106,7 @@ impl ComputerMachine {
                 return self.resume_process_failure(task, id, reason, &diagnostic);
             }
         };
-        let artifact = match verify_artifact(bytes.into(), ArtifactLimits::default()) {
+        let artifact = match verify_artifact(bytes, ArtifactLimits::default()) {
             Ok(artifact) => artifact,
             Err(_) => {
                 return self.resume_process_failure(
@@ -2708,7 +2705,7 @@ enum FileSystemOperation {
     CreateDirectory(Vec<u16>),
     Remove(Vec<u16>),
     Rename(Vec<u16>, Vec<u16>),
-    InstallExecutableFromRom(Vec<u16>, Vec<u16>),
+    CopyExecutable(Vec<u16>, Vec<u16>),
 }
 
 enum ProcessOperation {
@@ -3317,7 +3314,7 @@ fn copy_filesystem_request(request: HostRequestView<'_>) -> Result<TerminalReque
         (4, 1) => FileSystemOperation::CreateDirectory(string(0)?),
         (5, 1) => FileSystemOperation::Remove(string(0)?),
         (6, 2) => FileSystemOperation::Rename(string(0)?, string(1)?),
-        (7, 2) => FileSystemOperation::InstallExecutableFromRom(string(0)?, string(1)?),
+        (7, 2) => FileSystemOperation::CopyExecutable(string(0)?, string(1)?),
         _ => return Err(ComputerError::InvalidFileSystemRequest),
     };
     Ok(TerminalRequest::FileSystem {
@@ -3716,7 +3713,7 @@ mod tests {
     use crate::stdio::{InputOwner, InputOwnershipError};
     use crate::{
         ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits,
-        ProcessFailureReason, ProcessLimits, RomImage, TaskId, TerminalKey, TerminalKeyEvent,
+        ProcessFailureReason, ProcessLimits, SystemImage, TaskId, TerminalKey, TerminalKeyEvent,
         TerminalModifiers, VirtualPath, WorldFileSystemStore,
     };
 
@@ -3743,7 +3740,7 @@ mod tests {
             FileSystemLimits::default().maximum_logical_bytes,
             initial.filesystem_logical_capacity_bytes
         );
-        assert_eq!(2, initial.filesystem_nodes);
+        assert_eq!(1, initial.filesystem_nodes);
         assert_eq!(
             FileSystemLimits::default().maximum_nodes,
             initial.filesystem_node_capacity
@@ -3810,7 +3807,7 @@ mod tests {
             child_bytes.len() as u64,
             with_child.filesystem_logical_bytes
         );
-        assert_eq!(3, with_child.filesystem_nodes);
+        assert_eq!(2, with_child.filesystem_nodes);
 
         while computer.sessions.len() == 2 {
             let before = computer.resource_snapshot();
@@ -5412,17 +5409,17 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_installs_an_executable_from_rom_without_host_file_access() {
+    fn filesystem_copies_executables_without_host_file_access() {
         let limits = FileSystemLimits::testing();
-        let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
+        let owner = FileCapability::new(path("/", &limits), FileRights::OWNER);
         let child = crate::execution::fixtures::two_block_artifact(1, 1);
         let child_bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
-        let filesystem = ComputerFileSystem::with_rom(
+        let filesystem = ComputerFileSystem::with_system_image(
             limits,
-            rom_with_executable("/rom/hello", &child_bytes, &limits),
+            rom_with_executable("/bin/hello", &child_bytes, &limits),
         )
         .unwrap();
-        let installer = crate::execution::fixtures::process_install_rom_executable_artifact();
+        let installer = crate::execution::fixtures::process_copy_executable_artifact();
         let mut computer =
             ComputerMachine::start_in_filesystem(installer, profile(), &[], &[], filesystem, owner)
                 .unwrap();
@@ -5451,15 +5448,15 @@ mod tests {
         );
         assert_eq!(
             Err(FileSystemError::AlreadyExists),
-            computer.filesystem.install_executable_from_rom(
+            computer.filesystem.copy_executable(
                 &computer.initial_file_capability,
-                &path("/rom/hello", &limits),
+                &path("/bin/hello", &limits),
                 &path("/home/hello", &limits),
             ),
         );
         assert_eq!(
-            Err(FileSystemError::PermissionDenied),
-            computer.filesystem.install_executable_from_rom(
+            Ok(()),
+            computer.filesystem.copy_executable(
                 &computer.initial_file_capability,
                 &path("/home/hello", &limits),
                 &path("/home/copy", &limits),
@@ -5695,23 +5692,23 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_text_write_reports_rom_as_read_only_without_mutation() {
+    fn filesystem_text_write_can_replace_system_files() {
         let limits = FileSystemLimits::testing();
         let capability = FileCapability::new(path("/", &limits), FileRights::OWNER);
-        let boot = path("/rom/boot", &limits);
-        let filesystem = ComputerFileSystem::with_rom(
+        let boot = path("/boot/init", &limits);
+        let filesystem = ComputerFileSystem::with_system_image(
             limits,
-            rom_with_executable("/rom/boot", b"original", &limits),
+            rom_with_executable("/boot/init", b"original", &limits),
         )
         .unwrap();
         let artifact =
-            crate::execution::fixtures::filesystem_write_text_artifact("/rom/boot", "changed");
+            crate::execution::fixtures::filesystem_write_text_artifact("/boot/init", "changed");
 
         let (computer, result) = run_filesystem_artifact(artifact, filesystem, capability);
 
-        assert_eq!(-7, result);
+        assert_eq!(0, result);
         assert_eq!(
-            b"original",
+            b"changed",
             computer
                 .filesystem
                 .read_file_for_test(&boot)
@@ -5725,9 +5722,11 @@ mod tests {
         let limits = FileSystemLimits::testing();
         let guest_home = FileCapability::new(path("/home", &limits), FileRights::OWNER);
         let source = path("/home/source.kt", &limits);
-        let mut filesystem =
-            ComputerFileSystem::with_rom(limits, rom_with_executable("/rom/boot", b"rom", &limits))
-                .unwrap();
+        let mut filesystem = ComputerFileSystem::with_system_image(
+            limits,
+            rom_with_executable("/boot/init", b"rom", &limits),
+        )
+        .unwrap();
         filesystem
             .write_file(&guest_home, &source, b"fun main() = Unit", false)
             .unwrap();
@@ -5744,10 +5743,10 @@ mod tests {
         let root = computer.filesystem_stat(&path("/", &limits)).unwrap();
         assert_eq!(ComputerFileKind::Directory, root.metadata.kind);
         let listing = computer
-            .filesystem_list(&path("/", &limits), None, 2)
+            .filesystem_list(&path("/", &limits), None, 3)
             .unwrap();
         assert_eq!(
-            ["home", "rom"],
+            ["bin", "boot", "home"],
             listing
                 .entries
                 .iter()
@@ -6000,8 +5999,8 @@ mod tests {
                 crate::execution::fixtures::process_terminal_child_artifact(),
             ),
             (
-                "process-install-rom-executable.cpkt",
-                crate::execution::fixtures::process_install_rom_executable_artifact(),
+                "process-copy-executable.cpkt",
+                crate::execution::fixtures::process_copy_executable_artifact(),
             ),
         ]
     }
@@ -6010,21 +6009,21 @@ mod tests {
         VirtualPath::parse_utf8(value, limits).unwrap()
     }
 
-    fn empty_rom(limits: &FileSystemLimits) -> RomImage {
+    fn empty_rom(limits: &FileSystemLimits) -> SystemImage {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"CPKTROM\0");
+        bytes.extend_from_slice(b"CPKTSYS\0");
         bytes.extend_from_slice(&1_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         let digest = Sha256::digest(&bytes);
         bytes.extend_from_slice(&digest);
-        RomImage::admit(bytes.into(), limits).unwrap()
+        SystemImage::admit(bytes.into(), limits).unwrap()
     }
 
-    fn rom_with_executable(path: &str, content: &[u8], limits: &FileSystemLimits) -> RomImage {
+    fn rom_with_executable(path: &str, content: &[u8], limits: &FileSystemLimits) -> SystemImage {
         let path = path.as_bytes();
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"CPKTROM\0");
+        bytes.extend_from_slice(b"CPKTSYS\0");
         bytes.extend_from_slice(&1_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&1_u32.to_le_bytes());
@@ -6037,7 +6036,7 @@ mod tests {
         bytes.extend_from_slice(content);
         let digest = Sha256::digest(&bytes);
         bytes.extend_from_slice(&digest);
-        RomImage::admit(bytes.into(), limits).unwrap()
+        SystemImage::admit(bytes.into(), limits).unwrap()
     }
 
     fn filesystem_status() -> i32 {
@@ -6285,7 +6284,7 @@ mod tests {
     fn ctrl_c_is_delivered_to_an_idle_shell_and_plain_c_remains_input() {
         let mut computer = termination_fixture(crate::execution::fixtures::empty_loop_artifact(1));
         computer.sessions[1].executable.as_mut().unwrap().0 =
-            VirtualPath::parse_utf8("/rom/shell", &FileSystemLimits::testing()).unwrap();
+            VirtualPath::parse_utf8("/bin/shell", &FileSystemLimits::testing()).unwrap();
         computer
             .submit_terminal_key(terminate_key(TerminalKeyAction::Press))
             .unwrap();

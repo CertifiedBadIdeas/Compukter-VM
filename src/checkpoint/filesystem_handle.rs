@@ -40,8 +40,7 @@ impl HandleTable {
                     || slot.file.as_ref().is_some_and(|file| {
                         let path = file.path.to_string();
                         VirtualPath::parse_utf8(&path, limits).is_err()
-                            || !matches!(file.path.components().next(), Some("home" | "rom"))
-                            || file.mode.writable() && file.path.components().next() == Some("rom")
+                            || file.path.components().next().is_none()
                     })
             })
         {

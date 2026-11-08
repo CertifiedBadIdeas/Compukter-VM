@@ -16,7 +16,6 @@
  * limitations under the License.
  */
 
-mod blob;
 mod capability;
 mod error;
 mod handle;
@@ -24,8 +23,8 @@ mod limits;
 mod path;
 mod persistence;
 mod quota;
-mod rom;
 mod store;
+mod system_image;
 mod tree;
 mod worker;
 
@@ -39,8 +38,8 @@ pub use persistence::{
     PersistenceCodecError, RecoveredState, RecoveryCheckpoint, RecoveryError, RecoveryInput,
     RecoveryJournalRecord,
 };
-pub use rom::{RomImage, RomImageError};
 pub use store::{StoreError, StoreOpenError, WorldFileSystemStore};
+pub use system_image::{SystemImage, SystemImageError};
 pub use tree::{
     ComputerFileSystem, ExecutableRevision, FileSystemSnapshot, NodeKind, NodeMetadata,
 };

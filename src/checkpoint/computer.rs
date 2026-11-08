@@ -664,15 +664,15 @@ mod tests {
 
     #[test]
     fn checkpoint_store_reopens_complete_computer_and_discards_consumed_snapshot() {
-        use crate::{RomImage, StoreError, WorldFileSystemStore};
+        use crate::{StoreError, SystemImage, WorldFileSystemStore};
         use sha2::{Digest, Sha256};
         let filesystem_limits = FileSystemLimits::testing();
-        let mut rom = b"CPKTROM\0".to_vec();
+        let mut rom = b"CPKTSYS\0".to_vec();
         rom.extend_from_slice(&1_u16.to_le_bytes());
         rom.extend_from_slice(&0_u16.to_le_bytes());
         rom.extend_from_slice(&0_u32.to_le_bytes());
         rom.extend_from_slice(&Sha256::digest(&rom));
-        let rom = Arc::new(RomImage::admit(rom.into(), &filesystem_limits).unwrap());
+        let rom = Arc::new(SystemImage::admit(rom.into(), &filesystem_limits).unwrap());
         let root = std::env::temp_dir().join(format!(
             "compukters-computer-checkpoint-{}-{}",
             std::process::id(),

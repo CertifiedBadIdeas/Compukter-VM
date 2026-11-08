@@ -87,14 +87,18 @@ impl std::fmt::Debug for VerifiedArtifact {
 #[derive(Debug)]
 pub(crate) struct VerifiedArtifactInner {
     decoded: DecodedArtifact,
+    _bytes_owner: crate::shared_bytes::SharedBytes,
     prepared_program: std::sync::OnceLock<Arc<crate::execution::PreparedProgram>>,
 }
 
 impl VerifiedArtifact {
-    pub(crate) fn new(decoded: DecodedArtifact) -> Self {
+    pub(crate) fn new(mut decoded: DecodedArtifact) -> Self {
+        let bytes_owner = crate::shared_bytes::SharedBytes::new(Arc::clone(&decoded.bytes));
+        decoded.bytes = Arc::clone(&bytes_owner);
         Self {
             inner: interner::intern(Arc::new(VerifiedArtifactInner {
                 decoded,
+                _bytes_owner: bytes_owner,
                 prepared_program: std::sync::OnceLock::new(),
             })),
         }
@@ -103,10 +107,14 @@ impl VerifiedArtifact {
     // Synthetic admission tests mutate decoded metadata without changing bytes.
     // They must never enter the content-addressed index of verified containers.
     #[cfg(any(test, feature = "program-sharing-benchmark"))]
-    pub(crate) fn new_unshared(decoded: DecodedArtifact) -> Self {
+    pub(crate) fn new_unshared(mut decoded: DecodedArtifact) -> Self {
+        let bytes_owner =
+            crate::shared_bytes::SharedBytes::new_unshared(Arc::clone(&decoded.bytes));
+        decoded.bytes = Arc::clone(&bytes_owner);
         Self {
             inner: Arc::new(VerifiedArtifactInner {
                 decoded,
+                _bytes_owner: bytes_owner,
                 prepared_program: std::sync::OnceLock::new(),
             }),
         }

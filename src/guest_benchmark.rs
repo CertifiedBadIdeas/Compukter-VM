@@ -34,9 +34,11 @@ mod execution;
 mod filesystem;
 mod limits;
 #[cfg(feature = "program-sharing-benchmark")]
+mod live_registry;
 mod process;
 #[cfg(feature = "program-sharing-benchmark")]
 mod redstone;
+mod shared_bytes;
 #[cfg(feature = "program-sharing-benchmark")]
 mod stdio;
 #[cfg(feature = "program-sharing-benchmark")]

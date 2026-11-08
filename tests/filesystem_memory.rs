@@ -110,7 +110,7 @@ fn physical_deduplication_does_not_discount_logical_quota() {
 fn file_and_node_limits_are_checked_before_visible_mutation() {
     let mut limits = FileSystemLimits::testing();
     limits.maximum_file_bytes = 3;
-    limits.maximum_nodes = 3;
+    limits.maximum_nodes = 2;
     let mut filesystem = ComputerFileSystem::with_limits(limits);
     let owner = owner();
 
@@ -167,7 +167,8 @@ fn executable_reads_require_authority_and_executable_metadata() {
     assert_eq!(
         filesystem
             .read_executable(&executor, &path("/home/tool"))
-            .unwrap(),
+            .unwrap()
+            .as_ref(),
         b"verified artifact",
     );
 }

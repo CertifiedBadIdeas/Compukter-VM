@@ -63,15 +63,20 @@ fn namespace_has_deterministic_isolated_mounts() {
 }
 
 #[test]
-fn rom_rejects_mutation_even_with_overbroad_rights() {
+fn root_is_an_ordinary_writable_tree() {
     let mut filesystem = ComputerFileSystem::testing();
-    let forged = FileCapability::new(path("/"), FileRights::OWNER);
-
+    let root_owner = FileCapability::new(path("/"), FileRights::OWNER);
+    filesystem
+        .create_directory(&root_owner, &path("/bin"))
+        .unwrap();
+    filesystem
+        .create_directory(&root_owner, &path("/bin/changed"))
+        .unwrap();
+    assert_eq!(filesystem.generation(), 2);
     assert_eq!(
-        filesystem.create_directory(&forged, &path("/rom/changed")),
-        Err(FileSystemError::ReadOnly),
+        filesystem.create_directory(&owner(), &path("/elsewhere")),
+        Err(FileSystemError::PermissionDenied)
     );
-    assert_eq!(filesystem.generation(), 0);
 }
 
 #[test]

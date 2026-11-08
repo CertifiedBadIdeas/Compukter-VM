@@ -22,12 +22,12 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::quota::{MutationCost, QuotaLedger};
-use super::rom::RomEntryKind;
+use super::system_image::SystemEntryKind;
 use super::worker::{ComputerPersistence, PersistenceMutation};
 use super::{
     CheckpointNode, FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits,
-    HandleTable, JournalOperation, OpenFile, OpenMode, RecoveredState, RomImage, RomImageError,
-    VirtualPath,
+    HandleTable, JournalOperation, OpenFile, OpenMode, RecoveredState, SystemImage,
+    SystemImageError, VirtualPath,
 };
 
 type Directory = BTreeMap<Box<str>, Node>;
@@ -109,7 +109,7 @@ impl Node {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StoredObject {
-    bytes: super::blob::SharedBlob,
+    bytes: crate::shared_bytes::SharedBytes,
     references: u32,
 }
 
@@ -130,7 +130,7 @@ impl ObjectStore {
             return;
         }
         let stored = self.0.entry(next).or_insert(StoredObject {
-            bytes: super::blob::SharedBlob::new(bytes),
+            bytes: crate::shared_bytes::SharedBytes::new(bytes),
             references: 0,
         });
         stored.references = stored
@@ -157,16 +157,10 @@ impl ObjectStore {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Mount {
-    Rom,
-    Home,
-}
-
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileSystemSnapshot {
-    home: Directory,
+    root: Directory,
     objects: ObjectStore,
     quota: QuotaLedger,
     generation: u64,
@@ -175,8 +169,7 @@ pub struct FileSystemSnapshot {
 /// One computer's deterministic in-memory namespace and logical object store.
 #[derive(Debug)]
 pub struct ComputerFileSystem {
-    rom: Directory,
-    home: Directory,
+    root: Directory,
     handles: HandleTable,
     objects: ObjectStore,
     quota: QuotaLedger,
@@ -188,11 +181,10 @@ pub struct ComputerFileSystem {
 impl ComputerFileSystem {
     pub fn with_limits(limits: FileSystemLimits) -> Self {
         Self {
-            rom: BTreeMap::new(),
-            home: BTreeMap::new(),
+            root: BTreeMap::from([(Box::from("home"), Node::directory(0))]),
             handles: HandleTable::new(limits.maximum_open_handles as usize),
             objects: ObjectStore::default(),
-            quota: QuotaLedger::new(&limits, 2),
+            quota: QuotaLedger::new(&limits, 1),
             limits,
             generation: 0,
             persistence: None,
@@ -203,35 +195,112 @@ impl ComputerFileSystem {
         &self.limits
     }
 
-    pub fn with_rom(limits: FileSystemLimits, image: RomImage) -> Result<Self, RomImageError> {
+    pub fn with_system_image(
+        limits: FileSystemLimits,
+        image: SystemImage,
+    ) -> Result<Self, SystemImageError> {
         let mut filesystem = Self::with_limits(limits);
-        for entry in image.entries() {
-            let components = entry.path.component_slice();
-            let (_, relative) = components
-                .split_first()
-                .ok_or(RomImageError::NonCanonical)?;
-            let (name, parent) = split_name(relative).map_err(|_| RomImageError::NonCanonical)?;
-            match entry.kind {
-                RomEntryKind::Directory => {
-                    find_directory_mut(&mut filesystem.rom, parent)
-                        .map_err(|_| RomImageError::NonCanonical)?
-                        .insert(Box::from(name), Node::directory(0));
+        filesystem
+            .install_system(&image)
+            .map_err(|_| SystemImageError::LimitExceeded)?;
+        Ok(filesystem)
+    }
+
+    pub(crate) fn empty(limits: FileSystemLimits) -> Self {
+        let mut filesystem = Self::with_limits(limits);
+        filesystem.root.clear();
+        filesystem.quota = QuotaLedger::new(&limits, 0);
+        filesystem
+    }
+
+    /// Reinstall packaged paths as one transaction. Other paths, including
+    /// /home, retain their contents. Existing readers/processes pin old bytes.
+    pub fn install_system(&mut self, image: &SystemImage) -> Result<(), FileSystemError> {
+        let generation = self.next_generation()?;
+        let mut staged = Self::empty(self.limits);
+        staged.root = self.root.clone();
+        staged.objects = self.objects.clone();
+        staged.quota = self.quota.clone();
+        staged.generation = self.generation;
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/", &self.limits)?,
+            FileRights::OWNER,
+        );
+        let mut operations = Vec::new();
+        let mut objects = BTreeMap::new();
+        for text in ["/bin", "/boot", "/home"] {
+            let path = VirtualPath::parse_utf8(text, &self.limits)?;
+            match staged.stat(&owner, &path) {
+                Ok(metadata) if metadata.kind == NodeKind::Directory => {}
+                Ok(_) => return Err(FileSystemError::NotDirectory),
+                Err(FileSystemError::NotFound) => {
+                    staged.create_directory(&owner, &path)?;
+                    find_node_mut(&mut staged.root, path.component_slice())?
+                        .metadata
+                        .generation = generation;
+                    operations.push(JournalOperation::create_directory(path, generation));
                 }
-                RomEntryKind::File => {
+                Err(error) => return Err(error),
+            }
+        }
+        for entry in image.entries() {
+            match entry.kind {
+                SystemEntryKind::Directory => match staged.stat(&owner, &entry.path) {
+                    Ok(metadata) if metadata.kind == NodeKind::Directory => {}
+                    Ok(_) => return Err(FileSystemError::NotDirectory),
+                    Err(FileSystemError::NotFound) => {
+                        staged.create_directory(&owner, &entry.path)?;
+                        find_node_mut(&mut staged.root, entry.path.component_slice())?
+                            .metadata
+                            .generation = generation;
+                        operations.push(JournalOperation::create_directory(
+                            entry.path.clone(),
+                            generation,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                },
+                SystemEntryKind::File => {
+                    staged.write_shared_file(
+                        &owner,
+                        &entry.path,
+                        Arc::clone(&entry.content),
+                        entry.executable,
+                    )?;
+                    find_node_mut(&mut staged.root, entry.path.component_slice())?
+                        .metadata
+                        .generation = generation;
                     let object = object_id(&entry.content);
-                    find_directory_mut(&mut filesystem.rom, parent)
-                        .map_err(|_| RomImageError::NonCanonical)?
-                        .insert(
-                            Box::from(name),
-                            Node::file(object, entry.content.len() as u64, 0, entry.executable),
-                        );
-                    filesystem
-                        .objects
-                        .replace(None, object, Arc::clone(&entry.content));
+                    // Queue the canonical shared bytes, not the image's input copy.
+                    let bytes = staged.read_snapshot(&owner, &entry.path)?;
+                    objects.insert(object, Arc::clone(&bytes));
+                    operations.push(JournalOperation::put_file(
+                        entry.path.clone(),
+                        generation,
+                        entry.content.len() as u64,
+                        object,
+                        entry.executable,
+                    ));
                 }
             }
         }
-        Ok(filesystem)
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let operation = JournalOperation::Batch { operations };
+        let persistence = self
+            .persistence
+            .as_ref()
+            .map(|p| p.prepare_batch(generation, objects.into_iter().collect(), operation))
+            .transpose()?;
+        self.root = staged.root;
+        self.objects = staged.objects;
+        self.quota = staged.quota;
+        self.generation = generation;
+        if let Some(persistence) = persistence {
+            persistence.publish();
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -252,6 +321,9 @@ impl ComputerFileSystem {
         recovered: &RecoveredState,
         objects: &BTreeMap<ObjectId, Arc<[u8]>>,
     ) -> Result<(), FileSystemError> {
+        self.root.clear();
+        self.objects = ObjectStore::default();
+        self.quota = QuotaLedger::new(&self.limits, 0);
         let logical_bytes = recovered.nodes().try_fold(0_u64, |total, node| {
             node.object()
                 .map_or(Some(total), |(_, size)| total.checked_add(size))
@@ -263,7 +335,7 @@ impl ComputerFileSystem {
             ..MutationCost::default()
         })?;
         for node in recovered.nodes() {
-            let (_, components) = writable_path(node.path())?;
+            let components = node.path().component_slice();
             let (name, parent) = split_name(components)?;
             let restored = match node {
                 CheckpointNode::Directory {
@@ -286,7 +358,7 @@ impl ComputerFileSystem {
                     Node::file(*object_id, *logical_size, *node_generation, *executable)
                 }
             };
-            find_directory_mut(&mut self.home, parent)?.insert(Box::from(name), restored);
+            find_directory_mut(&mut self.root, parent)?.insert(Box::from(name), restored);
         }
         self.quota.commit(reservation);
         self.generation = recovered.generation();
@@ -314,13 +386,11 @@ impl ComputerFileSystem {
         if path.components().len() == 0 {
             return Ok(Node::directory(0).metadata);
         }
-        let (mount, components) = split_mount(path)?;
+        let components = path.component_slice();
         if components.is_empty() {
             return Ok(Node::directory(0).metadata);
         }
-        Ok(find_node(self.directory(mount), components)?
-            .metadata
-            .clone())
+        Ok(find_node(&self.root, components)?.metadata.clone())
     }
 
     pub fn list(
@@ -330,13 +400,13 @@ impl ComputerFileSystem {
     ) -> Result<Vec<Box<str>>, FileSystemError> {
         require(capability, path, FileRights::LIST)?;
         if path.components().len() == 0 {
-            return Ok(vec![Box::from("home"), Box::from("rom")]);
+            return Ok(self.root.keys().cloned().collect());
         }
-        let (mount, components) = split_mount(path)?;
+        let components = path.component_slice();
         let directory = if components.is_empty() {
-            self.directory(mount)
+            &self.root
         } else {
-            match &find_node(self.directory(mount), components)?.contents {
+            match &find_node(&self.root, components)?.contents {
                 NodeContents::Directory(directory) => directory,
                 NodeContents::File(_) => return Err(FileSystemError::NotDirectory),
             }
@@ -350,18 +420,18 @@ impl ComputerFileSystem {
         &self,
         capability: &FileCapability,
         path: &VirtualPath,
-    ) -> Result<Arc<[u8]>, FileSystemError> {
+    ) -> Result<crate::shared_bytes::SharedBytes, FileSystemError> {
         require(capability, path, FileRights::READ)?;
         if path.components().len() == 0 {
             return Err(FileSystemError::IsDirectory);
         }
-        let (mount, components) = split_mount(path)?;
+        let components = path.component_slice();
         if components.is_empty() {
             return Err(FileSystemError::IsDirectory);
         }
-        let node = find_node(self.directory(mount), components)?;
+        let node = find_node(&self.root, components)?;
         let object = node.object_id().ok_or(FileSystemError::IsDirectory)?;
-        Ok(Arc::clone(
+        Ok(crate::shared_bytes::SharedBytes::clone(
             &self
                 .objects
                 .0
@@ -392,7 +462,9 @@ impl ComputerFileSystem {
         // Preserve handle admission limits even though the internal snapshot
         // needs no chunked reads or temporary byte buffer.
         let handle = self.open(capability, path, OpenMode::Read)?;
-        let result = self.read_snapshot(capability, path);
+        let result = self
+            .read_snapshot(capability, path)
+            .map(|bytes| Arc::clone(&bytes));
         self.close(handle)?;
         result
     }
@@ -402,9 +474,9 @@ impl ComputerFileSystem {
         capability: &FileCapability,
         path: &VirtualPath,
     ) -> Result<(), FileSystemError> {
-        let (mount, components) = mutable_target(capability, path, FileRights::CREATE)?;
+        let components = mutable_target(capability, path, FileRights::CREATE)?;
         let (name, parent_components) = split_name(components)?;
-        let parent = find_directory(self.directory(mount), parent_components)?;
+        let parent = find_directory(&self.root, parent_components)?;
         if parent.contains_key(name) {
             return Err(FileSystemError::AlreadyExists);
         }
@@ -419,7 +491,7 @@ impl ComputerFileSystem {
             None,
             JournalOperation::create_directory(path.clone(), generation),
         )?;
-        find_directory_mut(self.directory_mut(mount), parent_components)?
+        find_directory_mut(&mut self.root, parent_components)?
             .insert(Box::from(name), Node::directory(generation));
         self.quota.commit(reservation);
         self.generation = generation;
@@ -436,9 +508,20 @@ impl ComputerFileSystem {
         bytes: &[u8],
         executable: bool,
     ) -> Result<(), FileSystemError> {
-        let (mount, components) = writable_path(path)?;
+        self.write_shared_file(capability, path, Arc::from(bytes), executable)
+    }
+
+    fn write_shared_file(
+        &mut self,
+        capability: &FileCapability,
+        path: &VirtualPath,
+        bytes: Arc<[u8]>,
+        executable: bool,
+    ) -> Result<(), FileSystemError> {
+        require(capability, path, FileRights::WRITE)?;
+        let components = path.component_slice();
         let (name, parent_components) = split_name(components)?;
-        let parent = find_directory(self.directory(mount), parent_components)?;
+        let parent = find_directory(&self.root, parent_components)?;
         let previous = parent.get(name).cloned();
         if previous.is_some() {
             require(capability, path, FileRights::WRITE)?;
@@ -463,14 +546,13 @@ impl ComputerFileSystem {
             ..MutationCost::default()
         })?;
         let generation = self.next_generation()?;
-        let bytes: Arc<[u8]> = Arc::from(bytes);
         let object = object_id(&bytes);
         let persistence = self.prepare_persistence(
             generation,
             Some((object, Arc::clone(&bytes))),
             JournalOperation::put_file(path.clone(), generation, size, object, executable),
         )?;
-        find_directory_mut(self.directory_mut(mount), parent_components)?.insert(
+        find_directory_mut(&mut self.root, parent_components)?.insert(
             Box::from(name),
             Node::file(object, size, generation, executable),
         );
@@ -500,9 +582,10 @@ impl ComputerFileSystem {
         capability: &FileCapability,
         path: &VirtualPath,
     ) -> Result<ExecutableRevision, FileSystemError> {
-        let (mount, components) = writable_path(path)?;
+        require(capability, path, FileRights::WRITE)?;
+        let components = path.component_slice();
         let (name, parent_components) = split_name(components)?;
-        let parent = find_directory(self.directory(mount), parent_components)?;
+        let parent = find_directory(&self.root, parent_components)?;
         match parent.get(name) {
             Some(node) => {
                 require(capability, path, FileRights::WRITE)?;
@@ -544,33 +627,30 @@ impl ComputerFileSystem {
         self.write_file(capability, path, bytes, executable)
     }
 
-    pub(crate) fn install_executable_from_rom(
+    pub(crate) fn copy_executable(
         &mut self,
         capability: &FileCapability,
         source: &VirtualPath,
         destination: &VirtualPath,
     ) -> Result<(), FileSystemError> {
-        let (source_mount, source_components) = split_mount(source)?;
-        if source_mount != Mount::Rom {
-            return Err(FileSystemError::PermissionDenied);
-        }
-        let source_node = find_node(self.directory(source_mount), source_components)?;
-        if source_node.metadata.kind != NodeKind::File || !source_node.metadata.executable {
+        require(
+            capability,
+            source,
+            FileRights::READ | FileRights::INSPECT | FileRights::EXECUTE,
+        )?;
+        let source_bytes = self.read_snapshot(capability, source)?;
+        let source_node = find_node(&self.root, source.component_slice())?;
+        if !source_node.metadata.executable {
             return Err(FileSystemError::NotExecutable);
         }
-        let source_bytes = match source_node.contents {
-            NodeContents::File(object) => self.objects.bytes(&object).to_vec(),
-            NodeContents::Directory(_) => return Err(FileSystemError::NotExecutable),
-        };
-
-        let (destination_mount, destination_components) = writable_path(destination)?;
+        let destination_components = destination.component_slice();
         let (name, parent_components) = split_name(destination_components)?;
-        let parent = find_directory(self.directory(destination_mount), parent_components)?;
+        let parent = find_directory(&self.root, parent_components)?;
         if parent.contains_key(name) {
             return Err(FileSystemError::AlreadyExists);
         }
 
-        self.write_file(capability, destination, &source_bytes, true)
+        self.write_shared_file(capability, destination, Arc::clone(&source_bytes), true)
     }
 
     pub fn open(
@@ -587,8 +667,8 @@ impl ComputerFileSystem {
             rights |= FileRights::WRITE;
         }
         require(capability, path, rights)?;
-        let (mount, components) = split_mount(path)?;
-        match find_node(self.directory(mount), components)?.contents {
+        let components = path.component_slice();
+        match find_node(&self.root, components)?.contents {
             NodeContents::File(_) => {}
             NodeContents::Directory(_) => return Err(FileSystemError::IsDirectory),
         }
@@ -669,9 +749,9 @@ impl ComputerFileSystem {
         capability: &FileCapability,
         path: &VirtualPath,
     ) -> Result<(), FileSystemError> {
-        let (mount, components) = mutable_target(capability, path, FileRights::DELETE)?;
+        let components = mutable_target(capability, path, FileRights::DELETE)?;
         let (name, parent_components) = split_name(components)?;
-        let node = find_directory(self.directory(mount), parent_components)?
+        let node = find_directory(&self.root, parent_components)?
             .get(name)
             .ok_or(FileSystemError::NotFound)?
             .clone();
@@ -681,7 +761,7 @@ impl ComputerFileSystem {
         let generation = self.next_generation()?;
         let persistence =
             self.prepare_persistence(generation, None, JournalOperation::remove(path.clone()))?;
-        find_directory_mut(self.directory_mut(mount), parent_components)?.remove(name);
+        find_directory_mut(&mut self.root, parent_components)?.remove(name);
         if let Some(object) = node.object_id() {
             self.objects.remove(object);
         }
@@ -700,13 +780,8 @@ impl ComputerFileSystem {
         destination: &VirtualPath,
         replace: bool,
     ) -> Result<(), FileSystemError> {
-        let (source_mount, source_components) =
-            mutable_target(capability, source, FileRights::RENAME)?;
-        let (destination_mount, destination_components) =
-            mutable_target(capability, destination, FileRights::RENAME)?;
-        if source_mount != destination_mount {
-            return Err(FileSystemError::PermissionDenied);
-        }
+        let source_components = mutable_target(capability, source, FileRights::RENAME)?;
+        let destination_components = mutable_target(capability, destination, FileRights::RENAME)?;
         if source == destination {
             return Ok(());
         }
@@ -715,7 +790,7 @@ impl ComputerFileSystem {
         }
         let (source_name, source_parent) = split_name(source_components)?;
         let (destination_name, destination_parent) = split_name(destination_components)?;
-        let directory = self.directory(source_mount);
+        let directory = &self.root;
         let source_node = find_directory(directory, source_parent)?
             .get(source_name)
             .ok_or(FileSystemError::NotFound)?;
@@ -745,13 +820,12 @@ impl ComputerFileSystem {
             None,
             JournalOperation::rename(source.clone(), destination.clone(), replace),
         )?;
-        let mut node = find_directory_mut(self.directory_mut(source_mount), source_parent)?
+        let mut node = find_directory_mut(&mut self.root, source_parent)?
             .remove(source_name)
             .expect("source was validated before mutation");
         node.metadata.generation = generation;
-        let destination_directory =
-            find_directory_mut(self.directory_mut(destination_mount), destination_parent)
-                .expect("destination parent was validated before mutation");
+        let destination_directory = find_directory_mut(&mut self.root, destination_parent)
+            .expect("destination parent was validated before mutation");
         destination_directory.remove(destination_name);
         destination_directory.insert(Box::from(destination_name), node);
         if let Some(existing) = existing {
@@ -770,7 +844,7 @@ impl ComputerFileSystem {
     #[doc(hidden)]
     pub fn snapshot_for_test(&self) -> FileSystemSnapshot {
         FileSystemSnapshot {
-            home: self.home.clone(),
+            root: self.root.clone(),
             objects: self.objects.clone(),
             quota: self.quota.clone(),
             generation: self.generation,
@@ -787,8 +861,8 @@ impl ComputerFileSystem {
         path: &VirtualPath,
         bytes: Vec<u8>,
     ) -> Result<(), FileSystemError> {
-        let (mount, components) = writable_path(path)?;
-        let previous = find_node(self.directory(mount), components)?.clone();
+        let components = path.component_slice();
+        let previous = find_node(&self.root, components)?.clone();
         let previous_object = previous.object_id().ok_or(FileSystemError::IsDirectory)?;
         let size = u64::try_from(bytes.len()).map_err(|_| FileSystemError::QuotaExceeded)?;
         self.check_file_size(size)?;
@@ -810,7 +884,7 @@ impl ComputerFileSystem {
                 previous.metadata.executable,
             ),
         )?;
-        *find_node_mut(self.directory_mut(mount), components)? =
+        *find_node_mut(&mut self.root, components)? =
             Node::file(object, size, generation, previous.metadata.executable);
         self.objects.replace(Some(previous_object), object, bytes);
         self.quota.commit(reservation);
@@ -824,25 +898,11 @@ impl ComputerFileSystem {
     }
 
     fn file_bytes(&self, path: &VirtualPath) -> Result<&[u8], FileSystemError> {
-        let (mount, components) = split_mount(path)?;
-        let node = find_node(self.directory(mount), components)?;
+        let components = path.component_slice();
+        let node = find_node(&self.root, components)?;
         match node.contents {
             NodeContents::File(object) => Ok(self.objects.bytes(&object)),
             NodeContents::Directory(_) => Err(FileSystemError::IsDirectory),
-        }
-    }
-
-    fn directory(&self, mount: Mount) -> &Directory {
-        match mount {
-            Mount::Rom => &self.rom,
-            Mount::Home => &self.home,
-        }
-    }
-
-    fn directory_mut(&mut self, mount: Mount) -> &mut Directory {
-        match mount {
-            Mount::Rom => &mut self.rom,
-            Mount::Home => &mut self.home,
         }
     }
 
@@ -892,34 +952,13 @@ fn require(
         .ok_or(FileSystemError::PermissionDenied)
 }
 
-fn writable_path(path: &VirtualPath) -> Result<(Mount, &[Box<str>]), FileSystemError> {
-    let (mount, components) = split_mount(path)?;
-    if mount == Mount::Rom {
-        return Err(FileSystemError::ReadOnly);
-    }
-    Ok((mount, components))
-}
-
 fn mutable_target<'a>(
     capability: &FileCapability,
     path: &'a VirtualPath,
     rights: FileRights,
-) -> Result<(Mount, &'a [Box<str>]), FileSystemError> {
-    let (mount, components) = writable_path(path)?;
+) -> Result<&'a [Box<str>], FileSystemError> {
     require(capability, path, rights)?;
-    Ok((mount, components))
-}
-
-fn split_mount(path: &VirtualPath) -> Result<(Mount, &[Box<str>]), FileSystemError> {
-    let components = path.component_slice();
-    let (mount, rest) = components
-        .split_first()
-        .ok_or(FileSystemError::PermissionDenied)?;
-    match mount.as_ref() {
-        "rom" => Ok((Mount::Rom, rest)),
-        "home" => Ok((Mount::Home, rest)),
-        _ => Err(FileSystemError::NotFound),
-    }
+    Ok(path.component_slice())
 }
 
 fn split_name(components: &[Box<str>]) -> Result<(&str, &[Box<str>]), FileSystemError> {
@@ -1039,6 +1078,34 @@ mod tests {
     }
 
     #[test]
+    fn one_thousand_computer_files_reference_one_live_payload() {
+        let file = path("/home/shared-program", &FileSystemLimits::testing());
+        let owner = FileCapability::new(VirtualPath::root(), FileRights::OWNER);
+        let mut computers = Vec::new();
+        for _ in 0..1000 {
+            let mut filesystem = ComputerFileSystem::testing();
+            // Every caller supplies an independent buffer, as compiler/transfer
+            // boundaries do. Only immutable storage is shared afterwards.
+            filesystem
+                .write_file(&owner, &file, &vec![61; 8192], true)
+                .unwrap();
+            computers.push(filesystem);
+        }
+        let canonical = computers[0].read_snapshot(&owner, &file).unwrap();
+        assert!(computers
+            .iter()
+            .all(|fs| Arc::ptr_eq(&canonical, &fs.read_snapshot(&owner, &file).unwrap())));
+        assert_eq!(
+            8_192_000,
+            computers
+                .iter()
+                .map(ComputerFileSystem::logical_bytes)
+                .sum::<u64>()
+        );
+        assert_eq!(8192, canonical.len());
+    }
+
+    #[test]
     fn executable_install_is_atomic_for_absent_and_existing_outputs() {
         let limits = FileSystemLimits::testing();
         let owner = FileCapability::new(path("/home", &limits), FileRights::OWNER);
@@ -1091,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_root_exposes_mounts_only_to_authorized_guests() {
+    fn virtual_root_exposes_entries_only_to_authorized_guests() {
         let limits = FileSystemLimits::testing();
         let filesystem = ComputerFileSystem::with_limits(limits);
         let root = VirtualPath::root();
@@ -1102,7 +1169,7 @@ mod tests {
             filesystem.stat(&owner, &root).unwrap().kind
         );
         assert_eq!(
-            vec![Box::<str>::from("home"), Box::<str>::from("rom")],
+            vec![Box::<str>::from("home")],
             filesystem.list(&owner, &root).unwrap()
         );
         assert_eq!(
@@ -1135,6 +1202,14 @@ mod tests {
             .unwrap();
         filesystem.remove(&owner, &moved).unwrap();
         assert_eq!(b"original", snapshot.as_ref());
+        let mut another = ComputerFileSystem::with_limits(limits);
+        another
+            .write_file(&owner, &file, b"original", false)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &another.read_snapshot(&owner, &file).unwrap()
+        ));
         assert_eq!(
             b"recreated",
             filesystem.read_snapshot(&owner, &file).unwrap().as_ref()

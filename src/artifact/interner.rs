@@ -45,8 +45,10 @@ mod tests {
         let mut bytes = decoded.bytes.to_vec();
         bytes.extend_from_slice(&marker.to_le_bytes());
         decoded.bytes = bytes.into();
+        let bytes_owner = crate::shared_bytes::SharedBytes::new(Arc::clone(&decoded.bytes));
         Arc::new(VerifiedArtifactInner {
             decoded,
+            _bytes_owner: bytes_owner,
             prepared_program: OnceLock::new(),
         })
     }
@@ -77,6 +79,51 @@ mod tests {
                 &intern(candidate(marker))
             ));
         }
+    }
+
+    #[test]
+    fn independently_verified_distinct_programs_keep_their_prepared_identity() {
+        let owners: Vec<_> = (1..=192)
+            .map(|cost| {
+                let artifact = crate::execution::fixtures::two_block_artifact(cost, 1);
+                verify_artifact(
+                    Arc::from(artifact.decoded().bytes.to_vec()),
+                    ArtifactLimits::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let prepared: Vec<_> = owners
+            .iter()
+            .map(|owner| owner.prepared_program().unwrap())
+            .collect();
+        for (index, owner) in owners.iter().enumerate() {
+            let copied = verify_artifact(
+                Arc::from(owner.decoded().bytes.to_vec()),
+                ArtifactLimits::default(),
+            )
+            .unwrap();
+            assert!(Arc::ptr_eq(&owner.inner, &copied.inner));
+            assert!(Arc::ptr_eq(
+                &prepared[index],
+                &copied.prepared_program().unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn prepared_program_pins_shared_bytes_after_artifact_release() {
+        let input = {
+            let fixture = crate::execution::fixtures::two_block_artifact(4093, 1);
+            Arc::from(fixture.decoded().bytes.to_vec())
+        };
+        let artifact = verify_artifact(input, ArtifactLimits::default()).unwrap();
+        let bytes = Arc::clone(&artifact.decoded().bytes);
+        let prepared = artifact.prepared_program().unwrap();
+        drop(artifact);
+        let replacement = crate::shared_bytes::SharedBytes::new(Arc::from(bytes.to_vec()));
+        assert!(Arc::ptr_eq(&bytes, &replacement));
+        drop(prepared);
     }
 
     #[test]

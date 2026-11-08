@@ -49,6 +49,7 @@ pub mod limits;
 mod live_registry;
 mod process;
 mod redstone;
+mod shared_bytes;
 mod stdio;
 pub mod terminal;
 
@@ -87,7 +88,7 @@ pub use filesystem::{
     FileCapability, FileHandle, FileRights, FileSystemError, FileSystemLimits, FileSystemSnapshot,
     HandleTable, JournalOperation, JournalRecord, NodeKind, NodeMetadata, OpenFile, OpenMode,
     PersistenceCodecError, RecoveredState, RecoveryCheckpoint, RecoveryError, RecoveryInput,
-    RecoveryJournalRecord, RomImage, RomImageError, StoreError, StoreHealth, StoreOpenError,
+    RecoveryJournalRecord, StoreError, StoreHealth, StoreOpenError, SystemImage, SystemImageError,
     VirtualPath, WorldFileSystemStore,
 };
 pub use limits::ArtifactLimits;

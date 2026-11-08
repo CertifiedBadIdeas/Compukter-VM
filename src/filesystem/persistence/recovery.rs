@@ -244,6 +244,11 @@ fn apply(
     limits: &FileSystemLimits,
 ) -> Result<(), ()> {
     match operation {
+        JournalOperation::Batch { operations } => {
+            for operation in operations {
+                apply(state, operation, generation, limits)?;
+            }
+        }
         JournalOperation::CreateDirectory {
             path,
             node_generation,
@@ -376,7 +381,7 @@ fn rebase(
 
 fn require_parent(state: &RecoveredState, path: &VirtualPath) -> Result<(), ()> {
     let parent = path.parent().ok_or(())?;
-    if parent.to_string() == "/home" {
+    if parent.to_string() == "/" {
         return Ok(());
     }
     state
@@ -399,7 +404,7 @@ fn generation_of(node: &CheckpointNode) -> u64 {
 }
 
 fn validate_state(state: &RecoveredState, limits: &FileSystemLimits) -> Result<(), ()> {
-    if state.nodes.len() > limits.maximum_nodes.saturating_sub(2) as usize {
+    if state.nodes.len() > limits.maximum_nodes as usize {
         return Err(());
     }
     let logical_bytes = state

@@ -11,6 +11,29 @@ The accepted architecture is tracked by
 Artifact, verifier, interpreter, heap, scheduler, snapshot, and optimization
 contracts will be introduced through independently verified roadmap slices.
 
+## Writable system storage
+
+Each computer owns an ordinary writable root tree. `/boot/init` starts the system,
+`/bin` contains bundled utilities, and `/home` contains user programs. `SystemImage`
+is an installation source (`CPKTSYS\0`, version 1), not a readonly mount or live overlay.
+The image seeds `/bin`, `/boot` and `/home`; it cannot contain paths inside `/home`.
+A new computer installs once. Reopening restores saved files and deletions even when
+another image is supplied. Explicit `install_system` replaces packaged paths in one
+bounded flat journal batch, preserving other files. A file/directory conflict,
+quota failure or queue rejection leaves the namespace unchanged. Existing executable
+snapshots retain their old bytes. The store-level installation call requires the
+caller to close that computer's active machine first and may wait for durable I/O.
+
+File objects remain content-addressed in the world store. Live immutable contents
+and fully verified execution images are weakly interned across computers; logical
+quotas still charge each file independently. The registries keep every live identity
+and remove their entries at final-owner release. Hash matches require byte equality.
+
+This development change intentionally breaks old storage: namespace checkpoint and
+journal version 2 persist all root descendants, logical computer checkpoint schema 6
+includes the whole tree, and C ABI 25 adds `compukter_store_install_system`. Previous
+ROM images, namespace versions and logical checkpoints are rejected explicitly.
+
 ## Verified artifact loading
 
 Artifact bytes enter the VM as an immutable `Arc<[u8]>`. The caller also
@@ -250,12 +273,11 @@ checks its own execution profile and capability/record schemas and derives heap-
 allocation layouts and mutable resident charges. Heap, stack, statics, type-initialization
 state, tasks and host requests remain private to the machine.
 
-A fixed 128-entry weak index interns artifacts only after full verification with the caller's
-limits. It compares complete container bytes as well as the content digest. The index owns no
-strong program references; the last artifact/image owner releases the program. Eviction can
-reduce sharing for later admissions without changing running machines. Parsing/verification
-is still repeated for each incoming binary. Concurrent first preparation may build temporary
-candidates outside global locks, then publishes one canonical program via `OnceLock`.
+A digest-indexed weak registry interns artifacts only after full verification with the caller's
+limits and complete-container equality. Every live identity remains discoverable; there is no
+live-entry eviction. Final artifact release removes its index entry. Parsing/verification is still
+repeated for each incoming binary. Concurrent first preparation may build temporary candidates
+outside global locks, then publishes one canonical program via `OnceLock`.
 
 Ordinary execution uses the shared typed prepared stream described below. Optional experimental
 representations are cached by shared program/mode; their mutable decode cache stays machine-owned.

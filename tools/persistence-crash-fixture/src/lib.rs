@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use compukter_vm::filesystem::{
     ComputerId, FileCapability, FileRights, FileSystemLimits, PersistenceAtomicPhase,
-    PersistenceAtomicTarget, PersistenceCrashPoint, RomImage, VirtualPath, WorldFileSystemStore,
+    PersistenceAtomicTarget, PersistenceCrashPoint, SystemImage, VirtualPath, WorldFileSystemStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -190,15 +190,15 @@ pub fn atomic_point_name(target: PersistenceAtomicTarget, phase: PersistenceAtom
     format!("{target}.{phase}")
 }
 
-pub fn empty_rom(limits: &FileSystemLimits) -> Arc<RomImage> {
+pub fn empty_rom(limits: &FileSystemLimits) -> Arc<SystemImage> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"CPKTROM\0");
+    bytes.extend_from_slice(b"CPKTSYS\0");
     bytes.extend_from_slice(&1_u16.to_le_bytes());
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     bytes.extend_from_slice(&0_u32.to_le_bytes());
     let digest = Sha256::digest(&bytes);
     bytes.extend_from_slice(&digest);
-    Arc::new(RomImage::admit(bytes.into(), limits).expect("empty ROM is valid"))
+    Arc::new(SystemImage::admit(bytes.into(), limits).expect("empty ROM is valid"))
 }
 
 pub fn owner() -> FileCapability {
@@ -207,4 +207,47 @@ pub fn owner() -> FileCapability {
 
 pub fn path(value: &str) -> VirtualPath {
     VirtualPath::parse_utf8(value, &FileSystemLimits::testing()).expect("fixture path is valid")
+}
+
+/// Two distinct payloads exercise all-objects-before-journal publication.
+pub fn system_image(version: u8, limits: &FileSystemLimits) -> Arc<SystemImage> {
+    let mut bytes = b"CPKTSYS\0".to_vec();
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    for (path, content) in [
+        ("/bin/tool", vec![version, 1]),
+        ("/boot/init", vec![version, 2]),
+    ] {
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(&[2, 1, 0, 0]);
+        bytes.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&content);
+    }
+    bytes.extend_from_slice(&Sha256::digest(&bytes));
+    Arc::new(SystemImage::admit(bytes.into(), limits).unwrap())
+}
+
+pub fn seed_system(root: &Path) {
+    let limits = FileSystemLimits::testing();
+    let store = WorldFileSystemStore::open(root, limits).unwrap();
+    let mut filesystem = store
+        .open_computer(COMPUTER_ID, system_image(0, &limits))
+        .unwrap();
+    filesystem
+        .write_file(&owner(), &path(BASELINE_PATH), BASELINE_BYTES, false)
+        .unwrap();
+    store.flush(COMPUTER_ID, filesystem.generation()).unwrap();
+    store.close().unwrap();
+}
+
+pub fn run_system_update(root: &Path, point: PersistenceCrashPoint) {
+    let limits = FileSystemLimits::testing();
+    let store =
+        WorldFileSystemStore::open_with_persistence_crash_point(root, limits, point).unwrap();
+    store
+        .install_system(COMPUTER_ID, system_image(1, &limits))
+        .expect("crash before completion");
+    panic!("system update crash point did not terminate");
 }

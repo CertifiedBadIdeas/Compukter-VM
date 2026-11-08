@@ -19,8 +19,8 @@
 use std::sync::Arc;
 
 use compukter_vm::{
-    ComputerFileSystem, FileCapability, FileRights, FileSystemError, FileSystemLimits, RomImage,
-    RomImageError, VirtualPath,
+    ComputerFileSystem, FileCapability, FileRights, FileSystemError, FileSystemLimits, SystemImage,
+    SystemImageError, VirtualPath,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,7 +34,7 @@ struct Entry<'a> {
 
 fn image(entries: &[Entry<'_>], trailing: &[u8]) -> Arc<[u8]> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"CPKTROM\0");
+    bytes.extend_from_slice(b"CPKTSYS\0");
     bytes.extend_from_slice(&1_u16.to_le_bytes());
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -57,21 +57,21 @@ fn valid_image() -> Arc<[u8]> {
     image(
         &[
             Entry {
-                path: "/rom/bin",
+                path: "/bin/bin",
                 kind: 1,
                 flags: 0,
                 reserved: 0,
                 content: b"",
             },
             Entry {
-                path: "/rom/bin/tool",
+                path: "/bin/bin/tool",
                 kind: 2,
                 flags: 1,
                 reserved: 0,
                 content: b"tool artifact",
             },
             Entry {
-                path: "/rom/boot",
+                path: "/boot/init",
                 kind: 2,
                 flags: 1,
                 reserved: 0,
@@ -91,41 +91,42 @@ fn path(value: &str) -> VirtualPath {
 }
 
 #[test]
-fn admitted_rom_is_hash_identified_mounted_and_immutable() {
+fn admitted_system_is_hash_identified_writable_and_capability_checked() {
     let limits = FileSystemLimits::testing();
     let bytes = valid_image();
-    let image = RomImage::admit(bytes.clone(), &limits).unwrap();
+    let image = SystemImage::admit(bytes.clone(), &limits).unwrap();
     let expected: [u8; 32] = bytes[bytes.len() - 32..].try_into().unwrap();
     assert_eq!(image.identity(), expected);
     assert_eq!(
-        RomImage::admit(bytes, &limits).unwrap().identity(),
+        SystemImage::admit(bytes, &limits).unwrap().identity(),
         expected
     );
 
-    let mut filesystem = ComputerFileSystem::with_rom(limits, image).unwrap();
+    let mut filesystem = ComputerFileSystem::with_system_image(limits, image).unwrap();
     let reader = FileCapability::new(
-        path("/rom"),
+        path("/"),
         FileRights::INSPECT | FileRights::LIST | FileRights::READ | FileRights::EXECUTE,
     );
     assert_eq!(
-        filesystem.read_file_for_test(&path("/rom/boot")).unwrap(),
+        filesystem.read_file_for_test(&path("/boot/init")).unwrap(),
         b"boot artifact",
     );
     assert!(
         filesystem
-            .stat(&reader, &path("/rom/boot"))
+            .stat(&reader, &path("/boot/init"))
             .unwrap()
             .executable
     );
     assert_eq!(
         filesystem
-            .read_executable(&reader, &path("/rom/boot"))
-            .unwrap(),
+            .read_executable(&reader, &path("/boot/init"))
+            .unwrap()
+            .as_ref(),
         b"boot artifact",
     );
     assert_eq!(
-        filesystem.write_file(&reader, &path("/rom/boot"), b"changed", true),
-        Err(FileSystemError::ReadOnly),
+        filesystem.write_file(&reader, &path("/boot/init"), b"changed", true),
+        Err(FileSystemError::PermissionDenied),
     );
 }
 
@@ -136,14 +137,14 @@ fn malformed_noncanonical_and_over_limit_images_are_rejected() {
         image(
             &[
                 Entry {
-                    path: "/rom/a",
+                    path: "/bin/a",
                     kind: 1,
                     flags: 0,
                     reserved: 0,
                     content: b"",
                 },
                 Entry {
-                    path: "/rom/a",
+                    path: "/bin/a",
                     kind: 1,
                     flags: 0,
                     reserved: 0,
@@ -164,7 +165,7 @@ fn malformed_noncanonical_and_over_limit_images_are_rejected() {
         ),
         image(
             &[Entry {
-                path: "/rom/missing/a",
+                path: "/bin/missing/a",
                 kind: 2,
                 flags: 0,
                 reserved: 0,
@@ -174,7 +175,7 @@ fn malformed_noncanonical_and_over_limit_images_are_rejected() {
         ),
         image(
             &[Entry {
-                path: "/rom/a",
+                path: "/bin/a",
                 kind: 1,
                 flags: 1,
                 reserved: 0,
@@ -184,7 +185,7 @@ fn malformed_noncanonical_and_over_limit_images_are_rejected() {
         ),
         image(
             &[Entry {
-                path: "/rom/a",
+                path: "/bin/a",
                 kind: 2,
                 flags: 2,
                 reserved: 0,
@@ -194,7 +195,7 @@ fn malformed_noncanonical_and_over_limit_images_are_rejected() {
         ),
         image(
             &[Entry {
-                path: "/rom/a",
+                path: "/bin/a",
                 kind: 2,
                 flags: 0,
                 reserved: 1,
@@ -205,14 +206,14 @@ fn malformed_noncanonical_and_over_limit_images_are_rejected() {
         image(
             &[
                 Entry {
-                    path: "/rom/z",
+                    path: "/bin/z",
                     kind: 2,
                     flags: 0,
                     reserved: 0,
                     content: b"z",
                 },
                 Entry {
-                    path: "/rom/a",
+                    path: "/bin/a",
                     kind: 2,
                     flags: 0,
                     reserved: 0,
@@ -223,7 +224,7 @@ fn malformed_noncanonical_and_over_limit_images_are_rejected() {
         ),
         image(
             &[Entry {
-                path: "/rom/a",
+                path: "/bin/a",
                 kind: 2,
                 flags: 0,
                 reserved: 0,
@@ -234,16 +235,16 @@ fn malformed_noncanonical_and_over_limit_images_are_rejected() {
     ];
     for bytes in cases {
         assert!(matches!(
-            RomImage::admit(bytes, &limits),
-            Err(RomImageError::Malformed | RomImageError::NonCanonical)
+            SystemImage::admit(bytes, &limits),
+            Err(SystemImageError::Malformed | SystemImageError::NonCanonical)
         ));
     }
 
     let mut small = limits;
-    small.maximum_rom_bytes = 32;
+    small.maximum_system_image_bytes = 32;
     assert_eq!(
-        RomImage::admit(valid_image(), &small),
-        Err(RomImageError::LimitExceeded),
+        SystemImage::admit(valid_image(), &small),
+        Err(SystemImageError::LimitExceeded),
     );
 }
 
@@ -253,8 +254,8 @@ fn digest_and_version_are_admission_boundaries() {
     let mut corrupt = valid_image().to_vec();
     corrupt[20] ^= 1;
     assert_eq!(
-        RomImage::admit(corrupt.into(), &limits),
-        Err(RomImageError::DigestMismatch),
+        SystemImage::admit(corrupt.into(), &limits),
+        Err(SystemImageError::DigestMismatch),
     );
 
     let mut unsupported = valid_image().to_vec();
@@ -263,7 +264,7 @@ fn digest_and_version_are_admission_boundaries() {
     let digest = Sha256::digest(&unsupported[..payload]);
     unsupported[payload..].copy_from_slice(&digest);
     assert_eq!(
-        RomImage::admit(unsupported.into(), &limits),
-        Err(RomImageError::UnsupportedVersion),
+        SystemImage::admit(unsupported.into(), &limits),
+        Err(SystemImageError::UnsupportedVersion),
     );
 }

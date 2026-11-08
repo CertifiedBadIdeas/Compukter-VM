@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use compukter_vm::{
-    ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits, OpenMode, RomImage,
-    StoreError, StoreHealth, StoreOpenError, VirtualPath, WorldFileSystemStore,
+    ComputerId, FileCapability, FileRights, FileSystemError, FileSystemLimits, OpenMode,
+    StoreError, StoreHealth, StoreOpenError, SystemImage, VirtualPath, WorldFileSystemStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -67,15 +67,15 @@ impl Drop for TestRoot {
     }
 }
 
-fn empty_rom(limits: &FileSystemLimits) -> Arc<RomImage> {
+fn empty_rom(limits: &FileSystemLimits) -> Arc<SystemImage> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"CPKTROM\0");
+    bytes.extend_from_slice(b"CPKTSYS\0");
     bytes.extend_from_slice(&1_u16.to_le_bytes());
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     bytes.extend_from_slice(&0_u32.to_le_bytes());
     let digest = Sha256::digest(&bytes);
     bytes.extend_from_slice(&digest);
-    Arc::new(RomImage::admit(bytes.into(), limits).unwrap())
+    Arc::new(SystemImage::admit(bytes.into(), limits).unwrap())
 }
 
 fn path(value: &str) -> VirtualPath {
@@ -84,6 +84,148 @@ fn path(value: &str) -> VirtualPath {
 
 fn owner() -> FileCapability {
     FileCapability::new(path("/home"), FileRights::OWNER)
+}
+
+fn system(files: &[(&str, &[u8])], limits: &FileSystemLimits) -> Arc<SystemImage> {
+    let mut bytes = b"CPKTSYS\0".to_vec();
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for (path, content) in files {
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(&[2, 1, 0, 0]);
+        bytes.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(content);
+    }
+    bytes.extend_from_slice(&Sha256::digest(&bytes));
+    Arc::new(SystemImage::admit(bytes.into(), limits).unwrap())
+}
+
+#[test]
+fn installed_system_is_persistent_and_changes_only_on_explicit_update() {
+    let root = TestRoot::new();
+    let limits = FileSystemLimits::testing();
+    let id = ComputerId::from_bytes([91; 16]);
+    let other = ComputerId::from_bytes([92; 16]);
+    let old = system(
+        &[("/bin/shell", b"old shell"), ("/boot/init", b"old boot")],
+        &limits,
+    );
+    let new = system(
+        &[("/bin/shell", b"new shell"), ("/boot/init", b"new boot")],
+        &limits,
+    );
+    let root_owner = FileCapability::new(path("/"), FileRights::OWNER);
+    let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
+    let mut first = store.open_computer(id, Arc::clone(&old)).unwrap();
+    let mut second = store.open_computer(other, Arc::clone(&old)).unwrap();
+    let running = first
+        .read_executable(&root_owner, &path("/bin/shell"))
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &running,
+        &second
+            .read_executable(&root_owner, &path("/bin/shell"))
+            .unwrap()
+    ));
+    first
+        .write_file(&root_owner, &path("/bin/shell"), b"custom shell", true)
+        .unwrap();
+    first.remove(&root_owner, &path("/boot/init")).unwrap();
+    first
+        .write_file(&owner(), &path("/home/notes"), b"keep me", false)
+        .unwrap();
+    store.flush(id, first.generation()).unwrap();
+    drop(first);
+    let first = store.open_computer(id, Arc::clone(&new)).unwrap();
+    assert_eq!(
+        b"custom shell",
+        first
+            .read_file_for_test(&path("/bin/shell"))
+            .unwrap()
+            .as_slice()
+    );
+    assert_eq!(
+        Err(FileSystemError::NotFound),
+        first.stat(&root_owner, &path("/boot/init"))
+    );
+    let before = first.generation();
+    drop(first);
+    store.install_system(id, Arc::clone(&new)).unwrap();
+    let first = store.open_computer(id, old).unwrap();
+    assert_eq!(before + 1, first.generation());
+    assert_eq!(
+        b"new shell",
+        first
+            .read_file_for_test(&path("/bin/shell"))
+            .unwrap()
+            .as_slice()
+    );
+    assert_eq!(
+        b"keep me",
+        first
+            .read_file_for_test(&path("/home/notes"))
+            .unwrap()
+            .as_slice()
+    );
+    assert_eq!(
+        b"old shell",
+        second
+            .read_file_for_test(&path("/bin/shell"))
+            .unwrap()
+            .as_slice()
+    );
+    assert_eq!(b"old shell", running.as_ref());
+    drop(first);
+    drop(second);
+    store.close().unwrap();
+    drop(store);
+    let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
+    let first = store.open_computer(id, new).unwrap();
+    assert_eq!(
+        b"new boot",
+        first
+            .read_file_for_test(&path("/boot/init"))
+            .unwrap()
+            .as_slice()
+    );
+    assert_eq!(
+        b"keep me",
+        first
+            .read_file_for_test(&path("/home/notes"))
+            .unwrap()
+            .as_slice()
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn failed_system_update_publishes_no_partial_files() {
+    let root = TestRoot::new();
+    let limits = FileSystemLimits::testing();
+    let id = ComputerId::from_bytes([93; 16]);
+    let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
+    let mut filesystem = store.open_computer(id, empty_rom(&limits)).unwrap();
+    let root_owner = FileCapability::new(path("/"), FileRights::OWNER);
+    filesystem
+        .create_directory(&root_owner, &path("/boot/init"))
+        .unwrap();
+    let before = filesystem.snapshot_for_test();
+    let image = system(
+        &[("/bin/shell", b"new shell"), ("/boot/init", b"new boot")],
+        &limits,
+    );
+    assert_eq!(
+        Err(FileSystemError::IsDirectory),
+        filesystem.install_system(&image)
+    );
+    assert_eq!(before, filesystem.snapshot_for_test());
+    store.flush(id, filesystem.generation()).unwrap();
+    drop(filesystem);
+    let filesystem = store.open_computer(id, image).unwrap();
+    assert_eq!(before, filesystem.snapshot_for_test());
+    store.close().unwrap();
 }
 
 #[test]
@@ -167,12 +309,28 @@ fn parent_traversal_world_root_is_rejected() {
 fn queue_backpressure_and_store_close_precede_visible_mutation() {
     let root = TestRoot::new();
     let mut limits = FileSystemLimits::testing();
+    // First installation itself requires one persistence queue reservation.
+    let seed = WorldFileSystemStore::open(root.path(), limits).unwrap();
+    let seeded = seed
+        .open_computer(ComputerId::from_bytes([1; 16]), empty_rom(&limits))
+        .unwrap();
+    seed.flush(ComputerId::from_bytes([1; 16]), seeded.generation())
+        .unwrap();
+    drop(seeded);
+    seed.close().unwrap();
+    drop(seed);
     limits.maximum_persistence_queue_records = 0;
     let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
     let mut filesystem = store
         .open_computer(ComputerId::from_bytes([1; 16]), empty_rom(&limits))
         .unwrap();
     let before = filesystem.snapshot_for_test();
+    let update = system(&[("/bin/tool", b"new utility")], &limits);
+    assert_eq!(
+        Err(FileSystemError::Busy),
+        filesystem.install_system(&update)
+    );
+    assert_eq!(before, filesystem.snapshot_for_test());
 
     assert_eq!(
         filesystem.write_file(&owner(), &path("/home/a"), b"a", false),
@@ -195,7 +353,7 @@ fn immediate_reopen_preserves_the_last_admitted_generation() {
     let id = ComputerId::from_bytes([51; 16]);
     let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
     let mut filesystem = store.open_computer(id, empty_rom(&limits)).unwrap();
-    for generation in 1..=32 {
+    for generation in 2..=33 {
         let expected = format!("saved before reboot {generation}");
         filesystem
             .write_file(&owner(), &path("/home/draft"), expected.as_bytes(), false)
@@ -232,13 +390,13 @@ fn admitted_mutation_becomes_durable_and_recovers_after_restart() {
             .unwrap();
 
         store.flush(computer, filesystem.generation()).unwrap();
-        assert_eq!(store.durable_generation(computer).unwrap(), 1);
+        assert_eq!(store.durable_generation(computer).unwrap(), 2);
         store.close().unwrap();
     }
 
     let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
     let filesystem = store.open_computer(computer, empty_rom(&limits)).unwrap();
-    assert_eq!(filesystem.generation(), 1);
+    assert_eq!(filesystem.generation(), 2);
     assert_eq!(
         filesystem
             .read_file_for_test(&path("/home/program"))
@@ -288,7 +446,7 @@ fn every_namespace_and_byte_mutation_replays_in_generation_order() {
         filesystem
             .remove(&owner(), &path("/home/temporary"))
             .unwrap();
-        assert_eq!(filesystem.generation(), 7);
+        assert_eq!(filesystem.generation(), 8);
 
         store.flush(computer, 7).unwrap();
         store.close().unwrap();
@@ -296,7 +454,7 @@ fn every_namespace_and_byte_mutation_replays_in_generation_order() {
 
     let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
     let filesystem = store.open_computer(computer, empty_rom(&limits)).unwrap();
-    assert_eq!(filesystem.generation(), 7);
+    assert_eq!(filesystem.generation(), 8);
     assert_eq!(
         filesystem
             .read_file_for_test(&path("/home/dir/program"))
@@ -358,6 +516,7 @@ fn worker_io_fault_degrades_existing_computer_to_read_only() {
         .unwrap();
     store.flush(computer, 1).unwrap();
 
+    store.flush(computer, filesystem.generation()).unwrap();
     let journal = root
         .path()
         .join("computers")
@@ -368,7 +527,10 @@ fn worker_io_fault_degrades_existing_computer_to_read_only() {
     filesystem
         .write_file(&owner(), &path("/home/volatile"), b"visible", false)
         .unwrap();
-    assert_eq!(store.flush(computer, 2), Err(StoreError::StorageFaulted));
+    assert_eq!(
+        store.flush(computer, filesystem.generation()),
+        Err(StoreError::StorageFaulted)
+    );
     assert_eq!(store.health(), StoreHealth::Faulted);
     assert_eq!(
         filesystem
@@ -412,7 +574,7 @@ fn tombstone_is_durable_recoverable_and_blocks_open() {
 
     let store = WorldFileSystemStore::open(root.path(), limits).unwrap();
     let recovered = store.open_computer(computer, empty_rom(&limits)).unwrap();
-    assert_eq!(recovered.generation(), 1);
+    assert_eq!(recovered.generation(), 2);
     store.close().unwrap();
 }
 

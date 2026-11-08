@@ -33,11 +33,11 @@ use compukter_ffi::{
     compukter_redstone_submit_input, compukter_resource_snapshot, compukter_resume_bool,
     compukter_resume_f32_bits, compukter_resume_failure, compukter_resume_i32,
     compukter_resume_value, compukter_store_close, compukter_store_durable_generation,
-    compukter_store_flush, compukter_store_health, compukter_store_open, compukter_store_recover,
-    compukter_store_tombstone, compukter_submit_canonical_line, compukter_terminal_changes_since,
-    compukter_terminal_commit, compukter_terminal_full_state, compukter_terminal_key,
-    compukter_terminal_text, compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus,
-    COMPUKTER_FFI_ABI_VERSION,
+    compukter_store_flush, compukter_store_health, compukter_store_install_system,
+    compukter_store_open, compukter_store_recover, compukter_store_tombstone,
+    compukter_submit_canonical_line, compukter_terminal_changes_since, compukter_terminal_commit,
+    compukter_terminal_full_state, compukter_terminal_key, compukter_terminal_text,
+    compukter_verify_artifact, compukter_verify_for_deploy, FfiStatus, COMPUKTER_FFI_ABI_VERSION,
 };
 use compukter_vm::ProcessFailureReason;
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(24, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(25, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 
@@ -462,7 +462,7 @@ fn c_abi_creates_a_machine_inside_an_open_world_store() {
     });
     assert_eq!(9, written);
     assert_eq!(1, generation[0]);
-    assert_eq!(0, u64::from_le_bytes(generation[1..9].try_into().unwrap()));
+    assert_eq!(1, u64::from_le_bytes(generation[1..9].try_into().unwrap()));
     assert_eq!(FfiStatus::Ok, compukter_close(machine));
     assert_eq!(FfiStatus::Ok, compukter_store_close(store));
 }
@@ -510,6 +510,33 @@ fn c_abi_boots_a_machine_from_the_executable_rom_entry() {
 }
 
 #[test]
+fn c_abi_system_update_is_explicit_and_can_repair_a_broken_boot() {
+    let root = TestRoot::new();
+    let store = open_store(root.path());
+    let id = [63; 16];
+    let original = rom_with_boot(&terminal_artifact(), true);
+    let machine = create_boot_machine(store, id, &original);
+    assert_eq!(FfiStatus::Ok, compukter_close(machine));
+    let broken = rom_with_boot(b"invalid artifact", true);
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_store_install_system(store, id.as_ptr(), broken.as_ptr(), broken.len())
+    });
+    assert_eq!(
+        vec![5, ProcessFailureReason::InvalidProgram.code() as u8],
+        boot_create_wire(store, id, &original)
+    );
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_store_install_system(store, core::ptr::null(), original.as_ptr(), original.len())
+    });
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_store_install_system(store, id.as_ptr(), original.as_ptr(), original.len())
+    });
+    let machine = create_boot_machine(store, id, &broken);
+    assert_eq!(FfiStatus::Ok, compukter_close(machine));
+    assert_eq!(FfiStatus::Ok, compukter_store_close(store));
+}
+
+#[test]
 fn c_abi_inspects_and_reads_the_machine_filesystem_in_bounded_pages() {
     let root = TestRoot::new();
     let store = open_store(root.path());
@@ -517,7 +544,7 @@ fn c_abi_inspects_and_reads_the_machine_filesystem_in_bounded_pages() {
     let rom = rom_with_boot(&artifact, true);
     let machine = create_boot_machine(store, [12; 16], &rom);
 
-    let stat = filesystem_stat(machine, b"/rom/boot");
+    let stat = filesystem_stat(machine, b"/boot/init");
     assert_eq!(28, stat.len());
     assert_eq!(1, stat[0]);
     assert_eq!(0, stat[1]);
@@ -534,14 +561,14 @@ fn c_abi_inspects_and_reads_the_machine_filesystem_in_bounded_pages() {
     assert_eq!(0, root_page[17]);
     assert_eq!(1, u32::from_le_bytes(root_page[18..22].try_into().unwrap()));
     let name_len = u16::from_le_bytes(root_page[22..24].try_into().unwrap()) as usize;
-    assert_eq!(b"home", &root_page[24..24 + name_len]);
+    assert_eq!(b"bin", &root_page[24..24 + name_len]);
 
-    let next_page = filesystem_list(machine, b"/", b"home", 1);
+    let next_page = filesystem_list(machine, b"/", b"boot", 1);
     assert_eq!(1, next_page[17]);
     let name_len = u16::from_le_bytes(next_page[22..24].try_into().unwrap()) as usize;
-    assert_eq!(b"rom", &next_page[24..24 + name_len]);
+    assert_eq!(b"home", &next_page[24..24 + name_len]);
 
-    let first = filesystem_read(machine, b"/rom/boot", 0, 8, generation);
+    let first = filesystem_read(machine, b"/boot/init", 0, 8, generation);
     assert_eq!(1, first[0]);
     assert_eq!(8, u64::from_le_bytes(first[9..17].try_into().unwrap()));
     assert_eq!(0, first[17]);
@@ -572,8 +599,8 @@ fn c_abi_inspects_and_reads_the_machine_filesystem_in_bounded_pages() {
     assert_eq!(FfiStatus::FilesystemNotDirectory, unsafe {
         compukter_filesystem_list(
             machine,
-            b"/rom/boot".as_ptr(),
-            b"/rom/boot".len(),
+            b"/boot/init".as_ptr(),
+            b"/boot/init".len(),
             core::ptr::null(),
             0,
             1,
@@ -598,8 +625,8 @@ fn c_abi_inspects_and_reads_the_machine_filesystem_in_bounded_pages() {
     assert_eq!(FfiStatus::FilesystemIsDirectory, unsafe {
         compukter_filesystem_read(
             machine,
-            b"/rom".as_ptr(),
-            b"/rom".len(),
+            b"/bin".as_ptr(),
+            b"/bin".len(),
             0,
             1,
             0,
@@ -611,8 +638,8 @@ fn c_abi_inspects_and_reads_the_machine_filesystem_in_bounded_pages() {
     assert_eq!(FfiStatus::FilesystemLimitExceeded, unsafe {
         compukter_filesystem_read(
             machine,
-            b"/rom/boot".as_ptr(),
-            b"/rom/boot".len(),
+            b"/boot/init".as_ptr(),
+            b"/boot/init".len(),
             0,
             32 * 1024 + 1,
             generation,
@@ -624,8 +651,8 @@ fn c_abi_inspects_and_reads_the_machine_filesystem_in_bounded_pages() {
     assert_eq!(FfiStatus::FilesystemStale, unsafe {
         compukter_filesystem_read(
             machine,
-            b"/rom/boot".as_ptr(),
-            b"/rom/boot".len(),
+            b"/boot/init".as_ptr(),
+            b"/boot/init".len(),
             0,
             8,
             generation.wrapping_add(1),
@@ -975,21 +1002,18 @@ fn terminal_artifact() -> Vec<u8> {
 }
 
 fn empty_rom() -> Vec<u8> {
-    let mut bytes = b"CPKTROM\0\x01\0\0\0\0\0\0\0".to_vec();
-    bytes.extend_from_slice(&[
-        0xcc, 0x66, 0xe6, 0x9e, 0x46, 0x7a, 0xbd, 0x44, 0xda, 0x92, 0x6f, 0xbb, 0xd2, 0x70, 0x3f,
-        0x99, 0xac, 0x00, 0x66, 0x27, 0x01, 0x21, 0x13, 0x00, 0xa3, 0xef, 0x3e, 0x03, 0x67, 0x3d,
-        0xf5, 0x95,
-    ]);
+    use sha2::{Digest, Sha256};
+    let mut bytes = b"CPKTSYS\0\x01\0\0\0\0\0\0\0".to_vec();
+    bytes.extend_from_slice(&Sha256::digest(&bytes));
     bytes
 }
 
 fn rom_with_boot(artifact: &[u8], executable: bool) -> Vec<u8> {
     use sha2::{Digest, Sha256};
 
-    let path = b"/rom/boot";
+    let path = b"/boot/init";
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"CPKTROM\0");
+    bytes.extend_from_slice(b"CPKTSYS\0");
     bytes.extend_from_slice(&1_u16.to_le_bytes());
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     bytes.extend_from_slice(&1_u32.to_le_bytes());
@@ -1145,7 +1169,6 @@ fn checkpoint_survives_store_reopen_and_requires_explicit_consumption() {
     let restore = |output: &mut [u8], written: &mut usize| unsafe {
         compukter_checkpoint_restore(
             store,
-            1,
             id.as_ptr(),
             rom.as_ptr(),
             rom.len(),
@@ -1228,7 +1251,6 @@ fn checkpoint_rejects_corruption_instead_of_booting_again() {
     assert_eq!(FfiStatus::CheckpointCorrupt, unsafe {
         compukter_checkpoint_restore(
             store,
-            1,
             id.as_ptr(),
             rom.as_ptr(),
             rom.len(),
@@ -1244,13 +1266,12 @@ fn checkpoint_rejects_corruption_instead_of_booting_again() {
 }
 
 #[test]
-fn checkpoint_restore_rejects_invalid_mode_and_pointers_before_lookup() {
+fn checkpoint_restore_rejects_invalid_pointers_before_lookup() {
     let mut output = [0; 9];
     let mut written = 0;
-    let call = |boot, id, count| unsafe {
+    let call = |id, count| unsafe {
         compukter_checkpoint_restore(
             0,
-            boot,
             id,
             core::ptr::null(),
             0,
@@ -1264,15 +1285,11 @@ fn checkpoint_restore_rejects_invalid_mode_and_pointers_before_lookup() {
     let mut call = call;
     assert_eq!(
         FfiStatus::InvalidArgument,
-        call(2, [0; 16].as_ptr(), &mut written)
+        call(core::ptr::null(), &mut written)
     );
     assert_eq!(
         FfiStatus::InvalidArgument,
-        call(1, core::ptr::null(), &mut written)
-    );
-    assert_eq!(
-        FfiStatus::InvalidArgument,
-        call(1, [0; 16].as_ptr(), core::ptr::null_mut())
+        call([0; 16].as_ptr(), core::ptr::null_mut())
     );
     assert_eq!(FfiStatus::InvalidArgument, unsafe {
         compukter_checkpoint_save(0, 0, [0; 16].as_ptr(), core::ptr::null(), 1)
