@@ -417,6 +417,7 @@ impl Machine {
             ("allocation_header_bytes", u64::from(header_bytes)),
             ("heap_capacity", plan.heap_arena_bytes),
             ("heap_used", used.heap_used_bytes),
+            ("heap_backing", self.heap.backing_bytes()),
             ("heap_allocator", plan.heap_allocator_bytes),
             ("frame_arena", plan.frame_arena_bytes),
             ("frame_records", plan.frame_record_bytes),
@@ -428,6 +429,10 @@ impl Machine {
             ("pending_state", plan.pending_state_bytes),
             ("machine_fixed", plan.machine_fixed_bytes),
             ("admitted_mutable_total", plan.mutable_resident_bytes()),
+            (
+                "allocated_mutable_total",
+                plan.mutable_resident_bytes() - plan.heap_arena_bytes + self.heap.backing_bytes(),
+            ),
             ("task_capacity", used.task_capacity),
             ("live_tasks", used.live_tasks),
         ] {

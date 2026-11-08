@@ -23,10 +23,12 @@ use crate::execution::checkpoint::{
 
 impl Checkpoint for ArenaUnit {
     fn write(&self, writer: &mut Writer) -> Result<()> {
-        self.0.write(writer)
+        writer.put(&self.0)
     }
     fn read(reader: &mut Reader<'_>) -> Result<Self> {
-        Ok(Self(Checkpoint::read(reader)?))
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(reader.take(16)?);
+        Ok(Self(bytes))
     }
 }
 
@@ -89,7 +91,8 @@ impl Heap {
         let invalid = || CheckpointError::InvalidState;
         if self.header_format != plan.header_format
             || u64::from(self.arena_bytes) != plan.heap_arena_bytes
-            || self.arena.len().checked_mul(16) != Some(self.arena_bytes as usize)
+            || self.arena.is_empty()
+            || self.arena.len() > self.arena_bytes as usize / 16
             || self.class_heads.len() != CLASS_COUNT
         {
             return Err(invalid());
@@ -113,6 +116,13 @@ impl Heap {
                 .checked_add(size)
                 .filter(|end| *end <= self.arena_bytes)
                 .ok_or_else(invalid)?;
+            // Only the terminal free block may extend beyond initialized
+            // backing. Allocated payloads must be complete, including pending
+            // reservations that Guest initialization has not finished yet.
+            let backed = self.arena.len() * 16;
+            if offset as usize > backed && (flags != 0 || offset != self.arena_bytes) {
+                return Err(invalid());
+            }
             if flags == 0 {
                 total_free = total_free.checked_add(size).ok_or_else(invalid)?;
             } else if flags & LIVE != 0 {
@@ -270,6 +280,81 @@ mod tests {
         reader.finish().unwrap();
         restored.validate_checkpoint(plan).unwrap();
         restored
+    }
+
+    #[test]
+    fn checkpoint_retains_small_backing_then_grows_without_changing_references() {
+        for format in [HeaderFormat::Legacy, HeaderFormat::select(65536, 4)] {
+            let plan = StoragePlan::heap_only(65536).with_header_format(format);
+            let mut heap = Heap::new(&plan).unwrap();
+            let reserved = heap
+                .reserve(AllocationRequest {
+                    block_bytes: 4000,
+                    type_id: 2,
+                })
+                .unwrap()
+                .unwrap();
+            let reference = heap.commit(reserved).unwrap();
+            heap.write_payload(reference, 0, b"retained").unwrap();
+            let mut restored = round_trip(&heap, &plan);
+            assert_eq!(4096, restored.backing_bytes());
+            assert_eq!(65536, restored.arena_bytes());
+            assert_eq!(heap.diagnostic(), restored.diagnostic());
+            let request = AllocationRequest {
+                block_bytes: 4096,
+                type_id: 3,
+            };
+            let next = restored.reserve(request).unwrap().unwrap();
+            assert_eq!(heap.reserve(request).unwrap(), Some(next));
+            assert_eq!(8192, restored.backing_bytes());
+            assert_eq!(
+                *b"retained",
+                restored.read_payload(reference, 0, 8).unwrap()
+            );
+            // Partial allocation initialization is still fully backed in a save.
+            let mut resumed = round_trip(&restored, &plan);
+            resumed.zero_reserved_payload(next, 0, 4080).unwrap();
+            resumed.commit(next).unwrap();
+            resumed.validate_checkpoint(&plan).unwrap();
+        }
+    }
+
+    #[test]
+    fn checkpoint_rejects_unbacked_allocations_and_free_metadata() {
+        for format in [HeaderFormat::Legacy, HeaderFormat::select(65536, 4)] {
+            let plan = StoragePlan::heap_only(65536).with_header_format(format);
+            let mut heap = Heap::new(&plan).unwrap();
+            heap.reserve(AllocationRequest {
+                block_bytes: 4096,
+                type_id: 2,
+            })
+            .unwrap()
+            .unwrap();
+            heap.validate_checkpoint(&plan).unwrap();
+            // Removing the split tail header must fail even though its payload is free.
+            heap.arena.truncate(256);
+            assert_eq!(
+                Err(CheckpointError::InvalidState),
+                heap.validate_checkpoint(&plan)
+            );
+            // A live/reserved block cannot extend into the unbacked suffix.
+            heap.arena.truncate(255);
+            assert_eq!(
+                Err(CheckpointError::InvalidState),
+                heap.validate_checkpoint(&plan)
+            );
+            let mut heap = Heap::new(&plan).unwrap();
+            heap.arena.resize(4097, ArenaUnit::ZERO);
+            assert_eq!(
+                Err(CheckpointError::InvalidState),
+                heap.validate_checkpoint(&plan)
+            );
+            heap.arena.clear();
+            assert_eq!(
+                Err(CheckpointError::InvalidState),
+                heap.validate_checkpoint(&plan)
+            );
+        }
     }
 
     #[test]

@@ -277,6 +277,28 @@ fn entry_string_array_allocation_failure_leaves_session_pristine() {
 }
 
 #[test]
+fn entry_argument_backing_failure_rolls_back_and_allows_a_later_start() {
+    let mut limits = profile();
+    limits.heap_bytes = 65536;
+    let mut session =
+        Session::admit(fixtures::entry_string_array_length_artifact(), limits, &[]).unwrap();
+    let arguments = [vec![0x0100; 3000].into_boxed_slice()];
+    let failure = super::tests::allocation_counter::fail_allocations_at_least(8192, 16);
+    assert_eq!(
+        Err(RunError::EntryAllocationFailed),
+        session.start(&[EntryValue::StringArray(&arguments)])
+    );
+    drop(failure);
+    session
+        .start(&[EntryValue::StringArray(&arguments)])
+        .unwrap();
+    assert_eq!(
+        AdvanceOutcome::Halted(Some(HostValueView::I32(1))),
+        session.advance(64, 0).unwrap()
+    );
+}
+
+#[test]
 fn admission_resolves_exact_identity_major_and_minimum_minor() {
     let operations = operation();
     let binding = CapabilityBinding::new("app", "entry", 1, 2, &operations);
@@ -1136,36 +1158,47 @@ fn steady_state_request_resume_allocates_nothing() {
     }
     let allocations = super::tests::allocation_counter::disable_and_read();
     assert_eq!(0, allocations);
+}
 
+#[test]
+fn string_response_heap_growth_is_bounded_then_reuses_backing() {
+    const ITERATIONS: u32 = 10_000;
     let mut execution_profile = profile();
+    execution_profile.heap_bytes = 16384;
     execution_profile.maximum_host_arguments = 0;
-    execution_profile.maximum_host_requests = ITERATIONS + 1;
-    execution_profile.maximum_accepted_responses = u64::from(ITERATIONS + 1);
+    execution_profile.maximum_host_requests = 2 * ITERATIONS + 1;
+    execution_profile.maximum_accepted_responses = u64::from(2 * ITERATIONS + 1);
     let operations = [OperationSchema::asynchronous(&[], HostValueType::String)];
     let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
     let mut string_session = Session::admit(
-        fixtures::string_response_loop_artifact(ITERATIONS + 1),
+        fixtures::string_response_loop_artifact(2 * ITERATIONS + 1),
         execution_profile,
         &[binding],
     )
     .unwrap();
     string_session.start(&[]).unwrap();
     let units = [0x0041, 0xd800, 0xdc00, 0x0100];
-    super::tests::allocation_counter::reset_and_enable();
-    for _ in 0..ITERATIONS {
-        let id = loop {
-            match string_session.advance(64, 64).unwrap() {
-                AdvanceOutcome::SliceExhausted => {}
-                AdvanceOutcome::HostRequestBatch(batch) => break batch.get(0).unwrap().id(),
-                other => panic!("{other:?}"),
-            }
-        };
-        string_session
-            .resume(id, HostResponse::Success(HostValueInput::String(&units)))
-            .unwrap();
+    for pass in 0..2 {
+        super::tests::allocation_counter::reset_and_enable();
+        for _ in 0..ITERATIONS {
+            let id = loop {
+                match string_session.advance(64, 64).unwrap() {
+                    AdvanceOutcome::SliceExhausted => {}
+                    AdvanceOutcome::HostRequestBatch(batch) => break batch.get(0).unwrap().id(),
+                    other => panic!("{other:?}"),
+                }
+            };
+            string_session
+                .resume(id, HostResponse::Success(HostValueInput::String(&units)))
+                .unwrap();
+        }
+        let allocations = super::tests::allocation_counter::disable_and_read();
+        if pass == 0 {
+            assert!(allocations <= 2, "unexpected storage churn: {allocations}");
+        } else {
+            assert_eq!(0, allocations);
+        }
     }
-    let allocations = super::tests::allocation_counter::disable_and_read();
-    assert_eq!(0, allocations);
 }
 
 #[test]

@@ -125,6 +125,89 @@ fn allocator_request(block_bytes: u32) -> AllocationRequest {
 }
 
 #[test]
+fn demand_grown_heap_retains_full_quota_and_live_offsets() {
+    for format in [HeaderFormat::Legacy, HeaderFormat::select(65536, 4)] {
+        let plan = StoragePlan::heap_only(65536).with_header_format(format);
+        let mut heap = Heap::new(&plan).unwrap();
+        assert_eq!(4096 + 1024, heap.test_reserved_bytes());
+        assert_eq!(65536, heap.diagnostic().total_free);
+        assert_eq!(65536, heap.diagnostic().largest_free_block);
+        let first = heap.reserve(allocator_request(4000)).unwrap().unwrap();
+        let reference = heap.commit(first).unwrap();
+        heap.write_payload(reference, 0, b"retained").unwrap();
+        let second = heap.reserve(allocator_request(10000)).unwrap().unwrap();
+        assert_eq!(BlockOffset(4000), second.block);
+        assert_eq!(14016 + 1024, heap.test_reserved_bytes());
+        assert_eq!(0, heap.test_arena_address() % 16);
+        assert_eq!(*b"retained", heap.read_payload(reference, 0, 8).unwrap());
+        assert_eq!(1, heap.managed_type(reference).unwrap());
+        heap.abort(second).unwrap();
+        heap.free(reference).unwrap();
+        assert_eq!(65536, heap.diagnostic().largest_free_block);
+        let entire = heap.reserve(allocator_request(65536)).unwrap().unwrap();
+        assert_eq!(BlockOffset(0), entire.block);
+        assert_eq!(65536 + 1024, heap.test_reserved_bytes());
+        assert!(heap.reserve(allocator_request(16)).unwrap().is_none());
+        heap.abort(entire).unwrap();
+        assert_eq!(65536, heap.total_free_bytes());
+    }
+}
+
+#[test]
+fn demand_grown_heap_backs_split_header_and_caps_non_power_of_two_quota() {
+    let mut heap = Heap::new(&allocator_plan(12272)).unwrap();
+    let first = heap.reserve(allocator_request(4096)).unwrap().unwrap();
+    // The remaining free block needs a header immediately after the allocation.
+    assert_eq!(8192 + 1024, heap.test_reserved_bytes());
+    let tail = heap.reserve(allocator_request(8176)).unwrap().unwrap();
+    assert_eq!(12272 + 1024, heap.test_reserved_bytes());
+    heap.abort(first).unwrap();
+    heap.abort(tail).unwrap();
+    assert_eq!(12272, heap.diagnostic().largest_free_block);
+    assert!(heap.reserve(allocator_request(12288)).unwrap().is_none());
+    assert_eq!(12272 + 1024, heap.test_reserved_bytes());
+}
+
+#[test]
+fn demand_grown_heap_allocation_failure_leaves_metadata_and_payload_intact() {
+    use super::tests::allocation_counter::fail_allocations_at_least;
+    for format in [HeaderFormat::Legacy, HeaderFormat::select(65536, 4)] {
+        let plan = StoragePlan::heap_only(65536).with_header_format(format);
+        let mut heap = Heap::new(&plan).unwrap();
+        let first = heap.reserve(allocator_request(32)).unwrap().unwrap();
+        let reference = heap.commit(first).unwrap();
+        heap.write_payload(reference, 0, b"retained").unwrap();
+        let diagnostic = heap.diagnostic();
+        let failure = fail_allocations_at_least(8192, 16);
+        assert!(heap.reserve(allocator_request(4096)).unwrap().is_none());
+        assert_eq!(diagnostic, heap.diagnostic());
+        assert_eq!(4096 + 1024, heap.test_reserved_bytes());
+        assert_eq!(*b"retained", heap.read_payload(reference, 0, 8).unwrap());
+        // Already backed space remains usable while host growth is unavailable.
+        let small = heap.reserve(allocator_request(32)).unwrap().unwrap();
+        heap.abort(small).unwrap();
+        drop(failure);
+        let large = heap.reserve(allocator_request(4096)).unwrap().unwrap();
+        assert_eq!(BlockOffset(32), large.block);
+        heap.abort(large).unwrap();
+        heap.free(reference).unwrap();
+        assert_eq!(65536, heap.diagnostic().largest_free_block);
+    }
+}
+
+#[test]
+fn demand_grown_heap_rounds_eight_byte_block_boundaries_to_backing_units() {
+    let mut heap = Heap::new(&allocator_plan(65536)).unwrap();
+    let first = heap.reserve(allocator_request(4088)).unwrap().unwrap();
+    assert_eq!(8192 + 1024, heap.test_reserved_bytes());
+    let second = heap.reserve(allocator_request(4104)).unwrap().unwrap();
+    assert_eq!(BlockOffset(4088), second.block);
+    heap.abort(second).unwrap();
+    heap.abort(first).unwrap();
+    assert_eq!(65536, heap.total_free_bytes());
+}
+
+#[test]
 fn allocator_splits_and_reuses_a_16_byte_tail() -> Result<(), AdmissionError> {
     let mut heap = Heap::new(&allocator_plan(128))?;
     let first = heap.reserve(allocator_request(48)).unwrap().unwrap();

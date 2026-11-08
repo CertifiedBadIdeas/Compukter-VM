@@ -5,6 +5,7 @@ use super::{
 };
 
 const NULL_OFFSET: u32 = u32::MAX;
+const INITIAL_BACKING_BYTES: u32 = 4096;
 const CLASS_COUNT: usize = 32 * 8;
 const ALLOCATED: u32 = 1;
 const MARKED: u32 = 2;
@@ -60,7 +61,10 @@ pub(super) struct HeapDiagnostic {
 
 pub(super) struct Heap {
     header_format: HeaderFormat,
-    arena: Box<[ArenaUnit]>,
+    // Initialized contiguous prefix only. Logical block sizes and free space
+    // cover arena_bytes; the terminal free block may extend beyond this buffer.
+    // All allocated payloads and every block's 16-byte metadata are backed.
+    arena: Vec<ArenaUnit>,
     arena_bytes: u32,
     class_heads: Box<[u32]>,
     first_bitmap: u32,
@@ -90,8 +94,8 @@ impl Heap {
                 supplied: heap_bytes,
             });
         }
-        let arena_len =
-            usize::try_from(heap_bytes / 16).map_err(|_| AdmissionError::StoragePlanOverflow)?;
+        let arena_len = usize::try_from(heap_bytes.min(INITIAL_BACKING_BYTES) / 16)
+            .map_err(|_| AdmissionError::StoragePlanOverflow)?;
         let mut arena = Vec::new();
         arena
             .try_reserve_exact(arena_len)
@@ -104,7 +108,7 @@ impl Heap {
         class_heads.resize(CLASS_COUNT, NULL_OFFSET);
         let mut heap = Self {
             header_format: plan.header_format,
-            arena: arena.into_boxed_slice(),
+            arena,
             arena_bytes: heap_bytes,
             class_heads: class_heads.into_boxed_slice(),
             first_bitmap: 0,
@@ -136,9 +140,26 @@ impl Heap {
         if block_size < request.block_bytes {
             return Err(VmFault::CorruptHeap);
         }
+        let remainder = block_size - request.block_bytes;
+        // Back the full allocation and the split tail's intrusive metadata
+        // before touching free lists. A failed host allocation leaves the heap
+        // unchanged and uses the ordinary collection/retry/exhaustion path.
+        let required = block
+            .0
+            .checked_add(request.block_bytes)
+            .and_then(|end| {
+                end.checked_add(if remainder >= MINIMUM_BLOCK_BYTES {
+                    MINIMUM_BLOCK_BYTES
+                } else {
+                    remainder
+                })
+            })
+            .ok_or(VmFault::CorruptHeap)?;
+        if !self.ensure_backing(required)? {
+            return Ok(None);
+        }
         let previous_size = self.read_previous_or_gray(block)?;
         self.remove_free(block)?;
-        let remainder = block_size - request.block_bytes;
         let allocated_size = if remainder >= MINIMUM_BLOCK_BYTES {
             let remainder_offset = BlockOffset(
                 block
@@ -162,6 +183,38 @@ impl Heap {
             block,
             type_id: request.type_id,
         }))
+    }
+
+    fn ensure_backing(&mut self, required: u32) -> Result<bool, VmFault> {
+        if required > self.arena_bytes {
+            return Err(VmFault::CorruptHeap);
+        }
+        let backed = self.arena.len() as u32 * 16;
+        if required <= backed {
+            return Ok(true);
+        }
+        // Blocks are 8-byte aligned; backing units are 16-byte aligned.
+        let required = required.checked_add(15).ok_or(VmFault::CorruptHeap)? & !15;
+        let target = required
+            .max(backed.saturating_mul(2))
+            .max(INITIAL_BACKING_BYTES)
+            .min(self.arena_bytes);
+        let units = (target / 16) as usize;
+        if self
+            .arena
+            .try_reserve_exact(units - self.arena.len())
+            .is_err()
+        {
+            return Ok(false);
+        }
+        // Vec growth may relocate host storage; Ref32 offsets remain unchanged.
+        self.arena.resize(units, ArenaUnit::ZERO);
+        Ok(true)
+    }
+
+    #[cfg(any(test, feature = "program-sharing-benchmark"))]
+    pub(super) fn backing_bytes(&self) -> u64 {
+        (self.arena.capacity() * core::mem::size_of::<ArenaUnit>()) as u64
     }
 
     pub(super) fn commit(&mut self, reservation: ReservedAllocation) -> Result<Ref32, VmFault> {
@@ -442,6 +495,7 @@ impl Heap {
                 .ok_or(VmFault::InvalidReference)?,
         );
         if block.0 >= self.arena_bytes
+            || block.0 as usize >= self.arena.len() * 16
             || !self.block_allocated(block)?
             || self.read_flags(block)? & LIVE == 0
         {
@@ -609,8 +663,7 @@ impl Heap {
 
     #[cfg(test)]
     pub(super) fn test_reserved_bytes(&self) -> usize {
-        self.arena.len() * core::mem::size_of::<u128>()
-            + self.class_heads.len() * core::mem::size_of::<u32>()
+        self.backing_bytes() as usize + self.class_heads.len() * core::mem::size_of::<u32>()
     }
 
     #[cfg(test)]

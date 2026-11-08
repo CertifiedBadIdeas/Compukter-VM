@@ -315,6 +315,7 @@ pub(super) mod allocation_counter {
     thread_local! {
         static ENABLED: Cell<bool> = const { Cell::new(false) };
         static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+        static FAIL_LAYOUT: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
     }
 
     pub(super) struct CountingAllocator;
@@ -322,12 +323,18 @@ pub(super) mod allocation_counter {
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             count();
+            if fail_layout(layout.size(), layout.align()) {
+                return core::ptr::null_mut();
+            }
             // SAFETY: the request is delegated unchanged to the system allocator.
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             count();
+            if fail_layout(layout.size(), layout.align()) {
+                return core::ptr::null_mut();
+            }
             // SAFETY: the request is delegated unchanged to the system allocator.
             unsafe { System.alloc_zeroed(layout) }
         }
@@ -341,9 +348,35 @@ pub(super) mod allocation_counter {
             if new_size > layout.size() {
                 count();
             }
+            if fail_layout(new_size, layout.align()) {
+                return core::ptr::null_mut();
+            }
             // SAFETY: the request is delegated unchanged to the system allocator.
             unsafe { System.realloc(pointer, layout, new_size) }
         }
+    }
+
+    fn fail_layout(size: usize, alignment: usize) -> bool {
+        FAIL_LAYOUT.with(|layout| {
+            layout.get().is_some_and(|(minimum, required_alignment)| {
+                size >= minimum && alignment == required_alignment
+            })
+        })
+    }
+
+    pub(crate) struct AllocationFailureGuard(Option<(usize, usize)>);
+
+    impl Drop for AllocationFailureGuard {
+        fn drop(&mut self) {
+            FAIL_LAYOUT.with(|layout| layout.set(self.0));
+        }
+    }
+
+    pub(crate) fn fail_allocations_at_least(
+        size: usize,
+        alignment: usize,
+    ) -> AllocationFailureGuard {
+        AllocationFailureGuard(FAIL_LAYOUT.with(|layout| layout.replace(Some((size, alignment)))))
     }
 
     fn count() {

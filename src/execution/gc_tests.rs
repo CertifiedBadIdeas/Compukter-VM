@@ -125,6 +125,64 @@ fn collect_with_external_roots(
 }
 
 #[test]
+fn collector_reclaims_grown_backing_and_coalesces_unbacked_tail() {
+    let image = ExecutionImage::admit(
+        fixtures::reference_field_roundtrip_artifact(),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let mut heap = Heap::new(&image.storage_plan().with_heap_arena_bytes(65536)).unwrap();
+    let ty = TypeKey { module: 0, ty: 1 };
+    let RuntimeTypeLayout::Object(layout) = image.type_layout(ty).unwrap() else {
+        unreachable!()
+    };
+    let first = allocate(&mut heap, ty, layout.block_bytes);
+    for _ in 0..600 {
+        allocate(&mut heap, ty, layout.block_bytes);
+    }
+    let last = allocate(&mut heap, ty, layout.block_bytes);
+    let backing = heap.backing_bytes();
+    assert!(backing > 4096 && backing < 65536);
+    let mut roots = ExternalRootTable::new(2).unwrap();
+    let first_root = roots.retain(first).unwrap();
+    let last_root = roots.retain(last).unwrap();
+    collect_with_external_roots(
+        &mut Collector::new(),
+        &mut heap,
+        &image,
+        &[],
+        &[],
+        &[],
+        &roots,
+    );
+    assert_eq!(2, heap.live_objects());
+    assert!(heap.managed_type(first).is_ok());
+    assert!(heap.managed_type(last).is_ok());
+    assert_eq!(backing, heap.backing_bytes());
+    roots.release(first_root).unwrap();
+    roots.release(last_root).unwrap();
+    collect_with_external_roots(
+        &mut Collector::new(),
+        &mut heap,
+        &image,
+        &[],
+        &[],
+        &[],
+        &roots,
+    );
+    assert_eq!(0, heap.live_objects());
+    assert_eq!(65536, heap.diagnostic().largest_free_block);
+    assert_eq!(backing, heap.backing_bytes());
+    heap.reserve(AllocationRequest {
+        block_bytes: 65536,
+        type_id: ty.ty,
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(65536, heap.backing_bytes());
+}
+
+#[test]
 fn collector_keeps_a_managed_value_while_an_external_handle_is_active() {
     let image = ExecutionImage::admit(
         fixtures::reference_field_roundtrip_artifact(),
@@ -512,6 +570,30 @@ fn post_collection_array_initialization_resumes_across_slices() {
     assert!(slices > 1);
     assert!(machine.consumed_maintenance_cost() > 0);
     assert_eq!(1, machine.test_heap_diagnostic().live_handles);
+}
+
+#[test]
+fn host_backing_failure_collects_once_then_reports_bounded_exhaustion() {
+    let mut profile = fixtures::profile();
+    profile.heap_bytes = 65536;
+    let mut machine =
+        fixtures::started_with_profile(fixtures::array_allocation_artifact(8192), profile);
+    let _failure = super::tests::allocation_counter::fail_allocations_at_least(8192, 16);
+    let mut terminal = None;
+    for _ in 0..10000 {
+        let outcome = machine.run_slice(64, 1).unwrap();
+        if outcome.is_terminal() {
+            terminal = Some(outcome);
+            break;
+        }
+    }
+    let outcome = terminal.expect("backing failure must terminate after a bounded retry");
+    let Outcome::AllocationExhausted(exhaustion) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(exhaustion.collection_attempted);
+    assert!(exhaustion.diagnostic.largest_free_block > exhaustion.diagnostic.requested);
+    assert_eq!(outcome, machine.run_slice(64, 1).unwrap());
 }
 
 #[test]

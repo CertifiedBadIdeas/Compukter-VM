@@ -30,7 +30,7 @@ quotas still charge each file independently. The registries keep every live iden
 and remove their entries at final-owner release. Hash matches require byte equality.
 
 This development change intentionally breaks old storage: namespace checkpoint and
-journal version 2 persist all root descendants, logical computer checkpoint schema 7
+journal version 2 persist all root descendants, logical computer checkpoint schema 8
 includes the whole tree, and C ABI 25 adds `compukter_store_install_system`. Previous
 ROM images, namespace versions and logical checkpoints are rejected explicitly.
 
