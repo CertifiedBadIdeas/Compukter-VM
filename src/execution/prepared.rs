@@ -8,7 +8,7 @@
 //! Private, verified execution plans. One operation retains one logical PC.
 use super::{
     error::{AdmissionError, VmFault},
-    frame::{FrameArena, FrameReservation},
+    frame::PreparedFrame,
     image::{ResolvedField, ResolvedFunction, ResolvedInstruction},
     machine::InstructionFailure,
     numeric,
@@ -719,25 +719,76 @@ fn prepare_extra(
     }
 }
 
+pub(super) enum RunEnd {
+    Boundary,
+    Branch(usize),
+    Failure(InstructionFailure),
+}
+
+pub(super) struct SimpleRun {
+    pub instruction: usize,
+    pub attempts: u64,
+    pub end: RunEnd,
+}
+
+// No allocation, safepoint or external effect occurs while the frame is borrowed.
+// Flush the logical PC and attempts before the machine handles any boundary/failure.
+pub(super) fn execute_run(
+    code: &PreparedCode,
+    frame: &mut PreparedFrame<'_>,
+    code_start: usize,
+    mut instruction: usize,
+    block_len: usize,
+    limit: u64,
+    headroom: u64,
+) -> SimpleRun {
+    let mut attempts = 0;
+    let end = loop {
+        if instruction >= block_len || attempts >= limit {
+            break RunEnd::Boundary;
+        }
+        let Some(op) = code.operation(code_start + instruction) else {
+            break RunEnd::Failure(InstructionFailure::Fault(VmFault::InvalidStoragePlan));
+        };
+        if op.opcode == 0 || op.opcode >= FIELD_GET {
+            break RunEnd::Boundary;
+        }
+        if attempts == headroom {
+            break RunEnd::Failure(InstructionFailure::Fault(VmFault::AccountingOverflow));
+        }
+        attempts += 1;
+        let result = if op.opcode < COPY32 || (105..=142).contains(&op.opcode) {
+            execute_numeric(*op, frame).map(|()| None)
+        } else {
+            execute_frame(*op, frame, &code.copies)
+        };
+        match result {
+            Ok(None) => instruction += 1,
+            Ok(Some(target)) => break RunEnd::Branch(target),
+            Err(failure) => break RunEnd::Failure(failure),
+        }
+    };
+    SimpleRun {
+        instruction,
+        attempts,
+        end,
+    }
+}
+
 #[inline]
 pub(super) fn execute_numeric(
     op: Operation,
-    arena: &mut FrameArena,
-    frame: FrameReservation,
+    frame: &mut PreparedFrame<'_>,
 ) -> Result<(), InstructionFailure> {
     macro_rules! read {
         ($ty:ty, $src:expr) => {
-            <$ty>::from_le_bytes(
-                arena
-                    .read_prepared(frame, $src)
-                    .map_err(InstructionFailure::Fault)?,
-            )
+            <$ty>::from_le_bytes(frame.read($src).map_err(InstructionFailure::Fault)?)
         };
     }
     macro_rules! write {
         ($value:expr) => {
-            arena
-                .write_prepared(frame, op.dst, ($value).to_le_bytes())
+            frame
+                .write(op.dst, ($value).to_le_bytes())
                 .map_err(InstructionFailure::Fault)
         };
     }
@@ -850,23 +901,18 @@ pub(super) fn execute_numeric(
 #[inline]
 pub(super) fn execute_frame(
     op: Operation,
-    arena: &mut FrameArena,
-    frame: FrameReservation,
+    frame: &mut PreparedFrame<'_>,
     copies: &[Copy],
 ) -> Result<Option<usize>, InstructionFailure> {
     macro_rules! read {
         ($ty:ty, $src:expr) => {
-            <$ty>::from_le_bytes(
-                arena
-                    .read_prepared(frame, $src)
-                    .map_err(InstructionFailure::Fault)?,
-            )
+            <$ty>::from_le_bytes(frame.read($src).map_err(InstructionFailure::Fault)?)
         };
     }
     macro_rules! write {
         ($value:expr) => {
-            arena
-                .write_prepared(frame, op.dst, ($value).to_le_bytes())
+            frame
+                .write(op.dst, ($value).to_le_bytes())
                 .map_err(InstructionFailure::Fault)
         };
     }
@@ -899,14 +945,14 @@ pub(super) fn execute_frame(
                 match copy.width {
                     4 => {
                         let value = read!(u32, copy.src);
-                        arena
-                            .write_prepared(frame, copy.dst, value.to_le_bytes())
+                        frame
+                            .write(copy.dst, value.to_le_bytes())
                             .map_err(InstructionFailure::Fault)?;
                     }
                     8 => {
                         let value = read!(u64, copy.src);
-                        arena
-                            .write_prepared(frame, copy.dst, value.to_le_bytes())
+                        frame
+                            .write(copy.dst, value.to_le_bytes())
                             .map_err(InstructionFailure::Fault)?;
                     }
                     _ => return Err(InstructionFailure::Fault(VmFault::InvalidStoragePlan)),

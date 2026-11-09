@@ -20,7 +20,7 @@ pub(crate) fn verify_artifact(
 }
 
 /// Benchmark control only: same verification and admission without identity reuse.
-#[cfg(feature = "program-sharing-benchmark")]
+#[cfg(all(feature = "program-sharing-benchmark", not(test)))]
 pub(crate) fn verify_artifact_unshared(
     bytes: Arc<[u8]>,
     limits: ArtifactLimits,

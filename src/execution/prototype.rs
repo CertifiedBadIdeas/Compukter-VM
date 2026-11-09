@@ -258,14 +258,13 @@ impl PreparedExecution {
                     .ok_or(InstructionFailure::Fault(VmFault::InvalidStoragePlan))?
             };
         }
-        execute(
-            op,
-            arena,
-            FrameReservation {
+        let mut window = arena
+            .prepared_frame(FrameReservation {
                 base: frame.base,
                 byte_len: frame.byte_len,
-            },
-        )
+            })
+            .map_err(InstructionFailure::Fault)?;
+        execute(op, &mut window)
     }
 }
 

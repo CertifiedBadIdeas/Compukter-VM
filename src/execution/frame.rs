@@ -99,6 +99,43 @@ pub(super) struct FrameArena {
     initialized: Vec<bool>,
 }
 
+// A scoped borrow validates the reservation once; operand accesses remain checked.
+pub(super) struct PreparedFrame<'a> {
+    bytes: &'a mut [u8],
+    #[cfg(test)]
+    initialized: &'a mut [bool],
+}
+
+impl PreparedFrame<'_> {
+    #[inline(always)]
+    pub(super) fn read<const N: usize>(&self, offset: u32) -> Result<[u8; N], VmFault> {
+        let start = offset as usize;
+        let end = start.checked_add(N).ok_or(VmFault::InvalidStoragePlan)?;
+        self.bytes
+            .get(start..end)
+            .ok_or(VmFault::InvalidStoragePlan)?
+            .try_into()
+            .map_err(|_| VmFault::InvalidStoragePlan)
+    }
+
+    #[inline(always)]
+    pub(super) fn write<const N: usize>(
+        &mut self,
+        offset: u32,
+        value: [u8; N],
+    ) -> Result<(), VmFault> {
+        let start = offset as usize;
+        let end = start.checked_add(N).ok_or(VmFault::InvalidStoragePlan)?;
+        self.bytes
+            .get_mut(start..end)
+            .ok_or(VmFault::InvalidStoragePlan)?
+            .copy_from_slice(&value);
+        #[cfg(test)]
+        self.initialized[start..end].fill(true);
+        Ok(())
+    }
+}
+
 pub(super) struct StaticArena {
     arena: FrameArena,
     layout: FrameLayout,
@@ -106,6 +143,18 @@ pub(super) struct StaticArena {
 }
 
 impl FrameArena {
+    pub(super) fn prepared_frame(
+        &mut self,
+        frame: FrameReservation,
+    ) -> Result<PreparedFrame<'_>, VmFault> {
+        let range = self.prepared_range(frame, 0, frame.byte_len as usize)?;
+        Ok(PreparedFrame {
+            bytes: &mut self.bytes[range.clone()],
+            #[cfg(test)]
+            initialized: &mut self.initialized[range],
+        })
+    }
+
     #[cfg(feature = "program-sharing-benchmark")]
     pub(super) fn bytes_len_for_benchmark(&self) -> u64 {
         self.bytes.len() as u64
@@ -1419,3 +1468,46 @@ mod tests {
 
 #[path = "checkpoint/frame.rs"]
 mod checkpoint_state;
+
+#[cfg(test)]
+mod prepared_window_tests {
+    use super::*;
+
+    #[test]
+    fn window_confines_operands_and_tracks_initialized_bytes_at_nonzero_base() {
+        let mut arena = FrameArena::new(32).unwrap();
+        let layout = FrameLayout {
+            byte_len: 8,
+            alignment: 8,
+            values: Box::new([]),
+        };
+        let first = arena.push(&layout).unwrap();
+        let second = arena.push(&layout).unwrap();
+        assert_ne!(first.base, second.base);
+        {
+            let mut window = arena.prepared_frame(second).unwrap();
+            window.write(4, 123_u32.to_le_bytes()).unwrap();
+            assert_eq!(window.read::<4>(4).unwrap(), 123_u32.to_le_bytes());
+            assert_eq!(window.read::<8>(4), Err(VmFault::InvalidStoragePlan));
+            assert_eq!(window.write(8, [1_u8]), Err(VmFault::InvalidStoragePlan));
+            assert_eq!(window.read::<4>(u32::MAX), Err(VmFault::InvalidStoragePlan));
+        }
+        assert_eq!(arena.read_prepared::<8>(first, 0).unwrap(), [0; 8]);
+        assert!(
+            arena.initialized[second.base as usize..second.base as usize + 4]
+                .iter()
+                .all(|v| !v)
+        );
+        assert!(
+            arena.initialized[second.base as usize + 4..second.base as usize + 8]
+                .iter()
+                .all(|v| *v)
+        );
+        assert!(arena
+            .prepared_frame(FrameReservation {
+                base: u32::MAX,
+                byte_len: 8
+            })
+            .is_err());
+    }
+}

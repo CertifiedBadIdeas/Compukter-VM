@@ -1396,46 +1396,55 @@ impl Machine {
                         .ok_or(RunError::NotRunnable)?;
                     if operation.opcode != 0 {
                         let frame = self.frames[frame_index];
+                        if operation.opcode < super::prepared::FIELD_GET {
+                            let mut window =
+                                match self.frame_arena.prepared_frame(FrameReservation {
+                                    base: frame.base,
+                                    byte_len: frame.byte_len,
+                                }) {
+                                    Ok(window) => window,
+                                    Err(fault) => {
+                                        let Some(attempts) =
+                                            self.executed_instructions.checked_add(1)
+                                        else {
+                                            return Ok(self.fault(VmFault::AccountingOverflow));
+                                        };
+                                        self.executed_instructions = attempts;
+                                        return Ok(self.fault(fault));
+                                    }
+                                };
+                            let run = super::prepared::execute_run(
+                                self.image.code(),
+                                &mut window,
+                                code_start,
+                                instruction_index,
+                                block_len,
+                                attempt_limit - (self.executed_instructions - attempts_before),
+                                u64::MAX - self.executed_instructions,
+                            );
+                            self.executed_instructions += run.attempts;
+                            self.frames[frame_index].instruction = run.instruction;
+                            match run.end {
+                                super::prepared::RunEnd::Boundary => {}
+                                super::prepared::RunEnd::Branch(target) => {
+                                    self.frames[frame_index].block = target;
+                                    self.frames[frame_index].instruction = 0;
+                                    break;
+                                }
+                                super::prepared::RunEnd::Failure(InstructionFailure::Trap(
+                                    trap,
+                                )) => return Ok(self.guest_trap(trap)),
+                                super::prepared::RunEnd::Failure(InstructionFailure::Fault(
+                                    fault,
+                                )) => return Ok(self.fault(fault)),
+                            }
+                            continue;
+                        }
                         let Some(attempts) = self.executed_instructions.checked_add(1) else {
                             return Ok(self.fault(VmFault::AccountingOverflow));
                         };
                         self.executed_instructions = attempts;
-                        // Numeric operations have no control effect. Keep their result
-                        // contract small instead of routing them through the branch/data dispatcher.
-                        if operation.opcode < super::prepared::COPY32
-                            || (105..=142).contains(&operation.opcode)
-                        {
-                            match super::prepared::execute_numeric(
-                                *operation,
-                                &mut self.frame_arena,
-                                FrameReservation {
-                                    base: frame.base,
-                                    byte_len: frame.byte_len,
-                                },
-                            ) {
-                                Ok(()) => self.frames[frame_index].instruction += 1,
-                                Err(InstructionFailure::Trap(trap)) => {
-                                    return Ok(self.guest_trap(trap))
-                                }
-                                Err(InstructionFailure::Fault(fault)) => {
-                                    return Ok(self.fault(fault))
-                                }
-                            }
-                            continue;
-                        }
-                        let result = if operation.opcode < super::prepared::FIELD_GET {
-                            super::prepared::execute_frame(
-                                *operation,
-                                &mut self.frame_arena,
-                                FrameReservation {
-                                    base: frame.base,
-                                    byte_len: frame.byte_len,
-                                },
-                                &self.image.code().copies,
-                            )
-                        } else {
-                            self.execute_prepared_data(*operation, frame)
-                        };
+                        let result = self.execute_prepared_data(*operation, frame);
                         match result {
                             Ok(None) => self.frames[frame_index].instruction += 1,
                             Ok(Some(target)) => {

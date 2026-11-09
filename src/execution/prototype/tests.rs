@@ -296,7 +296,7 @@ fn prepared_access_rejects_cross_frame_and_overflowing_offsets() {
 #[test]
 fn physical_slot_encoding_falls_back_when_small_register_ids_have_large_offsets() {
     let artifact = fixtures::unsigned_operation_artifact(
-        &vec![4; 130],
+        &[4; 130],
         2,
         Instruction::Add {
             form: 4,

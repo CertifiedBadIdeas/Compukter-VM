@@ -3,6 +3,7 @@ use crate::artifact::Instruction;
 use crate::execution::{
     checkpoint::{Reader, Writer},
     fixtures,
+    frame::{FrameArena, FrameReservation},
     image::ExecutionImage,
     machine::Machine,
     value::EntryArgument,
@@ -513,4 +514,122 @@ fn backed_arena(capacity: u32) -> FrameArena {
         })
         .unwrap();
     arena
+}
+
+fn simple_code(operations: &[Operation]) -> PreparedCode {
+    let mut lines = Vec::new();
+    for chunk in operations.chunks(4) {
+        let mut line = [Operation::default(); 4];
+        line[..chunk.len()].copy_from_slice(chunk);
+        lines.push(Line(line));
+    }
+    PreparedCode {
+        lines: lines.into_boxed_slice(),
+        len: operations.len(),
+        cold: Box::new([]),
+        copies: Box::new([]),
+        fields: Box::new([]),
+        arguments: Box::new([]),
+        reference: Box::new([]),
+    }
+}
+
+#[test]
+fn simple_runs_stop_at_every_limit_and_resume_before_control_or_lifecycle() {
+    let code = simple_code(&[
+        Operation {
+            opcode: IMMEDIATE32,
+            dst: 0,
+            lhs: 17,
+            rhs: 0,
+        },
+        Operation {
+            opcode: COPY32,
+            dst: 4,
+            lhs: 0,
+            rhs: 0,
+        },
+        Operation {
+            opcode: 1,
+            dst: 4,
+            lhs: 0,
+            rhs: 4,
+        },
+        Operation {
+            opcode: JUMP,
+            dst: 9,
+            lhs: 0,
+            rhs: 0,
+        },
+        Operation::default(),
+    ]);
+    let reservation = FrameReservation {
+        base: 0,
+        byte_len: 8,
+    };
+    for limit in 0..=5 {
+        let mut arena = backed_arena(16);
+        let mut window = arena.prepared_frame(reservation).unwrap();
+        let first = execute_run(&code, &mut window, 0, 0, 5, limit, u64::MAX);
+        assert_eq!(first.attempts, limit.min(4));
+        assert_eq!(first.instruction, limit.min(3) as usize);
+        if limit >= 4 {
+            assert!(matches!(first.end, RunEnd::Branch(9)));
+        } else {
+            assert!(matches!(first.end, RunEnd::Boundary));
+            let second = execute_run(&code, &mut window, 0, first.instruction, 5, 5, u64::MAX);
+            assert_eq!(first.attempts + second.attempts, 4);
+            assert!(matches!(second.end, RunEnd::Branch(9)));
+        }
+        assert_eq!(window.read::<4>(4).unwrap(), 34_u32.to_le_bytes());
+        let cold = execute_run(&code, &mut window, 0, 4, 5, 5, u64::MAX);
+        assert_eq!((cold.instruction, cold.attempts), (4, 0));
+        assert!(matches!(cold.end, RunEnd::Boundary));
+    }
+}
+
+#[test]
+fn simple_runs_keep_faulting_pc_and_attempts_without_executing_later_writes() {
+    let code = simple_code(&[
+        Operation {
+            opcode: IMMEDIATE32,
+            dst: 0,
+            lhs: 42,
+            rhs: 0,
+        },
+        Operation {
+            opcode: 13,
+            dst: 0,
+            lhs: 0,
+            rhs: 4,
+        },
+        Operation {
+            opcode: IMMEDIATE32,
+            dst: 0,
+            lhs: 99,
+            rhs: 0,
+        },
+    ]);
+    let mut arena = backed_arena(16);
+    let mut window = arena
+        .prepared_frame(FrameReservation {
+            base: 0,
+            byte_len: 8,
+        })
+        .unwrap();
+    let run = execute_run(&code, &mut window, 0, 0, 3, 10, u64::MAX);
+    assert_eq!((run.instruction, run.attempts), (1, 2));
+    assert!(matches!(
+        run.end,
+        RunEnd::Failure(InstructionFailure::Trap(
+            crate::execution::error::GuestTrap::DivisionByZero
+        ))
+    ));
+    assert_eq!(window.read::<4>(0).unwrap(), 42_u32.to_le_bytes());
+    let run = execute_run(&code, &mut window, 0, 0, 3, 10, 1);
+    assert_eq!((run.instruction, run.attempts), (1, 1));
+    assert!(matches!(
+        run.end,
+        RunEnd::Failure(InstructionFailure::Fault(VmFault::AccountingOverflow))
+    ));
 }
