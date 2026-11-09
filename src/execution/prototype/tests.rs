@@ -114,6 +114,53 @@ fn reference_and_candidates_preserve_scalar_results_and_every_instruction_bounda
 use crate::execution::prepared::tests::{binary, values};
 
 #[test]
+fn ordinary_heap_loads_match_reference_at_checkpoints_and_interruption_boundaries() {
+    let mut cases = vec![
+        (fixtures::field_roundtrip_artifact(), vec![]),
+        (fixtures::reference_array_roundtrip_artifact(), vec![]),
+        (fixtures::nonnull_zero_field_artifact(), vec![]),
+    ];
+    for (artifact, _) in fixtures::primitive_array_roundtrip_cases() {
+        cases.push((artifact, vec![]));
+    }
+    for (storage, value, expected) in [(1, 255, -1), (2, 65535, -1), (3, -1, 255), (4, -1, 65535)] {
+        cases.push((
+            fixtures::packed_array_roundtrip_artifact(storage, value, expected),
+            vec![],
+        ));
+    }
+    for index in [-1, 0, 1] {
+        cases.push((
+            fixtures::array_bounds_artifact(),
+            vec![EntryArgument::unowned(RuntimeValue::I32(index))],
+        ));
+    }
+    for (artifact, args) in cases {
+        let mut reference = started(artifact.clone(), &args);
+        let mut profile = fixtures::profile();
+        profile.heap_bytes = 16 * 1024;
+        let image = super::super::image::ExecutionImage::admit(artifact, profile).unwrap();
+        let mut candidate = super::super::machine::Machine::new_untraced(image).unwrap();
+        candidate.start(&args).unwrap();
+        for step in 0..100 {
+            let retirement = [0, 1, 2, 1, 3][step % 5];
+            let expected = reference.run_slice_with_retirement_limit(128, 8, retirement);
+            let actual = candidate.run_slice_with_retirement_limit(128, 8, retirement);
+            assert_eq!(
+                format!("{expected:?}"),
+                format!("{actual:?}"),
+                "step {step}"
+            );
+            assert_eq!(bytes(&reference), bytes(&candidate), "step {step}");
+            let encoded = bytes(&candidate);
+            let mut reader = Reader::new(&encoded, 8 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
+            candidate.restore_checkpoint_state(&mut reader).unwrap();
+            reader.finish().unwrap();
+        }
+    }
+}
+
+#[test]
 fn all_numeric_opcodes_match_reference_for_overflow_zero_nan_infinity_and_signed_zero() {
     for form in [1, 2, 3, 4, 8, 9] {
         let kind = if form >= 8 { form - 7 } else { form };
