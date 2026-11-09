@@ -125,6 +125,39 @@ fn allocator_request(block_bytes: u32) -> AllocationRequest {
 }
 
 #[test]
+fn demand_grown_heap_validates_backing_and_live_allocation_flags() {
+    use super::{layout::BLOCK_HEADER_BYTES, value::Ref32};
+
+    for format in [HeaderFormat::Legacy, HeaderFormat::select(65536, 4)] {
+        let plan = StoragePlan::heap_only(65536).with_header_format(format);
+        let mut heap = Heap::new(&plan).unwrap();
+        for reference in [
+            Ref32::image(0).unwrap(),
+            Ref32::external(0).unwrap(),
+            Ref32::reserved(0).unwrap(),
+            Ref32::managed(1).unwrap(),
+            Ref32::managed(BLOCK_HEADER_BYTES + 1).unwrap(),
+            Ref32::managed(8192 + BLOCK_HEADER_BYTES).unwrap(),
+            Ref32::managed(65536 + BLOCK_HEADER_BYTES).unwrap(),
+        ] {
+            assert_eq!(Err(VmFault::InvalidReference), heap.managed_type(reference));
+        }
+        let reservation = heap.reserve(allocator_request(32)).unwrap().unwrap();
+        let reference = Ref32::managed(reservation.block.0 + BLOCK_HEADER_BYTES).unwrap();
+        assert_eq!(Err(VmFault::InvalidReference), heap.managed_type(reference));
+        assert_eq!(reference, heap.commit(reservation).unwrap());
+        assert_eq!(Ok(1), heap.managed_type(reference));
+        let (mut head, mut tail) = (None, None);
+        heap.enqueue_gray(reference, 0, &mut head, &mut tail)
+            .unwrap();
+        assert_eq!(Ok(1), heap.managed_type(reference));
+        heap.dequeue_gray(&mut head, &mut tail).unwrap();
+        heap.free(reference).unwrap();
+        assert_eq!(Err(VmFault::InvalidReference), heap.managed_type(reference));
+    }
+}
+
+#[test]
 fn demand_grown_heap_retains_full_quota_and_live_offsets() {
     for format in [HeaderFormat::Legacy, HeaderFormat::select(65536, 4)] {
         let plan = StoragePlan::heap_only(65536).with_header_format(format);

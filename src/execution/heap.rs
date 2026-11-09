@@ -494,11 +494,11 @@ impl Heap {
                 .checked_sub(OBJECT_TYPE_ID)
                 .ok_or(VmFault::InvalidReference)?,
         );
-        if block.0 >= self.arena_bytes
-            || block.0 as usize >= self.arena.len() * 16
-            || !self.block_allocated(block)?
-            || self.read_flags(block)? & LIVE == 0
-        {
+        if block.0 >= self.arena_bytes || block.0 as usize >= self.arena.len() * 16 {
+            return Err(VmFault::InvalidReference);
+        }
+        let flags = self.read_flags(block)?;
+        if flags & (ALLOCATED | LIVE) != (ALLOCATED | LIVE) {
             return Err(VmFault::InvalidReference);
         }
         Ok(block)
