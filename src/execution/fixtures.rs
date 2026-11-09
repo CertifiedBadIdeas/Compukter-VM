@@ -5972,6 +5972,24 @@ pub(super) fn static_roundtrip_artifact() -> VerifiedArtifact {
 }
 
 pub(super) fn field_roundtrip_artifact() -> VerifiedArtifact {
+    primitive_field_roundtrip_artifact(1, Constant::I32(42))
+}
+
+pub(super) fn primitive_field_roundtrip_cases() -> Vec<VerifiedArtifact> {
+    [
+        (1, Constant::I32(-7)),
+        (2, Constant::I64(i64::MIN + 9)),
+        (3, Constant::F32(0x7fc0_1234)),
+        (4, Constant::F64(0x7ff8_0000_0000_1234)),
+        (5, Constant::Bool(true)),
+        (6, Constant::Char(0xd800)),
+    ]
+    .into_iter()
+    .map(|(kind, constant)| primitive_field_roundtrip_artifact(kind, constant))
+    .collect()
+}
+
+fn primitive_field_roundtrip_artifact(kind: u8, constant: Constant) -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let subclass = ValueType {
             kind: 7,
@@ -5981,7 +5999,7 @@ pub(super) fn field_roundtrip_artifact() -> VerifiedArtifact {
         artifact.modules[0].types[0] = NominalType::Function {
             name: 1,
             flags: 0,
-            result: primitive(1),
+            result: primitive(kind),
             parameters: Vec::new(),
         };
         artifact.modules[0].types.extend([
@@ -6023,16 +6041,16 @@ pub(super) fn field_roundtrip_artifact() -> VerifiedArtifact {
         artifact.modules[0].fields = vec![Field {
             owner: TypeId(2),
             name: 0,
-            value_type: primitive(1),
+            value_type: primitive(kind),
             flags: 1,
         }];
-        artifact.modules[0].constants = vec![Constant::I32(42)];
+        artifact.modules[0].constants = vec![constant];
         let function = &mut artifact.modules[0].functions[0];
         function.register_count = 4;
         function.values = crate::artifact::scalar_values(vec![
             subclass,
-            primitive(1),
-            primitive(1),
+            primitive(kind),
+            primitive(kind),
             primitive(5),
         ]);
         install_entry_blocks(

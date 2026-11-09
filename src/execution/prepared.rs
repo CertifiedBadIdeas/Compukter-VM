@@ -731,6 +731,11 @@ pub(super) struct SimpleRun {
     pub end: RunEnd,
 }
 
+pub(super) struct RunBudget {
+    pub limit: u64,
+    pub headroom: u64,
+}
+
 // No allocation, safepoint or external effect occurs while the frame is borrowed.
 // Flush the logical PC and attempts before the machine handles any boundary/failure.
 pub(super) fn execute_run(
@@ -739,28 +744,30 @@ pub(super) fn execute_run(
     code_start: usize,
     mut instruction: usize,
     block_len: usize,
-    limit: u64,
-    headroom: u64,
+    budget: RunBudget,
+    mut heap: impl FnMut(Operation, &mut PreparedFrame<'_>) -> Result<(), InstructionFailure>,
 ) -> SimpleRun {
     let mut attempts = 0;
     let end = loop {
-        if instruction >= block_len || attempts >= limit {
+        if instruction >= block_len || attempts >= budget.limit {
             break RunEnd::Boundary;
         }
         let Some(op) = code.operation(code_start + instruction) else {
             break RunEnd::Failure(InstructionFailure::Fault(VmFault::InvalidStoragePlan));
         };
-        if op.opcode == 0 || op.opcode >= FIELD_GET {
+        if op.opcode == 0 {
             break RunEnd::Boundary;
         }
-        if attempts == headroom {
+        if attempts == budget.headroom {
             break RunEnd::Failure(InstructionFailure::Fault(VmFault::AccountingOverflow));
         }
         attempts += 1;
         let result = if op.opcode < COPY32 || (105..=142).contains(&op.opcode) {
             execute_numeric(*op, frame).map(|()| None)
-        } else {
+        } else if op.opcode < FIELD_GET {
             execute_frame(*op, frame, &code.copies)
+        } else {
+            heap(*op, frame).map(|()| None)
         };
         match result {
             Ok(None) => instruction += 1,

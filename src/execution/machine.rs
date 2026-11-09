@@ -1396,64 +1396,55 @@ impl Machine {
                         .ok_or(RunError::NotRunnable)?;
                     if operation.opcode != 0 {
                         let frame = self.frames[frame_index];
-                        if operation.opcode < super::prepared::FIELD_GET {
-                            let mut window =
-                                match self.frame_arena.prepared_frame(FrameReservation {
-                                    base: frame.base,
-                                    byte_len: frame.byte_len,
-                                }) {
-                                    Ok(window) => window,
-                                    Err(fault) => {
-                                        let Some(attempts) =
-                                            self.executed_instructions.checked_add(1)
-                                        else {
-                                            return Ok(self.fault(VmFault::AccountingOverflow));
-                                        };
-                                        self.executed_instructions = attempts;
-                                        return Ok(self.fault(fault));
-                                    }
+                        let mut window = match self.frame_arena.prepared_frame(FrameReservation {
+                            base: frame.base,
+                            byte_len: frame.byte_len,
+                        }) {
+                            Ok(window) => window,
+                            Err(fault) => {
+                                let Some(attempts) = self.executed_instructions.checked_add(1)
+                                else {
+                                    return Ok(self.fault(VmFault::AccountingOverflow));
                                 };
-                            let run = super::prepared::execute_run(
-                                self.image.code(),
-                                &mut window,
-                                code_start,
-                                instruction_index,
-                                block_len,
-                                attempt_limit - (self.executed_instructions - attempts_before),
-                                u64::MAX - self.executed_instructions,
-                            );
-                            self.executed_instructions += run.attempts;
-                            self.frames[frame_index].instruction = run.instruction;
-                            match run.end {
-                                super::prepared::RunEnd::Boundary => {}
-                                super::prepared::RunEnd::Branch(target) => {
-                                    self.frames[frame_index].block = target;
-                                    self.frames[frame_index].instruction = 0;
-                                    break;
-                                }
-                                super::prepared::RunEnd::Failure(InstructionFailure::Trap(
-                                    trap,
-                                )) => return Ok(self.guest_trap(trap)),
-                                super::prepared::RunEnd::Failure(InstructionFailure::Fault(
-                                    fault,
-                                )) => return Ok(self.fault(fault)),
+                                self.executed_instructions = attempts;
+                                return Ok(self.fault(fault));
                             }
-                            continue;
-                        }
-                        let Some(attempts) = self.executed_instructions.checked_add(1) else {
-                            return Ok(self.fault(VmFault::AccountingOverflow));
                         };
-                        self.executed_instructions = attempts;
-                        let result = self.execute_prepared_data(*operation, frame);
-                        match result {
-                            Ok(None) => self.frames[frame_index].instruction += 1,
-                            Ok(Some(target)) => {
+                        let run = super::prepared::execute_run(
+                            self.image.code(),
+                            &mut window,
+                            code_start,
+                            instruction_index,
+                            block_len,
+                            super::prepared::RunBudget {
+                                limit: attempt_limit
+                                    - (self.executed_instructions - attempts_before),
+                                headroom: u64::MAX - self.executed_instructions,
+                            },
+                            |operation, window| {
+                                prepared_execution::execute_heap(
+                                    operation,
+                                    window,
+                                    &self.image,
+                                    &mut self.heap,
+                                )
+                            },
+                        );
+                        self.executed_instructions += run.attempts;
+                        self.frames[frame_index].instruction = run.instruction;
+                        match run.end {
+                            super::prepared::RunEnd::Boundary => {}
+                            super::prepared::RunEnd::Branch(target) => {
                                 self.frames[frame_index].block = target;
                                 self.frames[frame_index].instruction = 0;
                                 break;
                             }
-                            Err(InstructionFailure::Trap(trap)) => return Ok(self.guest_trap(trap)),
-                            Err(InstructionFailure::Fault(fault)) => return Ok(self.fault(fault)),
+                            super::prepared::RunEnd::Failure(InstructionFailure::Trap(trap)) => {
+                                return Ok(self.guest_trap(trap))
+                            }
+                            super::prepared::RunEnd::Failure(InstructionFailure::Fault(fault)) => {
+                                return Ok(self.fault(fault))
+                            }
                         }
                         continue;
                     }
@@ -3887,45 +3878,11 @@ impl Machine {
     }
 
     fn reference_type(&self, reference: super::value::Ref32) -> Result<super::TypeKey, VmFault> {
-        match reference.domain() {
-            super::value::ReferenceDomain::Managed => {
-                self.heap.managed_type(reference).and_then(|type_id| {
-                    self.image
-                        .type_key(type_id as usize)
-                        .ok_or(VmFault::InvalidResolvedId)
-                })
-            }
-            super::value::ReferenceDomain::External => self
-                .image
-                .reference_type(reference)
-                .ok_or(VmFault::InvalidReference),
-            super::value::ReferenceDomain::Image => self
-                .image
-                .reference_type(reference)
-                .ok_or(VmFault::InvalidReference),
-            super::value::ReferenceDomain::Reserved => Err(VmFault::InvalidReference),
-        }
+        prepared_execution::reference_type(&self.image, &self.heap, reference)
     }
 
     fn runtime_value_matches(&self, value: RuntimeValue, expected: ResolvedValueType) -> bool {
-        match value {
-            RuntimeValue::I32(_) => expected.kind == 1,
-            RuntimeValue::I64(_) => expected.kind == 2,
-            RuntimeValue::F32(_) => expected.kind == 3,
-            RuntimeValue::F64(_) => expected.kind == 4,
-            RuntimeValue::Bool(_) => expected.kind == 5,
-            RuntimeValue::Char(_) => expected.kind == 6,
-            RuntimeValue::Null => expected.kind == 7 && expected.nullable,
-            RuntimeValue::Reference(reference) if expected.kind == 7 => expected
-                .nominal
-                .and_then(|target| {
-                    self.reference_type(reference)
-                        .ok()
-                        .map(|actual| (actual, target))
-                })
-                .is_some_and(|(actual, target)| self.image.is_assignable(actual, target)),
-            RuntimeValue::Reference(_) => false,
-        }
+        prepared_execution::runtime_value_matches(&self.image, &self.heap, value, expected)
     }
 
     fn visit_runtime_roots(&self, mut visit: impl FnMut(Ref32)) {
@@ -3959,31 +3916,7 @@ impl Machine {
         &self,
         value: RuntimeValue,
     ) -> Result<(super::value::Ref32, super::TypeKey, ValueWidth, i32), InstructionFailure> {
-        let reference = match value {
-            RuntimeValue::Null => return Err(InstructionFailure::Trap(GuestTrap::NullReference)),
-            RuntimeValue::Reference(reference) => reference,
-            _ => return Err(InstructionFailure::Fault(VmFault::InvalidValueType)),
-        };
-        let ty = self
-            .heap
-            .managed_type(reference)
-            .map_err(InstructionFailure::Fault)
-            .and_then(|type_id| {
-                self.image
-                    .type_key(type_id as usize)
-                    .ok_or(InstructionFailure::Fault(VmFault::InvalidResolvedId))
-            })?;
-        let element = match self.image.type_layout(ty) {
-            Some(RuntimeTypeLayout::Array { element }) => *element,
-            _ => return Err(InstructionFailure::Fault(VmFault::InvalidReference)),
-        };
-        let length = match load_value(&self.heap, reference, 0, ValueWidth::I32)
-            .map_err(InstructionFailure::Fault)?
-        {
-            RuntimeValue::I32(length) if length >= 0 => length,
-            _ => return Err(InstructionFailure::Fault(VmFault::CorruptHeap)),
-        };
-        Ok((reference, ty, element, length))
+        prepared_execution::resolve_array(&self.image, &self.heap, value)
     }
 
     pub(super) fn consumed_fixed_cost(&self) -> u64 {

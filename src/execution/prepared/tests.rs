@@ -60,7 +60,7 @@ fn compare(artifact: crate::VerifiedArtifact, args: &[EntryArgument], steps: usi
     prepared.start(args).unwrap();
     for step in 0..steps {
         reference.use_reference_execution();
-        let limit = [0, 1, 2, 1, 3][step % 5];
+        let limit = [0, 1, 2, 1, 3, 64][step % 6];
         let budget = reference.minimum_run_budget().max(128);
         let expected = reference.run_slice_with_retirement_limit(budget, 8, limit);
         let actual = prepared.run_slice_with_retirement_limit(budget, 8, limit);
@@ -310,6 +310,16 @@ fn prepared_scalar_frame_bounds_remain_checked() {
 
 #[test]
 fn prepared_heap_operations_match_reference_results_traps_and_checkpoints() {
+    for artifact in fixtures::primitive_field_roundtrip_cases() {
+        compare(artifact, &[], 60);
+    }
+    for (storage, value, expected) in [(1, 255, -1), (2, 65535, -1), (3, -1, 255), (4, -1, 65535)] {
+        compare(
+            fixtures::packed_array_roundtrip_artifact(storage, value, expected),
+            &[],
+            60,
+        );
+    }
     for (artifact, _) in fixtures::primitive_array_roundtrip_cases() {
         compare(artifact, &[], 60);
     }
@@ -570,19 +580,52 @@ fn simple_runs_stop_at_every_limit_and_resume_before_control_or_lifecycle() {
     for limit in 0..=5 {
         let mut arena = backed_arena(16);
         let mut window = arena.prepared_frame(reservation).unwrap();
-        let first = execute_run(&code, &mut window, 0, 0, 5, limit, u64::MAX);
+        let first = execute_run(
+            &code,
+            &mut window,
+            0,
+            0,
+            5,
+            RunBudget {
+                limit,
+                headroom: u64::MAX,
+            },
+            |_, _| unreachable!(),
+        );
         assert_eq!(first.attempts, limit.min(4));
         assert_eq!(first.instruction, limit.min(3) as usize);
         if limit >= 4 {
             assert!(matches!(first.end, RunEnd::Branch(9)));
         } else {
             assert!(matches!(first.end, RunEnd::Boundary));
-            let second = execute_run(&code, &mut window, 0, first.instruction, 5, 5, u64::MAX);
+            let second = execute_run(
+                &code,
+                &mut window,
+                0,
+                first.instruction,
+                5,
+                RunBudget {
+                    limit: 5,
+                    headroom: u64::MAX,
+                },
+                |_, _| unreachable!(),
+            );
             assert_eq!(first.attempts + second.attempts, 4);
             assert!(matches!(second.end, RunEnd::Branch(9)));
         }
         assert_eq!(window.read::<4>(4).unwrap(), 34_u32.to_le_bytes());
-        let cold = execute_run(&code, &mut window, 0, 4, 5, 5, u64::MAX);
+        let cold = execute_run(
+            &code,
+            &mut window,
+            0,
+            4,
+            5,
+            RunBudget {
+                limit: 5,
+                headroom: u64::MAX,
+            },
+            |_, _| unreachable!(),
+        );
         assert_eq!((cold.instruction, cold.attempts), (4, 0));
         assert!(matches!(cold.end, RunEnd::Boundary));
     }
@@ -617,7 +660,18 @@ fn simple_runs_keep_faulting_pc_and_attempts_without_executing_later_writes() {
             byte_len: 8,
         })
         .unwrap();
-    let run = execute_run(&code, &mut window, 0, 0, 3, 10, u64::MAX);
+    let run = execute_run(
+        &code,
+        &mut window,
+        0,
+        0,
+        3,
+        RunBudget {
+            limit: 10,
+            headroom: u64::MAX,
+        },
+        |_, _| unreachable!(),
+    );
     assert_eq!((run.instruction, run.attempts), (1, 2));
     assert!(matches!(
         run.end,
@@ -626,10 +680,103 @@ fn simple_runs_keep_faulting_pc_and_attempts_without_executing_later_writes() {
         ))
     ));
     assert_eq!(window.read::<4>(0).unwrap(), 42_u32.to_le_bytes());
-    let run = execute_run(&code, &mut window, 0, 0, 3, 10, 1);
+    let run = execute_run(
+        &code,
+        &mut window,
+        0,
+        0,
+        3,
+        RunBudget {
+            limit: 10,
+            headroom: 1,
+        },
+        |_, _| unreachable!(),
+    );
     assert_eq!((run.instruction, run.attempts), (1, 1));
     assert!(matches!(
         run.end,
         RunEnd::Failure(InstructionFailure::Fault(VmFault::AccountingOverflow))
     ));
+}
+
+#[test]
+fn heap_runs_publish_attempts_and_fault_pc_and_keep_prior_effects_at_each_limit() {
+    let code = simple_code(&[
+        Operation {
+            opcode: IMMEDIATE32,
+            dst: 0,
+            lhs: 42,
+            rhs: 0,
+        },
+        Operation {
+            opcode: FIELD_SET + 1,
+            dst: 0,
+            lhs: 0,
+            rhs: 0,
+        },
+        Operation {
+            opcode: ARRAY_LOAD + 1,
+            dst: 0,
+            lhs: 0,
+            rhs: 0,
+        },
+        Operation {
+            opcode: IMMEDIATE32,
+            dst: 0,
+            lhs: 99,
+            rhs: 0,
+        },
+    ]);
+    for limit in 0..=4 {
+        for headroom in 0..=4 {
+            let mut arena = backed_arena(8);
+            let mut frame = arena
+                .prepared_frame(FrameReservation {
+                    base: 0,
+                    byte_len: 4,
+                })
+                .unwrap();
+            let mut stored = None;
+            let run = execute_run(
+                &code,
+                &mut frame,
+                0,
+                0,
+                4,
+                RunBudget { limit, headroom },
+                |op, frame| {
+                    if op.opcode == FIELD_SET + 1 {
+                        stored = Some(u32::from_le_bytes(frame.read(0).unwrap()));
+                        Ok(())
+                    } else {
+                        Err(InstructionFailure::Trap(
+                            crate::execution::error::GuestTrap::NullReference,
+                        ))
+                    }
+                },
+            );
+            let attempts = limit.min(headroom).min(3);
+            assert_eq!(run.attempts, attempts, "limit={limit}, headroom={headroom}");
+            assert_eq!(run.instruction, attempts.min(2) as usize);
+            assert_eq!(stored, (attempts >= 2).then_some(42));
+            if limit <= headroom && limit <= 2 {
+                assert!(matches!(run.end, RunEnd::Boundary));
+            } else if headroom < limit && headroom <= 2 {
+                assert!(matches!(
+                    run.end,
+                    RunEnd::Failure(InstructionFailure::Fault(VmFault::AccountingOverflow))
+                ));
+            } else {
+                assert!(matches!(
+                    run.end,
+                    RunEnd::Failure(InstructionFailure::Trap(
+                        crate::execution::error::GuestTrap::NullReference
+                    ))
+                ));
+            }
+            if attempts != 0 {
+                assert_eq!(frame.read::<4>(0).unwrap(), 42u32.to_le_bytes());
+            }
+        }
+    }
 }
