@@ -1406,7 +1406,7 @@ impl Machine {
                             || (105..=142).contains(&operation.opcode)
                         {
                             match super::prepared::execute_numeric(
-                                operation,
+                                *operation,
                                 &mut self.frame_arena,
                                 FrameReservation {
                                     base: frame.base,
@@ -1425,7 +1425,7 @@ impl Machine {
                         }
                         let result = if operation.opcode < super::prepared::FIELD_GET {
                             super::prepared::execute_frame(
-                                operation,
+                                *operation,
                                 &mut self.frame_arena,
                                 FrameReservation {
                                     base: frame.base,
@@ -1434,7 +1434,7 @@ impl Machine {
                                 &self.image.code().copies,
                             )
                         } else {
-                            self.execute_prepared_data(operation, frame)
+                            self.execute_prepared_data(*operation, frame)
                         };
                         match result {
                             Ok(None) => self.frames[frame_index].instruction += 1,

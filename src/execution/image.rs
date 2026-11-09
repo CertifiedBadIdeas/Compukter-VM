@@ -856,7 +856,12 @@ impl ExecutionImage {
     ) -> Option<super::prepared::Operation> {
         let block = self.block(block)?;
         (instruction < block.instruction_count)
-            .then(|| self.program.code.operation(block.code_start + instruction))
+            .then(|| {
+                self.program
+                    .code
+                    .operation(block.code_start + instruction)
+                    .copied()
+            })
             .flatten()
     }
 

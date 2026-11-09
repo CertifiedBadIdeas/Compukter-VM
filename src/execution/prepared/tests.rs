@@ -8,6 +8,41 @@ use crate::execution::{
     value::EntryArgument,
 };
 
+#[test]
+fn operation_lookup_checks_logical_end_before_cache_line_padding() {
+    let mut code = PreparedCode {
+        lines: vec![
+            Line([Operation::default(); 4]),
+            Line([Operation::default(); 4]),
+        ]
+        .into_boxed_slice(),
+        len: 5,
+        cold: Box::new([]),
+        copies: Box::new([]),
+        fields: Box::new([]),
+        arguments: Box::new([]),
+        reference: Box::new([]),
+    };
+    for index in 0..code.len {
+        code.lines[index / 4].0[index % 4] = Operation {
+            opcode: (ARRAY_LOAD + 7) | NON_NULL,
+            dst: index as u32 * 4,
+            lhs: 0x1234_5678,
+            rhs: u32::MAX,
+        };
+    }
+    for index in 0..code.len {
+        let operation = code.operation(index).unwrap();
+        assert_eq!(operation.opcode, (ARRAY_LOAD + 7) | NON_NULL);
+        assert_eq!(operation.dst, index as u32 * 4);
+        assert_eq!(operation.lhs, 0x1234_5678);
+        assert_eq!(operation.rhs, u32::MAX);
+    }
+    for index in [5, 6, 7, 8, usize::MAX] {
+        assert!(code.operation(index).is_none());
+    }
+}
+
 fn state(machine: &Machine) -> Vec<u8> {
     let mut writer = Writer::new(8 * 1024 * 1024);
     machine.write_checkpoint_state(&mut writer).unwrap();

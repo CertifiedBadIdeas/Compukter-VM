@@ -273,9 +273,10 @@ impl PreparedCode {
         ]
     }
 
+    // Keep fetch borrowed so opcode dispatch need not materialize the full operation.
     #[inline(always)]
-    pub(super) fn operation(&self, index: usize) -> Option<Operation> {
-        (index < self.len).then(|| self.lines[index / 4].0[index % 4])
+    pub(super) fn operation(&self, index: usize) -> Option<&Operation> {
+        (index < self.len).then(|| &self.lines[index / 4].0[index % 4])
     }
 
     pub(super) fn get(&self, index: usize) -> Option<&ResolvedInstruction> {
