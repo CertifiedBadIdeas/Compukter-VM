@@ -226,42 +226,28 @@ impl CompiledRun {
 
 #[derive(Clone, Copy)]
 pub(super) struct Exit {
-    state: Value,
     counts: [Value; 4], // attempted delta, remaining, fixed absolute, entered absolute
     block: usize,
     instruction: usize,
-    materialize: Option<Block>,
+    publish: Block,
 }
 impl Exit {
-    pub(super) fn spill(self, b: &mut FunctionBuilder<'_>) {
-        for (offset, value) in [
-            (std::mem::offset_of!(RunState, attempts), self.counts[0]),
-            (std::mem::offset_of!(RunState, remaining), self.counts[1]),
-            (std::mem::offset_of!(RunState, fixed), self.counts[2]),
-            (std::mem::offset_of!(RunState, blocks), self.counts[3]),
-        ] {
-            store(b, self.state, offset as u32, value);
-        }
-        for (offset, value) in [
-            (std::mem::offset_of!(RunState, block), self.block),
-            (
-                std::mem::offset_of!(RunState, instruction),
-                self.instruction,
-            ),
-        ] {
-            let value = b.ins().iconst(types::I64, value as i64);
-            store(b, self.state, offset as u32, value);
-        }
-    }
     pub(super) fn return_status(self, b: &mut FunctionBuilder<'_>, status: Value) {
-        if let Some(block) = self.materialize {
-            b.ins().jump(block, &[status.into()]);
-        } else {
-            b.ins().return_(&[status]);
-        }
+        let block = b.ins().iconst(types::I64, self.block as i64);
+        let instruction = b.ins().iconst(types::I64, self.instruction as i64);
+        let [attempts, remaining, fixed, entered] = self.counts;
+        let values = [
+            status,
+            attempts,
+            remaining,
+            fixed,
+            entered,
+            block,
+            instruction,
+        ];
+        b.ins().jump(self.publish, &values.map(Into::into));
     }
     fn finish(self, b: &mut FunctionBuilder<'_>) {
-        self.spill(b);
         let status = b.ins().iconst(types::I64, 0);
         self.return_status(b, status);
     }
@@ -301,6 +287,12 @@ fn edge(
 
 pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state: Value) {
     let plan = emitter.plan;
+    // Status, four counters and the exact Guest block/instruction are published
+    // once after every side exit, before the shared frame epilogue.
+    let publish = b.create_block();
+    for _ in 0..7 {
+        b.append_block_param(publish, types::I64);
+    }
     let limit = load(
         b,
         state,
@@ -349,11 +341,10 @@ pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state
     for ((region, &(_, block)), &body) in plan.region.iter().zip(&blocks).zip(&bodies) {
         b.switch_to_block(block);
         let mut exit = Exit {
-            state,
             counts: std::array::from_fn(|i| b.block_params(block)[i]),
             block: region.id,
             instruction: 0,
-            materialize: emitter.values.as_ref().map(|v| v.exit),
+            publish,
         };
         let stopped = b
             .ins()
@@ -430,6 +421,26 @@ pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state
         b.switch_to_block(block);
         exit.counts = std::array::from_fn(|i| b.block_params(block)[i]);
         exit.finish(b);
+    }
+    b.switch_to_block(publish);
+    let values: [Value; 7] = std::array::from_fn(|i| b.block_params(publish)[i]);
+    for (offset, value) in [
+        std::mem::offset_of!(RunState, attempts),
+        std::mem::offset_of!(RunState, remaining),
+        std::mem::offset_of!(RunState, fixed),
+        std::mem::offset_of!(RunState, blocks),
+        std::mem::offset_of!(RunState, block),
+        std::mem::offset_of!(RunState, instruction),
+    ]
+    .into_iter()
+    .zip(&values[1..])
+    {
+        store(b, state, offset as u32, *value);
+    }
+    if let Some(cache) = &emitter.values {
+        b.ins().jump(cache.exit, &[values[0].into()]);
+    } else {
+        b.ins().return_(&[values[0]]);
     }
 }
 

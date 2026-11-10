@@ -395,9 +395,6 @@ fn guard(
     let next = b.create_block();
     b.ins().brif(bad, fail, &[], next, &[]);
     b.switch_to_block(fail);
-    if let Some(exit) = exit {
-        exit.spill(b);
-    }
     let status = b
         .ins()
         .iconst(types::I64, ((reason << 32) | pc as u64) as i64);
