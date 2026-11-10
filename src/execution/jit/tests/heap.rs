@@ -164,7 +164,7 @@ fn native_mixed_heap_regions_preserve_checks_fault_order_and_prior_effects() {
                         rhs: 0,
                     },
                     Operation {
-                        opcode: get + 7 | if field.is_none() { NON_NULL } else { 0 },
+                        opcode: (get + 7) | if field.is_none() { NON_NULL } else { 0 },
                         dst: 16,
                         lhs: 0,
                         rhs: if field.is_some() { 0 } else { 4 },

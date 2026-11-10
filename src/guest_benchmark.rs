@@ -350,6 +350,12 @@ fn main() {
             JIT_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
             false
         }
+        #[cfg(feature = "baseline-jit")]
+        "jit-no-ssa-untraced" => {
+            execution::jit::benchmark_ssa(false);
+            JIT_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
         _ => panic!("expected traced or untraced"),
     };
     let filters: Vec<_> = args
@@ -496,7 +502,7 @@ fn main() {
     let mut summary = String::from("id\tmode\tsamples\theap_bytes\tcreate_median_ns\thot_min_ns\thot_median_ns\thot_max_ns\thot_fixed_units\thot_dynamic_units\thot_maintenance_units\thot_blocks\thot_executed_instructions\thot_retired_instructions\thot_requests\thot_responses\tcreate_cpu_median_ns\thot_cpu_median_ns\n");
     for case in cases {
         #[cfg(feature = "jit-diagnostics")]
-        fs::create_dir_all(&outputs).expect("diagnostic output directory");
+        fs::create_dir_all(outputs).expect("diagnostic output directory");
         #[cfg(feature = "jit-diagnostics")]
         fs::write(
             outputs.join(format!("{}-calls.tsv", case.id)),

@@ -19,6 +19,10 @@ use super::{
 };
 
 mod lower;
+#[cfg(feature = "guest-benchmark")]
+pub(crate) fn benchmark_ssa(enabled: bool) {
+    lower::slots::benchmark_enabled(enabled);
+}
 pub(super) use lower::RunState;
 const SLOTS: usize = 256;
 const HOT: u32 = 64;

@@ -361,3 +361,12 @@ heap packing is embedded in shared code. A failed callout exits at its exact PC
 with earlier frame and heap writes retained. Calls, allocation, initialization,
 host operations and GC remain interpreter boundaries; there is no inlining across
 those boundaries or automatic SIMD guarantee.
+
+Heap-free numeric regions promote at most 64 exact typed frame ranges to SSA
+for the current invocation. Arithmetic and checked values are selected; copy-only
+temporaries remain memory-backed to limit exit register pressure. Partially
+overlapping ranges remain in memory; exact-width aliases use bitcasts. Every
+exit materializes all promoted written bytes, including dead values and writes
+before a fault. Prefixes and heap regions keep direct frame access. There is no
+retained per-session cache. The benchmark-only `jit-no-ssa-untraced` mode disables
+this cold compilation choice in the same executable for controlled comparisons.

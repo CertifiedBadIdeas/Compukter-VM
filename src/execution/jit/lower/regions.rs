@@ -230,6 +230,7 @@ pub(super) struct Exit {
     counts: [Value; 4], // attempted delta, remaining, fixed absolute, entered absolute
     block: usize,
     instruction: usize,
+    materialize: Option<Block>,
 }
 impl Exit {
     pub(super) fn spill(self, b: &mut FunctionBuilder<'_>) {
@@ -252,10 +253,17 @@ impl Exit {
             store(b, self.state, offset as u32, value);
         }
     }
+    pub(super) fn return_status(self, b: &mut FunctionBuilder<'_>, status: Value) {
+        if let Some(block) = self.materialize {
+            b.ins().jump(block, &[status.into()]);
+        } else {
+            b.ins().return_(&[status]);
+        }
+    }
     fn finish(self, b: &mut FunctionBuilder<'_>) {
         self.spill(b);
         let status = b.ins().iconst(types::I64, 0);
-        b.ins().return_(&[status]);
+        self.return_status(b, status);
     }
     fn check(self, b: &mut FunctionBuilder<'_>, bad: Value, reason: u64) {
         guard(b, bad, reason, 0, Some(self));
@@ -345,6 +353,7 @@ pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state
             counts: std::array::from_fn(|i| b.block_params(block)[i]),
             block: region.id,
             instruction: 0,
+            materialize: emitter.values.as_ref().map(|v| v.exit),
         };
         let stopped = b
             .ins()
@@ -386,7 +395,8 @@ pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state
                     let target = edge(b, op.dst as usize, exit, &blocks, &mut outside);
                     b.ins().jump(target, &arguments(exit.counts));
                 } else {
-                    let condition = load(b, emitter.base, types::I32, op.dst);
+                    let condition =
+                        slots::read(b, emitter.base, emitter.values.as_ref(), types::I32, op.dst);
                     let bad = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, condition, 1);
                     guard(b, bad, 2, pc, Some(exit));
                     let yes = edge(b, op.lhs as usize, exit, &blocks, &mut outside);
@@ -429,6 +439,217 @@ mod tests {
     use crate::execution::{
         fixtures, frame::FrameReservation, heap::Heap, prepared::tests::backed_arena,
     };
+
+    fn linear(code: &PreparedCode, len: usize) -> CompiledRun {
+        let mut plan = Plan::prefix(code, 0, len).unwrap();
+        assert_eq!(plan.ops.len(), len);
+        plan.region.push(RegionBlock {
+            id: 0,
+            start: 0,
+            end: len,
+            cost: 1,
+        });
+        compile(plan, Reservation::acquire().unwrap()).unwrap()
+    }
+
+    fn failure_signature(failure: &InstructionFailure) -> String {
+        match failure {
+            InstructionFailure::Fault(fault) => format!("fault:{fault:?}"),
+            InstructionFailure::Trap(trap) => format!("trap:{trap:?}"),
+        }
+    }
+
+    fn compare_linear(
+        code: &PreparedCode,
+        compiled: &CompiledRun,
+        image: &ExecutionImage,
+        input: &[u8],
+        limit: u64,
+        headroom: u64,
+    ) {
+        let mut a = backed_arena(input.len() as u32);
+        let mut b = backed_arena(input.len() as u32);
+        let reservation = FrameReservation {
+            base: 0,
+            byte_len: input.len() as u32,
+        };
+        let mut reference = a.prepared_frame(reservation).unwrap();
+        let mut candidate = b.prepared_frame(reservation).unwrap();
+        reference.jit_bytes().copy_from_slice(input);
+        candidate.jit_bytes().copy_from_slice(input);
+        let expected = execute_run(
+            code,
+            &mut reference,
+            0,
+            0,
+            compiled.len,
+            RunBudget { limit, headroom },
+            |_, _| unreachable!(),
+        );
+        let mut heap = Heap::new(&image.storage_plan()).unwrap();
+        let actual = compiled.execute_region(
+            &mut candidate,
+            HeapAccess {
+                image,
+                heap: &mut heap,
+            },
+            RunState::new(limit, headroom, 999, 11, 3),
+        );
+        let failure = match &expected.end {
+            RunEnd::Failure(failure) => Some(failure_signature(failure)),
+            RunEnd::Boundary => None,
+            _ => unreachable!(),
+        };
+        assert_eq!(actual.failure.as_ref().map(failure_signature), failure);
+        assert_eq!(actual.state.attempts, expected.attempts);
+        assert_eq!(actual.state.instruction, expected.instruction as u64);
+        assert_eq!(
+            (
+                actual.state.remaining,
+                actual.state.fixed,
+                actual.state.blocks
+            ),
+            (999, 11, 3)
+        );
+        assert_eq!(
+            actual.exhausted,
+            failure.is_none() && expected.instruction < compiled.len && expected.attempts == limit
+        );
+        assert_eq!(reference.jit_bytes(), candidate.jit_bytes());
+    }
+
+    #[test]
+    fn scalar_regions_materialize_float_bits_and_dead_writes_at_every_exit() {
+        let image =
+            ExecutionImage::admit(fixtures::jit_numeric_loop_artifact(), fixtures::profile())
+                .unwrap();
+        let values = [
+            0_u64,
+            1,
+            u64::MAX,
+            0x8000_0000,
+            0x8000_0000_0000_0000,
+            0xffff_ffff,
+            0x7f80_0000,
+            0x7fc0_1234,
+            0x7ff0_0000_0000_0000,
+            0x7ff0_1234_5678_1234,
+        ];
+        for opcode in (1..=142).filter(|&op| numeric_type(op).is_some()) {
+            let code = crate::execution::prepared::tests::simple_code(
+                &(0..4)
+                    .map(|i| Operation {
+                        opcode,
+                        dst: 16 + i * 8,
+                        lhs: 0,
+                        rhs: 8,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let compiled = linear(&code, 4);
+            for &lhs in &values {
+                for &rhs in &values {
+                    let mut input = [0xa5; 64];
+                    input[..8].copy_from_slice(&lhs.to_le_bytes());
+                    input[8..16].copy_from_slice(&rhs.to_le_bytes());
+                    for cut in 0..=4 {
+                        compare_linear(&code, &compiled, &image, &input, cut, u64::MAX);
+                        compare_linear(&code, &compiled, &image, &input, u64::MAX, cut);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_aliases_unaligned_overlaps_and_sequential_copies_match_at_all_cuts() {
+        let image =
+            ExecutionImage::admit(fixtures::jit_numeric_loop_artifact(), fixtures::profile())
+                .unwrap();
+        for valid_bool in [false, true] {
+            let ops = [
+                Operation {
+                    opcode: IMMEDIATE64,
+                    dst: 1,
+                    lhs: 0x1234,
+                    rhs: 0x7ff00000,
+                },
+                Operation {
+                    opcode: IMMEDIATE32,
+                    dst: 5,
+                    lhs: 0xffffffff,
+                    rhs: 0,
+                },
+                Operation {
+                    opcode: COPIES,
+                    dst: 0,
+                    lhs: 2,
+                    rhs: 0,
+                },
+                Operation {
+                    opcode: COPY64,
+                    dst: 17,
+                    lhs: 1,
+                    rhs: 0,
+                },
+                Operation {
+                    opcode: IMMEDIATE64,
+                    dst: 33,
+                    lhs: 0,
+                    rhs: 0x3ff00000,
+                },
+                Operation {
+                    opcode: 4,
+                    dst: 25,
+                    lhs: 17,
+                    rhs: 33,
+                },
+                Operation {
+                    opcode: COPY64,
+                    dst: 41,
+                    lhs: 25,
+                    rhs: 0,
+                },
+                Operation {
+                    opcode: IMMEDIATE32,
+                    dst: 57,
+                    lhs: if valid_bool { 1 } else { 7 },
+                    rhs: 0,
+                },
+                Operation {
+                    opcode: COPY_BOOL,
+                    dst: 61,
+                    lhs: 57,
+                    rhs: 0,
+                },
+                Operation {
+                    opcode: COPY_CHAR,
+                    dst: 69,
+                    lhs: 65,
+                    rhs: 0,
+                },
+            ];
+            let mut code = crate::execution::prepared::tests::simple_code(&ops);
+            code.copies = vec![
+                Copy {
+                    src: 1,
+                    dst: 3,
+                    width: 4,
+                },
+                Copy {
+                    src: 3,
+                    dst: 5,
+                    width: 8,
+                },
+            ]
+            .into_boxed_slice();
+            let compiled = linear(&code, ops.len());
+            for cut in 0..=ops.len() as u64 + 1 {
+                compare_linear(&code, &compiled, &image, &[0xa5; 96], cut, u64::MAX);
+                compare_linear(&code, &compiled, &image, &[0xa5; 96], u64::MAX, cut);
+            }
+        }
+    }
 
     #[test]
     fn short_acyclic_bridges_keep_prefixes_while_long_chains_and_cycles_compile() {

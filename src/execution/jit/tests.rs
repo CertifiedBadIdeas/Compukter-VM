@@ -116,7 +116,7 @@ fn generated_numeric_operations_match_interpreter_edge_bits_and_random_inputs() 
         let mut random = 0x1234_5678_1234_5678_u64;
         for _ in 0..128 {
             let mut input = [0; 64];
-            for chunk in input.chunks_exact_mut(8) {
+            for chunk in input.as_chunks_mut::<8>().0 {
                 random ^= random << 13;
                 random ^= random >> 7;
                 random ^= random << 17;

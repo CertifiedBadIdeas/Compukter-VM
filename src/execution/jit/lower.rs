@@ -20,9 +20,11 @@ use cranelift_jit::{
 use cranelift_module::{default_libcall_names, Linkage, Module, ModuleResult};
 use std::{io, sync::Mutex};
 
+mod access;
 #[cfg(feature = "jit-diagnostics")]
 mod dump;
 mod regions;
+pub(super) mod slots;
 pub(in crate::execution) use regions::{RegionRun, RunState};
 
 pub(super) struct Plan {
@@ -77,82 +79,43 @@ impl Plan {
         };
         for index in 0..length.min(MAX_OPS) {
             let mut op = *code.operation(start.checked_add(index)?)?;
-            let mut access = Vec::new();
-            let mut writes = Vec::new();
-            if let Some(ty) = numeric_type(op.opcode) {
-                access.push((op.lhs, ty.bytes()));
-                if !(21..=28).contains(&op.opcode) {
-                    let width = if matches!(op.opcode, 134 | 138 | 142) {
-                        4
-                    } else {
-                        ty.bytes()
-                    };
-                    access.push((op.rhs, width));
+            if op.opcode == COPIES {
+                let copies = code.copies.get(op.dst as usize..op.lhs as usize)?;
+                if result.copies.len().checked_add(copies.len())? > MAX_OPS {
+                    break;
                 }
-                let width = if (29..=74).contains(&op.opcode) {
-                    4
-                } else {
-                    ty.bytes()
-                };
-                writes.push((op.dst, width));
-            } else if let Some(kind) = heap_kind(op.opcode) {
-                result.has_heap = true;
-                access.push((op.lhs, 4));
-                if matches!(op.opcode & 0xffff, 217..=231) {
-                    access.push((op.rhs, 4));
-                }
-                let width = if matches!(kind, 2 | 4) { 8 } else { 4 };
-                if matches!(op.opcode & 0xffff, 209..=215 | 225..=231) {
-                    access.push((op.dst, width));
-                } else {
-                    writes.push((op.dst, width));
-                }
-            } else {
-                match op.opcode {
-                    COPY32 | COPY_BOOL | COPY_CHAR => {
-                        access.push((op.lhs, 4));
-                        writes.push((op.dst, 4));
+                op.dst = result.copies.len() as u32;
+                for copy in copies {
+                    if !matches!(copy.width, 4 | 8) {
+                        return None;
                     }
-                    COPY64 => {
-                        access.push((op.lhs, 8));
-                        writes.push((op.dst, 8));
-                    }
-                    IMMEDIATE32 => writes.push((op.dst, 4)),
-                    IMMEDIATE64 => writes.push((op.dst, 8)),
-                    COPIES => {
-                        let copies = code.copies.get(op.dst as usize..op.lhs as usize)?;
-                        if result.copies.len().checked_add(copies.len())? > MAX_OPS {
-                            break;
-                        }
-                        op.dst = result.copies.len() as u32;
-                        for copy in copies {
-                            if !matches!(copy.width, 4 | 8) {
-                                return None;
-                            }
-                            access.push((copy.src, copy.width));
-                            writes.push((copy.dst, copy.width));
-                            result.copies.push(Copy {
-                                dst: copy.dst,
-                                src: copy.src,
-                                width: copy.width,
-                            });
-                        }
-                        op.lhs = result.copies.len() as u32;
-                    }
-                    BRANCH => access.push((op.dst, 4)),
-                    JUMP | NOP => {}
-                    _ => break,
+                    result.copies.push(Copy {
+                        dst: copy.dst,
+                        src: copy.src,
+                        width: copy.width,
+                    });
                 }
+                op.lhs = result.copies.len() as u32;
             }
-            for &(offset, width) in access.iter().chain(writes.iter()) {
-                let end = offset.checked_add(width)?;
+            let Some(accesses) = access::footprint(op, &result.copies) else {
+                break;
+            };
+            result.has_heap |= heap_kind(op.opcode).is_some();
+            for access in &accesses {
+                let end = access.offset.checked_add(access.ty.bytes())?;
                 if end > i32::MAX as u32 {
                     return None;
                 }
                 result.required_bytes = result.required_bytes.max(end);
             }
             #[cfg(test)]
-            result.writes.push(writes);
+            result.writes.push(
+                accesses
+                    .iter()
+                    .filter(|a| a.write)
+                    .map(|a| (a.offset, a.ty.bytes()))
+                    .collect(),
+            );
             result.ops.push(op);
             if matches!(op.opcode, JUMP | BRANCH) {
                 break;
@@ -438,7 +401,11 @@ fn guard(
     let status = b
         .ins()
         .iconst(types::I64, ((reason << 32) | pc as u64) as i64);
-    b.ins().return_(&[status]);
+    if let Some(exit) = exit {
+        exit.return_status(b, status);
+    } else {
+        b.ins().return_(&[status]);
+    }
     b.switch_to_block(next);
 }
 fn canonical(b: &mut FunctionBuilder<'_>, value: Value, ty: Type) -> Value {
@@ -461,8 +428,9 @@ fn number(
     pc: usize,
     ty: Type,
     exit: Option<regions::Exit>,
+    values: Option<&slots::Cache>,
 ) -> Value {
-    let lhs = load(b, base, ty, op.lhs);
+    let lhs = slots::read(b, base, values, ty, op.lhs);
     if (21..=28).contains(&op.opcode) {
         if op.opcode >= 25 {
             return lhs;
@@ -479,7 +447,7 @@ fn number(
     } else {
         ty
     };
-    let rhs = load(b, base, rhs_ty, op.rhs);
+    let rhs = slots::read(b, base, values, rhs_ty, op.rhs);
     if (29..=74).contains(&op.opcode) {
         let group = if op.opcode <= 52 {
             (op.opcode - 29) / 4
@@ -646,12 +614,14 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         let base = b.block_params(block)[0];
         let opaque = b.block_params(block)[1];
         let state = b.block_params(block)[2];
+        let values = slots::Cache::new(&plan, &mut b, base);
         let mut emitter = Emitter {
             base,
             opaque,
             plan: &plan,
             module,
             helpers: &helpers,
+            values,
         };
         if plan.region.is_empty() {
             let mut terminated = false;
@@ -667,6 +637,9 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
             }
         } else {
             regions::emit(&mut b, &mut emitter, state);
+        }
+        if let Some(values) = &emitter.values {
+            values.finish(&mut b, base);
         }
         b.seal_all_blocks();
         b.finalize(module.target_config());
@@ -713,6 +686,113 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
     })
 }
 
+struct Emitter<'a> {
+    base: Value,
+    opaque: Value,
+    plan: &'a Plan,
+    module: &'a mut JITModule,
+    helpers: &'a std::collections::BTreeMap<u32, cranelift_module::FuncId>,
+    values: Option<slots::Cache>,
+}
+impl Emitter<'_> {
+    fn operation(
+        &mut self,
+        b: &mut FunctionBuilder<'_>,
+        op: Operation,
+        pc: usize,
+        exit: Option<regions::Exit>,
+    ) -> bool {
+        let Self {
+            base,
+            opaque,
+            plan,
+            module,
+            helpers,
+            values,
+        } = self;
+        let (base, opaque) = (*base, *opaque);
+        if let Some(ty) = numeric_type(op.opcode) {
+            let value = number(b, base, op, pc, ty, exit, values.as_ref());
+            slots::write(b, base, values.as_ref(), op.dst, value);
+            return false;
+        }
+        if heap_kind(op.opcode).is_some() {
+            let helper = module.declare_func_in_func(helpers[&op.opcode], b.func);
+            let operands =
+                [op.dst, op.lhs, op.rhs].map(|value| b.ins().iconst(types::I32, value as i64));
+            let call = b
+                .ins()
+                .call(helper, &[opaque, operands[0], operands[1], operands[2]]);
+            let failed = b.inst_results(call)[0];
+            guard(b, failed, 4, pc, exit);
+            return false;
+        }
+        match op.opcode {
+            NOP => {}
+            COPY32 | COPY64 | COPY_BOOL | COPY_CHAR => {
+                let ty = if op.opcode == COPY64 {
+                    types::I64
+                } else {
+                    types::I32
+                };
+                let value = slots::read(b, base, values.as_ref(), ty, op.lhs);
+                if matches!(op.opcode, COPY_BOOL | COPY_CHAR) {
+                    let bad = b.ins().icmp_imm_s(
+                        IntCC::UnsignedGreaterThan,
+                        value,
+                        if op.opcode == COPY_BOOL { 1 } else { 65535 },
+                    );
+                    guard(b, bad, 2, pc, exit);
+                }
+                slots::write(b, base, values.as_ref(), op.dst, value);
+            }
+            IMMEDIATE32 | IMMEDIATE64 => {
+                let (ty, bits) = if op.opcode == IMMEDIATE32 {
+                    (types::I32, op.lhs as u64)
+                } else {
+                    (types::I64, op.lhs as u64 | (op.rhs as u64) << 32)
+                };
+                let value = b.ins().iconst(ty, bits as i64);
+                slots::write(b, base, values.as_ref(), op.dst, value);
+            }
+            COPIES => {
+                for copy in &plan.copies[op.dst as usize..op.lhs as usize] {
+                    let value = slots::read(
+                        b,
+                        base,
+                        values.as_ref(),
+                        if copy.width == 4 {
+                            types::I32
+                        } else {
+                            types::I64
+                        },
+                        copy.src,
+                    );
+                    slots::write(b, base, values.as_ref(), copy.dst, value);
+                }
+            }
+            JUMP | BRANCH => {
+                let target = if op.opcode == JUMP {
+                    b.ins().iconst(types::I64, op.dst as i64)
+                } else {
+                    let condition = slots::read(b, base, values.as_ref(), types::I32, op.dst);
+                    let bad = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, condition, 1);
+                    guard(b, bad, 2, pc, exit);
+                    let yes = b.ins().iconst(types::I64, op.lhs as i64);
+                    let no = b.ins().iconst(types::I64, op.rhs as i64);
+                    b.ins().select(condition, yes, no)
+                };
+                let status = b.ins().bor_imm_s(target, 1_i64 << 32);
+                b.ins().return_(&[status]);
+                return true;
+            }
+            _ => unreachable!("validated frame opcode"),
+        }
+
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,109 +816,5 @@ mod tests {
             memory.free_memory();
         }
         assert_eq!(counter.load(Ordering::Relaxed), 0);
-    }
-}
-
-struct Emitter<'a> {
-    base: Value,
-    opaque: Value,
-    plan: &'a Plan,
-    module: &'a mut JITModule,
-    helpers: &'a std::collections::BTreeMap<u32, cranelift_module::FuncId>,
-}
-impl Emitter<'_> {
-    fn operation(
-        &mut self,
-        b: &mut FunctionBuilder<'_>,
-        op: Operation,
-        pc: usize,
-        exit: Option<regions::Exit>,
-    ) -> bool {
-        let Self {
-            base,
-            opaque,
-            plan,
-            module,
-            helpers,
-        } = self;
-        let (base, opaque) = (*base, *opaque);
-        if let Some(ty) = numeric_type(op.opcode) {
-            let value = number(b, base, op, pc, ty, exit);
-            store(b, base, op.dst, value);
-            return false;
-        }
-        if heap_kind(op.opcode).is_some() {
-            let helper = module.declare_func_in_func(helpers[&op.opcode], b.func);
-            let operands =
-                [op.dst, op.lhs, op.rhs].map(|value| b.ins().iconst(types::I32, value as i64));
-            let call = b
-                .ins()
-                .call(helper, &[opaque, operands[0], operands[1], operands[2]]);
-            let failed = b.inst_results(call)[0];
-            guard(b, failed, 4, pc, exit);
-            return false;
-        }
-        match op.opcode {
-            NOP => {}
-            COPY32 | COPY64 | COPY_BOOL | COPY_CHAR => {
-                let ty = if op.opcode == COPY64 {
-                    types::I64
-                } else {
-                    types::I32
-                };
-                let value = load(b, base, ty, op.lhs);
-                if matches!(op.opcode, COPY_BOOL | COPY_CHAR) {
-                    let bad = b.ins().icmp_imm_s(
-                        IntCC::UnsignedGreaterThan,
-                        value,
-                        if op.opcode == COPY_BOOL { 1 } else { 65535 },
-                    );
-                    guard(b, bad, 2, pc, exit);
-                }
-                store(b, base, op.dst, value);
-            }
-            IMMEDIATE32 | IMMEDIATE64 => {
-                let (ty, bits) = if op.opcode == IMMEDIATE32 {
-                    (types::I32, op.lhs as u64)
-                } else {
-                    (types::I64, op.lhs as u64 | (op.rhs as u64) << 32)
-                };
-                let value = b.ins().iconst(ty, bits as i64);
-                store(b, base, op.dst, value);
-            }
-            COPIES => {
-                for copy in &plan.copies[op.dst as usize..op.lhs as usize] {
-                    let value = load(
-                        b,
-                        base,
-                        if copy.width == 4 {
-                            types::I32
-                        } else {
-                            types::I64
-                        },
-                        copy.src,
-                    );
-                    store(b, base, copy.dst, value);
-                }
-            }
-            JUMP | BRANCH => {
-                let target = if op.opcode == JUMP {
-                    b.ins().iconst(types::I64, op.dst as i64)
-                } else {
-                    let condition = load(b, base, types::I32, op.dst);
-                    let bad = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, condition, 1);
-                    guard(b, bad, 2, pc, exit);
-                    let yes = b.ins().iconst(types::I64, op.lhs as i64);
-                    let no = b.ins().iconst(types::I64, op.rhs as i64);
-                    b.ins().select(condition, yes, no)
-                };
-                let status = b.ins().bor_imm_s(target, 1_i64 << 32);
-                b.ins().return_(&[status]);
-                return true;
-            }
-            _ => unreachable!("validated frame opcode"),
-        }
-
-        false
     }
 }
