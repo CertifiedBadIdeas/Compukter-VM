@@ -149,6 +149,7 @@ impl Plan {
 }
 
 /// Never persisted or cached: native code receives this stack borrow for one call.
+/// Machine has paid the first block before constructing these counters.
 #[repr(C)]
 pub(in crate::execution) struct RunState {
     pub limit: u64,
@@ -322,8 +323,21 @@ pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state
         })
         .collect();
     let mut outside = Vec::new();
-    b.ins().jump(blocks[0].1, &arguments(initial));
-    for (region, &(_, block)) in plan.region.iter().zip(&blocks) {
+    let bodies: Vec<_> = plan
+        .region
+        .iter()
+        .map(|_| {
+            let block = b.create_block();
+            for _ in 0..4 {
+                b.append_block_param(block, types::I64);
+            }
+            block
+        })
+        .collect();
+    // Machine has already paid this entry block. Backedges use its normal
+    // header, so every later entry still checks and pays the original cost.
+    b.ins().jump(bodies[0], &arguments(initial));
+    for ((region, &(_, block)), &body) in plan.region.iter().zip(&blocks).zip(&bodies) {
         b.switch_to_block(block);
         let mut exit = Exit {
             state,
@@ -350,6 +364,9 @@ pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state
         exit.counts[1] = b.ins().iadd_imm_s(exit.counts[1], -(region.cost as i64));
         exit.counts[2] = b.ins().iadd_imm_s(exit.counts[2], region.cost as i64);
         exit.counts[3] = b.ins().iadd_imm_s(exit.counts[3], 1);
+        b.ins().jump(body, &arguments(exit.counts));
+        b.switch_to_block(body);
+        exit.counts = std::array::from_fn(|i| b.block_params(body)[i]);
         let mut terminated = false;
         for pc in region.start..region.end {
             exit.instruction = pc - region.start;
@@ -510,13 +527,14 @@ mod tests {
                         .unwrap();
                     let mut expected = RunState::new(limit, headroom, 1000, fixed, blocks);
                     let mut expected_reason = 0;
+                    let mut paid_entry = true;
                     loop {
                         let block = image.block(expected.block as usize).unwrap();
                         if expected.attempts >= limit {
                             expected_reason = 5;
                             break;
                         }
-                        if expected.instruction == 0 {
+                        if expected.instruction == 0 && !paid_entry {
                             if expected.remaining < u64::from(block.fixed_cost) {
                                 expected_reason = 5;
                                 break;
@@ -534,6 +552,7 @@ mod tests {
                             expected.fixed = fixed;
                             expected.blocks = blocks;
                         }
+                        paid_entry = false;
                         let run = execute_run(
                             image.code(),
                             &mut expected_frame,

@@ -46,7 +46,6 @@ pub(super) struct JitState {
     attempts: AtomicU64,
     compile_ns: AtomicU64,
     failures: AtomicU64,
-    has_regions: AtomicU8,
     #[cfg(feature = "jit-diagnostics")]
     exits: [AtomicU64; 6],
 }
@@ -67,7 +66,6 @@ impl Default for JitState {
             attempts: AtomicU64::new(0),
             compile_ns: AtomicU64::new(0),
             failures: AtomicU64::new(0),
-            has_regions: AtomicU8::new(0),
             #[cfg(feature = "jit-diagnostics")]
             exits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -128,11 +126,7 @@ fn compiler() -> Option<&'static SyncSender<Job>> {
                             );
                             match result {
                                 Ok(run) => {
-                                    let region = run.is_region();
                                     let _ = owner.slots[job.slot].native.set(Arc::new(run));
-                                    if region {
-                                        owner.has_regions.store(1, Ordering::Release);
-                                    }
                                 }
                                 Err(_) => {
                                     owner.failures.fetch_add(1, Ordering::Relaxed);
@@ -174,7 +168,8 @@ pub(super) fn try_execute(
     location: Location,
     budget: &RunBudget,
     heap: Option<HeapAccess<'_>>,
-) -> Option<SimpleRun> {
+    region_state: impl FnOnce() -> Option<RunState>,
+) -> Option<Execution> {
     let Location {
         block,
         code_start,
@@ -199,8 +194,45 @@ pub(super) fn try_execute(
         return None;
     }
     if let Some(native) = slot.native.get() {
-        if native.is_region()
-            || native.len > block_len.checked_sub(instruction)?
+        if native.is_region() {
+            if frame.jit_bytes().len() < native.required_bytes as usize {
+                return None;
+            }
+            let state = region_state()?;
+            let heap = heap?;
+            #[cfg(feature = "jit-diagnostics")]
+            let image = heap.image;
+            let result = native.execute_region(frame, heap, state);
+            #[cfg(feature = "jit-diagnostics")]
+            {
+                let category = if result.failure.is_some() {
+                    4
+                } else if result.exhausted {
+                    5
+                } else {
+                    let block = image
+                        .block(result.state.block as usize)
+                        .expect("verified region exit");
+                    if result.state.instruction as usize >= block.instruction_count {
+                        1
+                    } else if code
+                        .operation(block.code_start + result.state.instruction as usize)
+                        .is_some_and(|op| op.opcode == 0)
+                    {
+                        2
+                    } else {
+                        3
+                    }
+                };
+                owner.exits[category].fetch_add(1, Ordering::Relaxed);
+            }
+            owner.hits.fetch_add(1, Ordering::Relaxed);
+            owner
+                .attempts
+                .fetch_add(result.state.attempts, Ordering::Relaxed);
+            return Some(Execution::Region(result));
+        }
+        if native.len > block_len.checked_sub(instruction)?
             || native.len as u64 > budget.limit.min(budget.headroom)
             || frame.jit_bytes().len() < native.required_bytes as usize
         {
@@ -228,7 +260,7 @@ pub(super) fn try_execute(
         }
         owner.hits.fetch_add(1, Ordering::Relaxed);
         owner.attempts.fetch_add(result.attempts, Ordering::Relaxed);
-        return Some(result);
+        return Some(Execution::Prefix(result));
     }
     if slot.state.load(Ordering::Acquire) != COLD {
         return None;
@@ -278,70 +310,9 @@ pub(super) fn try_execute(
     None
 }
 
-/// Borrow the published module before preparing a frame window. Programs whose
-/// plans remain prefixes need only one shared flag read at block entry.
-pub(super) struct RegionEntry<'a> {
-    owner: &'a JitState,
-    native: &'a lower::CompiledRun,
-}
-pub(super) fn region_entry(code: &PreparedCode, key: usize) -> Option<RegionEntry<'_>> {
-    let owner = code.jit.get()?;
-    if owner.has_regions.load(Ordering::Acquire) == 0 {
-        return None;
-    }
-    let slot = &owner.slots[slot_index(key)];
-    if slot.key.load(Ordering::Acquire) != key {
-        return None;
-    }
-    let native = slot.native.get()?;
-    native.is_region().then_some(RegionEntry { owner, native })
-}
-impl RegionEntry<'_> {
-    pub(super) fn execute(
-        &self,
-        code: &PreparedCode,
-        frame: &mut PreparedFrame<'_>,
-        heap: HeapAccess<'_>,
-        state: RunState,
-    ) -> Option<lower::RegionRun> {
-        #[cfg(not(feature = "jit-diagnostics"))]
-        let _ = code;
-        let Self { owner, native } = self;
-        if frame.jit_bytes().len() < native.required_bytes as usize {
-            return None;
-        }
-        #[cfg(feature = "jit-diagnostics")]
-        let image = heap.image;
-        let result = native.execute_region(frame, heap, state);
-        #[cfg(feature = "jit-diagnostics")]
-        {
-            let category = if result.failure.is_some() {
-                4
-            } else if result.exhausted {
-                5
-            } else {
-                let block = image
-                    .block(result.state.block as usize)
-                    .expect("verified region exit");
-                if result.state.instruction as usize >= block.instruction_count {
-                    1
-                } else if code
-                    .operation(block.code_start + result.state.instruction as usize)
-                    .is_some_and(|op| op.opcode == 0)
-                {
-                    2
-                } else {
-                    3
-                }
-            };
-            owner.exits[category].fetch_add(1, Ordering::Relaxed);
-        }
-        owner.hits.fetch_add(1, Ordering::Relaxed);
-        owner
-            .attempts
-            .fetch_add(result.state.attempts, Ordering::Relaxed);
-        Some(result)
-    }
+pub(super) enum Execution {
+    Prefix(SimpleRun),
+    Region(lower::RegionRun),
 }
 
 /// Benchmark telemetry is shared per program, not retained per machine.

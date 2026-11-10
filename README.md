@@ -345,6 +345,9 @@ Native entry proves every operand fits the current frame. Single-block prefixes
 require sufficient attempt/headroom budget for the entire prefix; smaller budgets
 use interpretation. Connected regions instead check attempt limits and accounting
 overflow inside generated control flow and charge each entered block exactly once.
+Both kinds of entry use the existing prepared JIT lookup. Machine pays the first
+block; generated headers check and pay subsequent entries, including backedges.
+Region invocation state is constructed lazily only for a published region.
 An invocation-local stack record publishes remaining budget, exact block/instruction,
 attempts and fixed/block counters on every exit. Traced sessions retain the ordinary
 trace-preserving path; no native state is persisted. Checked division, Bool/Char and branch
