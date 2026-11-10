@@ -1381,43 +1381,44 @@ impl Machine {
                     .ok_or(RunError::NotRunnable)?
                     .code_start;
                 // A scoped frame/heap borrow cannot allocate or enter a Guest safepoint.
-                if let Ok(mut window) = self.frame_arena.prepared_frame(FrameReservation {
-                    base: frame.base,
-                    byte_len: frame.byte_len,
-                }) {
-                    let state = super::jit::RunState::new(
-                        attempt_limit - (self.executed_instructions - attempts_before),
-                        u64::MAX - self.executed_instructions,
-                        remaining,
-                        self.consumed_fixed_cost,
-                        self.entered_blocks,
-                    );
-                    if let Some(run) = super::jit::try_execute_region(
-                        self.image.code(),
-                        key,
-                        &mut window,
-                        super::jit::HeapAccess {
-                            image: &self.image,
-                            heap: &mut self.heap,
-                        },
-                        state,
-                    ) {
-                        self.executed_instructions += run.state.attempts;
-                        self.consumed_fixed_cost = run.state.fixed;
-                        self.entered_blocks = run.state.blocks;
-                        remaining = run.state.remaining as u32;
-                        self.frames[frame_index].block = run.state.block as usize;
-                        self.frames[frame_index].instruction = run.state.instruction as usize;
-                        if let Some(failure) = run.failure {
-                            return Ok(match failure {
-                                InstructionFailure::Trap(trap) => self.guest_trap(trap),
-                                InstructionFailure::Fault(fault) => self.fault(fault),
-                            });
+                if let Some(entry) = super::jit::region_entry(self.image.code(), key) {
+                    if let Ok(mut window) = self.frame_arena.prepared_frame(FrameReservation {
+                        base: frame.base,
+                        byte_len: frame.byte_len,
+                    }) {
+                        let state = super::jit::RunState::new(
+                            attempt_limit - (self.executed_instructions - attempts_before),
+                            u64::MAX - self.executed_instructions,
+                            remaining,
+                            self.consumed_fixed_cost,
+                            self.entered_blocks,
+                        );
+                        if let Some(run) = entry.execute(
+                            self.image.code(),
+                            &mut window,
+                            super::jit::HeapAccess {
+                                image: &self.image,
+                                heap: &mut self.heap,
+                            },
+                            state,
+                        ) {
+                            self.executed_instructions += run.state.attempts;
+                            self.consumed_fixed_cost = run.state.fixed;
+                            self.entered_blocks = run.state.blocks;
+                            remaining = run.state.remaining as u32;
+                            self.frames[frame_index].block = run.state.block as usize;
+                            self.frames[frame_index].instruction = run.state.instruction as usize;
+                            if let Some(failure) = run.failure {
+                                return Ok(match failure {
+                                    InstructionFailure::Trap(trap) => self.guest_trap(trap),
+                                    InstructionFailure::Fault(fault) => self.fault(fault),
+                                });
+                            }
+                            if run.exhausted {
+                                return Ok(Outcome::SliceExhausted);
+                            }
+                            continue 'run;
                         }
-                        if run.exhausted {
-                            return Ok(Outcome::SliceExhausted);
-                        }
-                        continue 'run;
                     }
                 }
             }

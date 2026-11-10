@@ -327,7 +327,11 @@ increasing visit intervals up to eight times. Unsupported entries, compiler erro
 exhausted module capacity and final retry failure retain interpretation. No compile
 job owns a Guest heap, frame, host binding or strong program reference.
 Untraced entries prefer connected regions spanning at most 16 same-function blocks,
-including loops. They reuse these slots, queue and module reservations; unsupported
+including loops. Admission prefers a reachable native cycle, or an acyclic plan
+that removes at least two dispatcher transitions on every exit path. Short
+bridges before lifecycle operations retain the prefix tier. These are generic
+profitability rules; no Guest function or benchmark identity is special-cased.
+Regions reuse the same slots, queue and module reservations; unsupported
 successors exit to the ordinary executor before their block cost is paid.
 
 At most 256 modules, including queued work and active owners, reserve up to 64 KiB

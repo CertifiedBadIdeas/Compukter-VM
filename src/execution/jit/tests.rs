@@ -451,6 +451,7 @@ fn connected_regions_match_every_retirement_cut_fixed_budget_and_fault_pc() {
             let slot = &owner.slots[slot_index(key)];
             assert_eq!(slot.key.swap(key, Ordering::AcqRel), EMPTY);
             slot.native.set(compiled).unwrap();
+            owner.has_regions.store(1, Ordering::Release);
         }
         for retirement in 0..=50 {
             for budget in image.minimum_slice_cost()..=image.minimum_slice_cost() + 20 {

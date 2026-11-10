@@ -89,7 +89,62 @@ impl Plan {
                 .iter()
                 .any(|target| result.region.iter().any(|b| b.id == *target as usize))
         });
-        (result.region.first()?.id == entry && connected).then_some(result)
+        (result.region.first()?.id == entry && connected && result.worth_compiling())
+            .then_some(result)
+    }
+    // Native region entry/accounting has a fixed cost. Avoid short acyclic
+    // bridges before lifecycle operations: they add native invocations without
+    // amortizing that cost. Cycles amortize across iterations; acyclic plans must
+    // remove at least two dispatcher transitions on every path to an exit.
+    fn worth_compiling(&self) -> bool {
+        let successors = |index: usize| {
+            let last = self.ops[self.region[index].end - 1];
+            let targets = match last.opcode {
+                JUMP => vec![last.dst as usize],
+                BRANCH => vec![last.lhs as usize, last.rhs as usize],
+                _ => return vec![None],
+            };
+            targets
+                .into_iter()
+                .map(|target| self.region.iter().position(|block| block.id == target))
+                .collect::<Vec<_>>()
+        };
+        let edges: Vec<_> = (0..self.region.len()).map(successors).collect();
+        fn cyclic(index: usize, edges: &[Vec<Option<usize>>], colors: &mut [u8]) -> bool {
+            if colors[index] == 1 {
+                return true;
+            }
+            if colors[index] == 2 {
+                return false;
+            }
+            colors[index] = 1;
+            for &next in edges[index].iter().flatten() {
+                if cyclic(next, edges, colors) {
+                    return true;
+                }
+            }
+            colors[index] = 2;
+            false
+        }
+        if cyclic(0, &edges, &mut vec![0; edges.len()]) {
+            return true;
+        }
+        let mut distance = vec![usize::MAX; edges.len()];
+        distance[0] = 0;
+        let mut queue = std::collections::VecDeque::from([0]);
+        while let Some(index) = queue.pop_front() {
+            for &next in &edges[index] {
+                match next {
+                    None if distance[index] < 2 => return false,
+                    Some(next) if distance[next] == usize::MAX => {
+                        distance[next] = distance[index] + 1;
+                        queue.push_back(next);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        true
     }
 }
 
@@ -356,6 +411,21 @@ mod tests {
     use crate::execution::{
         fixtures, frame::FrameReservation, heap::Heap, prepared::tests::backed_arena,
     };
+
+    #[test]
+    fn short_acyclic_bridges_keep_prefixes_while_long_chains_and_cycles_compile() {
+        let image = ExecutionImage::admit(
+            fixtures::jit_large_region_artifact(false),
+            fixtures::profile(),
+        )
+        .unwrap();
+        assert!(Plan::region(&image, 22).is_none());
+        assert!(Plan::region(&image, 21).is_some());
+        let image =
+            ExecutionImage::admit(fixtures::jit_numeric_loop_artifact(), fixtures::profile())
+                .unwrap();
+        assert!(Plan::region(&image, 0).is_some());
+    }
 
     #[test]
     fn bounded_regions_resume_at_original_pc_when_graph_or_operation_cap_is_reached() {
