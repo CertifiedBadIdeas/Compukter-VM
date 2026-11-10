@@ -321,11 +321,14 @@ only private/benchmark selection, and is not enabled by the Minecraft carrier.
 
 A prepared program lazily owns 256 direct-mapped hot-entry slots. Collisions
 fall back without growing the table. After 64 shared entry visits, a bounded
-prefix of up to 128 numeric/frame/checked-heap instructions can enter the process-wide queue
+plan of up to 128 numeric/frame/checked-heap instructions can enter the process-wide queue
 (capacity eight, one compiler thread). Queue bursts retry at exponentially
 increasing visit intervals up to eight times. Unsupported entries, compiler errors,
 exhausted module capacity and final retry failure retain interpretation. No compile
 job owns a Guest heap, frame, host binding or strong program reference.
+Untraced entries prefer connected regions spanning at most 16 same-function blocks,
+including loops. They reuse these slots, queue and module reservations; unsupported
+successors exit to the ordinary executor before their block cost is paid.
 
 At most 256 modules, including queued work and active owners, reserve up to 64 KiB
 each of page-rounded executable/readonly/data requests: a conservative 16 MiB
@@ -334,9 +337,13 @@ worker/stack, Cranelift code in the host executable and program-side metadata.
 Each finalized module is immutable and shared; the last owner explicitly frees
 its mappings after all borrowed calls end. There is no eviction/recompilation tier.
 
-Native entry requires sufficient remaining instruction attempts and overflow
-headroom for the entire prefix, and a frame large enough for every proven operand
-range. Partial budgets use the interpreter. Checked division, Bool/Char and branch
+Native entry proves every operand fits the current frame. Single-block prefixes
+require sufficient attempt/headroom budget for the entire prefix; smaller budgets
+use interpretation. Connected regions instead check attempt limits and accounting
+overflow inside generated control flow and charge each entered block exactly once.
+An invocation-local stack record publishes remaining budget, exact block/instruction,
+attempts and fixed/block counters on every exit. Traced sessions retain the ordinary
+trace-preserving path; no native state is persisted. Checked division, Bool/Char and branch
 failures publish exact PC/attempts with preceding writes preserved. Floating point
 retains canonical NaNs and separate multiply/add semantics. Non-allocating field
 and array operations use typed checked Rust callouts within mixed prefixes. These
@@ -347,17 +354,3 @@ heap packing is embedded in shared code. A failed callout exits at its exact PC
 with earlier frame and heap writes retained. Calls, allocation, initialization,
 host operations and GC remain interpreter boundaries; there is no inlining across
 those boundaries or automatic SIMD guarantee.
-
-For exact shared-code/private-state observations, build with
-`--features baseline-jit,program-sharing-benchmark` and run:
-
-```sh
-./target/release/guest-benchmark jit-fleet ARTIFACT_DIR REPORT_DIR 2000 65536 on CASE
-```
-
-This retains native sessions, advances each for 20 grants of 4096 retired
-instructions, compares every serialized state/accounting snapshot and completes
-representative checksums. It measures one-worker native sessions, not full
-computer filesystems/shells, parallel worker contention or Minecraft throughput.
-Its allocation counter includes requested Rust allocations, not executable mmap
-pages or allocator overhead; `jit.tsv`/`fleet.tsv` report code mappings separately.
