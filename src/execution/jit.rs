@@ -45,6 +45,8 @@ pub(super) struct JitState {
     attempts: AtomicU64,
     compile_ns: AtomicU64,
     failures: AtomicU64,
+    #[cfg(feature = "jit-diagnostics")]
+    exits: [AtomicU64; 5],
 }
 
 impl Default for JitState {
@@ -63,6 +65,8 @@ impl Default for JitState {
             attempts: AtomicU64::new(0),
             compile_ns: AtomicU64::new(0),
             failures: AtomicU64::new(0),
+            #[cfg(feature = "jit-diagnostics")]
+            exits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -194,6 +198,24 @@ pub(super) fn try_execute(
         }
         // This borrow keeps the program, slot and executable module alive through the call.
         let result = native.execute(frame, instruction, heap);
+        #[cfg(feature = "jit-diagnostics")]
+        {
+            // [branch, end-of-block, unsupported lifecycle, supported suffix, failure].
+            let category = match &result.end {
+                RunEnd::Branch(_) => 0,
+                RunEnd::Boundary if result.instruction >= block_len => 1,
+                RunEnd::Boundary
+                    if code
+                        .operation(code_start + result.instruction)
+                        .is_some_and(|op| op.opcode == 0) =>
+                {
+                    2
+                }
+                RunEnd::Boundary => 3,
+                RunEnd::Failure(_) => 4,
+            };
+            owner.exits[category].fetch_add(1, Ordering::Relaxed);
+        }
         owner.hits.fetch_add(1, Ordering::Relaxed);
         owner.attempts.fetch_add(result.attempts, Ordering::Relaxed);
         return Some(result);
@@ -253,12 +275,16 @@ pub(crate) struct Statistics {
     pub compile_ns: u64,
     pub failures: u64,
     pub state_bytes: usize,
+    #[cfg(feature = "jit-diagnostics")]
+    pub exits: [u64; 5],
 }
 pub(super) fn statistics(code: &PreparedCode) -> Statistics {
     let Some(owner) = code.jit.get() else {
         return Statistics::default();
     };
     let mut result = Statistics {
+        #[cfg(feature = "jit-diagnostics")]
+        exits: std::array::from_fn(|i| owner.exits[i].load(Ordering::Relaxed)),
         hits: owner.hits.load(Ordering::Relaxed),
         attempts: owner.attempts.load(Ordering::Relaxed),
         compile_ns: owner.compile_ns.load(Ordering::Relaxed),

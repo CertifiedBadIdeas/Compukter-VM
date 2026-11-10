@@ -26,6 +26,7 @@ persistence-crash-testing = []
 guest-benchmark = []
 program-sharing-benchmark = ["guest-benchmark"]
 execution-prototype = []
+jit-diagnostics = ["baseline-jit"]
 baseline-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:region"]
 
 [dependencies]
