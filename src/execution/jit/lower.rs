@@ -20,6 +20,8 @@ use cranelift_jit::{
 use cranelift_module::{default_libcall_names, Linkage, Module, ModuleResult};
 use std::{io, sync::Mutex};
 
+#[cfg(feature = "jit-diagnostics")]
+mod dump;
 mod regions;
 pub(in crate::execution) use regions::{RegionRun, RunState};
 
@@ -669,9 +671,17 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         b.seal_all_blocks();
         b.finalize(module.target_config());
     }
-    module
-        .define_function(id, &mut ctx)
-        .map_err(|e| e.to_string())?;
+    #[cfg(feature = "jit-diagnostics")]
+    let capture = dump::Capture::begin(&plan, &mut ctx);
+    let defined = module.define_function(id, &mut ctx);
+    #[cfg(feature = "jit-diagnostics")]
+    if let Some(capture) = capture {
+        if let Err(error) = &defined {
+            capture.error(&error.to_string());
+        }
+        capture.finish(&ctx);
+    }
+    defined.map_err(|e| e.to_string())?;
     let code_bytes = ctx
         .compiled_code()
         .ok_or("missing compiled code")?

@@ -8,6 +8,7 @@ use super::*;
 use crate::execution::image::ExecutionImage;
 use cranelift_codegen::ir::Block;
 
+#[derive(Debug)]
 pub(super) struct RegionBlock {
     id: usize,
     start: usize,
