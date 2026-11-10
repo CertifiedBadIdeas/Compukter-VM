@@ -8552,3 +8552,127 @@ pub(super) fn jit_heap_loop_artifact() -> VerifiedArtifact {
         configure_stack(artifact, 3, 1);
     })
 }
+
+#[cfg(feature = "baseline-jit")]
+pub(super) fn jit_connected_loop_artifact(fault: bool) -> VerifiedArtifact {
+    let mut body = vec![Instruction::Add {
+        form: 1,
+        dst: 0,
+        lhs: 0,
+        rhs: 1,
+    }];
+    if fault {
+        body.extend([
+            Instruction::Sub {
+                form: 1,
+                dst: 4,
+                lhs: 2,
+                rhs: 0,
+            },
+            Instruction::Div {
+                form: 1,
+                dst: 4,
+                lhs: 1,
+                rhs: 4,
+            },
+        ]);
+    }
+    body.extend([
+        Instruction::Less {
+            form: 1,
+            dst: 3,
+            lhs: 0,
+            rhs: 2,
+        },
+        Instruction::Branch {
+            condition: 3,
+            true_block: 2,
+            false_block: 3,
+        },
+    ]);
+    verified_blocks(
+        primitive(1),
+        0,
+        vec![
+            primitive(1),
+            primitive(1),
+            primitive(1),
+            primitive(5),
+            primitive(1),
+        ],
+        vec![Constant::I32(0), Constant::I32(1), Constant::I32(7)],
+        vec![
+            (
+                1,
+                vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 1,
+                    },
+                    Instruction::Const {
+                        dst: 2,
+                        constant: 2,
+                    },
+                    Instruction::Const {
+                        dst: 4,
+                        constant: 0,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+            ),
+            (1, body),
+            (
+                1,
+                vec![
+                    Instruction::Add {
+                        form: 1,
+                        dst: 4,
+                        lhs: 4,
+                        rhs: 0,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+            ),
+            (0, vec![Instruction::Return { value: 0 }]),
+        ],
+        1,
+    )
+}
+
+#[cfg(feature = "baseline-jit")]
+pub(super) fn jit_large_region_artifact(wide: bool) -> VerifiedArtifact {
+    let mut blocks = Vec::new();
+    for block in 0..24 {
+        let mut ops = if block == 0 {
+            vec![Instruction::Const {
+                dst: 0,
+                constant: 0,
+            }]
+        } else {
+            Vec::new()
+        };
+        for _ in 0..if wide { 20 } else { 1 } {
+            ops.push(Instruction::Add {
+                form: 1,
+                dst: 0,
+                lhs: 0,
+                rhs: 0,
+            });
+        }
+        ops.push(Instruction::Jump { target: block + 1 });
+        blocks.push((0, ops));
+    }
+    blocks.push((0, vec![Instruction::Return { value: 0 }]));
+    verified_blocks(
+        primitive(1),
+        0,
+        vec![primitive(1)],
+        vec![Constant::I32(1)],
+        blocks,
+        1,
+    )
+}

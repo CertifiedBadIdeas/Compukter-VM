@@ -19,6 +19,7 @@ use super::{
 };
 
 mod lower;
+pub(super) use lower::RunState;
 const SLOTS: usize = 256;
 const HOT: u32 = 64;
 const MAX_OPS: usize = 128;
@@ -46,7 +47,7 @@ pub(super) struct JitState {
     compile_ns: AtomicU64,
     failures: AtomicU64,
     #[cfg(feature = "jit-diagnostics")]
-    exits: [AtomicU64; 5],
+    exits: [AtomicU64; 6],
 }
 
 impl Default for JitState {
@@ -150,6 +151,7 @@ fn slot_index(key: usize) -> usize {
 }
 
 pub(super) struct Location {
+    pub block: Option<usize>,
     pub code_start: usize,
     pub instruction: usize,
     pub block_len: usize,
@@ -168,6 +170,7 @@ pub(super) fn try_execute(
     heap: Option<HeapAccess<'_>>,
 ) -> Option<SimpleRun> {
     let Location {
+        block,
         code_start,
         instruction,
         block_len,
@@ -190,7 +193,8 @@ pub(super) fn try_execute(
         return None;
     }
     if let Some(native) = slot.native.get() {
-        if native.len > block_len.checked_sub(instruction)?
+        if native.is_region()
+            || native.len > block_len.checked_sub(instruction)?
             || native.len as u64 > budget.limit.min(budget.headroom)
             || frame.jit_bytes().len() < native.required_bytes as usize
         {
@@ -235,7 +239,13 @@ pub(super) fn try_execute(
         return None;
     }
     let submitted = (|| {
-        let plan = lower::Plan::read(code, key, block_len.checked_sub(instruction)?)?;
+        let plan = block
+            .filter(|_| instruction == 0)
+            .and_then(|block| {
+                heap.as_ref()
+                    .and_then(|access| lower::Plan::region(access.image, block))
+            })
+            .or_else(|| lower::Plan::read(code, key, block_len.checked_sub(instruction)?))?;
         let reservation = Reservation::acquire()?;
         Some(compiler()?.try_send(Job {
             owner: Arc::downgrade(owner),
@@ -262,11 +272,62 @@ pub(super) fn try_execute(
     None
 }
 
+/// Enter before block payment. The stack-owned state is committed by Machine on return.
+pub(super) fn try_execute_region(
+    code: &PreparedCode,
+    key: usize,
+    frame: &mut PreparedFrame<'_>,
+    heap: HeapAccess<'_>,
+    state: RunState,
+) -> Option<lower::RegionRun> {
+    let owner = code.jit.get()?;
+    let slot = &owner.slots[slot_index(key)];
+    if slot.key.load(Ordering::Acquire) != key {
+        return None;
+    }
+    let native = slot.native.get()?;
+    if !native.is_region() || frame.jit_bytes().len() < native.required_bytes as usize {
+        return None;
+    }
+    #[cfg(feature = "jit-diagnostics")]
+    let image = heap.image;
+    let result = native.execute_region(frame, heap, state);
+    #[cfg(feature = "jit-diagnostics")]
+    {
+        let category = if result.failure.is_some() {
+            4
+        } else if result.exhausted {
+            5
+        } else {
+            let block = image
+                .block(result.state.block as usize)
+                .expect("verified region exit");
+            if result.state.instruction as usize >= block.instruction_count {
+                1
+            } else if code
+                .operation(block.code_start + result.state.instruction as usize)
+                .is_some_and(|op| op.opcode == 0)
+            {
+                2
+            } else {
+                3
+            }
+        };
+        owner.exits[category].fetch_add(1, Ordering::Relaxed);
+    }
+    owner.hits.fetch_add(1, Ordering::Relaxed);
+    owner
+        .attempts
+        .fetch_add(result.state.attempts, Ordering::Relaxed);
+    Some(result)
+}
+
 /// Benchmark telemetry is shared per program, not retained per machine.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Statistics {
     pub tracked: usize,
     pub compiled: usize,
+    pub regions: usize,
     pub pending: usize,
     pub code_bytes: usize,
     pub mapped_bytes: usize,
@@ -276,7 +337,7 @@ pub(crate) struct Statistics {
     pub failures: u64,
     pub state_bytes: usize,
     #[cfg(feature = "jit-diagnostics")]
-    pub exits: [u64; 5],
+    pub exits: [u64; 6],
 }
 pub(super) fn statistics(code: &PreparedCode) -> Statistics {
     let Some(owner) = code.jit.get() else {
@@ -297,6 +358,7 @@ pub(super) fn statistics(code: &PreparedCode) -> Statistics {
         result.pending += usize::from(slot.state.load(Ordering::Acquire) == QUEUED);
         if let Some(native) = slot.native.get() {
             result.compiled += 1;
+            result.regions += usize::from(native.is_region());
             result.code_bytes += native.code_bytes;
             result.mapped_bytes += native.mapped_bytes;
         }

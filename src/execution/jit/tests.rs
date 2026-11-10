@@ -252,6 +252,7 @@ fn compiled_entry_checks_short_frames_budgets_and_accounting_headroom() {
                 &code,
                 &mut frame,
                 Location {
+                    block: None,
                     code_start: 0,
                     instruction: 0,
                     block_len: 4,
@@ -293,6 +294,7 @@ fn hotness_publication_and_executable_lifetime_are_shared_across_threads() {
                         &code,
                         &mut frame,
                         Location {
+                            block: None,
                             code_start: 0,
                             instruction: 0,
                             block_len: 4,
@@ -429,3 +431,50 @@ fn executable_mapping_and_module_reservations_are_bounded() {
 
 #[path = "tests/heap.rs"]
 mod heap;
+
+#[test]
+fn connected_regions_match_every_retirement_cut_fixed_budget_and_fault_pc() {
+    for fault in [false, true] {
+        let image = ExecutionImage::admit(
+            fixtures::jit_connected_loop_artifact(fault),
+            fixtures::profile(),
+        )
+        .unwrap();
+        let owner = image
+            .code()
+            .jit
+            .get_or_init(|| Arc::new(JitState::default()));
+        for block in 0..3 {
+            let plan = lower::Plan::region(&image, block).unwrap();
+            let compiled = Arc::new(lower::compile(plan, Reservation::acquire().unwrap()).unwrap());
+            let key = image.block(block).unwrap().code_start;
+            let slot = &owner.slots[slot_index(key)];
+            assert_eq!(slot.key.swap(key, Ordering::AcqRel), EMPTY);
+            slot.native.set(compiled).unwrap();
+        }
+        for retirement in 0..=50 {
+            for budget in image.minimum_slice_cost()..=image.minimum_slice_cost() + 20 {
+                let mut a = Machine::new_untraced(image.clone()).unwrap();
+                let mut b = Machine::new_untraced(image.clone()).unwrap();
+                b.jit_enabled = true;
+                a.start(&[]).unwrap();
+                b.start(&[]).unwrap();
+                for step in 0..10 {
+                    let expected = a.run_slice_with_retirement_limit(budget, 8, retirement);
+                    let actual = b.run_slice_with_retirement_limit(budget, 8, retirement);
+                    assert_eq!(
+                        format!("{expected:?}"),
+                        format!("{actual:?}"),
+                        "fault={fault} budget={budget} retirement={retirement} step={step}"
+                    );
+                    assert_eq!(
+                        checkpoint(&a),
+                        checkpoint(&b),
+                        "fault={fault} budget={budget} retirement={retirement} step={step}"
+                    );
+                }
+            }
+        }
+        assert!(statistics(image.code()).hits > 0);
+    }
+}

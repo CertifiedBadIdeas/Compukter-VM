@@ -20,7 +20,11 @@ use cranelift_jit::{
 use cranelift_module::{default_libcall_names, Linkage, Module, ModuleResult};
 use std::{io, sync::Mutex};
 
+mod regions;
+pub(in crate::execution) use regions::{RegionRun, RunState};
+
 pub(super) struct Plan {
+    region: Vec<regions::RegionBlock>,
     ops: Vec<Operation>,
     copies: Vec<Copy>,
     required_bytes: u32,
@@ -56,7 +60,12 @@ fn heap_kind(opcode: u32) -> Option<u32> {
 
 impl Plan {
     pub(super) fn read(code: &PreparedCode, start: usize, length: usize) -> Option<Self> {
+        Self::prefix(code, start, length).filter(|p| p.ops.len() >= 4)
+    }
+
+    fn prefix(code: &PreparedCode, start: usize, length: usize) -> Option<Self> {
         let mut result = Self {
+            region: Vec::new(),
             ops: Vec::new(),
             copies: Vec::new(),
             required_bytes: 0,
@@ -147,7 +156,7 @@ impl Plan {
                 break;
             }
         }
-        (result.ops.len() >= 4).then_some(result)
+        (!result.ops.is_empty()).then_some(result)
     }
 }
 
@@ -212,8 +221,9 @@ impl JITMemoryProvider for LimitedMemory {
 pub(super) struct CompiledRun {
     _owner: ModuleOwner,
     _reservation: Reservation,
-    entry: unsafe extern "C" fn(*mut u8, *mut u8) -> u64,
+    entry: unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> u64,
     pub(super) has_heap: bool,
+    region: bool,
     pub len: usize,
     pub required_bytes: u32,
     pub code_bytes: usize,
@@ -233,14 +243,17 @@ impl std::fmt::Debug for CompiledRun {
 }
 
 impl CompiledRun {
-    pub(super) fn execute(
+    pub(super) fn is_region(&self) -> bool {
+        self.region
+    }
+
+    fn invoke(
         &self,
         frame: &mut PreparedFrame<'_>,
-        instruction: usize,
         heap: Option<HeapAccess<'_>>,
-    ) -> SimpleRun {
-        assert!(frame.jit_bytes().len() >= self.required_bytes as usize);
-        let (status, failure) = if self.has_heap {
+        state: *mut u8,
+    ) -> (u64, Option<InstructionFailure>) {
+        if self.has_heap {
             let access = heap.expect("heap plan requires a scoped heap borrow");
             let mut context = HeapContext {
                 frame: frame.jit_view(),
@@ -253,16 +266,29 @@ impl CompiledRun {
             // SAFETY: Plan bounds all frame operands. Heap callouts borrow the
             // invocation context synchronously, without allocation/GC/frame resize.
             // The module owner and all borrowed storage remain alive until return.
-            let status = unsafe { (self.entry)(base, opaque) };
+            let status = unsafe { (self.entry)(base, opaque, state) };
             (status, context.failure)
         } else {
             // SAFETY: this plan emits bounded frame operations and never reads the
             // unused null context. The private entry has exactly this signature.
             (
-                unsafe { (self.entry)(frame.jit_bytes().as_mut_ptr(), core::ptr::null_mut()) },
+                unsafe {
+                    (self.entry)(frame.jit_bytes().as_mut_ptr(), core::ptr::null_mut(), state)
+                },
                 None,
             )
-        };
+        }
+    }
+
+    pub(super) fn execute(
+        &self,
+        frame: &mut PreparedFrame<'_>,
+        instruction: usize,
+        heap: Option<HeapAccess<'_>>,
+    ) -> SimpleRun {
+        assert!(frame.jit_bytes().len() >= self.required_bytes as usize);
+        assert!(!self.region);
+        let (status, failure) = self.invoke(frame, heap, core::ptr::null_mut());
         let detail = status as u32 as usize;
         let reason = status >> 32;
         let (done, pc, end) = match reason {
@@ -393,11 +419,20 @@ fn load(b: &mut FunctionBuilder<'_>, base: Value, ty: Type, offset: u32) -> Valu
 fn store(b: &mut FunctionBuilder<'_>, base: Value, offset: u32, value: Value) {
     b.ins().store(flags(), value, base, offset as i32);
 }
-fn guard(b: &mut FunctionBuilder<'_>, bad: Value, reason: u64, pc: usize) {
+fn guard(
+    b: &mut FunctionBuilder<'_>,
+    bad: Value,
+    reason: u64,
+    pc: usize,
+    exit: Option<regions::Exit>,
+) {
     let fail = b.create_block();
     let next = b.create_block();
     b.ins().brif(bad, fail, &[], next, &[]);
     b.switch_to_block(fail);
+    if let Some(exit) = exit {
+        exit.spill(b);
+    }
     let status = b
         .ins()
         .iconst(types::I64, ((reason << 32) | pc as u64) as i64);
@@ -417,7 +452,14 @@ fn canonical(b: &mut FunctionBuilder<'_>, value: Value, ty: Type) -> Value {
     b.ins().select(nan, replacement, value)
 }
 
-fn number(b: &mut FunctionBuilder<'_>, base: Value, op: Operation, pc: usize, ty: Type) -> Value {
+fn number(
+    b: &mut FunctionBuilder<'_>,
+    base: Value,
+    op: Operation,
+    pc: usize,
+    ty: Type,
+    exit: Option<regions::Exit>,
+) -> Value {
     let lhs = load(b, base, ty, op.lhs);
     if (21..=28).contains(&op.opcode) {
         if op.opcode >= 25 {
@@ -492,7 +534,7 @@ fn number(b: &mut FunctionBuilder<'_>, base: Value, op: Operation, pc: usize, ty
         9 | 10 => b.ins().imul(lhs, rhs),
         13 | 14 | 17 | 18 | 105 | 106 | 109 | 110 => {
             let zero = b.ins().icmp_imm_s(IntCC::Equal, rhs, 0);
-            guard(b, zero, 3, pc);
+            guard(b, zero, 3, pc, exit);
             if op.opcode >= 105 {
                 return if op.opcode <= 106 {
                     b.ins().udiv(lhs, rhs)
@@ -588,6 +630,7 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         .params
         .push(AbiParam::new(module.target_config().pointer_type()));
     ctx.func.signature.params.push(AbiParam::new(pointer_type));
+    ctx.func.signature.params.push(AbiParam::new(pointer_type));
     ctx.func.signature.returns.push(AbiParam::new(types::I64));
     let id = module
         .declare_function("run", Linkage::Local, &ctx.func.signature)
@@ -600,88 +643,28 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         b.append_block_params_for_function_params(block);
         let base = b.block_params(block)[0];
         let opaque = b.block_params(block)[1];
-        let mut terminated = false;
-        for (pc, &op) in plan.ops.iter().enumerate() {
-            if let Some(ty) = numeric_type(op.opcode) {
-                let value = number(&mut b, base, op, pc, ty);
-                store(&mut b, base, op.dst, value);
-                continue;
+        let state = b.block_params(block)[2];
+        let mut emitter = Emitter {
+            base,
+            opaque,
+            plan: &plan,
+            module,
+            helpers: &helpers,
+        };
+        if plan.region.is_empty() {
+            let mut terminated = false;
+            for (pc, &op) in plan.ops.iter().enumerate() {
+                terminated = emitter.operation(&mut b, op, pc, None);
+                if terminated {
+                    break;
+                }
             }
-            if heap_kind(op.opcode).is_some() {
-                let helper = module.declare_func_in_func(helpers[&op.opcode], b.func);
-                let operands =
-                    [op.dst, op.lhs, op.rhs].map(|value| b.ins().iconst(types::I32, value as i64));
-                let call = b
-                    .ins()
-                    .call(helper, &[opaque, operands[0], operands[1], operands[2]]);
-                let failed = b.inst_results(call)[0];
-                guard(&mut b, failed, 4, pc);
-                continue;
+            if !terminated {
+                let status = b.ins().iconst(types::I64, 0);
+                b.ins().return_(&[status]);
             }
-            match op.opcode {
-                NOP => {}
-                COPY32 | COPY64 | COPY_BOOL | COPY_CHAR => {
-                    let ty = if op.opcode == COPY64 {
-                        types::I64
-                    } else {
-                        types::I32
-                    };
-                    let value = load(&mut b, base, ty, op.lhs);
-                    if matches!(op.opcode, COPY_BOOL | COPY_CHAR) {
-                        let bad = b.ins().icmp_imm_s(
-                            IntCC::UnsignedGreaterThan,
-                            value,
-                            if op.opcode == COPY_BOOL { 1 } else { 65535 },
-                        );
-                        guard(&mut b, bad, 2, pc);
-                    }
-                    store(&mut b, base, op.dst, value);
-                }
-                IMMEDIATE32 | IMMEDIATE64 => {
-                    let (ty, bits) = if op.opcode == IMMEDIATE32 {
-                        (types::I32, op.lhs as u64)
-                    } else {
-                        (types::I64, op.lhs as u64 | (op.rhs as u64) << 32)
-                    };
-                    let value = b.ins().iconst(ty, bits as i64);
-                    store(&mut b, base, op.dst, value);
-                }
-                COPIES => {
-                    for copy in &plan.copies[op.dst as usize..op.lhs as usize] {
-                        let value = load(
-                            &mut b,
-                            base,
-                            if copy.width == 4 {
-                                types::I32
-                            } else {
-                                types::I64
-                            },
-                            copy.src,
-                        );
-                        store(&mut b, base, copy.dst, value);
-                    }
-                }
-                JUMP | BRANCH => {
-                    let target = if op.opcode == JUMP {
-                        b.ins().iconst(types::I64, op.dst as i64)
-                    } else {
-                        let condition = load(&mut b, base, types::I32, op.dst);
-                        let bad = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, condition, 1);
-                        guard(&mut b, bad, 2, pc);
-                        let yes = b.ins().iconst(types::I64, op.lhs as i64);
-                        let no = b.ins().iconst(types::I64, op.rhs as i64);
-                        b.ins().select(condition, yes, no)
-                    };
-                    let status = b.ins().bor_imm_s(target, 1_i64 << 32);
-                    b.ins().return_(&[status]);
-                    terminated = true;
-                }
-                _ => unreachable!("validated frame opcode"),
-            }
-        }
-        if !terminated {
-            let status = b.ins().iconst(types::I64, 0);
-            b.ins().return_(&[status]);
+        } else {
+            regions::emit(&mut b, &mut emitter, state);
         }
         b.seal_all_blocks();
         b.finalize(module.target_config());
@@ -698,7 +681,9 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
     let pointer = module.get_finalized_function(id);
     // SAFETY: lowering declared exactly fn(frame_pointer, opaque_context) -> u64 with native calling convention.
     let entry = unsafe {
-        std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut u8, *mut u8) -> u64>(pointer)
+        std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> u64>(
+            pointer,
+        )
     };
     drop(locked);
     Ok(CompiledRun {
@@ -706,6 +691,7 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         _reservation: reservation,
         entry,
         has_heap: plan.has_heap,
+        region: !plan.region.is_empty(),
         len: plan.ops.len(),
         required_bytes: plan.required_bytes,
         code_bytes,
@@ -740,5 +726,109 @@ mod tests {
             memory.free_memory();
         }
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+}
+
+struct Emitter<'a> {
+    base: Value,
+    opaque: Value,
+    plan: &'a Plan,
+    module: &'a mut JITModule,
+    helpers: &'a std::collections::BTreeMap<u32, cranelift_module::FuncId>,
+}
+impl Emitter<'_> {
+    fn operation(
+        &mut self,
+        b: &mut FunctionBuilder<'_>,
+        op: Operation,
+        pc: usize,
+        exit: Option<regions::Exit>,
+    ) -> bool {
+        let Self {
+            base,
+            opaque,
+            plan,
+            module,
+            helpers,
+        } = self;
+        let (base, opaque) = (*base, *opaque);
+        if let Some(ty) = numeric_type(op.opcode) {
+            let value = number(b, base, op, pc, ty, exit);
+            store(b, base, op.dst, value);
+            return false;
+        }
+        if heap_kind(op.opcode).is_some() {
+            let helper = module.declare_func_in_func(helpers[&op.opcode], b.func);
+            let operands =
+                [op.dst, op.lhs, op.rhs].map(|value| b.ins().iconst(types::I32, value as i64));
+            let call = b
+                .ins()
+                .call(helper, &[opaque, operands[0], operands[1], operands[2]]);
+            let failed = b.inst_results(call)[0];
+            guard(b, failed, 4, pc, exit);
+            return false;
+        }
+        match op.opcode {
+            NOP => {}
+            COPY32 | COPY64 | COPY_BOOL | COPY_CHAR => {
+                let ty = if op.opcode == COPY64 {
+                    types::I64
+                } else {
+                    types::I32
+                };
+                let value = load(b, base, ty, op.lhs);
+                if matches!(op.opcode, COPY_BOOL | COPY_CHAR) {
+                    let bad = b.ins().icmp_imm_s(
+                        IntCC::UnsignedGreaterThan,
+                        value,
+                        if op.opcode == COPY_BOOL { 1 } else { 65535 },
+                    );
+                    guard(b, bad, 2, pc, exit);
+                }
+                store(b, base, op.dst, value);
+            }
+            IMMEDIATE32 | IMMEDIATE64 => {
+                let (ty, bits) = if op.opcode == IMMEDIATE32 {
+                    (types::I32, op.lhs as u64)
+                } else {
+                    (types::I64, op.lhs as u64 | (op.rhs as u64) << 32)
+                };
+                let value = b.ins().iconst(ty, bits as i64);
+                store(b, base, op.dst, value);
+            }
+            COPIES => {
+                for copy in &plan.copies[op.dst as usize..op.lhs as usize] {
+                    let value = load(
+                        b,
+                        base,
+                        if copy.width == 4 {
+                            types::I32
+                        } else {
+                            types::I64
+                        },
+                        copy.src,
+                    );
+                    store(b, base, copy.dst, value);
+                }
+            }
+            JUMP | BRANCH => {
+                let target = if op.opcode == JUMP {
+                    b.ins().iconst(types::I64, op.dst as i64)
+                } else {
+                    let condition = load(b, base, types::I32, op.dst);
+                    let bad = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, condition, 1);
+                    guard(b, bad, 2, pc, exit);
+                    let yes = b.ins().iconst(types::I64, op.lhs as i64);
+                    let no = b.ins().iconst(types::I64, op.rhs as i64);
+                    b.ins().select(condition, yes, no)
+                };
+                let status = b.ins().bor_imm_s(target, 1_i64 << 32);
+                b.ins().return_(&[status]);
+                return true;
+            }
+            _ => unreachable!("validated frame opcode"),
+        }
+
+        false
     }
 }

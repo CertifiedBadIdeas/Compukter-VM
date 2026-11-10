@@ -498,9 +498,10 @@ fn main() {
         #[cfg(feature = "baseline-jit")]
         {
             let s = admit(&case, heap, traced).jit_statistics();
+            eprintln!("JIT connected regions {} {}", case.id, s.regions);
             #[cfg(feature = "jit-diagnostics")]
             eprintln!(
-                "JIT exits {} [branch,end,lifecycle,suffix,failure] {:?}",
+                "JIT exits {} [branch,end,lifecycle,suffix,failure,budget] {:?}",
                 case.id, s.exits
             );
             jit_report.push_str(&format!(
