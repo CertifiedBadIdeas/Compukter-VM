@@ -62,6 +62,8 @@ use terminal::*;
 use verify::verify_artifact;
 
 const SLICE: u32 = 4096;
+#[cfg(feature = "baseline-jit")]
+static JIT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Work([u64; 8]);
@@ -199,12 +201,19 @@ fn admit(case: &Case, heap: u32, traced: bool) -> Session {
         0,
         &operations,
     )];
-    if traced {
+    let session = if traced {
         Session::admit(case.artifact.clone(), profile(heap), &bindings)
     } else {
         Session::admit_untraced(case.artifact.clone(), profile(heap), &bindings)
     }
-    .expect("benchmark admission")
+    .expect("benchmark admission");
+    #[cfg(feature = "baseline-jit")]
+    let mut session = session;
+    #[cfg(feature = "baseline-jit")]
+    if JIT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        session.enable_jit();
+    }
+    session
 }
 
 fn run(case: &Case, heap: u32, traced: bool) -> Measurement {
@@ -275,6 +284,10 @@ mod sharing_benchmark;
 #[path = "guest_benchmark/memory.rs"]
 mod memory_benchmark;
 
+#[cfg(all(feature = "baseline-jit", feature = "program-sharing-benchmark"))]
+#[path = "guest_benchmark/jit_fleet.rs"]
+mod jit_fleet;
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     #[cfg(feature = "program-sharing-benchmark")]
@@ -306,6 +319,11 @@ fn main() {
         prototype_benchmark::main(&args[1..]);
         return;
     }
+    #[cfg(all(feature = "baseline-jit", feature = "program-sharing-benchmark"))]
+    if args.first().is_some_and(|arg| arg == "jit-fleet") {
+        jit_fleet::main(&args[1..]);
+        return;
+    }
     assert!(
         (5..=6).contains(&args.len()),
         "usage: guest-benchmark ARTIFACT_DIR REPORT_DIR SAMPLES HEAP_BYTES traced|untraced [ID_PREFIX,...]"
@@ -322,6 +340,16 @@ fn main() {
     let traced = match args[4].as_str() {
         "traced" => true,
         "untraced" => false,
+        #[cfg(feature = "baseline-jit")]
+        "jit-traced" => {
+            JIT_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        #[cfg(feature = "baseline-jit")]
+        "jit-untraced" => {
+            JIT_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
         _ => panic!("expected traced or untraced"),
     };
     let filters: Vec<_> = args
@@ -371,9 +399,20 @@ fn main() {
             "no cases for {filter}"
         );
     }
+    #[cfg(feature = "baseline-jit")]
+    let mut cold_report = String::from("id\tcreate_ns\thot_ns\tcreate_cpu_ns\thot_cpu_ns\n");
     // Cross-check the production path against traced semantics before timing samples.
     for case in &cases {
         let warmup = run(case, heap, traced);
+        #[cfg(feature = "baseline-jit")]
+        cold_report.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            case.id,
+            warmup.create_ns,
+            warmup.hot_ns,
+            optional_ns(warmup.create_cpu_ns),
+            optional_ns(warmup.hot_cpu_ns)
+        ));
         let control = run(case, heap, !traced);
         assert_eq!(
             warmup.create, control.create,
@@ -381,6 +420,39 @@ fn main() {
             case.id
         );
         assert_eq!(warmup.hot, control.hot, "operation work for {}", case.id);
+    }
+    #[cfg(feature = "baseline-jit")]
+    let mut jit_report = String::from("id\tphase\twall_ns\tcompile_ns\tcompiled\tcode_bytes\tmapped_bytes_upper_bound\tstate_bytes\thits\tnative_attempts\ttracked\tpending\tfailures\n");
+    #[cfg(feature = "baseline-jit")]
+    {
+        for case in &cases {
+            let start = Instant::now();
+            for _ in 0..64 {
+                run(case, heap, traced);
+            }
+            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+            let probe = admit(case, heap, traced);
+            while probe.jit_statistics().pending != 0 {
+                assert!(Instant::now() < deadline, "JIT preparation timeout");
+                std::thread::yield_now();
+            }
+            let s = probe.jit_statistics();
+            jit_report.push_str(&format!(
+                "{}\twarmup\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                case.id,
+                start.elapsed().as_nanos(),
+                s.compile_ns,
+                s.compiled,
+                s.code_bytes,
+                s.mapped_bytes,
+                s.state_bytes,
+                s.hits,
+                s.attempts,
+                s.tracked,
+                s.pending,
+                s.failures
+            ));
+        }
     }
     let mut raw = String::from(
         "id\tmode\tsample\theap_bytes\tcreate_ns\thot_ns\tcreate_cpu_ns\thot_cpu_ns\n",
@@ -423,6 +495,24 @@ fn main() {
     }
     let mut summary = String::from("id\tmode\tsamples\theap_bytes\tcreate_median_ns\thot_min_ns\thot_median_ns\thot_max_ns\thot_fixed_units\thot_dynamic_units\thot_maintenance_units\thot_blocks\thot_executed_instructions\thot_retired_instructions\thot_requests\thot_responses\tcreate_cpu_median_ns\thot_cpu_median_ns\n");
     for case in cases {
+        #[cfg(feature = "baseline-jit")]
+        {
+            let s = admit(&case, heap, traced).jit_statistics();
+            jit_report.push_str(&format!(
+                "{}\tmeasured\t0\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                case.id,
+                s.compile_ns,
+                s.compiled,
+                s.code_bytes,
+                s.mapped_bytes,
+                s.state_bytes,
+                s.hits,
+                s.attempts,
+                s.tracked,
+                s.pending,
+                s.failures
+            ));
+        }
         summary.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             case.id,
@@ -462,6 +552,10 @@ fn main() {
         ));
     }
     fs::create_dir_all(outputs).expect("report directory");
+    #[cfg(feature = "baseline-jit")]
+    fs::write(outputs.join("jit.tsv"), jit_report).expect("JIT report");
+    #[cfg(feature = "baseline-jit")]
+    fs::write(outputs.join("cold.tsv"), cold_report).expect("cold report");
     fs::write(outputs.join("samples.tsv"), raw).expect("sample report");
     fs::write(outputs.join("measurements.tsv"), &summary).expect("summary report");
     eprintln!(

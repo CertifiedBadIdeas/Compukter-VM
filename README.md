@@ -312,11 +312,46 @@ not covered by these operations. Every operation preserves one logical instructi
 block cost, attempt/retirement, safepoint, source position and checkpoint boundary. No code fusion,
 native JIT, SIMD data kernel or artifact/checkpoint/C ABI change is introduced.
 
-The benchmark-only inspection command reports logical/prepared/cold counts, aligned operation bytes,
-cold enum slot bytes, copy/field plan bytes and block-table bytes. These are code-storage components,
-not total program memory; variable lifecycle payloads and other program metadata are excluded.
+## Experimental baseline JIT
+
+`baseline-jit` enables an opt-in Cranelift 0.137.1 tier (Rust 1.97 or newer).
+Production builds and sessions continue to use the prepared interpreter by default;
+no executable, Runtime ABI or checkpoint format changes. This feature currently has
+only private/benchmark selection, and is not enabled by the Minecraft carrier.
+
+A prepared program lazily owns 256 direct-mapped hot-entry slots. Collisions
+fall back without growing the table. After 64 shared entry visits, a bounded
+prefix of up to 128 numeric/frame instructions can enter the process-wide queue
+(capacity eight, one compiler thread). Queue bursts retry at exponentially
+increasing visit intervals up to eight times. Unsupported entries, compiler errors,
+exhausted module capacity and final retry failure retain interpretation. No compile
+job owns a Guest heap, frame, host binding or strong program reference.
+
+At most 256 modules, including queued work and active owners, reserve up to 64 KiB
+each of page-rounded executable/readonly/data requests: a conservative 16 MiB
+mapping envelope. This excludes compiler transient allocations, its one persistent
+worker/stack, Cranelift code in the host executable and program-side metadata.
+Each finalized module is immutable and shared; the last owner explicitly frees
+its mappings after all borrowed calls end. There is no eviction/recompilation tier.
+
+Native entry requires sufficient remaining instruction attempts and overflow
+headroom for the entire prefix, and a frame large enough for every proven operand
+range. Partial budgets use the interpreter. Checked division, Bool/Char and branch
+failures publish exact PC/attempts with preceding writes preserved. Floating point
+retains canonical NaNs and separate multiply/add semantics. Heap access, calls,
+allocation, initialization, host operations and GC remain in the interpreter;
+there is no inlining across those boundaries or automatic SIMD guarantee.
+
+For exact shared-code/private-state observations, build with
+`--features baseline-jit,program-sharing-benchmark` and run:
 
 ```sh
-cargo build --release --locked --offline --features guest-benchmark --bin guest-benchmark
-./target/release/guest-benchmark inspect PROGRAM.cpkt
+./target/release/guest-benchmark jit-fleet ARTIFACT_DIR REPORT_DIR 2000 65536 on CASE
 ```
+
+This retains native sessions, advances each for 20 grants of 4096 retired
+instructions, compares every serialized state/accounting snapshot and completes
+representative checksums. It measures one-worker native sessions, not full
+computer filesystems/shells, parallel worker contention or Minecraft throughput.
+Its allocation counter includes requested Rust allocations, not executable mmap
+pages or allocator overhead; `jit.tsv`/`fleet.tsv` report code mappings separately.
