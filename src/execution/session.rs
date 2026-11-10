@@ -102,6 +102,10 @@ impl core::fmt::Debug for Session {
 }
 
 impl Session {
+    #[cfg(feature = "jit-diagnostics")]
+    pub(crate) fn jit_call_report(&self) -> String {
+        self.machine.jit_call_report()
+    }
     #[cfg(feature = "baseline-jit")]
     pub(crate) fn jit_statistics(&self) -> super::jit::Statistics {
         self.machine.jit_statistics()

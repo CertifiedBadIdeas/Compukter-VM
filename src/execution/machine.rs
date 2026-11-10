@@ -319,6 +319,10 @@ impl AllocationRetry {
 }
 
 impl Machine {
+    #[cfg(feature = "jit-diagnostics")]
+    pub(super) fn jit_call_report(&self) -> String {
+        super::jit::calls::report(&self.image)
+    }
     #[cfg(feature = "baseline-jit")]
     pub(super) fn jit_statistics(&self) -> super::jit::Statistics {
         super::jit::statistics(self.image.code())
@@ -1825,6 +1829,15 @@ impl Machine {
                         let Some(target_function) = self.image.function(target) else {
                             return Ok(self.fault(VmFault::InvalidResolvedId));
                         };
+                        #[cfg(feature = "jit-diagnostics")]
+                        if self.jit_enabled {
+                            super::jit::record_call(
+                                &self.image,
+                                block_index,
+                                instruction_index,
+                                target,
+                            );
+                        }
                         if let CallArguments::Prepared(transfers) = &args {
                             let caller = self.frames[frame_index];
                             let source = FrameReservation {

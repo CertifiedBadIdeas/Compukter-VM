@@ -495,6 +495,14 @@ fn main() {
     }
     let mut summary = String::from("id\tmode\tsamples\theap_bytes\tcreate_median_ns\thot_min_ns\thot_median_ns\thot_max_ns\thot_fixed_units\thot_dynamic_units\thot_maintenance_units\thot_blocks\thot_executed_instructions\thot_retired_instructions\thot_requests\thot_responses\tcreate_cpu_median_ns\thot_cpu_median_ns\n");
     for case in cases {
+        #[cfg(feature = "jit-diagnostics")]
+        fs::create_dir_all(&outputs).expect("diagnostic output directory");
+        #[cfg(feature = "jit-diagnostics")]
+        fs::write(
+            outputs.join(format!("{}-calls.tsv", case.id)),
+            admit(&case, heap, traced).jit_call_report(),
+        )
+        .expect("call diagnostics");
         #[cfg(feature = "baseline-jit")]
         {
             let s = admit(&case, heap, traced).jit_statistics();

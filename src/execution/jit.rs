@@ -39,6 +39,11 @@ struct Slot {
     native: OnceLock<Arc<lower::CompiledRun>>,
 }
 
+#[cfg(feature = "jit-diagnostics")]
+pub(super) mod calls;
+#[cfg(feature = "jit-diagnostics")]
+pub(super) use calls::record_call;
+
 #[derive(Debug)]
 pub(super) struct JitState {
     slots: Box<[Slot]>,
@@ -48,6 +53,8 @@ pub(super) struct JitState {
     failures: AtomicU64,
     #[cfg(feature = "jit-diagnostics")]
     exits: [AtomicU64; 6],
+    #[cfg(feature = "jit-diagnostics")]
+    calls: std::sync::Mutex<std::collections::BTreeMap<(usize, usize, usize), u64>>,
 }
 
 impl Default for JitState {
@@ -68,6 +75,8 @@ impl Default for JitState {
             failures: AtomicU64::new(0),
             #[cfg(feature = "jit-diagnostics")]
             exits: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(feature = "jit-diagnostics")]
+            calls: Default::default(),
         }
     }
 }
