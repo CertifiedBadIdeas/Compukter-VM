@@ -288,6 +288,10 @@ mod memory_benchmark;
 #[path = "guest_benchmark/jit_fleet.rs"]
 mod jit_fleet;
 
+#[cfg(feature = "baseline-jit")]
+#[path = "guest_benchmark/jit_mixed_fleet.rs"]
+mod jit_mixed_fleet;
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     #[cfg(feature = "program-sharing-benchmark")]
@@ -322,6 +326,11 @@ fn main() {
     #[cfg(all(feature = "baseline-jit", feature = "program-sharing-benchmark"))]
     if args.first().is_some_and(|arg| arg == "jit-fleet") {
         jit_fleet::main(&args[1..]);
+        return;
+    }
+    #[cfg(feature = "baseline-jit")]
+    if args.first().is_some_and(|arg| arg == "jit-mixed-fleet") {
+        jit_mixed_fleet::main(&args[1..]);
         return;
     }
     assert!(
@@ -434,7 +443,7 @@ fn main() {
         assert_eq!(warmup.hot, control.hot, "operation work for {}", case.id);
     }
     #[cfg(feature = "baseline-jit")]
-    let mut jit_report = String::from("id\tphase\twall_ns\tcompile_ns\tcompiled\tcode_bytes\tmapped_bytes_upper_bound\tstate_bytes\thits\tnative_attempts\ttracked\tpending\tfailures\n");
+    let mut jit_report = String::from("id\tphase\twall_ns\tcompile_ns\tcompiled\tcode_bytes\tmapped_bytes_upper_bound\tstate_bytes\thits\tnative_attempts\ttracked\tpending\tfailures\thot_telemetry\n");
     #[cfg(feature = "baseline-jit")]
     {
         for case in &cases {
@@ -450,7 +459,7 @@ fn main() {
             }
             let s = probe.jit_statistics();
             jit_report.push_str(&format!(
-                "{}\twarmup\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\twarmup\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.id,
                 start.elapsed().as_nanos(),
                 s.compile_ns,
@@ -462,7 +471,8 @@ fn main() {
                 s.attempts,
                 s.tracked,
                 s.pending,
-                s.failures
+                s.failures,
+                s.hot_telemetry
             ));
         }
     }
@@ -525,7 +535,7 @@ fn main() {
                 case.id, s.exits
             );
             jit_report.push_str(&format!(
-                "{}\tmeasured\t0\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\tmeasured\t0\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.id,
                 s.compile_ns,
                 s.compiled,
@@ -536,7 +546,8 @@ fn main() {
                 s.attempts,
                 s.tracked,
                 s.pending,
-                s.failures
+                s.failures,
+                s.hot_telemetry
             ));
         }
         summary.push_str(&format!(

@@ -89,6 +89,21 @@ impl Default for JitState {
     }
 }
 
+impl JitState {
+    #[inline]
+    fn record_native(&self, attempts: u64) {
+        // Hot telemetry is diagnostic work. Updating one shared cache line on
+        // every native exit serializes otherwise independent execution workers.
+        #[cfg(any(test, feature = "jit-telemetry"))]
+        {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.attempts.fetch_add(attempts, Ordering::Relaxed);
+        }
+        #[cfg(not(any(test, feature = "jit-telemetry")))]
+        let _ = attempts;
+    }
+}
+
 // A token bounds *all* in-flight and published modules, including active calls.
 // The memory provider separately caps every module's page-rounded allocations.
 static LIVE_MODULES: AtomicUsize = AtomicUsize::new(0);
@@ -252,8 +267,7 @@ pub(super) fn try_execute(
                 };
                 owner.exits[category].fetch_add(1, Ordering::Relaxed);
             }
-            owner.hits.fetch_add(1, Ordering::Relaxed);
-            owner.attempts.fetch_add(native_attempts, Ordering::Relaxed);
+            owner.record_native(native_attempts);
             return Some(Execution::Region(result));
         }
         if native.len > block_len.checked_sub(instruction)?
@@ -282,8 +296,7 @@ pub(super) fn try_execute(
             };
             owner.exits[category].fetch_add(1, Ordering::Relaxed);
         }
-        owner.hits.fetch_add(1, Ordering::Relaxed);
-        owner.attempts.fetch_add(result.attempts, Ordering::Relaxed);
+        owner.record_native(result.attempts);
         return Some(Execution::Prefix(result));
     }
     if slot.state.load(Ordering::Acquire) != COLD {
@@ -348,6 +361,7 @@ pub(crate) struct Statistics {
     pub pending: usize,
     pub code_bytes: usize,
     pub mapped_bytes: usize,
+    pub hot_telemetry: bool,
     pub hits: u64,
     pub attempts: u64,
     pub compile_ns: u64,
@@ -363,6 +377,7 @@ pub(super) fn statistics(code: &PreparedCode) -> Statistics {
     let mut result = Statistics {
         #[cfg(feature = "jit-diagnostics")]
         exits: std::array::from_fn(|i| owner.exits[i].load(Ordering::Relaxed)),
+        hot_telemetry: cfg!(any(test, feature = "jit-telemetry")),
         hits: owner.hits.load(Ordering::Relaxed),
         attempts: owner.attempts.load(Ordering::Relaxed),
         compile_ns: owner.compile_ns.load(Ordering::Relaxed),
