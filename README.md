@@ -321,7 +321,7 @@ only private/benchmark selection, and is not enabled by the Minecraft carrier.
 
 A prepared program lazily owns 256 direct-mapped hot-entry slots. Collisions
 fall back without growing the table. After 64 shared entry visits, a bounded
-prefix of up to 128 numeric/frame instructions can enter the process-wide queue
+prefix of up to 128 numeric/frame/checked-heap instructions can enter the process-wide queue
 (capacity eight, one compiler thread). Queue bursts retry at exponentially
 increasing visit intervals up to eight times. Unsupported entries, compiler errors,
 exhausted module capacity and final retry failure retain interpretation. No compile
@@ -338,9 +338,15 @@ Native entry requires sufficient remaining instruction attempts and overflow
 headroom for the entire prefix, and a frame large enough for every proven operand
 range. Partial budgets use the interpreter. Checked division, Bool/Char and branch
 failures publish exact PC/attempts with preceding writes preserved. Floating point
-retains canonical NaNs and separate multiply/add semantics. Heap access, calls,
-allocation, initialization, host operations and GC remain in the interpreter;
-there is no inlining across those boundaries or automatic SIMD guarantee.
+retains canonical NaNs and separate multiply/add semantics. Non-allocating field
+and array operations use typed checked Rust callouts within mixed prefixes. These
+specialize the ordinary prepared heap executor by opcode, retaining reference,
+type, bounds, nullability and admission-specific heap-layout checks. A scoped
+invocation context borrows the current frame/image/heap; no instance address or
+heap packing is embedded in shared code. A failed callout exits at its exact PC
+with earlier frame and heap writes retained. Calls, allocation, initialization,
+host operations and GC remain interpreter boundaries; there is no inlining across
+those boundaries or automatic SIMD guarantee.
 
 For exact shared-code/private-state observations, build with
 `--features baseline-jit,program-sharing-benchmark` and run:
