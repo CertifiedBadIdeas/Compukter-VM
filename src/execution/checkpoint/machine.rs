@@ -159,6 +159,8 @@ impl Machine {
         }
         let mut machine = Self {
             image,
+            #[cfg(feature = "baseline-jit")]
+            jit_enabled: false,
             #[cfg(any(test, feature = "execution-prototype"))]
             reference_execution: false,
             #[cfg(feature = "execution-prototype")]

@@ -8458,3 +8458,28 @@ fn inline_record_response_fixture(wide: bool) -> VerifiedArtifact {
     let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
+
+#[cfg(feature = "baseline-jit")]
+pub(super) fn jit_numeric_loop_artifact() -> VerifiedArtifact {
+    let mut operations = vec![Instruction::Const {
+        dst: 0,
+        constant: 0,
+    }];
+    for _ in 0..6 {
+        operations.push(Instruction::Add {
+            form: 1,
+            dst: 0,
+            lhs: 0,
+            rhs: 0,
+        });
+    }
+    operations.push(Instruction::Jump { target: 0 });
+    verified_blocks(
+        primitive(0),
+        0,
+        vec![primitive(1)],
+        vec![Constant::I32(1)],
+        vec![(1, operations)],
+        1,
+    )
+}

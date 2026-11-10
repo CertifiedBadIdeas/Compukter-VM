@@ -71,6 +71,8 @@ struct Plans {
 
 #[derive(Debug)]
 pub(super) struct PreparedCode {
+    #[cfg(feature = "baseline-jit")]
+    pub(super) jit: std::sync::OnceLock<std::sync::Arc<super::jit::JitState>>,
     lines: Box<[Line]>,
     len: usize,
     cold: Box<[ResolvedInstruction]>,
@@ -245,6 +247,8 @@ impl CodeBuilder {
             lines.push(line);
         }
         Ok(PreparedCode {
+            #[cfg(feature = "baseline-jit")]
+            jit: std::sync::OnceLock::new(),
             lines: lines.into_boxed_slice(),
             len,
             cold: self.cold.into_boxed_slice(),

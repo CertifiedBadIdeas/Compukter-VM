@@ -11,6 +11,8 @@ mod heap;
 mod heap_ops;
 mod host;
 mod image;
+#[cfg(feature = "baseline-jit")]
+pub(crate) mod jit;
 mod layout;
 mod machine;
 mod math;

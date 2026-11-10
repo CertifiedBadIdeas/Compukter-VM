@@ -26,11 +26,20 @@ persistence-crash-testing = []
 guest-benchmark = []
 program-sharing-benchmark = ["guest-benchmark"]
 execution-prototype = []
+baseline-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:region"]
 
 [dependencies]
 libm = { version = "=0.2.16", default-features = false }
 ryu = { version = "1.0", default-features = false }
 sha2 = { version = "0.10", default-features = false }
+
+cranelift-codegen = { version = "=0.137.1", optional = true }
+cranelift-frontend = { version = "=0.137.1", optional = true }
+cranelift-jit = { version = "=0.137.1", optional = true }
+cranelift-module = { version = "=0.137.1", optional = true }
+cranelift-native = { version = "=0.137.1", optional = true }
+
+region = { version = "=3.0.2", optional = true }
 
 [profile.release]
 codegen-units = 1

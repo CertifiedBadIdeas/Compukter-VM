@@ -128,6 +128,8 @@ pub(super) fn write_frame_value(
 
 pub(super) struct Machine {
     image: ExecutionImage,
+    #[cfg(feature = "baseline-jit")]
+    pub(super) jit_enabled: bool,
     #[cfg(any(test, feature = "execution-prototype"))]
     reference_execution: bool,
     #[cfg(feature = "execution-prototype")]
@@ -317,6 +319,11 @@ impl AllocationRetry {
 }
 
 impl Machine {
+    #[cfg(feature = "baseline-jit")]
+    pub(super) fn jit_statistics(&self) -> super::jit::Statistics {
+        super::jit::statistics(self.image.code())
+    }
+
     #[cfg(feature = "execution-prototype")]
     pub(super) fn prepare_execution(
         &mut self,
@@ -538,6 +545,8 @@ impl Machine {
         }
         Ok(Self {
             image,
+            #[cfg(feature = "baseline-jit")]
+            jit_enabled: false,
             #[cfg(any(test, feature = "execution-prototype"))]
             reference_execution: false,
             #[cfg(feature = "execution-prototype")]
@@ -1410,26 +1419,44 @@ impl Machine {
                                 return Ok(self.fault(fault));
                             }
                         };
-                        let run = super::prepared::execute_run(
-                            self.image.code(),
-                            &mut window,
-                            code_start,
-                            instruction_index,
-                            block_len,
-                            super::prepared::RunBudget {
-                                limit: attempt_limit
-                                    - (self.executed_instructions - attempts_before),
-                                headroom: u64::MAX - self.executed_instructions,
-                            },
-                            |operation, window| {
-                                prepared_execution::execute_heap(
-                                    operation,
-                                    window,
-                                    &self.image,
-                                    &mut self.heap,
+                        let budget = super::prepared::RunBudget {
+                            limit: attempt_limit - (self.executed_instructions - attempts_before),
+                            headroom: u64::MAX - self.executed_instructions,
+                        };
+                        #[cfg(feature = "baseline-jit")]
+                        let native = self
+                            .jit_enabled
+                            .then(|| {
+                                super::jit::try_execute(
+                                    self.image.code(),
+                                    &mut window,
+                                    code_start,
+                                    instruction_index,
+                                    block_len,
+                                    &budget,
                                 )
-                            },
-                        );
+                            })
+                            .flatten();
+                        #[cfg(not(feature = "baseline-jit"))]
+                        let native: Option<super::prepared::SimpleRun> = None;
+                        let run = native.unwrap_or_else(|| {
+                            super::prepared::execute_run(
+                                self.image.code(),
+                                &mut window,
+                                code_start,
+                                instruction_index,
+                                block_len,
+                                budget,
+                                |operation, window| {
+                                    prepared_execution::execute_heap(
+                                        operation,
+                                        window,
+                                        &self.image,
+                                        &mut self.heap,
+                                    )
+                                },
+                            )
+                        });
                         self.executed_instructions += run.attempts;
                         self.frames[frame_index].instruction = run.instruction;
                         match run.end {

@@ -12,6 +12,8 @@ use crate::execution::{
 #[test]
 fn operation_lookup_checks_logical_end_before_cache_line_padding() {
     let mut code = PreparedCode {
+        #[cfg(feature = "baseline-jit")]
+        jit: std::sync::OnceLock::new(),
         lines: vec![
             Line([Operation::default(); 4]),
             Line([Operation::default(); 4]),
@@ -514,7 +516,7 @@ fn default_numeric_operations_match_reference_on_integer_and_float_edges() {
     }
 }
 
-fn backed_arena(capacity: u32) -> FrameArena {
+pub(in crate::execution) fn backed_arena(capacity: u32) -> FrameArena {
     let mut arena = FrameArena::new(capacity).unwrap();
     arena
         .push(&crate::execution::frame::FrameLayout {
@@ -526,7 +528,7 @@ fn backed_arena(capacity: u32) -> FrameArena {
     arena
 }
 
-fn simple_code(operations: &[Operation]) -> PreparedCode {
+pub(in crate::execution) fn simple_code(operations: &[Operation]) -> PreparedCode {
     let mut lines = Vec::new();
     for chunk in operations.chunks(4) {
         let mut line = [Operation::default(); 4];
@@ -534,6 +536,8 @@ fn simple_code(operations: &[Operation]) -> PreparedCode {
         lines.push(Line(line));
     }
     PreparedCode {
+        #[cfg(feature = "baseline-jit")]
+        jit: std::sync::OnceLock::new(),
         lines: lines.into_boxed_slice(),
         len: operations.len(),
         cold: Box::new([]),

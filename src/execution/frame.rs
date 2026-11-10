@@ -107,6 +107,18 @@ pub(super) struct PreparedFrame<'a> {
 }
 
 impl PreparedFrame<'_> {
+    #[cfg(feature = "baseline-jit")]
+    pub(super) fn jit_bytes(&mut self) -> &mut [u8] {
+        self.bytes
+    }
+
+    #[cfg(all(test, feature = "baseline-jit"))]
+    pub(super) fn jit_mark_writes(&mut self, ranges: &[(u32, u32)]) {
+        for &(offset, width) in ranges {
+            self.initialized[offset as usize..(offset + width) as usize].fill(true);
+        }
+    }
+
     #[inline(always)]
     pub(super) fn read<const N: usize>(&self, offset: u32) -> Result<[u8; N], VmFault> {
         let start = offset as usize;

@@ -102,6 +102,16 @@ impl core::fmt::Debug for Session {
 }
 
 impl Session {
+    #[cfg(feature = "baseline-jit")]
+    pub(crate) fn jit_statistics(&self) -> super::jit::Statistics {
+        self.machine.jit_statistics()
+    }
+
+    #[cfg(feature = "baseline-jit")]
+    pub(crate) fn enable_jit(&mut self) {
+        self.machine.jit_enabled = true;
+    }
+
     #[cfg(feature = "execution-prototype")]
     pub(crate) fn use_reference_execution(&mut self) {
         self.machine.use_reference_execution();
