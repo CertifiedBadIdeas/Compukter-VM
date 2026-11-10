@@ -106,7 +106,48 @@ pub(super) struct PreparedFrame<'a> {
     initialized: &'a mut [bool],
 }
 
+// The native call and its checked callouts access this borrow sequentially. Keep
+// only raw pointers here: a callout must derive its temporary slice from the same
+// pointer used by generated code, rather than reborrowing a separate &mut frame.
+#[cfg(feature = "baseline-jit")]
+pub(super) struct JitFrame<'a> {
+    bytes: *mut u8,
+    len: usize,
+    #[cfg(test)]
+    initialized: *mut bool,
+    _borrow: core::marker::PhantomData<&'a mut [u8]>,
+}
+
+#[cfg(feature = "baseline-jit")]
+impl JitFrame<'_> {
+    pub(super) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes
+    }
+
+    pub(super) fn reborrow(&mut self) -> PreparedFrame<'_> {
+        // SAFETY: jit_view retains the exclusive borrow of both original slices
+        // for this view's lifetime. A reborrow cannot outlive &mut self, and the
+        // synchronous callout returns before generated code accesses them again.
+        PreparedFrame {
+            bytes: unsafe { core::slice::from_raw_parts_mut(self.bytes, self.len) },
+            #[cfg(test)]
+            initialized: unsafe { core::slice::from_raw_parts_mut(self.initialized, self.len) },
+        }
+    }
+}
+
 impl PreparedFrame<'_> {
+    #[cfg(feature = "baseline-jit")]
+    pub(super) fn jit_view(&mut self) -> JitFrame<'_> {
+        JitFrame {
+            bytes: self.bytes.as_mut_ptr(),
+            len: self.bytes.len(),
+            #[cfg(test)]
+            initialized: self.initialized.as_mut_ptr(),
+            _borrow: core::marker::PhantomData,
+        }
+    }
+
     #[cfg(feature = "baseline-jit")]
     pub(super) fn jit_bytes(&mut self) -> &mut [u8] {
         self.bytes

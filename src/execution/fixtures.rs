@@ -8483,3 +8483,72 @@ pub(super) fn jit_numeric_loop_artifact() -> VerifiedArtifact {
         1,
     )
 }
+
+#[cfg(feature = "baseline-jit")]
+pub(super) fn jit_heap_loop_artifact() -> VerifiedArtifact {
+    verified_mutated(|artifact| {
+        let reference = ValueType {
+            kind: 7,
+            flags: 0,
+            nominal_type: TypeId(1),
+        };
+        artifact.modules[0].types[0] = NominalType::Function {
+            name: 1,
+            flags: 0,
+            result: primitive(0),
+            parameters: Vec::new(),
+        };
+        artifact.modules[0]
+            .types
+            .push(plain_class(TypeId(u32::MAX), 0, 1));
+        artifact.modules[0].declared_types = 2;
+        artifact.modules[0].fields = vec![Field {
+            owner: TypeId(1),
+            name: 0,
+            value_type: primitive(1),
+            flags: 1,
+        }];
+        artifact.modules[0].constants = vec![Constant::I32(1)];
+        let function = &mut artifact.modules[0].functions[0];
+        function.register_count = 3;
+        function.values =
+            crate::artifact::scalar_values(vec![reference, primitive(1), primitive(1)]);
+        install_entry_blocks(
+            artifact,
+            vec![
+                vec![
+                    Instruction::NewObject {
+                        dst: 0,
+                        type_ref: 1,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+                vec![
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::FieldGet {
+                        dst: 2,
+                        receiver: 0,
+                        field_ref: 0,
+                    },
+                    Instruction::Add {
+                        form: 1,
+                        dst: 2,
+                        lhs: 2,
+                        rhs: 1,
+                    },
+                    Instruction::FieldSet {
+                        receiver: 0,
+                        field_ref: 0,
+                        value: 2,
+                    },
+                    Instruction::Jump { target: 1 },
+                ],
+            ],
+        );
+        artifact.modules[0].blocks[1].flags = 1;
+        configure_stack(artifact, 3, 1);
+    })
+}

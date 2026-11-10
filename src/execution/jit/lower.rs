@@ -24,6 +24,7 @@ pub(super) struct Plan {
     ops: Vec<Operation>,
     copies: Vec<Copy>,
     required_bytes: u32,
+    has_heap: bool,
     #[cfg(test)]
     writes: Vec<Vec<(u32, u32)>>,
 }
@@ -38,12 +39,28 @@ pub(super) fn numeric_type(opcode: u32) -> Option<Type> {
     Some([types::I32, types::I64, types::F32, types::F64][form as usize])
 }
 
+fn heap_kind(opcode: u32) -> Option<u32> {
+    // Only array loads use the NON_NULL flag; reject other unknown flag bits.
+    match opcode {
+        201..=207 => Some(opcode - FIELD_GET),
+        209..=215 => Some(opcode - FIELD_SET),
+        217..=223 => Some(opcode - ARRAY_LOAD),
+        225..=231 => Some(opcode - ARRAY_STORE),
+        ARRAY_LENGTH => Some(1),
+        flagged if (217..=223).contains(&(flagged ^ NON_NULL)) => {
+            Some((flagged ^ NON_NULL) - ARRAY_LOAD)
+        }
+        _ => None,
+    }
+}
+
 impl Plan {
     pub(super) fn read(code: &PreparedCode, start: usize, length: usize) -> Option<Self> {
         let mut result = Self {
             ops: Vec::new(),
             copies: Vec::new(),
             required_bytes: 0,
+            has_heap: false,
             #[cfg(test)]
             writes: Vec::new(),
         };
@@ -67,6 +84,18 @@ impl Plan {
                     ty.bytes()
                 };
                 writes.push((op.dst, width));
+            } else if let Some(kind) = heap_kind(op.opcode) {
+                result.has_heap = true;
+                access.push((op.lhs, 4));
+                if matches!(op.opcode & 0xffff, 217..=231) {
+                    access.push((op.rhs, 4));
+                }
+                let width = if matches!(kind, 2 | 4) { 8 } else { 4 };
+                if matches!(op.opcode & 0xffff, 209..=215 | 225..=231) {
+                    access.push((op.dst, width));
+                } else {
+                    writes.push((op.dst, width));
+                }
             } else {
                 match op.opcode {
                     COPY32 | COPY_BOOL | COPY_CHAR => {
@@ -183,7 +212,8 @@ impl JITMemoryProvider for LimitedMemory {
 pub(super) struct CompiledRun {
     _owner: ModuleOwner,
     _reservation: Reservation,
-    entry: unsafe extern "C" fn(*mut u8) -> u64,
+    entry: unsafe extern "C" fn(*mut u8, *mut u8) -> u64,
+    pub(super) has_heap: bool,
     pub len: usize,
     pub required_bytes: u32,
     pub code_bytes: usize,
@@ -203,12 +233,36 @@ impl std::fmt::Debug for CompiledRun {
 }
 
 impl CompiledRun {
-    pub(super) fn execute(&self, frame: &mut PreparedFrame<'_>, instruction: usize) -> SimpleRun {
+    pub(super) fn execute(
+        &self,
+        frame: &mut PreparedFrame<'_>,
+        instruction: usize,
+        heap: Option<HeapAccess<'_>>,
+    ) -> SimpleRun {
         assert!(frame.jit_bytes().len() >= self.required_bytes as usize);
-        // SAFETY: Plan bounds every operand by required_bytes and lower emits only
-        // bounded frame operations. No GC, allocation, call-out or frame resize occurs.
-        // The private function pointer has exactly this signature and its owner is borrowed.
-        let status = unsafe { (self.entry)(frame.jit_bytes().as_mut_ptr()) };
+        let (status, failure) = if self.has_heap {
+            let access = heap.expect("heap plan requires a scoped heap borrow");
+            let mut context = HeapContext {
+                frame: frame.jit_view(),
+                image: access.image,
+                heap: access.heap,
+                failure: None,
+            };
+            let base = context.frame.as_mut_ptr();
+            let opaque = (&mut context as *mut HeapContext<'_, '_>).cast::<u8>();
+            // SAFETY: Plan bounds all frame operands. Heap callouts borrow the
+            // invocation context synchronously, without allocation/GC/frame resize.
+            // The module owner and all borrowed storage remain alive until return.
+            let status = unsafe { (self.entry)(base, opaque) };
+            (status, context.failure)
+        } else {
+            // SAFETY: this plan emits bounded frame operations and never reads the
+            // unused null context. The private entry has exactly this signature.
+            (
+                unsafe { (self.entry)(frame.jit_bytes().as_mut_ptr(), core::ptr::null_mut()) },
+                None,
+            )
+        };
         let detail = status as u32 as usize;
         let reason = status >> 32;
         let (done, pc, end) = match reason {
@@ -223,6 +277,11 @@ impl CompiledRun {
                 detail + 1,
                 instruction + detail,
                 RunEnd::Failure(InstructionFailure::Trap(GuestTrap::DivisionByZero)),
+            ),
+            4 => (
+                detail + 1,
+                instruction + detail,
+                RunEnd::Failure(failure.expect("checked callout failure")),
             ),
             _ => unreachable!("private JIT return status"),
         };
@@ -239,6 +298,89 @@ impl CompiledRun {
             attempts: done as u64,
             end,
         }
+    }
+}
+
+// Rust owns rich errors and all admission-specific heap state. Native code sees
+// only an opaque invocation pointer and a success/failure bit, never a heap base.
+struct HeapContext<'frame, 'heap> {
+    frame: crate::execution::frame::JitFrame<'frame>,
+    image: &'heap crate::execution::image::ExecutionImage,
+    heap: &'heap mut crate::execution::heap::Heap,
+    failure: Option<InstructionFailure>,
+}
+
+unsafe extern "C" fn checked_heap<const OPCODE: u32>(
+    context: *mut u8,
+    dst: u32,
+    lhs: u32,
+    rhs: u32,
+) -> u32 {
+    // SAFETY: only private generated calls use this symbol; execute supplies a
+    // live, exclusive context for precisely the synchronous native invocation.
+    let context = unsafe { &mut *context.cast::<HeapContext<'_, '_>>() };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::execution::machine::prepared_execution::execute_heap_opcode::<OPCODE>(
+            Operation {
+                opcode: OPCODE,
+                dst,
+                lhs,
+                rhs,
+            },
+            &mut context.frame.reborrow(),
+            context.image,
+            context.heap,
+        )
+    }))
+    .unwrap_or(Err(InstructionFailure::Fault(VmFault::CorruptHeap)));
+    match result {
+        Ok(()) => 0,
+        Err(failure) => {
+            context.failure = Some(failure);
+            1
+        }
+    }
+}
+
+fn heap_helper(opcode: u32) -> *const u8 {
+    match opcode {
+        201 => checked_heap::<201> as *const u8,
+        202 => checked_heap::<202> as *const u8,
+        203 => checked_heap::<203> as *const u8,
+        204 => checked_heap::<204> as *const u8,
+        205 => checked_heap::<205> as *const u8,
+        206 => checked_heap::<206> as *const u8,
+        207 => checked_heap::<207> as *const u8,
+        209 => checked_heap::<209> as *const u8,
+        210 => checked_heap::<210> as *const u8,
+        211 => checked_heap::<211> as *const u8,
+        212 => checked_heap::<212> as *const u8,
+        213 => checked_heap::<213> as *const u8,
+        214 => checked_heap::<214> as *const u8,
+        215 => checked_heap::<215> as *const u8,
+        217 => checked_heap::<217> as *const u8,
+        218 => checked_heap::<218> as *const u8,
+        219 => checked_heap::<219> as *const u8,
+        220 => checked_heap::<220> as *const u8,
+        221 => checked_heap::<221> as *const u8,
+        222 => checked_heap::<222> as *const u8,
+        223 => checked_heap::<223> as *const u8,
+        225 => checked_heap::<225> as *const u8,
+        226 => checked_heap::<226> as *const u8,
+        227 => checked_heap::<227> as *const u8,
+        228 => checked_heap::<228> as *const u8,
+        229 => checked_heap::<229> as *const u8,
+        230 => checked_heap::<230> as *const u8,
+        231 => checked_heap::<231> as *const u8,
+        232 => checked_heap::<232> as *const u8,
+        65753 => checked_heap::<65753> as *const u8,
+        65754 => checked_heap::<65754> as *const u8,
+        65755 => checked_heap::<65755> as *const u8,
+        65756 => checked_heap::<65756> as *const u8,
+        65757 => checked_heap::<65757> as *const u8,
+        65758 => checked_heap::<65758> as *const u8,
+        65759 => checked_heap::<65759> as *const u8,
+        _ => unreachable!("validated heap opcode"),
     }
 }
 
@@ -408,6 +550,15 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         .map_err(|e| e.to_string())?;
     let bytes = Arc::new(AtomicUsize::new(0));
     let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+    let helpers: std::collections::BTreeMap<_, _> = plan
+        .ops
+        .iter()
+        .filter(|op| heap_kind(op.opcode).is_some())
+        .map(|op| (op.opcode, format!("checked_heap_{}", op.opcode)))
+        .collect();
+    for (&opcode, name) in &helpers {
+        builder.symbol(name, heap_helper(opcode));
+    }
     builder.memory_provider(Box::new(LimitedMemory {
         inner: SystemMemoryProvider::new(),
         bytes: bytes.clone(),
@@ -415,11 +566,28 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
     let owner = ModuleOwner(Mutex::new(Some(JITModule::new(builder))));
     let mut locked = owner.0.lock().unwrap();
     let module = locked.as_mut().unwrap();
+    let pointer_type = module.target_config().pointer_type();
+    let mut helper_signature = module.make_signature();
+    helper_signature.params.push(AbiParam::new(pointer_type));
+    helper_signature
+        .params
+        .extend([AbiParam::new(types::I32); 3]);
+    helper_signature.returns.push(AbiParam::new(types::I32));
+    let helpers = helpers
+        .into_iter()
+        .map(|(opcode, name)| {
+            module
+                .declare_function(&name, Linkage::Import, &helper_signature)
+                .map(|id| (opcode, id))
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
     let mut ctx = module.make_context();
     ctx.func
         .signature
         .params
         .push(AbiParam::new(module.target_config().pointer_type()));
+    ctx.func.signature.params.push(AbiParam::new(pointer_type));
     ctx.func.signature.returns.push(AbiParam::new(types::I64));
     let id = module
         .declare_function("run", Linkage::Local, &ctx.func.signature)
@@ -431,11 +599,23 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         b.switch_to_block(block);
         b.append_block_params_for_function_params(block);
         let base = b.block_params(block)[0];
+        let opaque = b.block_params(block)[1];
         let mut terminated = false;
         for (pc, &op) in plan.ops.iter().enumerate() {
             if let Some(ty) = numeric_type(op.opcode) {
                 let value = number(&mut b, base, op, pc, ty);
                 store(&mut b, base, op.dst, value);
+                continue;
+            }
+            if heap_kind(op.opcode).is_some() {
+                let helper = module.declare_func_in_func(helpers[&op.opcode], b.func);
+                let operands =
+                    [op.dst, op.lhs, op.rhs].map(|value| b.ins().iconst(types::I32, value as i64));
+                let call = b
+                    .ins()
+                    .call(helper, &[opaque, operands[0], operands[1], operands[2]]);
+                let failed = b.inst_results(call)[0];
+                guard(&mut b, failed, 4, pc);
                 continue;
             }
             match op.opcode {
@@ -516,14 +696,16 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         .len();
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let pointer = module.get_finalized_function(id);
-    // SAFETY: lowering declared exactly fn(frame_pointer) -> u64 with native calling convention.
-    let entry =
-        unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut u8) -> u64>(pointer) };
+    // SAFETY: lowering declared exactly fn(frame_pointer, opaque_context) -> u64 with native calling convention.
+    let entry = unsafe {
+        std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut u8, *mut u8) -> u64>(pointer)
+    };
     drop(locked);
     Ok(CompiledRun {
         _owner: owner,
         _reservation: reservation,
         entry,
+        has_heap: plan.has_heap,
         len: plan.ops.len(),
         required_bytes: plan.required_bytes,
         code_bytes,

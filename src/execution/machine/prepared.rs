@@ -11,13 +11,33 @@ use crate::execution::frame::PreparedFrame;
 use crate::execution::prepared::{self as code, Operation};
 
 #[inline]
-pub(super) fn execute_heap(
+pub(in crate::execution) fn execute_heap(
     operation: Operation,
     frame: &mut PreparedFrame<'_>,
     image: &ExecutionImage,
     heap: &mut Heap,
 ) -> Result<(), InstructionFailure> {
-    let op = operation;
+    execute_heap_opcode::<0>(operation, frame, image, heap)
+}
+
+// Zero selects the dynamic interpreter operation. JIT callouts select their
+// verified opcode at compile time, keeping scalar decoding and all heap checks
+// in this one implementation while removing repeated runtime type dispatch.
+#[inline(always)]
+pub(in crate::execution) fn execute_heap_opcode<const OPCODE: u32>(
+    operation: Operation,
+    frame: &mut PreparedFrame<'_>,
+    image: &ExecutionImage,
+    heap: &mut Heap,
+) -> Result<(), InstructionFailure> {
+    let op = if OPCODE == 0 {
+        operation
+    } else {
+        Operation {
+            opcode: OPCODE,
+            ..operation
+        }
+    };
     let fault = InstructionFailure::Fault;
     macro_rules! read {
         ($ty:ty, $offset:expr) => {

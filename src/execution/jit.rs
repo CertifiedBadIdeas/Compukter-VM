@@ -145,14 +145,29 @@ fn slot_index(key: usize) -> usize {
     (mixed ^ (mixed >> 32)) as usize % SLOTS
 }
 
+pub(super) struct Location {
+    pub code_start: usize,
+    pub instruction: usize,
+    pub block_len: usize,
+}
+
+pub(super) struct HeapAccess<'a> {
+    pub image: &'a super::image::ExecutionImage,
+    pub heap: &'a mut super::heap::Heap,
+}
+
 pub(super) fn try_execute(
     code: &PreparedCode,
     frame: &mut PreparedFrame<'_>,
-    code_start: usize,
-    instruction: usize,
-    block_len: usize,
+    location: Location,
     budget: &RunBudget,
+    heap: Option<HeapAccess<'_>>,
 ) -> Option<SimpleRun> {
+    let Location {
+        code_start,
+        instruction,
+        block_len,
+    } = location;
     if budget.limit == 0 || budget.headroom == 0 {
         return None;
     }
@@ -178,7 +193,7 @@ pub(super) fn try_execute(
             return None;
         }
         // This borrow keeps the program, slot and executable module alive through the call.
-        let result = native.execute(frame, instruction);
+        let result = native.execute(frame, instruction, heap);
         owner.hits.fetch_add(1, Ordering::Relaxed);
         owner.attempts.fetch_add(result.attempts, Ordering::Relaxed);
         return Some(result);

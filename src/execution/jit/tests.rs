@@ -63,7 +63,7 @@ fn compare_run(
     let actual = if limit.min(headroom) >= compiled.len as u64
         && input.len() >= compiled.required_bytes as usize
     {
-        compiled.execute(&mut candidate, 0)
+        compiled.execute(&mut candidate, 0, None)
     } else {
         execute_run(
             code,
@@ -248,7 +248,17 @@ fn compiled_entry_checks_short_frames_budgets_and_accounting_headroom() {
             })
             .unwrap();
         for (limit, headroom) in [(3, 8), (8, 3), (4, 4)] {
-            let actual = try_execute(&code, &mut frame, 0, 0, 4, &RunBudget { limit, headroom });
+            let actual = try_execute(
+                &code,
+                &mut frame,
+                Location {
+                    code_start: 0,
+                    instruction: 0,
+                    block_len: 4,
+                },
+                &RunBudget { limit, headroom },
+                None,
+            );
             assert_eq!(
                 actual.is_some(),
                 capacity == 64 && limit >= 4 && headroom >= 4
@@ -282,13 +292,16 @@ fn hotness_publication_and_executable_lifetime_are_shared_across_threads() {
                     let _ = try_execute(
                         &code,
                         &mut frame,
-                        0,
-                        0,
-                        4,
+                        Location {
+                            code_start: 0,
+                            instruction: 0,
+                            block_len: 4,
+                        },
                         &RunBudget {
                             limit: 4,
                             headroom: 4,
                         },
+                        None,
                     );
                 }
             });
@@ -316,7 +329,7 @@ fn hotness_publication_and_executable_lifetime_are_shared_across_threads() {
             byte_len: 64,
         })
         .unwrap();
-    assert_eq!(native.execute(&mut frame, 0).attempts, 4);
+    assert_eq!(native.execute(&mut frame, 0, None).attempts, 4);
     assert_eq!(frame.read::<4>(0).unwrap(), 77_u32.to_le_bytes());
     drop(native);
     assert!(weak.upgrade().is_none());
@@ -336,7 +349,9 @@ fn jit_machine_matches_traces_and_checkpoint_bytes_at_slice_boundaries() {
         .into_iter()
         .map(|x| x.artifact)
         .collect();
+    let heap_fixture = artifacts.len();
     artifacts.extend([
+        fixtures::jit_heap_loop_artifact(),
         fixtures::jit_numeric_loop_artifact(),
         fixtures::nested_call_artifact(),
         fixtures::nested_fault_artifact(),
@@ -345,7 +360,7 @@ fn jit_machine_matches_traces_and_checkpoint_bytes_at_slice_boundaries() {
         fixtures::exception_artifact(true, true, false),
     ]);
     let mut hits = 0;
-    for artifact in artifacts {
+    for (artifact_index, artifact) in artifacts.into_iter().enumerate() {
         for traced in [false, true] {
             let image = ExecutionImage::admit(artifact.clone(), fixtures::profile()).unwrap();
             let mut a = if traced {
@@ -390,6 +405,12 @@ fn jit_machine_matches_traces_and_checkpoint_bytes_at_slice_boundaries() {
                     b.jit_enabled = true;
                 }
             }
+            if artifact_index == heap_fixture {
+                assert!(
+                    b.jit_statistics().hits > 0,
+                    "heap loop must execute generated code"
+                );
+            }
             hits += b.jit_statistics().hits;
         }
     }
@@ -405,3 +426,6 @@ fn executable_mapping_and_module_reservations_are_bounded() {
     assert!(!reserve_count(&count));
     assert_eq!(count.load(Ordering::Relaxed), MAX_MODULES);
 }
+
+#[path = "tests/heap.rs"]
+mod heap;

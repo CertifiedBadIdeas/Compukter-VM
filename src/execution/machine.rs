@@ -1,5 +1,5 @@
 #[path = "machine/prepared.rs"]
-mod prepared_execution;
+pub(super) mod prepared_execution;
 
 use super::{
     array_copy::PendingArrayCopy,
@@ -1430,10 +1430,16 @@ impl Machine {
                                 super::jit::try_execute(
                                     self.image.code(),
                                     &mut window,
-                                    code_start,
-                                    instruction_index,
-                                    block_len,
+                                    super::jit::Location {
+                                        code_start,
+                                        instruction: instruction_index,
+                                        block_len,
+                                    },
                                     &budget,
+                                    Some(super::jit::HeapAccess {
+                                        image: &self.image,
+                                        heap: &mut self.heap,
+                                    }),
                                 )
                             })
                             .flatten();
