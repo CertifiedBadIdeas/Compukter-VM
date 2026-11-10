@@ -348,6 +348,14 @@ overflow inside generated control flow and charge each entered block exactly onc
 Both kinds of entry use the existing prepared JIT lookup. Machine pays the first
 block; generated headers check and pay subsequent entries, including backedges.
 Region invocation state is constructed lazily only for a published region.
+Each planned block segment proves that its complete instruction count fits the
+remaining attempt limit and accounting headroom. A short segment budget returns
+through the shared state/frame epilogue, then the ordinary prepared interpreter
+executes the precise tail of that already-paid block. Fault guards retain exact
+instruction counts; neither a second block charge nor a duplicate native slow
+body is introduced. `jit-no-block-budget-untraced` keeps per-instruction native
+budget checks as a cold benchmark control. Native-attempt telemetry excludes
+instructions handled by the interpreted tail.
 An invocation-local stack record publishes remaining budget, exact block/instruction,
 attempts and fixed/block counters on every exit. Traced sessions retain the ordinary
 trace-preserving path; no native state is persisted. Checked division, Bool/Char and branch

@@ -10,7 +10,8 @@ use super::*;
 use crate::execution::frame::PreparedFrame;
 use crate::execution::prepared::{self as code, Operation};
 
-#[inline]
+// Preserve the hot interpreter dispatch when optional JIT tails add callers.
+#[inline(always)]
 pub(in crate::execution) fn execute_heap(
     operation: Operation,
     frame: &mut PreparedFrame<'_>,

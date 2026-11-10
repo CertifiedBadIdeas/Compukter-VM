@@ -24,6 +24,8 @@ mod access;
 #[cfg(feature = "jit-diagnostics")]
 mod dump;
 mod regions;
+#[cfg(feature = "guest-benchmark")]
+pub(super) use regions::benchmark_block_budget;
 pub(super) mod slots;
 pub(in crate::execution) use regions::{RegionRun, RunState};
 

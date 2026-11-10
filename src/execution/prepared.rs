@@ -786,7 +786,8 @@ pub(super) fn execute_run(
     }
 }
 
-#[inline]
+// Preserve the hot interpreter dispatch when optional JIT tails add callers.
+#[inline(always)]
 pub(super) fn execute_numeric(
     op: Operation,
     frame: &mut PreparedFrame<'_>,
@@ -909,7 +910,8 @@ pub(super) fn execute_numeric(
     }
 }
 
-#[inline]
+// Preserve the hot interpreter dispatch when optional JIT tails add callers.
+#[inline(always)]
 pub(super) fn execute_frame(
     op: Operation,
     frame: &mut PreparedFrame<'_>,

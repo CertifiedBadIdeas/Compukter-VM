@@ -480,3 +480,52 @@ fn connected_regions_match_every_retirement_cut_fixed_budget_and_fault_pc() {
         assert!(statistics(image.code()).hits > 0);
     }
 }
+
+#[test]
+fn capped_region_tails_match_machine_checkpoints_across_short_slices_and_restore() {
+    let image = ExecutionImage::admit(
+        fixtures::jit_large_region_artifact(true),
+        fixtures::profile(),
+    )
+    .unwrap();
+    let owner = image
+        .code()
+        .jit
+        .get_or_init(|| Arc::new(JitState::default()));
+    let compiled = Arc::new(
+        lower::compile(
+            lower::Plan::region(&image, 0).unwrap(),
+            Reservation::acquire().unwrap(),
+        )
+        .unwrap(),
+    );
+    let key = image.block(0).unwrap().code_start;
+    let slot = &owner.slots[slot_index(key)];
+    assert_eq!(slot.key.swap(key, Ordering::AcqRel), EMPTY);
+    slot.native.set(compiled).unwrap();
+    for limit in [1, 20, 127, 128, 129] {
+        let mut reference = Machine::new_untraced(image.clone()).unwrap();
+        let mut candidate = Machine::new_untraced(image.clone()).unwrap();
+        candidate.jit_enabled = true;
+        reference.start(&[]).unwrap();
+        candidate.start(&[]).unwrap();
+        for step in 0..600 {
+            let expected = reference.run_slice_with_retirement_limit(128, 8, limit);
+            let actual = candidate.run_slice_with_retirement_limit(128, 8, limit);
+            assert_eq!(
+                format!("{expected:?}"),
+                format!("{actual:?}"),
+                "limit={limit} step={step}"
+            );
+            let bytes = checkpoint(&candidate);
+            assert_eq!(checkpoint(&reference), bytes, "limit={limit} step={step}");
+            if step % 31 == 0 {
+                let mut reader = Reader::new(&bytes, 8 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
+                candidate.restore_checkpoint_state(&mut reader).unwrap();
+                reader.finish().unwrap();
+                candidate.jit_enabled = true;
+            }
+        }
+    }
+    assert!(statistics(image.code()).hits > 0);
+}

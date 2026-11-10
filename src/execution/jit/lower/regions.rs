@@ -8,6 +8,26 @@ use super::*;
 use crate::execution::image::ExecutionImage;
 use cranelift_codegen::ir::Block;
 
+// A cold compilation choice, absent from the generated hot path.
+#[cfg(feature = "guest-benchmark")]
+static BLOCK_BUDGET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(feature = "guest-benchmark")]
+pub(in crate::execution) fn benchmark_block_budget(enabled: bool) {
+    BLOCK_BUDGET.store(enabled, Ordering::Relaxed);
+}
+
+fn block_budget_enabled() -> bool {
+    #[cfg(feature = "guest-benchmark")]
+    {
+        BLOCK_BUDGET.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "guest-benchmark"))]
+    {
+        true
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct RegionBlock {
     id: usize,
@@ -191,13 +211,96 @@ pub(in crate::execution) struct RegionRun {
     pub exhausted: bool,
     pub failure: Option<InstructionFailure>,
 }
+// Compiler telemetry is consumed by JitState before the Machine dispatcher.
+// Keep it outside RegionRun so prefix dispatch retains its original enum layout.
+pub(in crate::execution) struct RegionExecution {
+    pub run: RegionRun,
+    pub native_attempts: u64,
+    needs_tail: bool,
+}
+
+impl RegionExecution {
+    pub(in crate::execution) fn finish(
+        mut self,
+        frame: &mut PreparedFrame<'_>,
+        heap: HeapAccess<'_>,
+    ) -> RegionRun {
+        if self.needs_tail {
+            self.run.finish_tail(frame, heap);
+        }
+        self.run
+    }
+}
+
+impl RegionRun {
+    // Keep the rare short-budget continuation outside the native entry wrapper:
+    // normal entry must not preserve frame/image/heap for an interpreter call.
+    #[cold]
+    #[inline(never)]
+    fn finish_tail(&mut self, frame: &mut PreparedFrame<'_>, heap: HeapAccess<'_>) {
+        let block = heap
+            .image
+            .block(self.state.block as usize)
+            .expect("verified region exit");
+        self.interpret_tail(
+            heap.image.code(),
+            frame,
+            block.code_start,
+            block.instruction_count,
+            heap,
+        );
+    }
+
+    // Native code has returned and materialized its frame. This block was
+    // already paid; execute_run performs only its remaining instructions.
+    fn interpret_tail(
+        &mut self,
+        code: &PreparedCode,
+        frame: &mut PreparedFrame<'_>,
+        code_start: usize,
+        block_len: usize,
+        heap: HeapAccess<'_>,
+    ) {
+        let run = crate::execution::prepared::execute_run(
+            code,
+            frame,
+            code_start,
+            self.state.instruction as usize,
+            block_len,
+            RunBudget {
+                limit: self.state.limit - self.state.attempts,
+                headroom: self.state.headroom - self.state.attempts,
+            },
+            |operation, frame| {
+                crate::execution::machine::prepared_execution::execute_heap(
+                    operation, frame, heap.image, heap.heap,
+                )
+            },
+        );
+        self.state.attempts += run.attempts;
+        self.state.instruction = run.instruction as u64;
+        match run.end {
+            RunEnd::Boundary => {
+                self.exhausted = self.state.attempts == self.state.limit
+                    && self.state.instruction < block_len as u64;
+            }
+            RunEnd::Branch(target) => {
+                self.state.block = target as u64;
+                self.state.instruction = 0;
+                self.exhausted = self.state.attempts == self.state.limit;
+            }
+            RunEnd::Failure(failure) => self.failure = Some(failure),
+        }
+    }
+}
+
 impl CompiledRun {
     pub(in super::super) fn execute_region(
         &self,
         frame: &mut PreparedFrame<'_>,
         heap: HeapAccess<'_>,
         mut state: RunState,
-    ) -> RegionRun {
+    ) -> RegionExecution {
         assert!(self.region && frame.jit_bytes().len() >= self.required_bytes as usize);
         let (status, failure) =
             self.invoke(frame, Some(heap), (&mut state as *mut RunState).cast());
@@ -209,17 +312,21 @@ impl CompiledRun {
             }
         }
         let failure = match reason {
-            0 | 5 => None,
+            0 | 5 | 7 => None,
             2 => Some(InstructionFailure::Fault(VmFault::InvalidValueType)),
             3 => Some(InstructionFailure::Trap(GuestTrap::DivisionByZero)),
             4 => Some(failure.expect("checked callout failure")),
             6 => Some(InstructionFailure::Fault(VmFault::AccountingOverflow)),
             _ => unreachable!("private region status"),
         };
-        RegionRun {
-            state,
-            exhausted: reason == 5,
-            failure,
+        RegionExecution {
+            native_attempts: state.attempts,
+            needs_tail: reason == 7,
+            run: RegionRun {
+                state,
+                exhausted: reason == 5,
+                failure,
+            },
         }
     }
 }
@@ -287,6 +394,7 @@ fn edge(
 
 pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state: Value) {
     let plan = emitter.plan;
+    let block_budget = block_budget_enabled();
     // Status, four counters and the exact Guest block/instruction are published
     // once after every side exit, before the shared frame epilogue.
     let publish = b.create_block();
@@ -368,17 +476,34 @@ pub(super) fn emit(b: &mut FunctionBuilder<'_>, emitter: &mut Emitter<'_>, state
         b.ins().jump(body, &arguments(exit.counts));
         b.switch_to_block(body);
         exit.counts = std::array::from_fn(|i| b.block_params(body)[i]);
+        if block_budget {
+            // attempts never exceeds either bound: entry starts at zero and
+            // each preceding block proved its complete segment fits.
+            let attempts_left = b.ins().isub(limit, exit.counts[0]);
+            let headroom_left = b.ins().isub(headroom, exit.counts[0]);
+            let length = (region.end - region.start) as i64;
+            let short_attempts = b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, attempts_left, length);
+            let short_headroom = b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, headroom_left, length);
+            let short = b.ins().bor(short_attempts, short_headroom);
+            exit.check(b, short, 7);
+        }
         let mut terminated = false;
         for pc in region.start..region.end {
             exit.instruction = pc - region.start;
-            let stopped = b
-                .ins()
-                .icmp(IntCC::UnsignedGreaterThanOrEqual, exit.counts[0], limit);
-            exit.check(b, stopped, 5);
-            let overflow =
-                b.ins()
-                    .icmp(IntCC::UnsignedGreaterThanOrEqual, exit.counts[0], headroom);
-            exit.check(b, overflow, 6);
+            if !block_budget {
+                let stopped =
+                    b.ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, exit.counts[0], limit);
+                exit.check(b, stopped, 5);
+                let overflow =
+                    b.ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, exit.counts[0], headroom);
+                exit.check(b, overflow, 6);
+            }
             exit.counts[0] = b.ins().iadd_imm_s(exit.counts[0], 1);
             let op = plan.ops[pc];
             if matches!(op.opcode, JUMP | BRANCH) {
@@ -498,7 +623,7 @@ mod tests {
             |_, _| unreachable!(),
         );
         let mut heap = Heap::new(&image.storage_plan()).unwrap();
-        let actual = compiled.execute_region(
+        let mut execution = compiled.execute_region(
             &mut candidate,
             HeapAccess {
                 image,
@@ -506,6 +631,22 @@ mod tests {
             },
             RunState::new(limit, headroom, 999, 11, 3),
         );
+        let actual = &mut execution.run;
+        if execution.needs_tail {
+            assert_eq!(execution.native_attempts, 0);
+            actual.interpret_tail(
+                code,
+                &mut candidate,
+                0,
+                compiled.len,
+                HeapAccess {
+                    image,
+                    heap: &mut heap,
+                },
+            );
+        } else {
+            assert_eq!(execution.native_attempts, actual.state.attempts);
+        }
         let failure = match &expected.end {
             RunEnd::Failure(failure) => Some(failure_signature(failure)),
             RunEnd::Boundary => None,
@@ -663,6 +804,83 @@ mod tests {
     }
 
     #[test]
+    fn short_entry_tail_preserves_paid_counters_and_native_attempt_telemetry() {
+        let image = ExecutionImage::admit(
+            fixtures::jit_connected_loop_artifact(false),
+            fixtures::profile(),
+        )
+        .unwrap();
+        let block = image.block(0).unwrap();
+        let compiled = compile(
+            Plan::region(&image, 0).unwrap(),
+            Reservation::acquire().unwrap(),
+        )
+        .unwrap();
+        for limit in 1..block.instruction_count as u64 {
+            for headroom in 0..block.instruction_count as u64 {
+                let mut a = backed_arena(128);
+                let mut b = backed_arena(128);
+                let reservation = FrameReservation {
+                    base: 0,
+                    byte_len: 128,
+                };
+                let mut reference = a.prepared_frame(reservation).unwrap();
+                let mut candidate = b.prepared_frame(reservation).unwrap();
+                let expected = execute_run(
+                    image.code(),
+                    &mut reference,
+                    block.code_start,
+                    0,
+                    block.instruction_count,
+                    RunBudget { limit, headroom },
+                    |_, _| unreachable!(),
+                );
+                let mut heap = Heap::new(&image.storage_plan()).unwrap();
+                let execution = compiled.execute_region(
+                    &mut candidate,
+                    HeapAccess {
+                        image: &image,
+                        heap: &mut heap,
+                    },
+                    RunState::new(limit, headroom, 999, 11, 3),
+                );
+                assert_eq!(
+                    execution.native_attempts, 0,
+                    "short entry is interpreted after native return"
+                );
+                let actual = execution.finish(
+                    &mut candidate,
+                    HeapAccess {
+                        image: &image,
+                        heap: &mut heap,
+                    },
+                );
+                assert_eq!(actual.state.attempts, expected.attempts);
+                assert_eq!(actual.state.instruction, expected.instruction as u64);
+                assert_eq!(
+                    (
+                        actual.state.remaining,
+                        actual.state.fixed,
+                        actual.state.blocks
+                    ),
+                    (999, 11, 3)
+                );
+                let failure = match &expected.end {
+                    RunEnd::Failure(failure) => Some(failure_signature(failure)),
+                    RunEnd::Boundary => None,
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual.failure.as_ref().map(failure_signature), failure);
+                assert_eq!(
+                    actual.exhausted,
+                    failure.is_none() && expected.attempts == limit
+                );
+                assert_eq!(reference.jit_bytes(), candidate.jit_bytes());
+            }
+        }
+    }
+
+    #[test]
     fn short_acyclic_bridges_keep_prefixes_while_long_chains_and_cycles_compile() {
         let image = ExecutionImage::admit(
             fixtures::jit_large_region_artifact(false),
@@ -708,14 +926,22 @@ mod tests {
                 })
                 .unwrap();
             let mut heap = Heap::new(&image.storage_plan()).unwrap();
-            let result = compiled.execute_region(
-                &mut frame,
-                HeapAccess {
-                    image: &image,
-                    heap: &mut heap,
-                },
-                RunState::new(1000, 1000, 10000, 0, 0),
-            );
+            let result = compiled
+                .execute_region(
+                    &mut frame,
+                    HeapAccess {
+                        image: &image,
+                        heap: &mut heap,
+                    },
+                    RunState::new(1000, 1000, 10000, 0, 0),
+                )
+                .finish(
+                    &mut frame,
+                    HeapAccess {
+                        image: &image,
+                        heap: &mut heap,
+                    },
+                );
             assert!(!result.exhausted && result.failure.is_none());
             assert_eq!((result.state.block, result.state.instruction), expected);
             assert_eq!(result.state.attempts, compiled.len as u64);
@@ -734,6 +960,7 @@ mod tests {
             Reservation::acquire().unwrap(),
         )
         .unwrap();
+        let mut saw_native_then_tail = false;
         for (fixed, blocks) in [
             (0, 0),
             (u64::MAX, 0),
@@ -823,7 +1050,7 @@ mod tests {
                             break;
                         }
                     }
-                    let actual = compiled.execute_region(
+                    let execution = compiled.execute_region(
                         &mut frame,
                         HeapAccess {
                             image: &image,
@@ -831,6 +1058,17 @@ mod tests {
                         },
                         RunState::new(limit, headroom, 1000, fixed, blocks),
                     );
+                    let native_attempts = execution.native_attempts;
+                    let actual = execution.finish(
+                        &mut frame,
+                        HeapAccess {
+                            image: &image,
+                            heap: &mut heap,
+                        },
+                    );
+                    assert!(native_attempts <= actual.state.attempts);
+                    saw_native_then_tail |=
+                        native_attempts > 0 && native_attempts < actual.state.attempts;
                     assert_eq!(actual.exhausted, expected_reason == 5);
                     assert_eq!(actual.failure.is_some(), expected_reason == 6);
                     if let Some(failure) = actual.failure {
@@ -858,5 +1096,9 @@ mod tests {
                 }
             }
         }
+        assert!(
+            saw_native_then_tail,
+            "cuts must exercise materialization before an interpreted tail"
+        );
     }
 }

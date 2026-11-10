@@ -356,6 +356,12 @@ fn main() {
             JIT_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
             false
         }
+        #[cfg(feature = "baseline-jit")]
+        "jit-no-block-budget-untraced" => {
+            execution::jit::benchmark_block_budget(false);
+            JIT_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
         _ => panic!("expected traced or untraced"),
     };
     let filters: Vec<_> = args

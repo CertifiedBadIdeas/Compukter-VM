@@ -23,6 +23,10 @@ mod lower;
 pub(crate) fn benchmark_ssa(enabled: bool) {
     lower::slots::benchmark_enabled(enabled);
 }
+#[cfg(feature = "guest-benchmark")]
+pub(crate) fn benchmark_block_budget(enabled: bool) {
+    lower::benchmark_block_budget(enabled);
+}
 pub(super) use lower::RunState;
 const SLOTS: usize = 256;
 const HOT: u32 = 64;
@@ -215,7 +219,16 @@ pub(super) fn try_execute(
             let heap = heap?;
             #[cfg(feature = "jit-diagnostics")]
             let image = heap.image;
-            let result = native.execute_region(frame, heap, state);
+            let execution = native.execute_region(
+                frame,
+                HeapAccess {
+                    image: heap.image,
+                    heap: &mut *heap.heap,
+                },
+                state,
+            );
+            let native_attempts = execution.native_attempts;
+            let result = execution.finish(frame, heap);
             #[cfg(feature = "jit-diagnostics")]
             {
                 let category = if result.failure.is_some() {
@@ -240,9 +253,7 @@ pub(super) fn try_execute(
                 owner.exits[category].fetch_add(1, Ordering::Relaxed);
             }
             owner.hits.fetch_add(1, Ordering::Relaxed);
-            owner
-                .attempts
-                .fetch_add(result.state.attempts, Ordering::Relaxed);
+            owner.attempts.fetch_add(native_attempts, Ordering::Relaxed);
             return Some(Execution::Region(result));
         }
         if native.len > block_len.checked_sub(instruction)?
