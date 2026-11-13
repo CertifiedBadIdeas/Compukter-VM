@@ -145,6 +145,8 @@ fn slot() -> Slot {
         key: AtomicUsize::new(0),
         progress: AtomicU64::new(COLD),
         native: OnceLock::new(),
+        #[cfg(feature = "jit-admission-diagnostics")]
+        first_request_ns: AtomicU64::new(0),
     }
 }
 

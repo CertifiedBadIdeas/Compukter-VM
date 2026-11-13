@@ -18,6 +18,8 @@ use super::{
     prepared::{PreparedCode, RunBudget, RunEnd, SimpleRun},
 };
 
+#[cfg(feature = "jit-admission-diagnostics")]
+mod admission;
 mod lower;
 mod resources;
 use resources::{Denied, ProgramBudget, Reservation, Scope, MODULE_BYTES};
@@ -47,6 +49,8 @@ struct Slot {
     // [epoch/visits:32][unused:20][queue backoff:4][state:8]
     progress: AtomicU64,
     native: OnceLock<Arc<lower::CompiledRun>>,
+    #[cfg(feature = "jit-admission-diagnostics")]
+    first_request_ns: AtomicU64,
 }
 
 #[cfg(feature = "jit-diagnostics")]
@@ -61,6 +65,8 @@ pub(super) struct JitState {
     hits: AtomicU64,
     attempts: AtomicU64,
     compile_ns: AtomicU64,
+    #[cfg(feature = "jit-admission-diagnostics")]
+    admission: admission::Counters,
     failures: AtomicU64,
     #[cfg(feature = "jit-diagnostics")]
     exits: [AtomicU64; 6],
@@ -76,12 +82,16 @@ impl Default for JitState {
                     key: AtomicUsize::new(EMPTY),
                     progress: AtomicU64::new(COLD),
                     native: OnceLock::new(),
+                    #[cfg(feature = "jit-admission-diagnostics")]
+                    first_request_ns: AtomicU64::new(0),
                 })
                 .collect(),
             budget: Arc::new(ProgramBudget::default()),
             hits: AtomicU64::new(0),
             attempts: AtomicU64::new(0),
             compile_ns: AtomicU64::new(0),
+            #[cfg(feature = "jit-admission-diagnostics")]
+            admission: Default::default(),
             failures: AtomicU64::new(0),
             #[cfg(feature = "jit-diagnostics")]
             exits: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -171,6 +181,10 @@ struct Job {
     slot: usize,
     plan: lower::Plan,
     reservation: Reservation,
+    #[cfg(feature = "jit-admission-diagnostics")]
+    queued_ns: u64,
+    #[cfg(feature = "jit-admission-diagnostics")]
+    requested_ns: u64,
 }
 
 fn compiler() -> Option<&'static SyncSender<Job>> {
@@ -183,15 +197,32 @@ fn compiler() -> Option<&'static SyncSender<Job>> {
                 .spawn(move || {
                     while let Ok(job) = receiver.recv() {
                         if job.owner.strong_count() == 0 {
+                            #[cfg(feature = "jit-admission-diagnostics")]
+                            admission::CANCELED.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
+                        #[cfg(feature = "jit-admission-diagnostics")]
+                        let start_ns = admission::now();
+                        #[cfg(feature = "jit-admission-diagnostics")]
+                        let cpu_start = admission::cpu_ns();
                         let start = std::time::Instant::now();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             lower::compile(job.plan, job.reservation)
                         }))
                         .unwrap_or_else(|_| Err("compiler panicked".into()));
+                        #[cfg(feature = "jit-admission-diagnostics")]
+                        let cpu_elapsed = admission::cpu_ns().saturating_sub(cpu_start);
                         // Do not pin an otherwise dead program during compilation.
                         if let Some(owner) = job.owner.upgrade() {
+                            #[cfg(feature = "jit-admission-diagnostics")]
+                            {
+                                let c = &owner.admission;
+                                c.started.fetch_add(1, Ordering::Relaxed);
+                                let wait = start_ns.saturating_sub(job.queued_ns);
+                                c.queue_wait_ns.fetch_add(wait, Ordering::Relaxed);
+                                c.queue_wait_max_ns.fetch_max(wait, Ordering::Relaxed);
+                                c.compile_cpu_ns.fetch_add(cpu_elapsed, Ordering::Relaxed);
+                            }
                             owner.compile_ns.fetch_add(
                                 start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                                 Ordering::Relaxed,
@@ -199,6 +230,21 @@ fn compiler() -> Option<&'static SyncSender<Job>> {
                             match result {
                                 Ok(run) => {
                                     let _ = owner.slots[job.slot].native.set(Arc::new(run));
+                                    #[cfg(feature = "jit-admission-diagnostics")]
+                                    {
+                                        let now = admission::now();
+                                        let c = &owner.admission;
+                                        c.published.fetch_add(1, Ordering::Relaxed);
+                                        let wait = now.saturating_sub(job.requested_ns);
+                                        c.request_wait_ns.fetch_add(wait, Ordering::Relaxed);
+                                        c.request_wait_max_ns.fetch_max(wait, Ordering::Relaxed);
+                                        let _ = c.first_published_ns.compare_exchange(
+                                            0,
+                                            now,
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
                                 }
                                 Err(_) => {
                                     owner.failures.fetch_add(1, Ordering::Relaxed);
@@ -207,6 +253,9 @@ fn compiler() -> Option<&'static SyncSender<Job>> {
                             owner.slots[job.slot]
                                 .progress
                                 .store(FINISHED, Ordering::Release);
+                        } else {
+                            #[cfg(feature = "jit-admission-diagnostics")]
+                            admission::CANCELED.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 })
@@ -342,9 +391,29 @@ pub(super) fn try_execute(
     if !slot.try_queue(&owner.budget) {
         return None;
     }
+    #[cfg(feature = "jit-admission-diagnostics")]
+    {
+        let now = admission::now();
+        owner.admission.requests.fetch_add(1, Ordering::Relaxed);
+        let _ =
+            slot.first_request_ns
+                .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = owner.admission.first_requested_ns.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
     let reservation = match Reservation::try_acquire(owner.budget.clone()) {
         Ok(reservation) => reservation,
         Err(denied) => {
+            #[cfg(feature = "jit-admission-diagnostics")]
+            match denied.scope {
+                Scope::Global => &owner.admission.denied_global,
+                Scope::Program => &owner.admission.denied_program,
+            }
+            .fetch_add(1, Ordering::Relaxed);
             slot.defer(denied);
             return None;
         }
@@ -356,20 +425,45 @@ pub(super) fn try_execute(
                 .and_then(|access| lower::Plan::region(access.image, block))
         })
         .or_else(|| lower::Plan::read(code, key, block_len.saturating_sub(instruction)));
+    #[cfg(feature = "jit-admission-diagnostics")]
+    if plan.is_none() {
+        owner.admission.unsupported.fetch_add(1, Ordering::Relaxed);
+    }
     let submitted = plan.and_then(|plan| {
         Some(compiler()?.try_send(Job {
             owner: Arc::downgrade(owner),
             slot: index,
             plan,
             reservation,
+            #[cfg(feature = "jit-admission-diagnostics")]
+            queued_ns: admission::now(),
+            #[cfg(feature = "jit-admission-diagnostics")]
+            requested_ns: slot.first_request_ns.load(Ordering::Relaxed),
         }))
     });
     match submitted {
-        Some(Ok(())) => {}
-        Some(Err(std::sync::mpsc::TrySendError::Full(_))) => slot.retry_queue(),
+        Some(Ok(())) => {
+            #[cfg(feature = "jit-admission-diagnostics")]
+            owner.admission.submitted.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(Err(std::sync::mpsc::TrySendError::Full(_))) => {
+            #[cfg(feature = "jit-admission-diagnostics")]
+            owner.admission.queue_full.fetch_add(1, Ordering::Relaxed);
+            slot.retry_queue();
+        }
         _ => slot.progress.store(FINISHED, Ordering::Release),
     }
     None
+}
+
+#[cfg(all(feature = "jit-admission-diagnostics", feature = "guest-benchmark"))]
+pub(crate) fn admission_header() -> &'static str {
+    admission::Snapshot::header()
+}
+
+#[cfg(all(feature = "jit-admission-diagnostics", feature = "guest-benchmark"))]
+pub(crate) fn canceled_jobs() -> u64 {
+    admission::CANCELED.load(Ordering::Relaxed)
 }
 
 pub(super) enum Execution {
@@ -391,6 +485,8 @@ pub(crate) fn benchmark_resources() -> (usize, usize, usize) {
 /// Benchmark telemetry is shared per program, not retained per machine.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Statistics {
+    #[cfg(feature = "jit-admission-diagnostics")]
+    pub admission: admission::Snapshot,
     pub tracked: usize,
     pub compiled: usize,
     pub regions: usize,
@@ -399,6 +495,10 @@ pub(crate) struct Statistics {
     pub wait_global: usize,
     #[cfg(feature = "guest-benchmark")]
     pub wait_program: usize,
+    #[cfg(feature = "guest-benchmark")]
+    pub queue_delayed: usize,
+    #[cfg(feature = "guest-benchmark")]
+    pub queue_retry_visits: u64,
     #[cfg(feature = "guest-benchmark")]
     pub reserved_bytes: usize,
     #[cfg(feature = "guest-benchmark")]
@@ -419,6 +519,8 @@ pub(super) fn statistics(code: &PreparedCode) -> Statistics {
         return Statistics::default();
     };
     let mut result = Statistics {
+        #[cfg(feature = "jit-admission-diagnostics")]
+        admission: owner.admission.snapshot(),
         #[cfg(feature = "jit-diagnostics")]
         exits: std::array::from_fn(|i| owner.exits[i].load(Ordering::Relaxed)),
         hot_telemetry: cfg!(any(test, feature = "jit-telemetry")),
@@ -444,6 +546,13 @@ pub(super) fn statistics(code: &PreparedCode) -> Statistics {
         {
             result.wait_global += usize::from(status == WAIT_GLOBAL);
             result.wait_program += usize::from(status == WAIT_PROGRAM);
+            let progress = slot.progress.load(Ordering::Relaxed);
+            if progress & 0xff == COLD && progress & 0xf00 != 0 {
+                result.queue_delayed += 1;
+                result.queue_retry_visits += u64::from(
+                    (HOT << ((progress >> 8) & 0xf)).saturating_sub((progress >> 32) as u32),
+                );
+            }
         }
         if let Some(native) = slot.native.get() {
             result.compiled += 1;

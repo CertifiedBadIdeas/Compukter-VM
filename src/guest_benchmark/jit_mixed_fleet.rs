@@ -230,7 +230,11 @@ pub(super) fn main(args: &[String]) {
     let mut groups: Vec<Vec<(usize, Session)>> = (0..workers).map(|_| Vec::new()).collect();
     let create = Instant::now();
     for index in 0..population {
-        let program = index % programs;
+        let program = if reverse {
+            programs - 1 - index % programs
+        } else {
+            index % programs
+        };
         let mut session = admit(&cases[program], heap, false);
         session.start(&[]).unwrap();
         let (ready, task, text) = request(&mut session);
@@ -313,6 +317,29 @@ pub(super) fn main(args: &[String]) {
     )
     .unwrap();
     fs::write(outputs.join("jit.tsv"), telemetry).unwrap();
+    #[cfg(feature = "jit-admission-diagnostics")]
+    {
+        let mut rows = format!(
+            "id\t{}\tqueue_delayed\tqueue_retry_visits\n",
+            execution::jit::admission_header()
+        );
+        for (case, probe) in cases.iter().zip(&probes) {
+            let s = probe.jit_statistics();
+            rows.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                case.id,
+                s.admission.row(),
+                s.queue_delayed,
+                s.queue_retry_visits
+            ));
+        }
+        fs::write(outputs.join("admission.tsv"), rows).unwrap();
+        fs::write(
+            outputs.join("compiler.tsv"),
+            format!("canceled_jobs\n{}\n", execution::jit::canceled_jobs()),
+        )
+        .unwrap();
+    }
     let mut batch_rows = String::from("batch\twall_ns\tcpu_ns\tworker_max_wall_ns\tretired\n");
     for (batch, wall) in walls.into_iter().enumerate() {
         let selected: Vec<_> = measurements.iter().filter(|s| s.0 == batch).collect();
