@@ -62,6 +62,8 @@ use terminal::*;
 use verify::verify_artifact;
 
 const SLICE: u32 = 4096;
+#[path = "guest_benchmark/profile.rs"]
+mod profile;
 #[cfg(feature = "baseline-jit")]
 static JIT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -425,11 +427,25 @@ fn main() {
             "no cases for {filter}"
         );
     }
+    let profiler = profile::Profile::from_environment();
+    if profiler.is_some() {
+        assert_eq!(
+            cases.len(),
+            1,
+            "external profiling requires one selected case"
+        );
+    }
     #[cfg(feature = "baseline-jit")]
     let mut cold_report = String::from("id\tcreate_ns\thot_ns\tcreate_cpu_ns\thot_cpu_ns\n");
     // Cross-check the production path against traced semantics before timing samples.
     for case in &cases {
+        if let Some(profiler) = &profiler {
+            profiler.wait("cold");
+        }
         let warmup = run(case, heap, traced);
+        if let Some(profiler) = &profiler {
+            profiler.wait("cold-done");
+        }
         #[cfg(feature = "baseline-jit")]
         cold_report.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\n",
@@ -463,6 +479,20 @@ fn main() {
                 std::thread::yield_now();
             }
             let s = probe.jit_statistics();
+            #[cfg(feature = "jit-diagnostics")]
+            {
+                fs::create_dir_all(outputs).expect("diagnostic output directory");
+                fs::write(
+                    outputs.join(format!("{}-calls-warm.tsv", case.id)),
+                    probe.jit_call_report(),
+                )
+                .expect("warm call diagnostics");
+                fs::write(
+                    outputs.join(format!("{}-exits-warm.tsv", case.id)),
+                    s.exits.map(|value| value.to_string()).join("\t") + "\n",
+                )
+                .expect("warm exit diagnostics");
+            }
             jit_report.push_str(&format!(
                 "{}\twarmup\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.id,
@@ -480,6 +510,9 @@ fn main() {
                 s.hot_telemetry
             ));
         }
+    }
+    if let Some(profiler) = &profiler {
+        profiler.wait("warm");
     }
     let mut raw = String::from(
         "id\tmode\tsample\theap_bytes\tcreate_ns\thot_ns\tcreate_cpu_ns\thot_cpu_ns\n",
@@ -519,6 +552,9 @@ fn main() {
             case.samples.push(measurement);
         }
         eprintln!("measurement round {}/{} complete", sample + 1, repetitions);
+    }
+    if let Some(profiler) = &profiler {
+        profiler.wait("done");
     }
     let mut summary = String::from("id\tmode\tsamples\theap_bytes\tcreate_median_ns\thot_min_ns\thot_median_ns\thot_max_ns\thot_fixed_units\thot_dynamic_units\thot_maintenance_units\thot_blocks\thot_executed_instructions\thot_retired_instructions\thot_requests\thot_responses\tcreate_cpu_median_ns\thot_cpu_median_ns\n");
     for case in cases {
