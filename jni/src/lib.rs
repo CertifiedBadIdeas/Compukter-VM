@@ -16,6 +16,9 @@
  * limitations under the License.
  */
 
+mod advance_scratch;
+
+use advance_scratch::AdvanceScratchPool;
 use compukter_ffi::{
     compukter_abi_version, compukter_advance, compukter_advance_with_retirement_limit,
     compukter_checkpoint_discard, compukter_checkpoint_host_copy, compukter_checkpoint_host_size,
@@ -43,6 +46,7 @@ use jni::{
 };
 
 const INVALID_ARGUMENT: jint = FfiStatus::InvalidArgument as jint;
+static ADVANCE_SCRATCH: AdvanceScratchPool = AdvanceScratchPool::new(8);
 
 fn bytes(env: &Env<'_>, value: &JByteArray<'_>) -> Result<Vec<u8>> {
     env.convert_byte_array(value)
@@ -74,10 +78,37 @@ fn output_call(
     written_out: &JLongArray<'_>,
     call: impl FnOnce(*mut u8, usize, *mut usize) -> FfiStatus,
 ) -> Result<jint> {
+    output_call_with_reuse(env, output, written_out, false, call)
+}
+
+fn output_call_with_reuse(
+    env: &Env<'_>,
+    output: &JByteArray<'_>,
+    written_out: &JLongArray<'_>,
+    reuse_advance: bool,
+    call: impl FnOnce(*mut u8, usize, *mut usize) -> FfiStatus,
+) -> Result<jint> {
     if written_out.len(env)? != 1 {
         return Ok(INVALID_ARGUMENT);
     }
-    let mut buffer = vec![0; output.len(env)?];
+    let size = output.len(env)?;
+    if reuse_advance && size == compukter_max_outcome_bytes() {
+        // Both advance FFI functions initialize every byte they report as written.
+        // Only that prefix is copied to Java, so retained bytes never escape.
+        let mut scratch = ADVANCE_SCRATCH.lease(size);
+        return output_call_into(env, output, written_out, scratch.bytes(), call);
+    }
+    let mut buffer = vec![0; size];
+    output_call_into(env, output, written_out, &mut buffer, call)
+}
+
+fn output_call_into(
+    env: &Env<'_>,
+    output: &JByteArray<'_>,
+    written_out: &JLongArray<'_>,
+    buffer: &mut [u8],
+    call: impl FnOnce(*mut u8, usize, *mut usize) -> FfiStatus,
+) -> Result<jint> {
     let mut written = 0usize;
     let status = call(buffer.as_mut_ptr(), buffer.len(), &mut written);
     write_long(env, written_out, written)?;
@@ -730,17 +761,23 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_adva
     written: JLongArray<'caller>,
 ) -> jint {
     status(&mut env, |env| {
-        output_call(env, &output, &written, |out, capacity, count| unsafe {
-            compukter_advance(
-                handle as u64,
-                guest_budget as u32,
-                maintenance_budget as u32,
-                host_request_budget as u32,
-                out,
-                capacity,
-                count,
-            )
-        })
+        output_call_with_reuse(
+            env,
+            &output,
+            &written,
+            true,
+            |out, capacity, count| unsafe {
+                compukter_advance(
+                    handle as u64,
+                    guest_budget as u32,
+                    maintenance_budget as u32,
+                    host_request_budget as u32,
+                    out,
+                    capacity,
+                    count,
+                )
+            },
+        )
     })
 }
 
@@ -764,19 +801,25 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniNative_adva
             return Ok(INVALID_ARGUMENT);
         }
         let mut retired = 0_u64;
-        let result = output_call(env, &output, &written, |out, capacity, count| unsafe {
-            compukter_advance_with_retirement_limit(
-                handle as u64,
-                guest_budget as u32,
-                maintenance_budget as u32,
-                host_request_budget as u32,
-                retirement_limit as u32,
-                out,
-                capacity,
-                count,
-                &mut retired,
-            )
-        })?;
+        let result = output_call_with_reuse(
+            env,
+            &output,
+            &written,
+            true,
+            |out, capacity, count| unsafe {
+                compukter_advance_with_retirement_limit(
+                    handle as u64,
+                    guest_budget as u32,
+                    maintenance_budget as u32,
+                    host_request_budget as u32,
+                    retirement_limit as u32,
+                    out,
+                    capacity,
+                    count,
+                    &mut retired,
+                )
+            },
+        )?;
         if result == FfiStatus::Ok as jint {
             write_long(env, &retired_out, retired as usize)?;
         }
