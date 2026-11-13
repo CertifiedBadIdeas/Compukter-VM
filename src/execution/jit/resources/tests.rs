@@ -160,30 +160,78 @@ fn deferred_hot_code_retries_after_release_even_before_wait_is_published() {
     let waiting = slot();
     waiting.defer(denied);
     for _ in 0..HOT * 2 {
-        assert!(!waiting.try_queue(&b));
+        assert!(!waiting.try_queue(&b, &QUEUE.epoch));
     }
     assert_eq!(waiting.status(), WAIT_GLOBAL);
     drop(occupied);
-    assert!(!waiting.try_queue(&b)); // Reheat after release; do not compile immediately.
-    assert!((0..HOT).any(|_| waiting.try_queue(&b)));
+    assert!(!waiting.try_queue(&b, &QUEUE.epoch)); // Reheat after release; do not compile immediately.
+    assert!((0..HOT).any(|_| waiting.try_queue(&b, &QUEUE.epoch)));
 
     let occupied = Reservation::try_acquire(b.clone()).unwrap();
     let denied = Reservation::try_acquire(b.clone()).unwrap_err();
     drop(occupied); // Release races ahead of publishing the deferred state.
     waiting.defer(denied);
-    assert!(!waiting.try_queue(&b));
-    assert!((0..HOT).any(|_| waiting.try_queue(&b)));
+    assert!(!waiting.try_queue(&b, &QUEUE.epoch));
+    assert!((0..HOT).any(|_| waiting.try_queue(&b, &QUEUE.epoch)));
 }
 
 #[test]
-fn queue_backoff_stays_bounded_without_permanently_disabling_hot_code() {
+fn full_queue_retries_after_one_dequeue_without_reheating() {
     let program = ProgramBudget::default();
     let slot = slot();
-    for _ in 0..12 {
-        slot.retry_queue();
-        assert!((0..=HOT << 8).any(|_| slot.try_queue(&program)));
-        assert_eq!(slot.status(), QUEUED);
+    let epoch = AtomicU32::new(0);
+    let (sender, receiver) = sync_channel(1);
+    sender.try_send(()).unwrap();
+    assert!((0..HOT).any(|_| slot.try_queue(&program, &epoch)));
+    let observed = epoch.load(Ordering::Acquire);
+    assert!(matches!(
+        sender.try_send(()),
+        Err(std::sync::mpsc::TrySendError::Full(()))
+    ));
+    slot.retry_queue(observed);
+    for _ in 0..16384 {
+        assert!(!slot.try_queue(&program, &epoch));
     }
+    receiver.recv().unwrap();
+    epoch.fetch_add(1, Ordering::Release);
+    assert!(slot.try_queue(&program, &epoch));
+    assert!(!slot.try_queue(&program, &epoch));
+    sender.try_send(()).unwrap();
+}
+
+#[test]
+fn queue_progress_before_wait_publication_and_epoch_wrap_are_not_lost() {
+    let program = ProgramBudget::default();
+    for initial in [0, u32::MAX] {
+        let slot = slot();
+        let epoch = AtomicU32::new(initial);
+        let observed = epoch.load(Ordering::Acquire);
+        epoch.fetch_add(1, Ordering::Release);
+        slot.retry_queue(observed);
+        assert!(slot.try_queue(&program, &epoch));
+    }
+}
+
+#[test]
+fn concurrent_visitors_retry_a_released_queue_slot_only_once() {
+    let program = ProgramBudget::default();
+    let slot = slot();
+    let epoch = AtomicU32::new(0);
+    slot.retry_queue(0);
+    epoch.store(1, Ordering::Release);
+    let claims = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..128 {
+                    if slot.try_queue(&program, &epoch) {
+                        claims.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(claims.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -195,7 +243,7 @@ fn concurrent_hot_visitors_claim_only_one_compilation() {
         for _ in 0..8 {
             scope.spawn(|| {
                 for _ in 0..128 {
-                    if slot.try_queue(&program) {
+                    if slot.try_queue(&program, &QUEUE.epoch) {
                         claims.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -237,6 +285,49 @@ fn release_epoch_wrap_does_not_strand_a_waiting_slot() {
     waiting.defer(Reservation::try_acquire(p.clone()).unwrap_err());
     drop(a);
     assert_eq!(p.epoch(Scope::Global), 0);
-    assert!(!waiting.try_queue(&p));
-    assert!((0..HOT).any(|_| waiting.try_queue(&p)));
+    assert!(!waiting.try_queue(&p, &QUEUE.epoch));
+    assert!((0..HOT).any(|_| waiting.try_queue(&p, &QUEUE.epoch)));
+}
+
+#[test]
+fn queue_backpressure_is_shared_by_hot_entries_without_reserving_more_code() {
+    let owner = JitState::default();
+    let epoch = AtomicU32::new(7);
+    owner.queue_blocked.store(8, Ordering::Release);
+    for _ in 0..32 {
+        let slot = slot();
+        slot.progress
+            .store(u64::from(HOT - 1) << 32, Ordering::Relaxed);
+        assert!(slot.try_queue(&owner.budget, &epoch));
+        assert!(owner.defer_for_queue(&slot, &epoch));
+        assert_eq!(slot.status(), WAIT_QUEUE);
+        assert_eq!(owner.budget.usage().1, Usage::default());
+        epoch.fetch_add(1, Ordering::Release);
+        assert!(slot.try_queue(&owner.budget, &epoch));
+        assert!(!owner.defer_for_queue(&slot, &epoch));
+        let reservation = Reservation::try_acquire(owner.budget.clone()).unwrap();
+        assert_eq!(owner.budget.usage().1.pending, 1);
+        drop(reservation);
+        owner.queue_blocked.store(
+            u64::from(epoch.load(Ordering::Acquire)) + 1,
+            Ordering::Release,
+        );
+    }
+}
+
+#[test]
+fn shared_queue_pressure_clears_after_early_progress_and_epoch_wrap() {
+    let owner = JitState::default();
+    for initial in [0, u32::MAX] {
+        let epoch = AtomicU32::new(initial);
+        epoch.fetch_add(1, Ordering::Release);
+        owner
+            .queue_blocked
+            .store(u64::from(initial) + 1, Ordering::Release);
+        let slot = slot();
+        slot.retry_queue(initial);
+        assert!(slot.try_queue(&owner.budget, &epoch));
+        assert!(!owner.defer_for_queue(&slot, &epoch));
+        assert_eq!(owner.queue_blocked.load(Ordering::Acquire), 0);
+    }
 }

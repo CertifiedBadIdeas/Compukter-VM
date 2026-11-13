@@ -51,6 +51,8 @@ counters!(
     denied_program,
     unsupported,
     queue_full,
+    channel_full,
+    queue_deferred,
     submitted,
     started,
     published,

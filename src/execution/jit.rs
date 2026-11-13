@@ -21,6 +21,7 @@ use super::{
 #[cfg(feature = "jit-admission-diagnostics")]
 mod admission;
 mod lower;
+mod queue;
 mod resources;
 use resources::{Denied, ProgramBudget, Reservation, Scope, MODULE_BYTES};
 #[cfg(feature = "guest-benchmark")]
@@ -41,12 +42,14 @@ const QUEUED: u64 = 1;
 const FINISHED: u64 = 2;
 const WAIT_GLOBAL: u64 = 3;
 const WAIT_PROGRAM: u64 = 4;
+const WAIT_QUEUE: u64 = 5;
+static QUEUE: queue::Capacity = queue::Capacity::new();
 
 #[derive(Debug)]
 struct Slot {
     key: AtomicUsize,
     // One atomic word prevents a late cold visitor corrupting a waiting epoch.
-    // [epoch/visits:32][unused:20][queue backoff:4][state:8]
+    // [epoch/visits:32][unused:24][state:8]
     progress: AtomicU64,
     native: OnceLock<Arc<lower::CompiledRun>>,
     #[cfg(feature = "jit-admission-diagnostics")]
@@ -62,6 +65,8 @@ pub(super) use calls::record_call;
 pub(super) struct JitState {
     slots: Box<[Slot]>,
     budget: Arc<ProgramBudget>,
+    // One Full event suppresses other entries of this program until queue progress.
+    queue_blocked: AtomicU64,
     hits: AtomicU64,
     attempts: AtomicU64,
     compile_ns: AtomicU64,
@@ -87,6 +92,7 @@ impl Default for JitState {
                 })
                 .collect(),
             budget: Arc::new(ProgramBudget::default()),
+            queue_blocked: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             attempts: AtomicU64::new(0),
             compile_ns: AtomicU64::new(0),
@@ -102,6 +108,25 @@ impl Default for JitState {
 }
 
 impl JitState {
+    fn defer_for_queue(&self, slot: &Slot, queue: &AtomicU32) -> bool {
+        let before = self.queue_blocked.load(Ordering::Acquire);
+        if before == 0 {
+            return false;
+        }
+        let epoch = (before - 1) as u32;
+        if queue.load(Ordering::Acquire) != epoch {
+            let _ =
+                self.queue_blocked
+                    .compare_exchange(before, 0, Ordering::AcqRel, Ordering::Acquire);
+            return false;
+        }
+        slot.retry_queue(epoch);
+        #[cfg(feature = "jit-admission-diagnostics")]
+        self.admission
+            .queue_deferred
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
     #[inline]
     fn record_native(&self, attempts: u64) {
         // Hot telemetry is diagnostic work. Updating one shared cache line on
@@ -121,18 +146,17 @@ impl Slot {
         self.progress.load(Ordering::Acquire) & 0xff
     }
 
-    fn try_queue(&self, budget: &ProgramBudget) -> bool {
+    fn try_queue(&self, budget: &ProgramBudget, queue: &AtomicU32) -> bool {
         let before = self.progress.load(Ordering::Acquire);
         let state = before & 0xff;
-        let backoff = before & 0xf00;
         let counter = (before >> 32) as u32;
         let after = match state {
             COLD => {
                 let visits = counter + 1;
-                if visits < HOT << (backoff >> 8) {
-                    (u64::from(visits) << 32) | backoff | COLD
+                if visits < HOT {
+                    (u64::from(visits) << 32) | COLD
                 } else {
-                    backoff | QUEUED
+                    QUEUED
                 }
             }
             WAIT_GLOBAL | WAIT_PROGRAM => {
@@ -144,7 +168,14 @@ impl Slot {
                 if budget.epoch(scope) == counter {
                     return false;
                 }
-                backoff | COLD
+                COLD
+            }
+            WAIT_QUEUE => {
+                if queue.load(Ordering::Acquire) == counter {
+                    return false;
+                }
+                // This slot was already hot; a dequeue makes it eligible again.
+                QUEUED
             }
             _ => return false,
         };
@@ -155,24 +186,18 @@ impl Slot {
     }
 
     fn defer(&self, denied: Denied) {
-        let backoff = self.progress.load(Ordering::Relaxed) & 0xf00;
         let state = match denied.scope {
             Scope::Global => WAIT_GLOBAL,
             Scope::Program => WAIT_PROGRAM,
         };
-        self.progress.store(
-            (u64::from(denied.epoch) << 32) | backoff | state,
-            Ordering::Release,
-        );
+        self.progress
+            .store((u64::from(denied.epoch) << 32) | state, Ordering::Release);
     }
 
-    fn retry_queue(&self) {
-        // Back off to at most 16K visits, without permanently rejecting a burst.
-        let retries = ((self.progress.load(Ordering::Relaxed) >> 8) & 0xf)
-            .saturating_add(1)
-            .min(8);
+    fn retry_queue(&self, epoch: u32) {
+        // Capture before try_send so a dequeue racing ahead of this store is observed.
         self.progress
-            .store((retries << 8) | COLD, Ordering::Release);
+            .store((u64::from(epoch) << 32) | WAIT_QUEUE, Ordering::Release);
     }
 }
 
@@ -181,6 +206,7 @@ struct Job {
     slot: usize,
     plan: lower::Plan,
     reservation: Reservation,
+    queue_permit: queue::Permit<'static>,
     #[cfg(feature = "jit-admission-diagnostics")]
     queued_ns: u64,
     #[cfg(feature = "jit-admission-diagnostics")]
@@ -191,11 +217,13 @@ fn compiler() -> Option<&'static SyncSender<Job>> {
     static COMPILER: OnceLock<Option<SyncSender<Job>>> = OnceLock::new();
     COMPILER
         .get_or_init(|| {
-            let (sender, receiver) = sync_channel::<Job>(8);
+            let (sender, receiver) = sync_channel::<Job>(queue::CAPACITY);
             std::thread::Builder::new()
                 .name("compukter-jit".into())
                 .spawn(move || {
                     while let Ok(job) = receiver.recv() {
+                        // Receiving returns capacity before compilation, including canceled owners.
+                        drop(job.queue_permit);
                         if job.owner.strong_count() == 0 {
                             #[cfg(feature = "jit-admission-diagnostics")]
                             admission::CANCELED.fetch_add(1, Ordering::Relaxed);
@@ -388,9 +416,42 @@ pub(super) fn try_execute(
         owner.record_native(result.attempts);
         return Some(Execution::Prefix(result));
     }
-    if !slot.try_queue(&owner.budget) {
+    if !slot.try_queue(&owner.budget, &QUEUE.epoch) {
         return None;
     }
+    request_compile(
+        code,
+        owner,
+        index,
+        key,
+        Location {
+            block,
+            code_start,
+            instruction,
+            block_len,
+        },
+        heap.as_ref().map(|access| access.image),
+    );
+    None
+}
+
+#[cold]
+#[inline(never)]
+fn request_compile(
+    code: &PreparedCode,
+    owner: &Arc<JitState>,
+    index: usize,
+    key: usize,
+    location: Location,
+    image: Option<&super::image::ExecutionImage>,
+) {
+    let Location {
+        block,
+        instruction,
+        block_len,
+        ..
+    } = location;
+    let slot = &owner.slots[index];
     #[cfg(feature = "jit-admission-diagnostics")]
     {
         let now = admission::now();
@@ -405,6 +466,9 @@ pub(super) fn try_execute(
             Ordering::Relaxed,
         );
     }
+    if owner.defer_for_queue(slot, &QUEUE.epoch) {
+        return;
+    }
     let reservation = match Reservation::try_acquire(owner.budget.clone()) {
         Ok(reservation) => reservation,
         Err(denied) => {
@@ -415,45 +479,71 @@ pub(super) fn try_execute(
             }
             .fetch_add(1, Ordering::Relaxed);
             slot.defer(denied);
-            return None;
+            return;
+        }
+    };
+    // Serialize the pressure check with this program's one pending reservation.
+    // A producer may have read the old gate before the preceding Full published it.
+    if owner.defer_for_queue(slot, &QUEUE.epoch) {
+        return;
+    }
+    let queue_permit = match QUEUE.reserve() {
+        Ok(permit) => permit,
+        Err(epoch) => {
+            #[cfg(feature = "jit-admission-diagnostics")]
+            owner.admission.queue_full.fetch_add(1, Ordering::Relaxed);
+            owner
+                .queue_blocked
+                .store(u64::from(epoch) + 1, Ordering::Release);
+            slot.retry_queue(epoch);
+            return;
         }
     };
     let plan = block
         .filter(|_| instruction == 0)
-        .and_then(|block| {
-            heap.as_ref()
-                .and_then(|access| lower::Plan::region(access.image, block))
-        })
+        .and_then(|block| image.and_then(|image| lower::Plan::region(image, block)))
         .or_else(|| lower::Plan::read(code, key, block_len.saturating_sub(instruction)));
     #[cfg(feature = "jit-admission-diagnostics")]
     if plan.is_none() {
         owner.admission.unsupported.fetch_add(1, Ordering::Relaxed);
     }
     let submitted = plan.and_then(|plan| {
-        Some(compiler()?.try_send(Job {
-            owner: Arc::downgrade(owner),
-            slot: index,
-            plan,
-            reservation,
-            #[cfg(feature = "jit-admission-diagnostics")]
-            queued_ns: admission::now(),
-            #[cfg(feature = "jit-admission-diagnostics")]
-            requested_ns: slot.first_request_ns.load(Ordering::Relaxed),
-        }))
+        let epoch = QUEUE.epoch.load(Ordering::Acquire);
+        Some((
+            epoch,
+            compiler()?.try_send(Job {
+                owner: Arc::downgrade(owner),
+                slot: index,
+                plan,
+                reservation,
+                queue_permit,
+                #[cfg(feature = "jit-admission-diagnostics")]
+                queued_ns: admission::now(),
+                #[cfg(feature = "jit-admission-diagnostics")]
+                requested_ns: slot.first_request_ns.load(Ordering::Relaxed),
+            }),
+        ))
     });
     match submitted {
-        Some(Ok(())) => {
+        Some((_, Ok(()))) => {
             #[cfg(feature = "jit-admission-diagnostics")]
             owner.admission.submitted.fetch_add(1, Ordering::Relaxed);
         }
-        Some(Err(std::sync::mpsc::TrySendError::Full(_))) => {
+        Some((epoch, Err(std::sync::mpsc::TrySendError::Full(job)))) => {
             #[cfg(feature = "jit-admission-diagnostics")]
-            owner.admission.queue_full.fetch_add(1, Ordering::Relaxed);
-            slot.retry_queue();
+            {
+                owner.admission.queue_full.fetch_add(1, Ordering::Relaxed);
+                owner.admission.channel_full.fetch_add(1, Ordering::Relaxed);
+            }
+            // Publish shared pressure before releasing the pending reservation.
+            owner
+                .queue_blocked
+                .store(u64::from(epoch) + 1, Ordering::Release);
+            slot.retry_queue(epoch);
+            drop(job);
         }
         _ => slot.progress.store(FINISHED, Ordering::Release),
     }
-    None
 }
 
 #[cfg(all(feature = "jit-admission-diagnostics", feature = "guest-benchmark"))]
@@ -480,6 +570,11 @@ pub(crate) fn benchmark_quiet_passes() -> u32 {
 pub(crate) fn benchmark_resources() -> (usize, usize, usize) {
     let (usage, _) = ProgramBudget::default().usage();
     (usage.modules, usage.bytes, usage.pending)
+}
+
+#[cfg(feature = "guest-benchmark")]
+pub(crate) fn benchmark_queue_permits() -> usize {
+    QUEUE.used()
 }
 
 /// Benchmark telemetry is shared per program, not retained per machine.
@@ -546,13 +641,7 @@ pub(super) fn statistics(code: &PreparedCode) -> Statistics {
         {
             result.wait_global += usize::from(status == WAIT_GLOBAL);
             result.wait_program += usize::from(status == WAIT_PROGRAM);
-            let progress = slot.progress.load(Ordering::Relaxed);
-            if progress & 0xff == COLD && progress & 0xf00 != 0 {
-                result.queue_delayed += 1;
-                result.queue_retry_visits += u64::from(
-                    (HOT << ((progress >> 8) & 0xf)).saturating_sub((progress >> 32) as u32),
-                );
-            }
+            result.queue_delayed += usize::from(status == WAIT_QUEUE);
         }
         if let Some(native) = slot.native.get() {
             result.compiled += 1;

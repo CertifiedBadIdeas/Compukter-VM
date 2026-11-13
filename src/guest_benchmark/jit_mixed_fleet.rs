@@ -313,7 +313,10 @@ pub(super) fn main(args: &[String]) {
     assert!(modules <= 2048 && bytes <= 16 * 1024 * 1024);
     fs::write(
         outputs.join("resources.tsv"),
-        format!("modules\treserved_bytes\tpending\n{modules}\t{bytes}\t{pending}\n"),
+        format!(
+            "modules\treserved_bytes\tpending\tqueue_permits\n{modules}\t{bytes}\t{pending}\t{}\n",
+            execution::jit::benchmark_queue_permits()
+        ),
     )
     .unwrap();
     fs::write(outputs.join("jit.tsv"), telemetry).unwrap();

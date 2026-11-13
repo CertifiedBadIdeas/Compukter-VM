@@ -322,11 +322,22 @@ only private/benchmark selection, and is not enabled by the Minecraft carrier.
 A prepared program lazily owns 256 direct-mapped hot-entry slots. Collisions
 fall back without growing the table. After 64 shared entry visits, a bounded
 plan of up to 128 numeric/frame/checked-heap instructions can enter the process-wide queue
-(capacity eight, one compiler thread). Queue bursts retry at exponentially
-increasing visit intervals, capped at 16384 visits without a permanent retry limit.
+(capacity eight, one compiler thread). A full-queue rejection waits for a capacity-release
+epoch; the next visit after queue progress may retry without reheating. A queue
+position is reserved before building a plan; builders and queued jobs share the
+eight-position capacity. Receiving a job returns its position before compilation.
+Abandoned plans and canceled jobs return theirs through the same RAII permit.
+The release epoch is sampled before capacity admission so progress racing ahead
+of wait publication is not lost. A shared per-program pressure
+gate defers other entries after Full, before they reserve memory or build plans;
+a second check under the pending reservation closes concurrent producer races.
+The gate is published before that reservation is released. It adds one AtomicU64
+per prepared JIT program and no per-session fields. Retry eligibility still needs
+an execution visit and does not guarantee FIFO admission or equal coverage.
 Resource-denied slots wait for the corresponding global/program release epoch,
 then must become hot again. Unsupported entries and compiler errors finish their
-slots and retain interpretation. No compile
+slots and retain interpretation. Plan construction and submission use a cold outlined helper; the ready native
+entry retains its thin dispatch path. No compile
 job owns a Guest heap, frame, host binding or strong program reference.
 Untraced entries prefer connected regions spanning at most 16 same-function blocks,
 including loops. Admission prefers a reachable native cycle, or an acyclic plan
