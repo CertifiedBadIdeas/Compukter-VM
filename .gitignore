@@ -2,3 +2,14 @@
 /.agents/tmp/
 .idea
 __pycache__/
+
+# Performance reports and archives are kept outside source checkouts.
+/docs/performance/
+*.gz
+*.zip
+*.tar
+*.xz
+*.zst
+*.bz2
+*.7z
+*.bundle
