@@ -329,6 +329,11 @@ fn main() {
         return;
     }
     #[cfg(feature = "baseline-jit")]
+    if args.first().is_some_and(|arg| arg == "jit-resource-churn") {
+        jit_mixed_fleet::churn(&args[1..]);
+        return;
+    }
+    #[cfg(feature = "baseline-jit")]
     if args.first().is_some_and(|arg| arg == "jit-mixed-fleet") {
         jit_mixed_fleet::main(&args[1..]);
         return;

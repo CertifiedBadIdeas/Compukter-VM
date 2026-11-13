@@ -323,8 +323,10 @@ A prepared program lazily owns 256 direct-mapped hot-entry slots. Collisions
 fall back without growing the table. After 64 shared entry visits, a bounded
 plan of up to 128 numeric/frame/checked-heap instructions can enter the process-wide queue
 (capacity eight, one compiler thread). Queue bursts retry at exponentially
-increasing visit intervals up to eight times. Unsupported entries, compiler errors,
-exhausted module capacity and final retry failure retain interpretation. No compile
+increasing visit intervals, capped at 16384 visits without a permanent retry limit.
+Resource-denied slots wait for the corresponding global/program release epoch,
+then must become hot again. Unsupported entries and compiler errors finish their
+slots and retain interpretation. No compile
 job owns a Guest heap, frame, host binding or strong program reference.
 Untraced entries prefer connected regions spanning at most 16 same-function blocks,
 including loops. Admission prefers a reachable native cycle, or an acyclic plan
@@ -334,9 +336,15 @@ profitability rules; no Guest function or benchmark identity is special-cased.
 Regions reuse the same slots, queue and module reservations; unsupported
 successors exit to the ordinary executor before their block cost is paid.
 
-At most 256 modules, including queued work and active owners, reserve up to 64 KiB
-each of page-rounded executable/readonly/data requests: a conservative 16 MiB
-mapping envelope. This excludes compiler transient allocations, its one persistent
+A process-wide 16 MiB budget covers finalized page-rounded executable/readonly/data
+mappings plus 64 KiB worst-case reservations for queued and compiling modules.
+Successful compilation returns unused headroom; failures and cancelled jobs return
+their whole reservation. A separate 2048-module limit bounds retained module metadata.
+Each prepared program admits at most 64 modules, 512 KiB and one pending compilation;
+these quotas prevent one program from occupying the global budget, without promising
+equal coverage or priority among an unbounded set of programs. All admission and
+release locks are cold-path global-before-program locks; native execution takes none.
+The byte budget excludes compiler transient allocations, its one persistent
 worker/stack, Cranelift code in the host executable and program-side metadata.
 Each finalized module is immutable and shared; the last owner explicitly frees
 its mappings after all borrowed calls end. There is no eviction/recompilation tier.

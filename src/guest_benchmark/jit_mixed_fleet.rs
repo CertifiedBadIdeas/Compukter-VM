@@ -47,7 +47,7 @@ fn stats(probes: &[Session], phase: &str, output: &mut String, cases: &[Case]) {
     for (case, probe) in cases.iter().zip(probes) {
         let s = probe.jit_statistics();
         output.push_str(&format!(
-            "{}\t{phase}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{phase}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             case.id,
             s.tracked,
             s.compiled,
@@ -60,7 +60,11 @@ fn stats(probes: &[Session], phase: &str, output: &mut String, cases: &[Case]) {
             s.compile_ns,
             s.hits,
             s.attempts,
-            s.hot_telemetry
+            s.hot_telemetry,
+            s.wait_global,
+            s.wait_program,
+            s.reserved_bytes,
+            s.admission_epoch
         ));
     }
 }
@@ -73,7 +77,12 @@ fn drain(probes: &[Session]) {
 }
 
 pub(super) fn main(args: &[String]) {
-    assert_eq!(args.len(), 9, "jit-mixed-fleet INPUT OUTPUT POPULATION PROGRAMS WORKERS HEAP off|on forward|reverse BATCHES");
+    assert!([9, 10].contains(&args.len()), "jit-mixed-fleet INPUT OUTPUT POPULATION PROGRAMS WORKERS HEAP off|on forward|reverse BATCHES [warm|cold]");
+    let cold = match args.get(9).map(String::as_str).unwrap_or("warm") {
+        "cold" => true,
+        "warm" => false,
+        _ => panic!("warmup mode"),
+    };
     let inputs = Path::new(&args[0]);
     let outputs = Path::new(&args[1]);
     let population: usize = args[2].parse().unwrap();
@@ -143,12 +152,19 @@ pub(super) fn main(args: &[String]) {
         "programs must be genuinely distinct"
     );
     let probes: Vec<_> = cases.iter().map(|c| admit(c, heap, false)).collect();
-    let mut telemetry = String::from("id\tphase\ttracked\tcompiled\tregions\tpending\tfailures\tcode_bytes\tmapped_bytes\tstate_bytes\tcompile_ns\thits\tnative_attempts\thot_telemetry\n");
+    let mut telemetry = String::from("id\tphase\ttracked\tcompiled\tregions\tpending\tfailures\tcode_bytes\tmapped_bytes\tstate_bytes\tcompile_ns\thits\tnative_attempts\thot_telemetry\twait_global\twait_program\treserved_bytes\tadmission_epoch\n");
     let warm_start = Instant::now();
     // Warm low-frequency construction paths too: a handful of complete runs
     // leaves once-per-session initializers below HOT even while loop bodies are hot.
-    if enabled {
-        for pass in 0..512 {
+    let mut warm_passes = 0;
+    if enabled && !cold {
+        let mut epochs: Vec<_> = probes
+            .iter()
+            .map(|p| p.jit_statistics().admission_epoch)
+            .collect();
+        let mut quiet = 0;
+        let quiet_passes = execution::jit::benchmark_quiet_passes();
+        for pass in 0..4096 {
             for offset in 0..programs {
                 let index = (offset + pass) % programs;
                 let index = if reverse { programs - 1 - index } else { index };
@@ -169,11 +185,33 @@ pub(super) fn main(args: &[String]) {
                 }
                 drain(&probes[index..index + 1]);
             }
+            warm_passes = pass + 1;
+            let next: Vec<_> = probes
+                .iter()
+                .map(|p| p.jit_statistics().admission_epoch)
+                .collect();
+            quiet = if next == epochs { quiet + 1 } else { 0 };
+            epochs = next;
+            // A deferred slot first observes release, then needs HOT visits.
+            // Include unsupported-plan releases, not just published modules.
+            if warm_passes >= 512 && quiet >= quiet_passes {
+                break;
+            }
         }
+        assert!(
+            quiet >= quiet_passes,
+            "JIT admission profile did not quiesce"
+        );
         stats(&probes, "initializers-warm", &mut telemetry, &cases);
     }
     // Keep program owners alive, visit every program each pass, and expose admission order.
-    for pass in 0..if enabled { 2 } else { 1 } {
+    for pass in 0..if cold {
+        0
+    } else if enabled {
+        2
+    } else {
+        1
+    } {
         for offset in 0..programs {
             let index = (offset + pass) % programs;
             let index = if reverse { programs - 1 - index } else { index };
@@ -264,6 +302,16 @@ pub(super) fn main(args: &[String]) {
     )
     .unwrap();
     stats(&probes, "after", &mut telemetry, &cases);
+    drain(&probes);
+    stats(&probes, "drained", &mut telemetry, &cases);
+    let (modules, bytes, pending) = execution::jit::benchmark_resources();
+    assert_eq!(pending, 0);
+    assert!(modules <= 2048 && bytes <= 16 * 1024 * 1024);
+    fs::write(
+        outputs.join("resources.tsv"),
+        format!("modules\treserved_bytes\tpending\n{modules}\t{bytes}\t{pending}\n"),
+    )
+    .unwrap();
     fs::write(outputs.join("jit.tsv"), telemetry).unwrap();
     let mut batch_rows = String::from("batch\twall_ns\tcpu_ns\tworker_max_wall_ns\tretired\n");
     for (batch, wall) in walls.into_iter().enumerate() {
@@ -320,5 +368,62 @@ pub(super) fn main(args: &[String]) {
         assert_eq!(text, case.expected, "checksum for {}", case.id);
     }
     fs::write(outputs.join("checks.tsv"), checks).unwrap();
-    fs::write(outputs.join("fleet.tsv"),format!("population\tprograms\tworkers\tmode\torder\twarm_ns\tadmission_ns\tbase_requested_bytes\tready_requested_bytes\tactive_requested_bytes\n{population}\t{programs}\t{workers}\t{}\t{}\t{warm_ns}\t{admission_ns}\t{base_live}\t{ready_live}\t{active_live}\n",args[6],args[7])).unwrap();
+    fs::write(outputs.join("fleet.tsv"),format!("population\tprograms\tworkers\tmode\torder\twarm_ns\tadmission_ns\tbase_requested_bytes\tready_requested_bytes\tactive_requested_bytes\twarm_passes\n{population}\t{programs}\t{workers}\t{}\t{}\t{warm_ns}\t{admission_ns}\t{base_live}\t{ready_live}\t{active_live}\t{warm_passes}\n",args[6],args[7])).unwrap();
+}
+
+/// Drop all program owners and all retained sessions between passes, in one process.
+/// The ordinary matrix uses independent processes and cannot establish this lifetime property.
+pub(super) fn churn(args: &[String]) {
+    assert_eq!(
+        args.len(),
+        4,
+        "jit-resource-churn INPUT OUTPUT POPULATION WORKERS"
+    );
+    let output = Path::new(&args[1]);
+    fs::create_dir_all(output).unwrap();
+    let mut rows = String::from(
+        "pass\torder\twarmup\tmodules_after_drop\tbytes_after_drop\tpending_after_drop\n",
+    );
+    for (pass, (order, warmup)) in [
+        ("forward", "cold"),
+        ("reverse", "warm"),
+        ("forward", "warm"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = output.join(format!("pass-{pass}"));
+        main(&[
+            args[0].clone(),
+            directory.to_str().unwrap().into(),
+            args[2].clone(),
+            "32".into(),
+            args[3].clone(),
+            "65536".into(),
+            "on".into(),
+            order.into(),
+            "20".into(),
+            warmup.into(),
+        ]);
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        // A compiler can briefly retain its publication borrow after marking the
+        // last slot FINISHED. Wait for that owner rather than assuming thread order.
+        let usage = loop {
+            let usage = execution::jit::benchmark_resources();
+            if usage == (0, 0, 0) || Instant::now() >= deadline {
+                break usage;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(
+            usage,
+            (0, 0, 0),
+            "program/session drop must return every native reservation"
+        );
+        rows.push_str(&format!(
+            "{pass}\t{order}\t{warmup}\t{}\t{}\t{}\n",
+            usage.0, usage.1, usage.2
+        ));
+    }
+    fs::write(output.join("churn.tsv"), rows).unwrap();
 }

@@ -6,7 +6,7 @@
 
 //! Experimental shared baseline tier. No lifecycle work or native pointer enters Guest state.
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     mpsc::{sync_channel, SyncSender},
     Arc, OnceLock, Weak,
 };
@@ -19,6 +19,8 @@ use super::{
 };
 
 mod lower;
+mod resources;
+use resources::{Denied, ProgramBudget, Reservation, Scope, MODULE_BYTES};
 #[cfg(feature = "guest-benchmark")]
 pub(crate) fn benchmark_ssa(enabled: bool) {
     lower::slots::benchmark_enabled(enabled);
@@ -31,19 +33,19 @@ pub(super) use lower::RunState;
 const SLOTS: usize = 256;
 const HOT: u32 = 64;
 const MAX_OPS: usize = 128;
-const MAX_MODULES: usize = 256;
-const MODULE_BYTES: usize = 64 * 1024;
 const EMPTY: usize = usize::MAX;
-const COLD: u8 = 0;
-const QUEUED: u8 = 1;
-const FINISHED: u8 = 2;
+const COLD: u64 = 0;
+const QUEUED: u64 = 1;
+const FINISHED: u64 = 2;
+const WAIT_GLOBAL: u64 = 3;
+const WAIT_PROGRAM: u64 = 4;
 
 #[derive(Debug)]
 struct Slot {
     key: AtomicUsize,
-    visits: AtomicU32,
-    state: AtomicU8,
-    retries: AtomicU8,
+    // One atomic word prevents a late cold visitor corrupting a waiting epoch.
+    // [epoch/visits:32][unused:20][queue backoff:4][state:8]
+    progress: AtomicU64,
     native: OnceLock<Arc<lower::CompiledRun>>,
 }
 
@@ -55,6 +57,7 @@ pub(super) use calls::record_call;
 #[derive(Debug)]
 pub(super) struct JitState {
     slots: Box<[Slot]>,
+    budget: Arc<ProgramBudget>,
     hits: AtomicU64,
     attempts: AtomicU64,
     compile_ns: AtomicU64,
@@ -71,12 +74,11 @@ impl Default for JitState {
             slots: (0..SLOTS)
                 .map(|_| Slot {
                     key: AtomicUsize::new(EMPTY),
-                    visits: AtomicU32::new(0),
-                    state: AtomicU8::new(COLD),
-                    retries: AtomicU8::new(0),
+                    progress: AtomicU64::new(COLD),
                     native: OnceLock::new(),
                 })
                 .collect(),
+            budget: Arc::new(ProgramBudget::default()),
             hits: AtomicU64::new(0),
             attempts: AtomicU64::new(0),
             compile_ns: AtomicU64::new(0),
@@ -104,25 +106,63 @@ impl JitState {
     }
 }
 
-// A token bounds *all* in-flight and published modules, including active calls.
-// The memory provider separately caps every module's page-rounded allocations.
-static LIVE_MODULES: AtomicUsize = AtomicUsize::new(0);
-struct Reservation;
-fn reserve_count(counter: &AtomicUsize) -> bool {
-    counter
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_MODULES).then_some(n + 1)
-        })
-        .is_ok()
-}
-impl Reservation {
-    fn acquire() -> Option<Self> {
-        reserve_count(&LIVE_MODULES).then(|| Self)
+impl Slot {
+    fn status(&self) -> u64 {
+        self.progress.load(Ordering::Acquire) & 0xff
     }
-}
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        LIVE_MODULES.fetch_sub(1, Ordering::Release);
+
+    fn try_queue(&self, budget: &ProgramBudget) -> bool {
+        let before = self.progress.load(Ordering::Acquire);
+        let state = before & 0xff;
+        let backoff = before & 0xf00;
+        let counter = (before >> 32) as u32;
+        let after = match state {
+            COLD => {
+                let visits = counter + 1;
+                if visits < HOT << (backoff >> 8) {
+                    (u64::from(visits) << 32) | backoff | COLD
+                } else {
+                    backoff | QUEUED
+                }
+            }
+            WAIT_GLOBAL | WAIT_PROGRAM => {
+                let scope = if state == WAIT_GLOBAL {
+                    Scope::Global
+                } else {
+                    Scope::Program
+                };
+                if budget.epoch(scope) == counter {
+                    return false;
+                }
+                backoff | COLD
+            }
+            _ => return false,
+        };
+        self.progress
+            .compare_exchange(before, after, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && after & 0xff == QUEUED
+    }
+
+    fn defer(&self, denied: Denied) {
+        let backoff = self.progress.load(Ordering::Relaxed) & 0xf00;
+        let state = match denied.scope {
+            Scope::Global => WAIT_GLOBAL,
+            Scope::Program => WAIT_PROGRAM,
+        };
+        self.progress.store(
+            (u64::from(denied.epoch) << 32) | backoff | state,
+            Ordering::Release,
+        );
+    }
+
+    fn retry_queue(&self) {
+        // Back off to at most 16K visits, without permanently rejecting a burst.
+        let retries = ((self.progress.load(Ordering::Relaxed) >> 8) & 0xf)
+            .saturating_add(1)
+            .min(8);
+        self.progress
+            .store((retries << 8) | COLD, Ordering::Release);
     }
 }
 
@@ -165,7 +205,7 @@ fn compiler() -> Option<&'static SyncSender<Job>> {
                                 }
                             }
                             owner.slots[job.slot]
-                                .state
+                                .progress
                                 .store(FINISHED, Ordering::Release);
                         }
                     }
@@ -299,50 +339,35 @@ pub(super) fn try_execute(
         owner.record_native(result.attempts);
         return Some(Execution::Prefix(result));
     }
-    if slot.state.load(Ordering::Acquire) != COLD {
+    if !slot.try_queue(&owner.budget) {
         return None;
     }
-    if slot.visits.fetch_add(1, Ordering::Relaxed) + 1 < HOT << slot.retries.load(Ordering::Relaxed)
-    {
-        return None;
-    }
-    if slot
-        .state
-        .compare_exchange(COLD, QUEUED, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return None;
-    }
-    let submitted = (|| {
-        let plan = block
-            .filter(|_| instruction == 0)
-            .and_then(|block| {
-                heap.as_ref()
-                    .and_then(|access| lower::Plan::region(access.image, block))
-            })
-            .or_else(|| lower::Plan::read(code, key, block_len.checked_sub(instruction)?))?;
-        let reservation = Reservation::acquire()?;
+    let reservation = match Reservation::try_acquire(owner.budget.clone()) {
+        Ok(reservation) => reservation,
+        Err(denied) => {
+            slot.defer(denied);
+            return None;
+        }
+    };
+    let plan = block
+        .filter(|_| instruction == 0)
+        .and_then(|block| {
+            heap.as_ref()
+                .and_then(|access| lower::Plan::region(access.image, block))
+        })
+        .or_else(|| lower::Plan::read(code, key, block_len.saturating_sub(instruction)));
+    let submitted = plan.and_then(|plan| {
         Some(compiler()?.try_send(Job {
             owner: Arc::downgrade(owner),
             slot: index,
             plan,
             reservation,
         }))
-    })();
+    });
     match submitted {
         Some(Ok(())) => {}
-        Some(Err(std::sync::mpsc::TrySendError::Full(_)))
-            if slot.retries.load(Ordering::Relaxed) < 8 =>
-        {
-            // A burst from one hot loop must not permanently exclude later runs.
-            // Retry at exponentially increasing visit intervals, at most eight times.
-            slot.retries.fetch_add(1, Ordering::Relaxed);
-            slot.visits.store(0, Ordering::Relaxed);
-            slot.state.store(COLD, Ordering::Release);
-        }
-        _ => {
-            slot.state.store(FINISHED, Ordering::Release);
-        }
+        Some(Err(std::sync::mpsc::TrySendError::Full(_))) => slot.retry_queue(),
+        _ => slot.progress.store(FINISHED, Ordering::Release),
     }
     None
 }
@@ -352,6 +377,17 @@ pub(super) enum Execution {
     Region(lower::RegionRun),
 }
 
+#[cfg(feature = "guest-benchmark")]
+pub(crate) fn benchmark_quiet_passes() -> u32 {
+    HOT + 1
+}
+
+#[cfg(feature = "guest-benchmark")]
+pub(crate) fn benchmark_resources() -> (usize, usize, usize) {
+    let (usage, _) = ProgramBudget::default().usage();
+    (usage.modules, usage.bytes, usage.pending)
+}
+
 /// Benchmark telemetry is shared per program, not retained per machine.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Statistics {
@@ -359,6 +395,14 @@ pub(crate) struct Statistics {
     pub compiled: usize,
     pub regions: usize,
     pub pending: usize,
+    #[cfg(feature = "guest-benchmark")]
+    pub wait_global: usize,
+    #[cfg(feature = "guest-benchmark")]
+    pub wait_program: usize,
+    #[cfg(feature = "guest-benchmark")]
+    pub reserved_bytes: usize,
+    #[cfg(feature = "guest-benchmark")]
+    pub admission_epoch: u32,
     pub code_bytes: usize,
     pub mapped_bytes: usize,
     pub hot_telemetry: bool,
@@ -382,12 +426,25 @@ pub(super) fn statistics(code: &PreparedCode) -> Statistics {
         attempts: owner.attempts.load(Ordering::Relaxed),
         compile_ns: owner.compile_ns.load(Ordering::Relaxed),
         failures: owner.failures.load(Ordering::Relaxed),
-        state_bytes: std::mem::size_of::<JitState>() + SLOTS * std::mem::size_of::<Slot>(),
+        state_bytes: std::mem::size_of::<JitState>()
+            + SLOTS * std::mem::size_of::<Slot>()
+            + std::mem::size_of::<ProgramBudget>(),
         ..Statistics::default()
     };
+    #[cfg(feature = "guest-benchmark")]
+    {
+        result.reserved_bytes = owner.budget.usage().1.bytes;
+        result.admission_epoch = owner.budget.epoch(Scope::Program);
+    }
     for slot in &owner.slots {
         result.tracked += usize::from(slot.key.load(Ordering::Relaxed) != EMPTY);
-        result.pending += usize::from(slot.state.load(Ordering::Acquire) == QUEUED);
+        let status = slot.status();
+        result.pending += usize::from(status == QUEUED);
+        #[cfg(feature = "guest-benchmark")]
+        {
+            result.wait_global += usize::from(status == WAIT_GLOBAL);
+            result.wait_program += usize::from(status == WAIT_PROGRAM);
+        }
         if let Some(native) = slot.native.get() {
             result.compiled += 1;
             result.regions += usize::from(native.is_region());

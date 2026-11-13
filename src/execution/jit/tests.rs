@@ -322,6 +322,8 @@ fn hotness_publication_and_executable_lifetime_are_shared_across_threads() {
         .get()
         .unwrap()
         .clone();
+    let budget = code.jit.get().unwrap().budget.clone();
+    assert_eq!(budget.usage().1.modules, 1);
     let weak = Arc::downgrade(&native);
     let mapped = native.mapped_counter.clone();
     assert!(mapped.load(Ordering::Relaxed) > 0);
@@ -338,6 +340,7 @@ fn hotness_publication_and_executable_lifetime_are_shared_across_threads() {
     drop(native);
     assert!(weak.upgrade().is_none());
     assert_eq!(mapped.load(Ordering::Relaxed), 0);
+    assert_eq!(budget.usage().1, resources::Usage::default());
 }
 
 fn checkpoint(machine: &Machine) -> Vec<u8> {
@@ -419,16 +422,6 @@ fn jit_machine_matches_traces_and_checkpoint_bytes_at_slice_boundaries() {
         }
     }
     assert!(hits > 0, "machine comparison must execute generated code");
-}
-
-#[test]
-fn executable_mapping_and_module_reservations_are_bounded() {
-    let count = AtomicUsize::new(0);
-    for _ in 0..MAX_MODULES {
-        assert!(reserve_count(&count));
-    }
-    assert!(!reserve_count(&count));
-    assert_eq!(count.load(Ordering::Relaxed), MAX_MODULES);
 }
 
 #[path = "tests/heap.rs"]

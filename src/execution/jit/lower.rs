@@ -546,7 +546,7 @@ fn number(
     }
 }
 
-pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRun, String> {
+pub(super) fn compile(plan: Plan, mut reservation: Reservation) -> Result<CompiledRun, String> {
     let mut settings = settings::builder();
     settings
         .set("opt_level", "speed")
@@ -668,6 +668,7 @@ pub(super) fn compile(plan: Plan, reservation: Reservation) -> Result<CompiledRu
         )
     };
     drop(locked);
+    reservation.settle(bytes.load(Ordering::Relaxed));
     Ok(CompiledRun {
         _owner: owner,
         _reservation: reservation,
