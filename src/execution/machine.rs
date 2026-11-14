@@ -1266,7 +1266,11 @@ impl Machine {
         Ok(outcome)
     }
 
-    fn has_pending_guest_instruction(&self) -> bool {
+    pub(super) fn collection_active(&self) -> bool {
+        self.collector.is_active()
+    }
+
+    pub(super) fn has_pending_guest_instruction(&self) -> bool {
         if let Some(pending) = self.pending_raise {
             return pending.retires_instruction;
         }

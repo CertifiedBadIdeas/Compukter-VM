@@ -2113,3 +2113,74 @@ fn shared_program_revalidates_each_capability_and_record_schema() {
     // A failed binding must not poison either the program cache or later admission.
     Session::admit(artifact, profile(), &[binding]).unwrap();
 }
+
+#[test]
+fn host_reference_reply_during_concat_collection_does_not_corrupt_session() {
+    for byte_array in [false, true] {
+        let kind = if byte_array {
+            HostValueType::ByteArray
+        } else {
+            HostValueType::String
+        };
+        let operations = [OperationSchema::asynchronous(&[], kind)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut limits = profile();
+        limits.heap_bytes = 64;
+        let mut session = Session::admit(
+            fixtures::concat_and_waiting_host_artifact(byte_array),
+            limits,
+            &[binding],
+        )
+        .unwrap();
+        session.start(&[]).unwrap();
+        let request = loop {
+            match session.advance(64, 0).unwrap() {
+                AdvanceOutcome::HostRequestBatch(batch) => {
+                    let request = batch.get(0).unwrap();
+                    break (request.task_id(), request.id());
+                }
+                AdvanceOutcome::SliceExhausted => {}
+                other => panic!("before request: {other:?}"),
+            }
+        };
+        for _ in 0..100 {
+            if session.test_collector_active() {
+                break;
+            }
+            assert_eq!(
+                AdvanceOutcome::SliceExhausted,
+                session.advance(64, 0).unwrap()
+            );
+        }
+        assert!(
+            session.test_collector_active(),
+            "concat must begin a collection"
+        );
+        let response = if byte_array {
+            HostValueInput::ByteArray(&[65])
+        } else {
+            HostValueInput::String(&[65])
+        };
+        session
+            .resume_for(request.0, request.1, HostResponse::Success(response))
+            .unwrap();
+        assert_eq!(
+            AdvanceOutcome::SliceExhausted,
+            session.advance(64, 0).unwrap()
+        );
+        for _ in 0..1000 {
+            match session.advance(64, 1).unwrap() {
+                AdvanceOutcome::SliceExhausted => {}
+                AdvanceOutcome::Halted(None) => {
+                    assert_eq!(1, session.accounting().accepted_responses);
+                    break;
+                }
+                other => panic!("after response: {other:?}"),
+            }
+        }
+        assert_eq!(
+            AdvanceOutcome::Halted(None),
+            session.advance(64, 1).unwrap()
+        );
+    }
+}

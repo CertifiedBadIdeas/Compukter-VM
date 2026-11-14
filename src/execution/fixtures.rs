@@ -3392,6 +3392,171 @@ pub(super) fn char_array_string_artifact(start: i32, end: i32) -> VerifiedArtifa
     )
 }
 
+pub(super) fn concat_and_waiting_host_artifact(byte_array: bool) -> VerifiedArtifact {
+    let string = ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    };
+    literal_string_program_blocks_configured(
+        primitive(0),
+        vec![primitive(1)],
+        Vec::new(),
+        &[0x48, 0x69],
+        vec![vec![Instruction::Return { value: u16::MAX }]],
+        |artifact| {
+            artifact.header.runtime_minor = 14;
+            artifact.header.semantic_features = 0b1110;
+            artifact.capabilities.push(Capability {
+                namespace: 0,
+                name: 1,
+                abi_major: 1,
+                minimum_abi_minor: 0,
+                flags: 1,
+                operation_count: 1,
+            });
+            artifact.manifest.required_capabilities = 1;
+            artifact.manifest.maximum_host_requests = 1;
+            artifact.manifest.maximum_coroutines = 3;
+            artifact.manifest.maximum_call_depth = 1;
+            artifact.manifest.required_stack_bytes = 256;
+            let module = &mut artifact.modules[0];
+            for _ in 0..2 {
+                module.types.push(NominalType::Function {
+                    name: 1,
+                    flags: 1,
+                    result: primitive(0),
+                    parameters: Vec::new(),
+                });
+            }
+            if let NominalType::Function { flags, .. } = &mut module.types[0] {
+                *flags = 1;
+            }
+            module.declared_types = module.types.len() as u32;
+            let mut root = function(0, 0, vec![primitive(1), primitive(1)], 0);
+            root.flags = 1;
+            root.block_count = 3;
+            let host_value = if byte_array {
+                let id = TypeId(module.types.len() as u32);
+                module.types.push(NominalType::Array {
+                    storage: 1,
+                    name: 0,
+                    element: primitive(1),
+                    super_type: None,
+                });
+                module.declared_types = module.types.len() as u32;
+                ValueType {
+                    kind: 7,
+                    flags: 0,
+                    nominal_type: id,
+                }
+            } else {
+                string
+            };
+            let mut host = function(1, 0, vec![host_value], 3);
+            host.flags = 1;
+            host.block_count = 2;
+            let mut concat = function(2, 0, vec![string, string, string, string], 5);
+            concat.flags = 1;
+            concat.block_count = 4;
+            module.functions = vec![root, host, concat];
+            module.declared_functions = 3;
+            install_owned_blocks(
+                artifact,
+                vec![
+                    (
+                        FunctionId(0),
+                        vec![
+                            Instruction::CoroutineSpawn {
+                                dst: 0,
+                                function_ref: 1,
+                                args: Box::new([]),
+                            },
+                            Instruction::CoroutineSpawn {
+                                dst: 1,
+                                function_ref: 2,
+                                args: Box::new([]),
+                            },
+                            Instruction::CoroutineJoin {
+                                dst: u16::MAX,
+                                coroutine: 0,
+                                resume_block: 1,
+                            },
+                        ],
+                    ),
+                    (
+                        FunctionId(0),
+                        vec![Instruction::CoroutineJoin {
+                            dst: u16::MAX,
+                            coroutine: 1,
+                            resume_block: 2,
+                        }],
+                    ),
+                    (FunctionId(0), vec![Instruction::Return { value: u16::MAX }]),
+                    (
+                        FunctionId(1),
+                        vec![Instruction::CapabilityCallAsync {
+                            dst: 0,
+                            capability: 0,
+                            operation: 0,
+                            args: Box::new([]),
+                            resume_block: 4,
+                        }],
+                    ),
+                    (FunctionId(1), vec![Instruction::Return { value: u16::MAX }]),
+                    (
+                        FunctionId(2),
+                        vec![
+                            Instruction::Const {
+                                dst: 0,
+                                constant: 0,
+                            },
+                            Instruction::Const {
+                                dst: 1,
+                                constant: 0,
+                            },
+                            Instruction::Jump { target: 6 },
+                        ],
+                    ),
+                    (
+                        FunctionId(2),
+                        vec![
+                            Instruction::StringConcat {
+                                dst: 2,
+                                lhs: 0,
+                                rhs: 1,
+                            },
+                            Instruction::Jump { target: 7 },
+                        ],
+                    ),
+                    (
+                        FunctionId(2),
+                        vec![
+                            Instruction::StringConcat {
+                                dst: 2,
+                                lhs: 0,
+                                rhs: 1,
+                            },
+                            Instruction::Jump { target: 8 },
+                        ],
+                    ),
+                    (
+                        FunctionId(2),
+                        vec![
+                            Instruction::StringConcat {
+                                dst: 2,
+                                lhs: 0,
+                                rhs: 1,
+                            },
+                            Instruction::Return { value: u16::MAX },
+                        ],
+                    ),
+                ],
+            );
+        },
+    )
+}
+
 pub(super) fn repeated_concat_artifact(content_equality: bool) -> VerifiedArtifact {
     let string = ValueType {
         kind: 7,

@@ -344,6 +344,16 @@ impl Session {
         if let Some(outcome) = self.machine.terminal_outcome() {
             return self.map_machine_outcome(outcome, 0, 0, &mut remaining_retirements);
         }
+        // A queued response may temporarily switch the active task and allocate.
+        // Finish the current Guest instruction and its collection before doing so:
+        // both the collector's root cursor and pending instruction belong to that task.
+        if !self.replies.is_empty()
+            && !self.resuming_host_reference
+            && !self.machine.record_response_pending()
+            && (self.machine.collection_active() || self.machine.has_pending_guest_instruction())
+        {
+            return self.run_and_map(guest_budget, maintenance_budget, &mut remaining_retirements);
+        }
         if !self.resuming_host_reference && !self.machine.record_response_pending() {
             while let Some(reply) = self.replies.pop_front() {
                 let result = match reply.value {
@@ -686,6 +696,8 @@ impl Session {
         if self.replies.is_empty()
             && !self.resuming_host_reference
             && !self.machine.record_response_pending()
+            && !self.machine.collection_active()
+            && !self.machine.has_pending_guest_instruction()
         {
             if let HostResponse::Success(HostValueInput::String(units)) = response {
                 self.inbound_is_bytes = false;
@@ -802,6 +814,11 @@ impl Session {
             accepted_responses: self.accepted_responses,
             trace_digest: self.machine.trace_digest(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_collector_active(&self) -> bool {
+        self.machine.test_collector_active()
     }
 
     #[cfg(test)]
