@@ -7902,6 +7902,68 @@ pub(super) fn reference_and_scalar_tasks_artifact(byte_array: bool) -> VerifiedA
     crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
 }
 
+pub(super) fn outbound_bytes_and_waiting_string_tasks_artifact() -> VerifiedArtifact {
+    let base = reference_and_scalar_tasks_artifact(true);
+    let mut artifact = crate::decode::records::decode_artifact(
+        base.decoded().bytes.clone(),
+        &ArtifactLimits::default(),
+    )
+    .unwrap();
+    let module = &mut artifact.modules[0];
+    module.functions[2].values = crate::artifact::scalar_values(vec![ValueType {
+        kind: 7,
+        flags: 0,
+        nominal_type: TypeId(0x8000_0000),
+    }]);
+    let outbound = Instruction::CapabilityCallAsync {
+        dst: u16::MAX,
+        capability: 0,
+        operation: 2,
+        args: vec![0].into_boxed_slice(),
+        resume_block: 5,
+    };
+    let cost = outbound.fixed_cost().unwrap();
+    module.code[4].instructions = vec![outbound].into_boxed_slice();
+    module.code[4].fixed_cost = cost;
+    module.blocks[4].declared_fixed_cost = cost;
+    module.functions[1].block_count = 3;
+    module.functions[2].first_block = BlockId(6);
+    if let Instruction::CapabilityCallAsync { resume_block, .. } =
+        &mut module.code[5].instructions[0]
+    {
+        *resume_block = 7;
+    }
+    let ret = Instruction::Return { value: u16::MAX };
+    let ret_cost = ret.fixed_cost().unwrap();
+    module.blocks.insert(
+        5,
+        Block {
+            owner_function: FunctionId(1),
+            code_record: BlockId(5),
+            instruction_count: 1,
+            declared_fixed_cost: ret_cost,
+            flags: 0,
+        },
+    );
+    module.code.insert(
+        5,
+        DecodedCode {
+            bytes: ByteRange { start: 0, end: 0 },
+            instructions: vec![ret].into_boxed_slice(),
+            fixed_cost: ret_cost,
+        },
+    );
+    for (index, block) in module.blocks.iter_mut().enumerate() {
+        block.code_record = BlockId(index as u32);
+    }
+    artifact.capabilities[0].operation_count = 3;
+    artifact.manifest.maximum_block_cost =
+        artifact.manifest.maximum_block_cost.max(cost).max(ret_cost);
+    artifact.manifest.minimum_slice_cost = artifact.manifest.maximum_block_cost;
+    let bytes = crate::test_encode::encode_artifact_rehashed(artifact).unwrap();
+    crate::verify::verify_execution_fixture(Arc::from(bytes), ArtifactLimits::default()).unwrap()
+}
+
 pub(crate) fn inline_value_decoded(component: u16) -> crate::artifact::DecodedArtifact {
     let mut artifact = crate::decode::records::decode_artifact(
         Arc::from(crate::test_support::minimal_vector()),

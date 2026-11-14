@@ -147,6 +147,91 @@ fn independent_tasks_publish_together_and_resume_out_of_order() {
 }
 
 #[test]
+fn host_string_response_waits_until_another_tasks_outbound_bytes_are_copied() {
+    let operations = [
+        OperationSchema::asynchronous(&[], HostValueType::ByteArray),
+        OperationSchema::asynchronous(&[], HostValueType::String),
+        OperationSchema::asynchronous(&[HostValueType::ByteArray], HostValueType::Unit),
+    ];
+    let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+    let mut session = Session::admit(
+        fixtures::outbound_bytes_and_waiting_string_tasks_artifact(),
+        profile(),
+        &[binding],
+    )
+    .unwrap();
+    session.start(&[]).unwrap();
+    let (reader, waiting) = match session.advance(64, 64).unwrap() {
+        AdvanceOutcome::HostRequestBatch(batch) => {
+            assert_eq!(2, batch.len());
+            let first = batch.get(0).unwrap();
+            let second = batch.get(1).unwrap();
+            (
+                (first.task_id(), first.id()),
+                (second.task_id(), second.id()),
+            )
+        }
+        other => panic!("expected two requests: {other:?}"),
+    };
+    let payload = vec![0x5a; 2048];
+    session
+        .resume_for(
+            reader.0,
+            reader.1,
+            HostResponse::Success(HostValueInput::ByteArray(&payload)),
+        )
+        .unwrap();
+    for _ in 0..200 {
+        if session.test_preparing_request() {
+            break;
+        }
+        match session.advance(64, 64).unwrap() {
+            AdvanceOutcome::SliceExhausted | AdvanceOutcome::HostRequestBatch(_) => {}
+            other => panic!("unexpected before outbound preparation: {other:?}"),
+        }
+    }
+    assert!(session.test_preparing_request());
+    let response = vec![65u16; 200];
+    session
+        .resume_for(
+            waiting.0,
+            waiting.1,
+            HostResponse::Success(HostValueInput::String(&response)),
+        )
+        .unwrap();
+    let outbound = loop {
+        match session.advance(64, 64).unwrap() {
+            AdvanceOutcome::SliceExhausted => {}
+            AdvanceOutcome::HostRequestBatch(batch) => {
+                let request = batch.get(0).unwrap();
+                assert_eq!(2, request.operation());
+                assert_eq!(
+                    Some(HostValueView::ByteArray(&payload)),
+                    request.arguments().get(0)
+                );
+                break (request.task_id(), request.id());
+            }
+            other => panic!("unexpected during outbound preparation: {other:?}"),
+        }
+    };
+    session
+        .resume_for(
+            outbound.0,
+            outbound.1,
+            HostResponse::Success(HostValueInput::Unit),
+        )
+        .unwrap();
+    for _ in 0..200 {
+        match session.advance(64, 64).unwrap() {
+            AdvanceOutcome::SliceExhausted => {}
+            AdvanceOutcome::Halted(None) => return,
+            other => panic!("unexpected after responses: {other:?}"),
+        }
+    }
+    panic!("session did not halt");
+}
+
+#[test]
 fn entry_string_array_is_materialized_as_one_owned_guest_argument() {
     let mut session = Session::admit(
         fixtures::entry_string_array_length_artifact(),

@@ -344,6 +344,14 @@ impl Session {
         if let Some(outcome) = self.machine.terminal_outcome() {
             return self.map_machine_outcome(outcome, 0, 0, &mut remaining_retirements);
         }
+        // Outbound arguments still belong to the currently suspended Guest call.
+        // Finish copying them before replies can temporarily switch to another task.
+        if self.preparing_request.is_some()
+            && !self.resuming_host_reference
+            && !self.machine.record_response_pending()
+        {
+            return self.advance_request_preparation(guest_budget, maintenance_budget);
+        }
         // A queued response may temporarily switch the active task and allocate.
         // Finish the current Guest instruction and its collection before doing so:
         // both the collector's root cursor and pending instruction belong to that task.
@@ -696,6 +704,7 @@ impl Session {
         if self.replies.is_empty()
             && !self.resuming_host_reference
             && !self.machine.record_response_pending()
+            && self.preparing_request.is_none()
             && !self.machine.collection_active()
             && !self.machine.has_pending_guest_instruction()
         {
@@ -819,6 +828,11 @@ impl Session {
     #[cfg(test)]
     pub(super) fn test_collector_active(&self) -> bool {
         self.machine.test_collector_active()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_preparing_request(&self) -> bool {
+        self.preparing_request.is_some()
     }
 
     #[cfg(test)]
