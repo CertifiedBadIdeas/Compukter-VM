@@ -779,22 +779,33 @@ impl PendingRecord {
 
 impl HostRecordValue {
     pub(super) fn resident_bytes(&self) -> usize {
-        self.type_name.capacity()
-            + self.fields.capacity() * core::mem::size_of::<HostRecordMember>()
-            + self
-                .fields
-                .iter()
-                .map(|field| {
-                    field.name.capacity()
-                        + match &field.value {
-                            HostRecordScalar::String(units) => units.capacity() * 2,
-                            HostRecordScalar::Record(child) => {
-                                core::mem::size_of::<HostRecordValue>() + child.resident_bytes()
-                            }
-                            _ => 0,
-                        }
-                })
-                .sum::<usize>()
+        self.checked_resident_bytes()
+            .expect("validated record has bounded storage")
+    }
+
+    pub(crate) fn checked_resident_bytes(&self) -> Option<usize> {
+        fn visit(record: &HostRecordValue, depth: usize) -> Option<usize> {
+            if depth > MAXIMUM_RECORD_DEPTH {
+                return None;
+            }
+            let mut bytes = record.type_name.capacity().checked_add(
+                record
+                    .fields
+                    .capacity()
+                    .checked_mul(core::mem::size_of::<HostRecordMember>())?,
+            )?;
+            for field in &record.fields {
+                bytes = bytes.checked_add(field.name.capacity())?;
+                bytes = bytes.checked_add(match &field.value {
+                    HostRecordScalar::String(units) => units.capacity().checked_mul(2)?,
+                    HostRecordScalar::Record(child) => core::mem::size_of::<HostRecordValue>()
+                        .checked_add(visit(child, depth + 1)?)?,
+                    _ => 0,
+                })?;
+            }
+            Some(bytes)
+        }
+        visit(self, 1)
     }
 }
 

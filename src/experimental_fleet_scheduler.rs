@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 mod output;
 use output::WorkerOutput;
+mod memory;
+use memory::{ByteBudget, Reservation};
+pub use memory::{FleetCommandMemory, FleetMemoryLimits};
 
 static NEXT_FLEET_DEPLOYMENT_CANDIDATE: AtomicU64 = AtomicU64::new(1);
 const MAXIMUM_PENDING_TIMERS: usize = 256;
@@ -424,17 +427,39 @@ impl Command {
 }
 
 struct LaneMailbox {
-    commands: VecDeque<Command>,
+    commands: VecDeque<QueuedCommand>,
     capacity: usize,
+    memory: Arc<ByteBudget>,
+    machine_limit: usize,
+    machine_memory: HashMap<u64, Arc<ByteBudget>>,
     /// At most one entry per registered machine; registration is capped at 4096.
     stops: std::collections::BTreeSet<u64>,
 }
 
+struct QueuedCommand {
+    command: Command,
+    // Keep both reservations until execution finishes, including early returns.
+    _memory: Option<(Reservation, Reservation)>,
+}
+
 impl LaneMailbox {
+    #[cfg(test)]
     fn new(capacity: usize) -> Self {
+        let limits = FleetMemoryLimits::default();
+        Self::with_memory(
+            capacity,
+            ByteBudget::new(limits.command_bytes),
+            limits.command_bytes_per_machine,
+        )
+    }
+
+    fn with_memory(capacity: usize, memory: Arc<ByteBudget>, machine_limit: usize) -> Self {
         Self {
             commands: VecDeque::new(),
             capacity,
+            memory,
+            machine_limit,
+            machine_memory: HashMap::new(),
             stops: Default::default(),
         }
     }
@@ -443,21 +468,50 @@ impl LaneMailbox {
         if self.commands.len() == self.capacity {
             return Err(command);
         }
-        self.commands.push_back(command);
+        let Some(bytes) = memory::command_payload_bytes(&command)
+            .and_then(|payload| payload.checked_add(std::mem::size_of::<QueuedCommand>()))
+        else {
+            return Err(command);
+        };
+        let Some(global) = self.memory.reserve(bytes) else {
+            return Err(command);
+        };
+        let machine = command.machine();
+        let local = match self.machine_memory.entry(machine) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().reserve(bytes),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let budget = ByteBudget::new(self.machine_limit);
+                let reservation = budget.reserve(bytes);
+                if reservation.is_some() {
+                    entry.insert(budget);
+                }
+                reservation
+            }
+        };
+        let Some(local) = local else {
+            return Err(command);
+        };
+        self.commands.push_back(QueuedCommand {
+            command,
+            _memory: Some((global, local)),
+        });
         Ok(())
     }
 
-    fn next(&mut self) -> Option<Command> {
+    fn next(&mut self) -> Option<QueuedCommand> {
         if let Some(machine) = self.stops.first().copied() {
             if let Some(index) = self
                 .commands
                 .iter()
-                .position(|command| command.machine() == machine)
+                .position(|queued| queued.command.machine() == machine)
             {
                 return self.commands.remove(index);
             }
             self.stops.remove(&machine);
-            return Some(Command::Stop { machine });
+            return Some(QueuedCommand {
+                command: Command::Stop { machine },
+                _memory: None,
+            });
         }
         self.commands.pop_front()
     }
@@ -600,6 +654,7 @@ pub struct FleetScheduler {
     workers: Vec<JoinHandle<()>>,
     metrics: Arc<Metrics>,
     waiting_publishers: Arc<AtomicUsize>,
+    command_memory: Arc<ByteBudget>,
 }
 
 impl FleetScheduler {
@@ -627,6 +682,25 @@ impl FleetScheduler {
         inspections: Vec<RequestInspection>,
         coordinated_turns: bool,
     ) -> Result<Self, &'static str> {
+        Self::new_with_memory_limits(
+            machines,
+            config,
+            inspections,
+            coordinated_turns,
+            FleetMemoryLimits::default(),
+        )
+    }
+
+    pub fn new_with_memory_limits(
+        machines: Vec<(u64, ComputerMachine)>,
+        config: FleetConfig,
+        inspections: Vec<RequestInspection>,
+        coordinated_turns: bool,
+        memory_limits: FleetMemoryLimits,
+    ) -> Result<Self, &'static str> {
+        if memory_limits.command_bytes == 0 || memory_limits.command_bytes_per_machine == 0 {
+            return Err("invalid fleet memory limits");
+        }
         if machines.len() > 4096 {
             return Err("fleet size exceeds maximum");
         }
@@ -669,9 +743,14 @@ impl FleetScheduler {
         let waiting_publishers = Arc::new(AtomicUsize::new(0));
         let inspections = Arc::new(inspections);
         let mut lanes = Vec::new();
+        let command_memory = ByteBudget::new(memory_limits.command_bytes);
         let mut workers: Vec<JoinHandle<()>> = Vec::new();
         for (lane, actors) in partitions.into_iter().enumerate() {
-            let mailbox = Arc::new(Mutex::new(LaneMailbox::new(config.mailbox_capacity)));
+            let mailbox = Arc::new(Mutex::new(LaneMailbox::with_memory(
+                config.mailbox_capacity,
+                Arc::clone(&command_memory),
+                memory_limits.command_bytes_per_machine,
+            )));
             lanes.push(Arc::clone(&mailbox));
             let events = event_tx.clone();
             let stop = Arc::clone(&stopped);
@@ -727,6 +806,7 @@ impl FleetScheduler {
             workers,
             metrics,
             waiting_publishers,
+            command_memory,
         })
     }
 
@@ -1301,6 +1381,10 @@ impl FleetScheduler {
             requests: self.metrics.requests.load(Ordering::Relaxed),
         }
     }
+
+    pub fn command_memory(&self) -> FleetCommandMemory {
+        self.command_memory.snapshot()
+    }
 }
 
 impl Drop for FleetScheduler {
@@ -1337,12 +1421,18 @@ fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
 fn remove_actor(
     actors: &mut HashMap<u64, Actor>,
     queue: &mut VecDeque<u64>,
+    mailbox: &Mutex<LaneMailbox>,
     id: u64,
 ) -> Option<Actor> {
     let actor = actors.remove(&id)?;
     // Closing can complete without draining ordinary output. Stale ready entries
     // must not accumulate across repeated close/attach cycles under backpressure.
     queue.retain(|queued| *queued != id);
+    mailbox
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .machine_memory
+        .remove(&id);
     Some(actor)
 }
 
@@ -1424,21 +1514,22 @@ fn run_worker(
             return;
         }
         for _ in 0..4 {
-            let command = {
+            let queued = {
                 let mut mailbox = mailbox.lock().unwrap_or_else(|e| e.into_inner());
                 if events.has_pending() && mailbox.stops.is_empty() {
                     break;
                 }
-                let Some(command) = mailbox.next() else {
+                let Some(queued) = mailbox.next() else {
                     break;
                 };
-                if matches!(command, Command::Stop { .. })
-                    || mailbox.stops.contains(&command.machine())
+                if matches!(queued.command, Command::Stop { .. })
+                    || mailbox.stops.contains(&queued.command.machine())
                 {
-                    events.begin_closing(command.machine());
+                    events.begin_closing(queued.command.machine());
                 }
-                command
+                queued
             };
+            let QueuedCommand { command, _memory } = queued;
             match command {
                 Command::Deployment {
                     machine,
@@ -1754,8 +1845,8 @@ fn run_worker(
                     if !report_quiescent(machine, actor, &events, &stopped, coordinated_turns) {
                         return;
                     }
-                    let actor =
-                        remove_actor(&mut actors, &mut queue, machine).expect("checked actor");
+                    let actor = remove_actor(&mut actors, &mut queue, &mailbox, machine)
+                        .expect("checked actor");
                     let mut timers: Vec<_> = actor
                         .timers
                         .iter()
@@ -1783,7 +1874,7 @@ fn run_worker(
                     }
                 }
                 Command::Stop { machine } => {
-                    if let Some(actor) = remove_actor(&mut actors, &mut queue, machine) {
+                    if let Some(actor) = remove_actor(&mut actors, &mut queue, &mailbox, machine) {
                         let quiescent = if coordinated_turns && actor.tick_initialized {
                             Some(FleetQuiescent {
                                 tick: actor.tick,
@@ -4364,6 +4455,7 @@ mod tests {
                     true,
                 )
             });
+            let command_memory = Arc::clone(&mailbox.lock().unwrap().memory);
             let fleet = FleetScheduler {
                 lanes: vec![mailbox],
                 owners: Mutex::new(Owners {
@@ -4379,6 +4471,7 @@ mod tests {
                 workers: vec![worker],
                 metrics,
                 waiting_publishers: waiters,
+                command_memory,
             };
             let deadline = Instant::now() + Duration::from_secs(5);
             while fleet.stops.lock().unwrap().is_empty() {
@@ -4513,6 +4606,50 @@ mod tests {
     }
 
     #[test]
+    fn command_memory_is_shared_bounded_and_held_during_execution() {
+        fn command(machine: u64) -> Command {
+            Command::Reply {
+                machine,
+                task: 1,
+                request: 1,
+                value: ReplyValue::Bytes(vec![7; 1024].into_boxed_slice()),
+            }
+        }
+        let charge = std::mem::size_of::<QueuedCommand>() + 1024;
+        let memory = ByteBudget::new(2 * charge);
+        let mut first = LaneMailbox::with_memory(8, Arc::clone(&memory), charge);
+        let mut second = LaneMailbox::with_memory(8, Arc::clone(&memory), charge);
+        assert!(first.submit(command(1)).is_ok());
+        assert!(
+            first.submit(command(1)).is_err(),
+            "per-machine limit was not applied"
+        );
+        assert_eq!(
+            memory.snapshot().retained_bytes,
+            charge,
+            "rejection leaked the global reservation"
+        );
+        assert!(second.submit(command(2)).is_ok());
+        assert!(
+            second.submit(command(3)).is_err(),
+            "lanes exceeded their shared byte limit"
+        );
+        let executing = first.next().unwrap();
+        assert_eq!(memory.snapshot().retained_bytes, 2 * charge);
+        assert!(
+            first.submit(command(1)).is_err(),
+            "in-flight command escaped its machine limit"
+        );
+        drop(executing);
+        assert_eq!(memory.snapshot().retained_bytes, charge);
+        assert!(first.submit(command(1)).is_ok());
+        drop(first);
+        drop(second);
+        assert_eq!(memory.snapshot().retained_bytes, 0);
+        assert!(memory.snapshot().peak_bytes <= memory.snapshot().limit_bytes);
+    }
+
+    #[test]
     fn stop_with_a_full_mailbox_preserves_other_machines_observations() {
         let machines = (0..2)
             .map(|id| {
@@ -4528,13 +4665,20 @@ mod tests {
                 )
             })
             .collect();
-        let fleet = FleetScheduler::new(
+        let limit = 3 * std::mem::size_of::<QueuedCommand>();
+        let fleet = FleetScheduler::new_with_memory_limits(
             machines,
             FleetConfig {
                 workers: 1,
                 event_capacity: 1,
                 mailbox_capacity: 3,
                 ..config()
+            },
+            Vec::new(),
+            false,
+            FleetMemoryLimits {
+                command_bytes: limit,
+                command_bytes_per_machine: limit,
             },
         )
         .unwrap();
@@ -4549,6 +4693,7 @@ mod tests {
         fleet.resource_snapshot(1, 42).unwrap();
         fleet.resource_snapshot(0, 43).unwrap();
         assert_eq!(fleet.lanes[0].lock().unwrap().commands.len(), 3);
+        assert_eq!(fleet.command_memory().retained_bytes, limit);
         fleet.stop(1).unwrap();
 
         let mut other_snapshot = false;
@@ -4599,9 +4744,12 @@ mod tests {
                 request: 42
             })
             .is_ok());
-        assert!(matches!(mailbox.next(), Some(Command::Stop { machine: 1 })));
         assert!(matches!(
-            mailbox.next(),
+            mailbox.next().map(|queued| queued.command),
+            Some(Command::Stop { machine: 1 })
+        ));
+        assert!(matches!(
+            mailbox.next().map(|queued| queued.command),
             Some(Command::ResourceSnapshot {
                 machine: 2,
                 request: 42
