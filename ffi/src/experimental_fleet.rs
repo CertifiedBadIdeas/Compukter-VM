@@ -78,6 +78,13 @@ fn create_machines(
 }
 
 pub enum WireEvent {
+    Deployment {
+        machine: u64,
+        request: u64,
+        kind: u8,
+        status: crate::FfiStatus,
+        value: u64,
+    },
     InputResult {
         machine: u64,
         request: u64,
@@ -134,6 +141,43 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
         return Ok(None);
     };
     let (machine, tick, outcome, inspection) = match event {
+        FleetEvent::Deployment {
+            machine,
+            request,
+            result,
+        } => {
+            use compukter_vm::experimental_fleet_scheduler::{
+                DeploymentError as E, DeploymentResult as R,
+            };
+            let revision =
+                |value: compukter_vm::ExecutableRevision| value.generation().unwrap_or(0);
+            let (kind, status, value) = match result {
+                Ok(R::Prepared(token)) => (0, crate::FfiStatus::Ok, token),
+                Ok(R::Revision(value)) => (1, crate::FfiStatus::Ok, revision(value)),
+                Ok(R::Installed(value)) => (2, crate::FfiStatus::Ok, revision(value)),
+                Ok(R::Discarded) => (3, crate::FfiStatus::Ok, 0),
+                Err(error) => (
+                    4,
+                    match error {
+                        E::Verification => crate::FfiStatus::Verification,
+                        E::Admission => crate::FfiStatus::Admission,
+                        E::InvalidCandidate => crate::FfiStatus::StaleHandle,
+                        E::Capacity => crate::FfiStatus::BusyHandle,
+                        E::WrongMachine => crate::FfiStatus::DeploymentWrongMachine,
+                        E::ProfileChanged => crate::FfiStatus::DeploymentProfileChanged,
+                        E::FileSystem(error) => crate::ffi_api::file_read_status(error.into()),
+                    },
+                    0,
+                ),
+            };
+            return Ok(Some(WireEvent::Deployment {
+                machine,
+                request,
+                kind,
+                status,
+                value,
+            }));
+        }
         FleetEvent::InputResult {
             machine,
             request,

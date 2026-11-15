@@ -103,6 +103,37 @@ pub enum FilesystemResult {
     Read(crate::ComputerFileChunk),
 }
 
+/// Result of a deployment operation performed by the machine's owning worker.
+#[derive(Debug)]
+pub enum DeploymentResult {
+    Prepared(u64),
+    Revision(crate::ExecutableRevision),
+    Installed(crate::ExecutableRevision),
+    Discarded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeploymentError {
+    Verification,
+    Admission,
+    InvalidCandidate,
+    Capacity,
+    WrongMachine,
+    ProfileChanged,
+    FileSystem(crate::FileSystemError),
+}
+
+enum DeploymentCommand {
+    Prepare(Arc<[u8]>),
+    Revision(Box<str>),
+    Install {
+        path: Box<str>,
+        expected: crate::ExecutableRevision,
+        candidate: u64,
+    },
+    Discard(u64),
+}
+
 #[derive(Debug)]
 pub enum InputFailure {
     Terminal(crate::TerminalInputError),
@@ -147,6 +178,11 @@ impl ReplyValue {
 
 #[derive(Debug)]
 pub enum FleetEvent {
+    Deployment {
+        machine: u64,
+        request: u64,
+        result: Result<DeploymentResult, DeploymentError>,
+    },
     InputResult {
         machine: u64,
         request: u64,
@@ -250,6 +286,11 @@ pub struct FleetMetrics {
 }
 
 enum Command {
+    Deployment {
+        machine: u64,
+        request: u64,
+        operation: DeploymentCommand,
+    },
     Filesystem {
         machine: u64,
         request: u64,
@@ -350,6 +391,8 @@ struct Actor {
     request_scopes: HashMap<(u32, u64), u64>,
     inspected: HashMap<(u32, u64), u32>,
     timers: HashMap<(u32, u64), ScheduledTimer>,
+    deployment_candidates: HashMap<u64, crate::DeploymentCandidate>,
+    deployment_bytes: usize,
 }
 
 impl Actor {
@@ -376,6 +419,8 @@ impl Actor {
             request_scopes: HashMap::new(),
             inspected: HashMap::new(),
             timers: HashMap::new(),
+            deployment_candidates: HashMap::new(),
+            deployment_bytes: 0,
         }
     }
 }
@@ -449,6 +494,7 @@ impl FleetScheduler {
         let metrics = Arc::new(Metrics::default());
         let waiting_publishers = Arc::new(AtomicUsize::new(0));
         let inspections = Arc::new(inspections);
+        let next_deployment_candidate = Arc::new(AtomicU64::new(1));
         let mut lanes = Vec::new();
         let mut workers: Vec<JoinHandle<()>> = Vec::new();
         for (lane, actors) in partitions.into_iter().enumerate() {
@@ -459,6 +505,7 @@ impl FleetScheduler {
             let worker_metrics = Arc::clone(&metrics);
             let waiting = Arc::clone(&waiting_publishers);
             let inspections = Arc::clone(&inspections);
+            let next_deployment_candidate = Arc::clone(&next_deployment_candidate);
             let worker = match thread::Builder::new()
                 .name(format!("experimental-vm-{lane}"))
                 .spawn(move || {
@@ -472,6 +519,7 @@ impl FleetScheduler {
                         config,
                         inspections,
                         coordinated_turns,
+                        next_deployment_candidate,
                     )
                 }) {
                 Ok(worker) => worker,
@@ -714,6 +762,86 @@ impl FleetScheduler {
             return Err(SubmitError::InvalidInput);
         }
         self.send(machine, Command::RedstoneOutput { machine, packed })
+    }
+
+    /// Verify and retain a machine-bound candidate; all outcomes arrive as Deployment events.
+    pub fn prepare_deployment(
+        &self,
+        machine: u64,
+        request: u64,
+        artifact: Arc<[u8]>,
+    ) -> Result<(), SubmitError> {
+        if artifact.len() > crate::ArtifactLimits::default().artifact_bytes {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(
+            machine,
+            Command::Deployment {
+                machine,
+                request,
+                operation: DeploymentCommand::Prepare(artifact),
+            },
+        )
+    }
+
+    pub fn deployment_revision(
+        &self,
+        machine: u64,
+        request: u64,
+        path: Box<str>,
+    ) -> Result<(), SubmitError> {
+        if path.len() > 4096 {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(
+            machine,
+            Command::Deployment {
+                machine,
+                request,
+                operation: DeploymentCommand::Revision(path),
+            },
+        )
+    }
+
+    pub fn install_deployment(
+        &self,
+        machine: u64,
+        request: u64,
+        path: Box<str>,
+        expected: crate::ExecutableRevision,
+        candidate: u64,
+    ) -> Result<(), SubmitError> {
+        if path.len() > 4096 || matches!(expected, crate::ExecutableRevision::Present(0)) {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(
+            machine,
+            Command::Deployment {
+                machine,
+                request,
+                operation: DeploymentCommand::Install {
+                    path,
+                    expected,
+                    candidate,
+                },
+            },
+        )
+    }
+
+    pub fn discard_deployment(
+        &self,
+        machine: u64,
+        request: u64,
+        candidate: u64,
+    ) -> Result<(), SubmitError> {
+        self.send(
+            machine,
+            Command::Deployment {
+                machine,
+                request,
+                operation: DeploymentCommand::Discard(candidate),
+            },
+        )
     }
 
     pub fn resource_snapshot(&self, machine: u64, request: u64) -> Result<(), SubmitError> {
@@ -1085,6 +1213,7 @@ fn run_worker(
     config: FleetConfig,
     inspections: Arc<Vec<RequestInspection>>,
     coordinated_turns: bool,
+    next_deployment_candidate: Arc<AtomicU64>,
 ) {
     let mut queue = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
@@ -1095,6 +1224,113 @@ fn run_worker(
                 Err(TryRecvError::Disconnected) => return,
             };
             match command {
+                Command::Deployment {
+                    machine,
+                    request,
+                    operation,
+                } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    let result = match operation {
+                        DeploymentCommand::Prepare(bytes) => {
+                            if actor.deployment_candidates.len() >= 4
+                                || actor.deployment_bytes.saturating_add(bytes.len())
+                                    > crate::ArtifactLimits::default().artifact_bytes
+                            {
+                                Err(DeploymentError::Capacity)
+                            } else {
+                                match actor.machine.verify_for_deploy(bytes) {
+                                    Ok(candidate) => {
+                                        match next_deployment_candidate.fetch_update(
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                            |value| (value < i64::MAX as u64).then_some(value + 1),
+                                        ) {
+                                            Ok(token) => {
+                                                actor.deployment_bytes += candidate.bytes.len();
+                                                actor
+                                                    .deployment_candidates
+                                                    .insert(token, candidate);
+                                                Ok(DeploymentResult::Prepared(token))
+                                            }
+                                            Err(_) => Err(DeploymentError::Capacity),
+                                        }
+                                    }
+                                    Err(crate::HostVerifyError::Artifact(_)) => {
+                                        Err(DeploymentError::Verification)
+                                    }
+                                    Err(crate::HostVerifyError::Admission(_)) => {
+                                        Err(DeploymentError::Admission)
+                                    }
+                                }
+                            }
+                        }
+                        DeploymentCommand::Revision(path) => actor
+                            .machine
+                            .parse_inspection_path(&path)
+                            .and_then(|path| actor.machine.executable_revision(&path))
+                            .map(DeploymentResult::Revision)
+                            .map_err(DeploymentError::FileSystem),
+                        DeploymentCommand::Install {
+                            path,
+                            expected,
+                            candidate,
+                        } => match actor.machine.parse_inspection_path(&path) {
+                            Err(error) => Err(DeploymentError::FileSystem(error)),
+                            Ok(path) => match actor.deployment_candidates.remove(&candidate) {
+                                None => Err(DeploymentError::InvalidCandidate),
+                                Some(value) => {
+                                    let size = value.bytes.len();
+                                    match actor.machine.deploy(&path, expected, value) {
+                                        Ok(revision) => {
+                                            actor.deployment_bytes -= size;
+                                            Ok(DeploymentResult::Installed(revision))
+                                        }
+                                        Err(failure) => {
+                                            let error = match failure.error() {
+                                                crate::HostDeployError::WrongMachine => {
+                                                    DeploymentError::WrongMachine
+                                                }
+                                                crate::HostDeployError::ProfileChanged => {
+                                                    DeploymentError::ProfileChanged
+                                                }
+                                                crate::HostDeployError::FileSystem(error) => {
+                                                    DeploymentError::FileSystem(error)
+                                                }
+                                            };
+                                            actor
+                                                .deployment_candidates
+                                                .insert(candidate, failure.into_candidate());
+                                            Err(error)
+                                        }
+                                    }
+                                }
+                            },
+                        },
+                        DeploymentCommand::Discard(candidate) => {
+                            match actor.deployment_candidates.remove(&candidate) {
+                                None => Err(DeploymentError::InvalidCandidate),
+                                Some(value) => {
+                                    actor.deployment_bytes -= value.bytes.len();
+                                    Ok(DeploymentResult::Discarded)
+                                }
+                            }
+                        }
+                    };
+                    if !publish(
+                        &events,
+                        &stopped,
+                        &waiters,
+                        FleetEvent::Deployment {
+                            machine,
+                            request,
+                            result,
+                        },
+                    ) {
+                        return;
+                    }
+                }
                 Command::Filesystem {
                     machine,
                     request,
@@ -1307,6 +1543,7 @@ fn run_worker(
                         .any(|key| preserve_timers_at.is_none() || !actor.timers.contains_key(key))
                         || preserve_timers_at.is_some_and(|tick| tick < actor.tick)
                         || actor.timers.len() > 256
+                        || !actor.deployment_candidates.is_empty()
                         || !actor.inspecting.is_empty()
                         || !actor.inspected.is_empty()
                         || actor.compilation_token.is_some()
@@ -2348,6 +2585,145 @@ mod tests {
             next(&fleet),
             FleetEvent::Boundary {
                 outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(130))),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn deployment_preserves_candidate_after_conflict_and_owns_it_until_discarded() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let home = VirtualPath::parse_utf8("/home", &limits).unwrap();
+        let path = VirtualPath::parse_utf8("/home/demo", &limits).unwrap();
+        let owner = FileCapability::new(home, FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem.write_file(&owner, &path, b"old", true).unwrap();
+        let artifact = crate::execution::fixtures::two_block_artifact(1, 1);
+        let bytes: Arc<[u8]> =
+            Arc::from(crate::test_encode::encode_artifact(artifact.decoded()).unwrap());
+        let machine =
+            ComputerMachine::start_in_filesystem(artifact, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        let fleet = FleetScheduler::new(vec![(1, machine)], config()).unwrap();
+        fleet.prepare_deployment(1, 10, Arc::clone(&bytes)).unwrap();
+        let candidate = match next(&fleet) {
+            FleetEvent::Deployment {
+                request: 10,
+                result: Ok(DeploymentResult::Prepared(candidate)),
+                ..
+            } => candidate,
+            event => panic!("unexpected event {event:?}"),
+        };
+        fleet.detach(1).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::DetachRejected { machine: 1 }
+        ));
+        fleet
+            .install_deployment(
+                1,
+                11,
+                "/home/demo".into(),
+                crate::ExecutableRevision::Absent,
+                candidate,
+            )
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Deployment {
+                request: 11,
+                result: Err(DeploymentError::FileSystem(crate::FileSystemError::Busy)),
+                ..
+            }
+        ));
+        fleet
+            .deployment_revision(1, 12, "/home/demo".into())
+            .unwrap();
+        let revision = match next(&fleet) {
+            FleetEvent::Deployment {
+                request: 12,
+                result: Ok(DeploymentResult::Revision(revision)),
+                ..
+            } => revision,
+            event => panic!("unexpected event {event:?}"),
+        };
+        fleet
+            .install_deployment(1, 13, "/home/demo".into(), revision, candidate)
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Deployment {
+                request: 13,
+                result: Ok(DeploymentResult::Installed(
+                    crate::ExecutableRevision::Present(_)
+                )),
+                ..
+            }
+        ));
+        fleet.discard_deployment(1, 14, candidate).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Deployment {
+                request: 14,
+                result: Err(DeploymentError::InvalidCandidate),
+                ..
+            }
+        ));
+        fleet.detach(1).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Detached { machine: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn deployment_candidate_capacity_is_bounded_and_discard_releases_it() {
+        let artifact = crate::execution::fixtures::two_block_artifact(1, 1);
+        let bytes: Arc<[u8]> =
+            Arc::from(crate::test_encode::encode_artifact(artifact.decoded()).unwrap());
+        let machine = ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+        let fleet = FleetScheduler::new(vec![(1, machine)], config()).unwrap();
+        let mut first = 0;
+        for request in 0..4 {
+            fleet
+                .prepare_deployment(1, request, Arc::clone(&bytes))
+                .unwrap();
+            match next(&fleet) {
+                FleetEvent::Deployment {
+                    result: Ok(DeploymentResult::Prepared(candidate)),
+                    ..
+                } => {
+                    if request == 0 {
+                        first = candidate
+                    }
+                }
+                event => panic!("unexpected event {event:?}"),
+            }
+        }
+        fleet.prepare_deployment(1, 5, Arc::clone(&bytes)).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Deployment {
+                result: Err(DeploymentError::Capacity),
+                ..
+            }
+        ));
+        fleet.discard_deployment(1, 6, first).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Deployment {
+                result: Ok(DeploymentResult::Discarded),
+                ..
+            }
+        ));
+        fleet.prepare_deployment(1, 7, bytes).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Deployment {
+                result: Ok(DeploymentResult::Prepared(_)),
                 ..
             }
         ));

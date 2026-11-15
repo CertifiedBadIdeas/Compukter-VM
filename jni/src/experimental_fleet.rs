@@ -44,6 +44,74 @@ fn submit(result: Result<(), SubmitError>) -> jint {
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_deployment<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    request: jlong,
+    kind: jint,
+    payload: JByteArray<'a>,
+    candidate: jlong,
+    revision: jlong,
+) -> jint {
+    status(&mut env, |env| {
+        if machine < 0 || request < 0 || candidate < 0 || revision < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let maximum = if kind == 0 {
+            compukter_vm::ArtifactLimits::default().artifact_bytes
+        } else {
+            4096
+        };
+        if payload.len(env)? > maximum {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let payload = bytes(env, &payload)?;
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = map.get(&(handle as u64)) else {
+            return Ok(code(FfiStatus::StaleHandle));
+        };
+        let result = match kind {
+            0 if candidate == 0 && revision == 0 => {
+                fleet
+                    .scheduler
+                    .prepare_deployment(machine as u64, request as u64, payload.into())
+            }
+            1 if candidate == 0 && revision == 0 => match String::from_utf8(payload) {
+                Ok(path) => fleet.scheduler.deployment_revision(
+                    machine as u64,
+                    request as u64,
+                    path.into_boxed_str(),
+                ),
+                Err(_) => return Ok(code(FfiStatus::InvalidArgument)),
+            },
+            2 if candidate > 0 => match String::from_utf8(payload) {
+                Ok(path) => fleet.scheduler.install_deployment(
+                    machine as u64,
+                    request as u64,
+                    path.into_boxed_str(),
+                    if revision == 0 {
+                        compukter_vm::ExecutableRevision::Absent
+                    } else {
+                        compukter_vm::ExecutableRevision::Present(revision as u64)
+                    },
+                    candidate as u64,
+                ),
+                Err(_) => return Ok(code(FfiStatus::InvalidArgument)),
+            },
+            3 if candidate > 0 && revision == 0 && payload.is_empty() => fleet
+                .scheduler
+                .discard_deployment(machine as u64, request as u64, candidate as u64),
+            _ => return Ok(code(FfiStatus::InvalidArgument)),
+        };
+        Ok(submit(result))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_filesystemQuery<
     'a,
 >(
@@ -570,6 +638,21 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         if f.pending.is_none() {
             f.pending = match experimental_fleet::poll_event(&f.scheduler) {
                 Ok(None) => None,
+                Ok(Some(experimental_fleet::WireEvent::Deployment {
+                    machine,
+                    request,
+                    kind,
+                    status,
+                    value,
+                })) => {
+                    let mut bytes = vec![17];
+                    bytes.extend_from_slice(&machine.to_le_bytes());
+                    bytes.extend_from_slice(&request.to_le_bytes());
+                    bytes.push(kind);
+                    bytes.extend_from_slice(&(status as u32).to_le_bytes());
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                    Some(bytes)
+                }
                 Ok(Some(experimental_fleet::WireEvent::InputResult {
                     machine,
                     request,
