@@ -69,7 +69,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             || schemas.len(env)? > 65536
             || namespace.len(env)? > 256
             || name.len(env)? > 256
-            || detail.len(env)? > 1024
+            || detail.len(env)? > compukter_vm::MAXIMUM_HOST_FAILURE_DETAIL_BYTES
         {
             return Ok(code(FfiStatus::InvalidArgument));
         }
