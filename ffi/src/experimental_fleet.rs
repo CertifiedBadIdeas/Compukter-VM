@@ -68,7 +68,9 @@ fn create_machines(
 pub fn poll(fleet: &FleetScheduler) -> Result<Option<Vec<u8>>, String> {
     match poll_event(fleet)? {
         Some(WireEvent::Outcome(bytes)) => Ok(Some(bytes)),
-        Some(WireEvent::Stopped { .. }) => Err("stop requires the typed fleet event API".into()),
+        Some(WireEvent::Stopped { .. }) | Some(WireEvent::ScopeStopped { .. }) => {
+            Err("stop requires the typed fleet event API".into())
+        }
         Some(WireEvent::Inspection(_)) => {
             Err("inspection requires the typed fleet event API".into())
         }
@@ -79,6 +81,11 @@ pub fn poll(fleet: &FleetScheduler) -> Result<Option<Vec<u8>>, String> {
 pub enum WireEvent {
     Outcome(Vec<u8>),
     Inspection(Vec<u8>),
+    ScopeStopped {
+        machine: u64,
+        scope: u64,
+        pending: Vec<(u32, u64)>,
+    },
     Stopped {
         machine: u64,
         pending: Vec<(u32, u64)>,
@@ -103,6 +110,17 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             }),
             true,
         ),
+        FleetEvent::ScopeStopped {
+            machine,
+            scope,
+            pending,
+        } => {
+            return Ok(Some(WireEvent::ScopeStopped {
+                machine,
+                scope,
+                pending,
+            }));
+        }
         FleetEvent::Stopped { machine, pending } => {
             return Ok(Some(WireEvent::Stopped { machine, pending }));
         }

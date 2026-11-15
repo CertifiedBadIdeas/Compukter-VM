@@ -119,6 +119,12 @@ pub enum FleetEvent {
         machine: u64,
         pending: Vec<(u32, u64)>,
     },
+    /// Requests belonging to a finished or replaced process must be discarded by the host.
+    ScopeStopped {
+        machine: u64,
+        scope: u64,
+        pending: Vec<(u32, u64)>,
+    },
     Error {
         machine: u64,
         message: String,
@@ -163,6 +169,10 @@ enum Command {
     Stop {
         machine: u64,
     },
+    TerminalKey {
+        machine: u64,
+        event: crate::TerminalKeyEvent,
+    },
     Cost {
         machine: u64,
         task: u32,
@@ -184,6 +194,8 @@ struct Actor {
     stopped: bool,
     pending: HashSet<(u32, u64)>,
     inspecting: HashSet<(u32, u64)>,
+    scopes: Vec<u64>,
+    request_scopes: HashMap<(u32, u64), u64>,
     inspected: HashMap<(u32, u64), u32>,
     timers: HashMap<(u32, u64), u64>,
 }
@@ -244,6 +256,8 @@ impl FleetScheduler {
                     stopped: false,
                     pending: HashSet::new(),
                     inspecting: HashSet::new(),
+                    scopes: vec![0],
+                    request_scopes: HashMap::new(),
                     inspected: HashMap::new(),
                     timers: HashMap::new(),
                 },
@@ -323,6 +337,14 @@ impl FleetScheduler {
                 deadline,
             },
         )
+    }
+
+    pub fn terminal_key(
+        &self,
+        machine: u64,
+        event: crate::TerminalKeyEvent,
+    ) -> Result<(), SubmitError> {
+        self.send(machine, Command::TerminalKey { machine, event })
     }
 
     pub fn reply(
@@ -505,6 +527,7 @@ fn run_worker(
                     for (task, request) in due {
                         actor.timers.remove(&(task, request));
                         actor.pending.remove(&(task, request));
+                        actor.request_scopes.remove(&(task, request));
                         if let Err(error) = actor.machine.resume_host_request_for(
                             task,
                             request,
@@ -542,19 +565,10 @@ fn run_worker(
                     if actor.timers.contains_key(&(task, request))
                         || !actor.pending.remove(&(task, request))
                     {
-                        if !publish(
-                            &events,
-                            &stopped,
-                            &waiters,
-                            FleetEvent::Error {
-                                machine,
-                                message: "reply does not match a pending request".into(),
-                            },
-                        ) {
-                            return;
-                        }
+                        // Completions can race with process exit and cancellation.
                         continue;
                     }
+                    actor.request_scopes.remove(&(task, request));
                     if let Err(error) =
                         actor
                             .machine
@@ -600,6 +614,27 @@ fn run_worker(
                         }
                     }
                 }
+                Command::TerminalKey { machine, event } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    if let Err(error) = actor.machine.submit_terminal_key(event) {
+                        if !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::Error {
+                                machine,
+                                message: format!("terminal key: {error:?}"),
+                            },
+                        ) {
+                            return;
+                        }
+                    } else {
+                        actor.parked = false;
+                        ready(machine, actor, &mut queue);
+                    }
+                }
                 Command::Cost {
                     machine,
                     task,
@@ -611,17 +646,7 @@ fn run_worker(
                     };
                     let key = (task, request);
                     if !actor.inspecting.remove(&key) {
-                        if !publish(
-                            &events,
-                            &stopped,
-                            &waiters,
-                            FleetEvent::Error {
-                                machine,
-                                message: "cost does not match an inspection".into(),
-                            },
-                        ) {
-                            return;
-                        }
+                        // An inspection can finish after its process has exited.
                         continue;
                     }
                     actor.inspected.insert(key, units);
@@ -715,6 +740,9 @@ fn run_worker(
                             }
                         } else {
                             if actor.inspecting.insert(key) {
+                                actor
+                                    .request_scopes
+                                    .insert(key, *actor.scopes.last().expect("root scope"));
                                 discovered = true;
                                 if !publish(
                                     &events,
@@ -756,6 +784,7 @@ fn run_worker(
                     }
                     if cost.units > config.host_budget {
                         actor.inspected.remove(&key);
+                        actor.request_scopes.remove(&key);
                         actor.requests_left -= 1;
                         discovered = true;
                         if let Err(error) = actor.machine.resume_host_request_for(
@@ -788,6 +817,9 @@ fn run_worker(
                     actor.requests_left -= cost.units;
                     actor.inspected.remove(&key);
                     actor.pending.insert(key);
+                    actor
+                        .request_scopes
+                        .insert(key, *actor.scopes.last().expect("root scope"));
                     discovered = true;
                     if request.namespace.as_ref() == "compukter"
                         && request.name.as_ref() == "timer"
@@ -845,6 +877,104 @@ fn run_worker(
                 } else {
                     ready(id, actor, &mut queue);
                 }
+            }
+            lifecycle @ (ComputerAdvanceOutcome::ProcessEntered(_)
+            | ComputerAdvanceOutcome::ProcessExited(_)
+            | ComputerAdvanceOutcome::ProcessReplaced { .. }) => {
+                let finished = match &lifecycle {
+                    ComputerAdvanceOutcome::ProcessEntered(scope) => {
+                        if actor.scopes.contains(scope) {
+                            Some(Err("duplicate process scope"))
+                        } else {
+                            actor.scopes.push(*scope);
+                            None
+                        }
+                    }
+                    ComputerAdvanceOutcome::ProcessExited(scope) => {
+                        if actor.scopes.len() <= 1 || actor.scopes.last() != Some(scope) {
+                            Some(Err("process exit scope mismatch"))
+                        } else {
+                            actor.scopes.pop();
+                            Some(Ok(*scope))
+                        }
+                    }
+                    ComputerAdvanceOutcome::ProcessReplaced { previous, current } => {
+                        if actor.scopes.last() != Some(previous)
+                            || current <= previous
+                            || actor.scopes.contains(current)
+                        {
+                            Some(Err("process replacement scope mismatch"))
+                        } else {
+                            *actor.scopes.last_mut().expect("root scope") = *current;
+                            Some(Ok(*previous))
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                if let Some(finished) = finished {
+                    let scope = match finished {
+                        Ok(scope) => scope,
+                        Err(message) => {
+                            actor.stopped = true;
+                            if !publish(
+                                &events,
+                                &stopped,
+                                &waiters,
+                                FleetEvent::Error {
+                                    machine: id,
+                                    message: message.into(),
+                                },
+                            ) {
+                                return;
+                            }
+                            continue;
+                        }
+                    };
+                    let keys: Vec<_> = actor
+                        .request_scopes
+                        .iter()
+                        .filter_map(|(key, owner)| (*owner == scope).then_some(*key))
+                        .collect();
+                    let mut pending = Vec::new();
+                    for key in keys {
+                        actor.request_scopes.remove(&key);
+                        actor.inspecting.remove(&key);
+                        actor.inspected.remove(&key);
+                        actor.pending.remove(&key);
+                        if actor.timers.remove(&key).is_none() {
+                            pending.push(key);
+                        }
+                    }
+                    pending.sort_unstable();
+                    if !pending.is_empty()
+                        && !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::ScopeStopped {
+                                machine: id,
+                                scope,
+                                pending,
+                            },
+                        )
+                    {
+                        return;
+                    }
+                }
+                if !publish(
+                    &events,
+                    &stopped,
+                    &waiters,
+                    FleetEvent::Boundary {
+                        machine: id,
+                        tick: actor.tick,
+                        outcome: lifecycle,
+                    },
+                ) {
+                    return;
+                }
+                actor.parked = false;
+                ready(id, actor, &mut queue);
             }
             other => {
                 actor.stopped = true;
@@ -927,6 +1057,210 @@ mod tests {
             assert!(Instant::now() < limit, "timed out waiting for VM advance");
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn process_lifecycle_events_do_not_stop_the_fleet() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let home = VirtualPath::parse_utf8("/home", &limits).unwrap();
+        let owner = FileCapability::new(home, FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits.clone());
+        let child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        let path = VirtualPath::parse_utf8("/home/child", &limits).unwrap();
+        filesystem.write_file(&owner, &path, &bytes, true).unwrap();
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let machine =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessEntered(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessExited(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(0))),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replacement_preserves_process_lifecycle_and_resumes_parent() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let mut filesystem = ComputerFileSystem::with_limits(limits.clone());
+        let launcher = crate::execution::fixtures::process_v3_exec_artifact(
+            &"/home/replacement".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let replacement = crate::execution::fixtures::process_v2_exit_artifact(37);
+        for (name, artifact) in [
+            ("/home/child", launcher),
+            ("/home/replacement", replacement),
+        ] {
+            let bytes = crate::test_encode::encode_artifact(artifact.decoded()).unwrap();
+            filesystem
+                .write_file(
+                    &owner,
+                    &VirtualPath::parse_utf8(name, &limits).unwrap(),
+                    &bytes,
+                    true,
+                )
+                .unwrap();
+        }
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let machine =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessEntered(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessReplaced {
+                    previous: 1,
+                    current: 2
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessExited(2),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(37))),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn terminating_child_cancels_its_pending_request_and_discards_late_reply() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, TerminalKey,
+            TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let mut filesystem = ComputerFileSystem::with_limits(limits.clone());
+        let child = crate::execution::fixtures::capability_artifact(true, true, 1, 0);
+        let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        filesystem
+            .write_file(
+                &owner,
+                &VirtualPath::parse_utf8("/home/child", &limits).unwrap(),
+                &bytes,
+                true,
+            )
+            .unwrap();
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 2, &ops);
+        let machine = ComputerMachine::start_in_filesystem(
+            parent,
+            profile(),
+            &[binding],
+            &[],
+            filesystem,
+            owner,
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessEntered(1),
+                ..
+            }
+        ));
+        let request = match next(&fleet) {
+            FleetEvent::Requests { requests, .. } => requests[0].clone(),
+            event => panic!("{event:?}"),
+        };
+        fleet
+            .terminal_key(
+                7,
+                TerminalKeyEvent::new(
+                    TerminalKey::C,
+                    TerminalKeyAction::Press,
+                    TerminalModifiers::new(TerminalModifiers::CONTROL).unwrap(),
+                ),
+            )
+            .unwrap();
+        match next(&fleet) {
+            FleetEvent::ScopeStopped {
+                machine: 7,
+                scope: 1,
+                pending,
+            } => assert_eq!(pending, vec![(request.task_id, request.id)]),
+            event => panic!("{event:?}"),
+        }
+        fleet
+            .reply(7, request.task_id, request.id, ReplyValue::Unit)
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessExited(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(130))),
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -325,6 +325,21 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                 Ok(Some(experimental_fleet::WireEvent::Inspection(b))) => {
                     Some([vec![1], b].concat())
                 }
+                Ok(Some(experimental_fleet::WireEvent::ScopeStopped {
+                    machine,
+                    scope,
+                    pending,
+                })) => {
+                    let mut b = vec![4];
+                    b.extend_from_slice(&machine.to_le_bytes());
+                    b.extend_from_slice(&scope.to_le_bytes());
+                    b.extend_from_slice(&(pending.len() as u32).to_le_bytes());
+                    for (task, request) in pending {
+                        b.extend_from_slice(&task.to_le_bytes());
+                        b.extend_from_slice(&request.to_le_bytes());
+                    }
+                    Some(b)
+                }
                 Ok(Some(experimental_fleet::WireEvent::Stopped { machine, pending })) => {
                     let mut b = vec![2];
                     b.extend_from_slice(&machine.to_le_bytes());
@@ -448,6 +463,46 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                     request as u64,
                     ReplyValue::Failure(kind, detail.into_boxed_str()),
                 ))
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_terminalKey<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    key: jint,
+    action: jint,
+    modifiers: jint,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0
+            || !(0..=u16::MAX as jint).contains(&key)
+            || !(0..=u8::MAX as jint).contains(&modifiers)
+        {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let Ok(key) = compukter_vm::TerminalKey::try_from(key as u16) else {
+            return Ok(code(FfiStatus::InvalidArgument));
+        };
+        let action = match action {
+            0 => compukter_vm::TerminalKeyAction::Press,
+            1 => compukter_vm::TerminalKeyAction::Repeat,
+            _ => return Ok(code(FfiStatus::InvalidArgument)),
+        };
+        let Ok(modifiers) = compukter_vm::TerminalModifiers::new(modifiers as u8) else {
+            return Ok(code(FfiStatus::InvalidArgument));
+        };
+        let event = compukter_vm::TerminalKeyEvent::new(key, action, modifiers);
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(f.scheduler.terminal_key(machine as u64, event))
             }))
     })
 }
