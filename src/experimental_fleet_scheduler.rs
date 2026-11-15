@@ -851,6 +851,22 @@ fn run_worker(
                 actor.remaining = 0;
                 actor.parked = false;
             }
+            ComputerAdvanceOutcome::WaitingForTerminalEvent => {
+                actor.parked = true;
+                if !publish(
+                    &events,
+                    &stopped,
+                    &waiters,
+                    FleetEvent::Boundary {
+                        machine: id,
+                        tick: actor.tick,
+                        outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                    },
+                ) {
+                    return;
+                }
+            }
+
             ComputerAdvanceOutcome::HostRequestBatch(batch) => {
                 let mut fresh = Vec::new();
                 let mut discovered = false;
@@ -1521,6 +1537,47 @@ mod tests {
         assert!(matches!(
             next(&fleet),
             FleetEvent::Requests { machine: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn terminal_input_resumes_a_parked_machine() {
+        use crate::{TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers};
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::stdio_conformance_artifact(&[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                ..
+            }
+        ));
+        let before_input = fleet.metrics().advances;
+        fleet
+            .terminal_key(
+                7,
+                TerminalKeyEvent::new(
+                    TerminalKey::Enter,
+                    TerminalKeyAction::Press,
+                    TerminalModifiers::default(),
+                ),
+            )
+            .unwrap();
+        wait_advances(&fleet, before_input + 1);
+        fleet.grant(7, 2, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(0))),
+                ..
+            }
         ));
     }
 
