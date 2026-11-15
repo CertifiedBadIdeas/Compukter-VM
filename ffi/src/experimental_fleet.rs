@@ -74,6 +74,7 @@ pub fn poll(fleet: &FleetScheduler) -> Result<Option<Vec<u8>>, String> {
         Some(WireEvent::Inspection(_)) => {
             Err("inspection requires the typed fleet event API".into())
         }
+        Some(WireEvent::Error { machine, message }) => Err(format!("machine {machine}: {message}")),
         None => Ok(None),
     }
 }
@@ -81,6 +82,10 @@ pub fn poll(fleet: &FleetScheduler) -> Result<Option<Vec<u8>>, String> {
 pub enum WireEvent {
     Outcome(Vec<u8>),
     Inspection(Vec<u8>),
+    Error {
+        machine: u64,
+        message: String,
+    },
     ScopeStopped {
         machine: u64,
         scope: u64,
@@ -141,9 +146,10 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             tick,
             outcome: ComputerAdvanceOutcome::CompilationRequested(_),
         } => {
-            return Err(format!(
-                "machine {machine} requested compilation at tick {tick}; unsupported by experiment"
-            ))
+            return Ok(Some(WireEvent::Error {
+                machine,
+                message: format!("compilation requested at tick {tick}; unsupported by experiment"),
+            }))
         }
         FleetEvent::Boundary {
             machine,
@@ -151,7 +157,7 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             outcome,
         } => (machine, tick, outcome, false),
         FleetEvent::Error { machine, message } => {
-            return Err(format!("machine {machine}: {message}"))
+            return Ok(Some(WireEvent::Error { machine, message }))
         }
     };
     let encoded = crate::wire::encode_outcome(crate::bridge::copy_outcome(outcome));

@@ -350,7 +350,13 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                     }
                     Some(b)
                 }
-                Err(e) => Some([vec![3], e.into_bytes()].concat()),
+                Ok(Some(experimental_fleet::WireEvent::Error { machine, message })) => {
+                    let mut bytes = vec![3];
+                    bytes.extend_from_slice(&machine.to_le_bytes());
+                    bytes.extend_from_slice(message.as_bytes());
+                    Some(bytes)
+                }
+                Err(e) => Some([vec![5], e.into_bytes()].concat()),
             };
         }
         let Some(b) = f.pending.as_ref() else {

@@ -78,6 +78,7 @@ fn experimental_fleet_exposes_typed_stop_events() {
             }
             Some(WireEvent::Outcome(_)) => panic!("unexpected outcome"),
             Some(WireEvent::Inspection(_)) => panic!("unexpected inspection"),
+            Some(WireEvent::Error { .. }) => panic!("unexpected fleet error"),
             Some(WireEvent::ScopeStopped { .. }) => panic!("unexpected scope stop"),
             None => {
                 assert!(Instant::now() < deadline);
