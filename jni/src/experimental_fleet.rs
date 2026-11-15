@@ -279,7 +279,9 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                     return Ok(code(FfiStatus::InvalidArgument));
                 }
                 ReplyValue::String(
-                    b.chunks_exact(2)
+                    b.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|v| u16::from_le_bytes([v[0], v[1]]))
                         .collect(),
                 )
