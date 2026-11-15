@@ -8,7 +8,6 @@
 //! workers retain refused events without copying or consuming their payloads.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::mpsc;
 use std::sync::mpsc::{TryRecvError, TrySendError};
@@ -40,7 +39,6 @@ struct State {
 }
 
 struct Shared {
-    inflight: AtomicUsize,
     state: Mutex<State>,
     #[cfg(test)]
     changed: Condvar,
@@ -61,7 +59,6 @@ pub(super) fn channel(
 ) -> (EventSender, EventReceiver) {
     assert!(capacity > 0 && limit > 0 && machine_limit > 0);
     let shared = Arc::new(Shared {
-        inflight: AtomicUsize::new(0),
         state: Mutex::new(State {
             limit,
             machine_limit,
@@ -87,14 +84,6 @@ pub(super) fn channel(
 }
 
 impl EventSender {
-    pub(super) fn retain_inflight(&self, bytes: usize) {
-        self.shared.inflight.fetch_add(bytes, Ordering::AcqRel);
-    }
-
-    pub(super) fn release_inflight(&self, bytes: usize) {
-        self.shared.inflight.fetch_sub(bytes, Ordering::AcqRel);
-    }
-
     // Return refused ownership inline: boxing the error would allocate on
     // every backpressure retry. FleetEvent intentionally carries its payload.
     #[allow(clippy::result_large_err)]
@@ -213,10 +202,6 @@ impl EventReceiver {
             None if state.senders == 0 => Err(mpsc::RecvTimeoutError::Disconnected),
             None => Err(mpsc::RecvTimeoutError::Timeout),
         }
-    }
-
-    pub(super) fn inflight_bytes(&self) -> usize {
-        self.shared.inflight.load(Ordering::Acquire)
     }
 
     pub(super) fn memory(&self) -> FleetMemoryUsage {

@@ -11,17 +11,18 @@ use std::sync::mpsc::TrySendError;
 use std::sync::Arc;
 
 use super::memory::{observation_bytes, ByteBudget, OutputHeadroom, Reservation};
+use super::pending::PendingOutput;
 use super::{
     CloseRequest, EventSender, FleetDetachCompletion, FleetDetachRejection, FleetDetachResult,
     FleetEvent, FleetQuiescent, FleetStopCompletion, LifecycleCompletion,
 };
 
-/// One worker retains at most one unfinished operation's output. Ordinary
-/// execution cannot resume until it is delivered; closing commands cancel their
-/// observations and retain accounting in the independent completion slot.
+/// Machines with undelivered output pause independently under shared byte and
+/// entry reservations. Only an operation exceeding those reservations pauses
+/// the whole worker. Lifecycle completions retain their separate ownership.
 pub(super) struct WorkerOutput<'a> {
     transport: EventSender,
-    pending: RefCell<VecDeque<FleetEvent>>,
+    pending: RefCell<PendingOutput>,
     closing: RefCell<Option<ClosingOutput>>,
     headroom: Arc<AtomicBool>,
     waiters: &'a AtomicUsize,
@@ -31,13 +32,14 @@ impl<'a> WorkerOutput<'a> {
     pub(super) fn new(transport: EventSender, waiters: &'a AtomicUsize) -> Self {
         Self {
             transport,
-            pending: RefCell::new(VecDeque::new()),
+            pending: RefCell::new(PendingOutput::default()),
             closing: RefCell::new(None),
             headroom: Arc::new(AtomicBool::new(true)),
             waiters,
         }
     }
 
+    #[cfg(test)]
     pub(super) fn has_pending(&self) -> bool {
         !self.pending.borrow().is_empty() || !self.headroom.load(Ordering::Acquire)
     }
@@ -49,30 +51,18 @@ impl<'a> WorkerOutput<'a> {
             .map(|closing| closing.machine)
     }
 
+    pub(super) fn blocks_worker(&self) -> bool {
+        self.pending.borrow().blocks_worker() || !self.headroom.load(Ordering::Acquire)
+    }
+
+    pub(super) fn blocks_machine(&self, machine: u64) -> bool {
+        self.pending.borrow().contains(machine)
+    }
+
     pub(super) fn flush(&self) -> bool {
-        let mut pending = self.pending.borrow_mut();
-        let had_pending = !pending.is_empty();
-        while let Some(event) = pending.pop_front() {
-            let bytes = observation_bytes(&event);
-            match self.transport.sender.try_send(event) {
-                Ok(()) => {
-                    self.transport.sender.release_inflight(bytes);
-                    self.transport.signal.notify();
-                }
-                Err(TrySendError::Full(event)) => {
-                    pending.push_front(event);
-                    break;
-                }
-                Err(TrySendError::Disconnected(event)) => {
-                    pending.push_front(event);
-                    return false;
-                }
-            }
-        }
-        if had_pending && pending.is_empty() {
-            self.waiters.fetch_sub(1, Ordering::SeqCst);
-        }
-        true
+        self.pending
+            .borrow_mut()
+            .flush(&self.transport, self.waiters)
     }
 
     pub(super) fn begin_closing(&self, machine: u64, request: CloseRequest) -> bool {
@@ -96,23 +86,9 @@ impl<'a> WorkerOutput<'a> {
             overflowed: false,
             overflow_bytes: 0,
         };
-        let mut pending = self.pending.borrow_mut();
-        let had_pending = !pending.is_empty();
-        let mut unrelated = VecDeque::new();
-        while let Some(event) = pending.pop_front() {
-            if event.machine() == machine {
-                self.transport
-                    .sender
-                    .release_inflight(observation_bytes(&event));
-                output.retain(event);
-            } else {
-                unrelated.push_back(event);
-            }
-        }
-        *pending = unrelated;
-        if had_pending && pending.is_empty() {
-            self.waiters.fetch_sub(1, Ordering::SeqCst);
-        }
+        self.pending
+            .borrow_mut()
+            .drain_machine(machine, self.waiters, |event| output.retain(event));
         *closing = Some(output);
         true
     }
@@ -198,33 +174,19 @@ impl<'a> WorkerOutput<'a> {
             }
         }
         let mut pending = self.pending.borrow_mut();
-        if pending.is_empty() {
+        let event = if !pending.contains(event.machine()) {
             match self.transport.sender.try_send(event) {
                 Ok(()) => {
                     self.transport.signal.notify();
                     return true;
                 }
                 Err(TrySendError::Disconnected(_)) => return false,
-                Err(TrySendError::Full(event)) => {
-                    self.waiters.fetch_add(1, Ordering::SeqCst);
-                    self.transport
-                        .sender
-                        .retain_inflight(observation_bytes(&event));
-                    pending.push_back(event);
-                }
+                Err(TrySendError::Full(event)) => event,
             }
         } else {
-            // Tick processing and one Guest step each produce at most three
-            // events. No further ordinary operation may start with pending output.
-            assert!(
-                pending.len() < 3,
-                "worker operation exceeded output batch bound"
-            );
-            self.transport
-                .sender
-                .retain_inflight(observation_bytes(&event));
-            pending.push_back(event);
-        }
+            event
+        };
+        pending.push(event, &self.transport, self.waiters);
         true
     }
 }
@@ -288,11 +250,7 @@ impl ClosingOutput {
 
 impl Drop for WorkerOutput<'_> {
     fn drop(&mut self) {
-        if !self.pending.get_mut().is_empty() {
-            let bytes = self.pending.get_mut().iter().map(observation_bytes).sum();
-            self.transport.sender.release_inflight(bytes);
-            self.waiters.fetch_sub(1, Ordering::SeqCst);
-        }
+        self.pending.get_mut().clear(self.waiters);
     }
 }
 
@@ -325,6 +283,10 @@ mod tests {
                     sender,
                     signal: Arc::new(FleetEventSignal::default()),
                     completions: Arc::clone(&completions),
+                    pending: super::super::pending::PendingCapacity::new(
+                        FleetMemoryLimits::default(),
+                        64,
+                    ),
                     detach_memory: Arc::clone(&memory),
                     detach_machine_limit: local_limit,
                     detach_headroom: Arc::clone(&headroom),
@@ -402,6 +364,10 @@ mod tests {
                 sender,
                 signal: Arc::new(FleetEventSignal::default()),
                 completions: Arc::new(Mutex::new(BTreeMap::new())),
+                pending: super::super::pending::PendingCapacity::new(
+                    FleetMemoryLimits::default(),
+                    64,
+                ),
                 detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
                 detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
                 detach_headroom: Arc::new(AtomicUsize::new(0)),
@@ -426,7 +392,14 @@ mod tests {
             timers_pending: false
         }));
         assert_eq!(waiters.load(Ordering::SeqCst), 1);
-        assert!(receiver.inflight_bytes() >= 256 * 1024);
+        assert!(
+            output
+                .transport
+                .pending
+                .inflight_bytes
+                .load(Ordering::Acquire)
+                >= 256 * 1024
+        );
         output.begin_closing(2, CloseRequest::Stop);
         output.complete_stop(FleetStopCompletion {
             machine: 2,
@@ -461,6 +434,187 @@ mod tests {
             })
         ));
         assert_eq!(waiters.load(Ordering::SeqCst), 0);
-        assert_eq!(receiver.inflight_bytes(), 0);
+        assert_eq!(
+            output
+                .transport
+                .pending
+                .inflight_bytes
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+    fn bounded_transport(
+        capacity: usize,
+        machine_bytes: usize,
+        limits: FleetMemoryLimits,
+        pending_entries: usize,
+    ) -> (EventSender, super::super::event_queue::EventReceiver) {
+        let (sender, receiver) = super::super::event_queue::channel(capacity, 8192, machine_bytes);
+        (
+            EventSender {
+                sender,
+                signal: Arc::new(FleetEventSignal::default()),
+                completions: Arc::new(Mutex::new(BTreeMap::new())),
+                pending: super::super::pending::PendingCapacity::new(limits, pending_entries),
+                detach_memory: ByteBudget::new(limits.detach_output_bytes),
+                detach_machine_limit: limits.detach_output_bytes_per_machine,
+                detach_headroom: Arc::new(AtomicUsize::new(0)),
+            },
+            receiver,
+        )
+    }
+
+    fn observation(machine: u64, message: &str) -> FleetEvent {
+        FleetEvent::Error {
+            machine,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn another_machine_can_publish_while_one_machine_is_backpressured() {
+        let (transport, receiver) = bounded_transport(
+            8,
+            std::mem::size_of::<FleetEvent>() + 32,
+            FleetMemoryLimits::default(),
+            8,
+        );
+        let waiters = AtomicUsize::new(0);
+        let output = WorkerOutput::new(transport, &waiters);
+        assert!(output.emit(observation(1, "a")));
+        assert!(output.emit(observation(1, "b")));
+        assert!(output.blocks_machine(1));
+        assert!(!output.blocks_worker());
+        assert!(output.emit(observation(2, "c")));
+        assert!(!output.blocks_machine(2));
+        assert_eq!(receiver.try_recv().unwrap().machine(), 1);
+        assert_eq!(receiver.try_recv().unwrap().machine(), 2);
+        assert!(output.flush());
+        let FleetEvent::Error {
+            machine: 1,
+            message,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("pending result missing")
+        };
+        assert_eq!(message, "b");
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            output
+                .transport
+                .pending
+                .inflight_bytes
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn flush_skips_a_locally_full_machine_and_preserves_each_machines_order() {
+        let (transport, receiver) = bounded_transport(
+            2,
+            std::mem::size_of::<FleetEvent>() + 32,
+            FleetMemoryLimits::default(),
+            8,
+        );
+        let waiters = AtomicUsize::new(0);
+        let output = WorkerOutput::new(transport, &waiters);
+        assert!(output.emit(observation(0, "filler")));
+        assert!(output.emit(observation(1, "first")));
+        assert!(output.emit(observation(1, "second")));
+        assert!(output.emit(observation(1, "third")));
+        assert!(output.emit(observation(2, "other")));
+        assert_eq!(receiver.try_recv().unwrap().machine(), 0);
+        assert!(output.flush());
+        assert!(output.blocks_machine(1));
+        assert!(
+            !output.blocks_machine(2),
+            "local pressure prevented another owner's delivery"
+        );
+        assert_eq!(receiver.try_recv().unwrap().machine(), 1);
+        assert_eq!(receiver.try_recv().unwrap().machine(), 2);
+        for expected in ["second", "third"] {
+            assert!(output.flush());
+            let FleetEvent::Error {
+                machine: 1,
+                message,
+            } = receiver.try_recv().unwrap()
+            else {
+                panic!("ordered result missing")
+            };
+            assert_eq!(message, expected);
+        }
+        assert!(!output.blocks_machine(1));
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pending_capacity_is_shared_and_overflow_is_released_on_cancel_and_drop() {
+        for (global, local, entries) in [(1, 8192, 8), (8192, 1, 8), (8192, 8192, 1)] {
+            let limits = FleetMemoryLimits {
+                pending_output_bytes: global,
+                pending_output_bytes_per_machine: local,
+                ..FleetMemoryLimits::default()
+            };
+            let (transport, _receiver) = bounded_transport(1, 8192, limits, entries);
+            let capacity = Arc::clone(&transport.pending);
+            let waiters = AtomicUsize::new(0);
+            let first = WorkerOutput::new(transport.clone(), &waiters);
+            let second = WorkerOutput::new(transport, &waiters);
+            assert!(first.emit(observation(0, "occupied")));
+            assert!(first.emit(observation(1, "pending")));
+            assert_eq!(first.blocks_worker(), entries != 1);
+            assert!(second.emit(observation(2, "other worker")));
+            assert!(second.blocks_worker());
+            assert!(capacity.memory.snapshot().retained_bytes <= global);
+            assert!(capacity.entries.snapshot().retained_bytes <= entries);
+            assert!(capacity.headroom_bytes.load(Ordering::Acquire) > 0);
+            assert_eq!(waiters.load(Ordering::SeqCst), 2);
+            assert!(first.begin_closing(1, CloseRequest::Stop));
+            assert!(!first.blocks_worker());
+            assert!(!first.blocks_machine(1));
+            assert!(second.blocks_machine(2));
+            drop(first);
+            drop(second);
+            assert_eq!(capacity.inflight_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(waiters.load(Ordering::SeqCst), 0);
+            assert_eq!(capacity.memory.snapshot().retained_bytes, 0);
+            assert_eq!(capacity.entries.snapshot().retained_bytes, 0);
+            assert_eq!(capacity.headroom_bytes.load(Ordering::Acquire), 0);
+        }
+    }
+    #[test]
+    fn rotating_pending_owners_all_progress_with_one_delivery_slot() {
+        let (transport, receiver) = bounded_transport(1, 8192, FleetMemoryLimits::default(), 16);
+        let capacity = Arc::clone(&transport.pending);
+        let waiters = AtomicUsize::new(0);
+        let output = WorkerOutput::new(transport, &waiters);
+        assert!(output.emit(observation(0, "occupied")));
+        for machine in 1..=9 {
+            assert!(output.emit(observation(machine, "pending")));
+        }
+        assert!(!output.blocks_worker());
+        assert_eq!(receiver.try_recv().unwrap().machine(), 0);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..9 {
+            assert!(output.flush());
+            assert!(
+                seen.insert(receiver.try_recv().unwrap().machine()),
+                "duplicate owner delivery"
+            );
+        }
+        assert_eq!(seen, (1..=9).collect());
+        assert!(!output.has_pending());
+        assert_eq!(capacity.memory.snapshot().retained_bytes, 0);
+        assert_eq!(capacity.entries.snapshot().retained_bytes, 0);
+        assert_eq!(
+            output
+                .transport
+                .pending
+                .inflight_bytes
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
     }
 }

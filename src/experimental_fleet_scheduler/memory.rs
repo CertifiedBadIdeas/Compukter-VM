@@ -23,6 +23,13 @@ pub struct FleetMemoryLimits {
     /// blocks further ordinary publication until consumed.
     pub event_bytes: usize,
     pub event_bytes_per_machine: usize,
+    /// Backpressured per-machine batches, including observation payloads and
+    /// reservation handles. Entry reservations share event_capacity across all
+    /// workers. One already started operation per worker may exceed capacity;
+    /// that worker pauses ordinary execution until the excess is transferred.
+    /// Allocator/collection slack and detached state are separate.
+    pub pending_output_bytes: usize,
+    pub pending_output_bytes_per_machine: usize,
     /// Observation values, payloads and reservation handles retained while
     /// draining detach. Allocator metadata, collection slack and detached VM
     /// state are separate. One in-flight operation per worker is separate
@@ -36,6 +43,8 @@ impl Default for FleetMemoryLimits {
     fn default() -> Self {
         let artifact = crate::ArtifactLimits::default().artifact_bytes;
         Self {
+            pending_output_bytes: 4 * artifact,
+            pending_output_bytes_per_machine: 2 * artifact,
             event_bytes: 4 * artifact,
             event_bytes_per_machine: 2 * artifact,
             command_bytes: 4 * artifact,

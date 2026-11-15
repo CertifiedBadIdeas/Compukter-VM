@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 mod event_queue;
 use event_queue::{EventReceiver, EventSender as QueueSender};
 mod output;
+mod pending;
 use output::WorkerOutput;
 mod memory;
 use memory::{ByteBudget, Reservation};
@@ -512,7 +513,16 @@ impl LaneMailbox {
         self.next_for(None)
     }
 
+    #[cfg(test)]
     fn next_for(&mut self, active: Option<u64>) -> Option<QueuedCommand> {
+        self.next_eligible(active, |_| false)
+    }
+
+    fn next_eligible(
+        &mut self,
+        active: Option<u64>,
+        blocked: impl Fn(u64) -> bool,
+    ) -> Option<QueuedCommand> {
         self.paused
             .retain(|_, resume| !resume.load(Ordering::Acquire));
         let close = active
@@ -532,14 +542,24 @@ impl LaneMailbox {
                 _memory: None,
             });
         }
-        if self.paused.is_empty() {
-            return self.commands.pop_front();
-        }
-        let index = self
-            .commands
-            .iter()
-            .position(|queued| !self.paused.contains_key(&queued.command.machine()))?;
+        let index = self.eligible_index(blocked)?;
         self.commands.remove(index)
+    }
+
+    fn eligible_index(&self, blocked: impl Fn(u64) -> bool) -> Option<usize> {
+        self.commands.iter().position(|queued| {
+            let id = queued.command.machine();
+            // Membership is stable under the lane lock for the entire scan.
+            // Reading resume for each candidate could skip Add, observe a new
+            // acknowledgement, then select a later command of that same VM.
+            !self.paused.contains_key(&id) && !blocked(id)
+        })
+    }
+
+    fn has_eligible(&mut self, blocked: impl Fn(u64) -> bool) -> bool {
+        self.paused
+            .retain(|_, resume| !resume.load(Ordering::Acquire));
+        !self.closes.is_empty() || self.eligible_index(blocked).is_some()
     }
 }
 
@@ -654,6 +674,7 @@ struct EventSender {
     sender: QueueSender,
     signal: Arc<FleetEventSignal>,
     completions: LifecycleCompletions,
+    pending: Arc<pending::PendingCapacity>,
     detach_memory: Arc<ByteBudget>,
     detach_machine_limit: usize,
     detach_headroom: Arc<AtomicUsize>,
@@ -670,6 +691,7 @@ pub struct FleetScheduler {
     metrics: Arc<Metrics>,
     waiting_publishers: Arc<AtomicUsize>,
     command_memory: Arc<ByteBudget>,
+    pending: Arc<pending::PendingCapacity>,
     detach_memory: Arc<ByteBudget>,
     detach_headroom: Arc<AtomicUsize>,
 }
@@ -717,6 +739,8 @@ impl FleetScheduler {
     ) -> Result<Self, &'static str> {
         if memory_limits.command_bytes == 0
             || memory_limits.command_bytes_per_machine == 0
+            || memory_limits.pending_output_bytes == 0
+            || memory_limits.pending_output_bytes_per_machine == 0
             || memory_limits.event_bytes == 0
             || memory_limits.event_bytes_per_machine == 0
             || memory_limits.detach_output_bytes == 0
@@ -762,10 +786,12 @@ impl FleetScheduler {
         let completions = Arc::new(Mutex::new(BTreeMap::new()));
         let detach_memory = ByteBudget::new(memory_limits.detach_output_bytes);
         let detach_headroom = Arc::new(AtomicUsize::new(0));
+        let pending = pending::PendingCapacity::new(memory_limits, config.event_capacity);
         let event_tx = EventSender {
             sender: event_tx,
             signal: Arc::clone(&event_signal),
             completions: Arc::clone(&completions),
+            pending: Arc::clone(&pending),
             detach_memory: Arc::clone(&detach_memory),
             detach_machine_limit: memory_limits.detach_output_bytes_per_machine,
             detach_headroom: Arc::clone(&detach_headroom),
@@ -839,6 +865,7 @@ impl FleetScheduler {
             metrics,
             waiting_publishers,
             command_memory,
+            pending,
             detach_memory,
             detach_headroom,
         })
@@ -1543,15 +1570,33 @@ impl FleetScheduler {
         self.events.memory()
     }
 
-    /// Produced output waiting on workers, bounded to one operation per worker.
-    /// These bytes are separate from admitted events and lifecycle escrow.
+    /// All produced output waiting on workers: reserved batches plus at most
+    /// one operation of excess headroom per worker.
+    /// Includes reserved pending observations; do not add this to
+    /// pending_output_memory. Admitted events and lifecycle escrow are separate.
     pub fn event_inflight_bytes(&self) -> usize {
-        self.events.inflight_bytes()
+        self.pending.inflight_bytes.load(Ordering::Acquire)
     }
 
     /// At most one oversized event may occupy the ordinary queue.
     pub fn event_headroom_bytes(&self) -> usize {
         self.events.headroom_bytes()
+    }
+
+    /// Excess produced output: at most one operation per worker, counted outside
+    /// pending reservations. Nonzero bytes pause that worker, never other lanes.
+    pub fn pending_output_headroom_bytes(&self) -> usize {
+        self.pending.headroom_bytes.load(Ordering::Acquire)
+    }
+
+    pub fn pending_output_memory(&self) -> FleetMemoryUsage {
+        self.pending.memory.snapshot()
+    }
+
+    /// Reserved pending observations; the shared limit is event_capacity.
+    /// One in-flight operation per worker may exceed it before execution pauses.
+    pub fn pending_output_entries(&self) -> usize {
+        self.pending.entries.snapshot().retained_bytes
     }
 
     pub fn command_memory(&self) -> FleetMemoryUsage {
@@ -1718,7 +1763,7 @@ fn run_worker(
                         fence_detach(actors.get_mut(&machine), &mut mailbox, machine),
                     );
                 }
-                if events.has_pending() && mailbox.closes.is_empty() {
+                if events.blocks_worker() && mailbox.closes.is_empty() {
                     break;
                 }
                 let active = events.closing_machine();
@@ -1739,7 +1784,8 @@ fn run_worker(
                         continue;
                     }
                 }
-                let Some(queued) = mailbox.next_for(active) else {
+                let Some(queued) = mailbox.next_eligible(active, |id| events.blocks_machine(id))
+                else {
                     break;
                 };
                 queued
@@ -2350,12 +2396,19 @@ fn run_worker(
         {
             continue;
         }
-        if events.has_pending() {
+        if events.blocks_worker() {
             thread::park_timeout(Duration::from_millis(1));
             continue;
         }
-        let Some(id) = queue.pop_front() else {
-            thread::park_timeout(Duration::from_millis(1));
+        let ready_index = queue.iter().position(|id| !events.blocks_machine(*id));
+        let Some(id) = ready_index.and_then(|index| queue.remove(index)) else {
+            if !mailbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_eligible(|id| events.blocks_machine(id))
+            {
+                thread::park_timeout(Duration::from_millis(1));
+            }
             continue;
         };
         let Some(actor) = actors.get_mut(&id) else {
@@ -2367,13 +2420,18 @@ fn run_worker(
                 actor.queued = true;
                 queue.push_back(id);
                 if queue.iter().all(|id| {
-                    actors.get(id).is_none_or(|actor| {
-                        actor
-                            .detach_fence
-                            .as_ref()
-                            .is_some_and(|fence| !fence.load(Ordering::Acquire))
-                    })
-                }) {
+                    events.blocks_machine(*id)
+                        || actors.get(id).is_none_or(|actor| {
+                            actor
+                                .detach_fence
+                                .as_ref()
+                                .is_some_and(|fence| !fence.load(Ordering::Acquire))
+                        })
+                }) && !mailbox
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .has_eligible(|id| events.blocks_machine(id))
+                {
                     thread::park_timeout(Duration::from_millis(1));
                 }
                 continue;
@@ -2825,11 +2883,28 @@ mod tests {
             if let Some(event) = fleet.try_event() {
                 return event;
             }
-            assert!(
-                Instant::now() < limit,
-                "timed out waiting for scheduler event: {:?}",
-                fleet.metrics()
-            );
+            if Instant::now() >= limit {
+                let lanes: Vec<_> = fleet
+                    .lanes
+                    .iter()
+                    .map(|lane| {
+                        let lane = lane.lock().unwrap();
+                        (
+                            lane.commands
+                                .iter()
+                                .map(|q| q.command.machine())
+                                .collect::<Vec<_>>(),
+                            lane.paused
+                                .iter()
+                                .map(|(id, resume)| (*id, resume.load(Ordering::Acquire)))
+                                .collect::<Vec<_>>(),
+                            lane.closes.keys().copied().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect();
+                panic!("timed out waiting for scheduler event: {:?}; lanes={lanes:?}; pending={} headroom={} detach_headroom={}",
+                    fleet.metrics(), fleet.event_inflight_bytes(), fleet.pending_output_headroom_bytes(), fleet.detach_headroom_bytes());
+            }
             thread::yield_now();
         }
     }
@@ -2881,7 +2956,12 @@ mod tests {
             },
             Vec::new(),
             false,
-            memory_limits,
+            // These lifecycle tests require a fully stalled worker, rather than
+            // merely one backpressured VM. Make that pressure explicit.
+            FleetMemoryLimits {
+                pending_output_bytes: 1,
+                ..memory_limits
+            },
         )
         .unwrap();
         fleet.grant(0, 1, 64).unwrap();
@@ -2892,6 +2972,191 @@ mod tests {
             thread::yield_now();
         }
         fleet
+    }
+
+    fn two_machine_output_fleet(config: FleetConfig, limits: FleetMemoryLimits) -> FleetScheduler {
+        let machines = (0..2)
+            .map(|id| {
+                (
+                    id,
+                    ComputerMachine::start(
+                        crate::execution::fixtures::two_block_artifact(1, 1),
+                        profile(),
+                        &[],
+                        &[],
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        FleetScheduler::new_with_memory_limits(machines, config, Vec::new(), false, limits).unwrap()
+    }
+
+    fn wait_pending(fleet: &FleetScheduler, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fleet.pending_output_entries() < count {
+            assert!(
+                Instant::now() < deadline,
+                "pending observations did not arrive"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn output_pressure_preserves_order_while_other_commands_and_guest_execution_progress() {
+        let fleet = two_machine_output_fleet(
+            FleetConfig {
+                workers: 1,
+                event_capacity: 64,
+                ..config()
+            },
+            FleetMemoryLimits {
+                event_bytes_per_machine: std::mem::size_of::<FleetEvent>() + 32,
+                ..FleetMemoryLimits::default()
+            },
+        );
+        fleet.resource_snapshot(0, 100).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fleet.event_memory().retained_bytes == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        fleet.resource_snapshot(0, 101).unwrap();
+        wait_pending(&fleet, 1);
+        fleet.resource_snapshot(0, 102).unwrap();
+        fleet.resource_snapshot(1, 200).unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        // No ordinary polling: VM 0 stays backpressured. The worker must skip
+        // its accepted command and still execute VM 1's commands and Guest.
+        wait_advances(&fleet, 1);
+        wait_pending(&fleet, 2);
+        assert_eq!(fleet.pending_output_headroom_bytes(), 0);
+        assert!(
+            fleet.pending_output_memory().retained_bytes
+                <= fleet.pending_output_memory().limit_bytes
+        );
+        let mut first = Vec::new();
+        let mut second_snapshot = false;
+        let mut second_halted = false;
+        for _ in 0..5 {
+            match next(&fleet) {
+                FleetEvent::ResourceSnapshot {
+                    machine: 0,
+                    request,
+                    ..
+                } => first.push(request),
+                FleetEvent::ResourceSnapshot {
+                    machine: 1,
+                    request: 200,
+                    ..
+                } => second_snapshot = true,
+                FleetEvent::Boundary {
+                    machine: 1,
+                    outcome: ComputerAdvanceOutcome::Halted(None),
+                    ..
+                } => {
+                    assert!(
+                        second_snapshot,
+                        "Guest result overtook its earlier observation"
+                    );
+                    second_halted = true;
+                }
+                event => panic!("unexpected observation: {event:?}"),
+            }
+        }
+        assert_eq!(first, vec![100, 101, 102]);
+        assert!(second_snapshot && second_halted);
+        assert!(fleet.try_event().is_none());
+    }
+
+    #[test]
+    fn closing_one_of_multiple_backpressured_machines_retains_the_others_output() {
+        for detach in [false, true] {
+            let fleet = two_machine_output_fleet(
+                FleetConfig {
+                    workers: 1,
+                    event_capacity: 1,
+                    ..config()
+                },
+                FleetMemoryLimits::default(),
+            );
+            fleet.resource_snapshot(0, 100).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fleet.event_memory().retained_bytes == 0 {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            fleet.resource_snapshot(0, 101).unwrap();
+            wait_pending(&fleet, 1);
+            fleet.resource_snapshot(1, 200).unwrap();
+            // event_capacity=1 also bounds pending entry reservations. VM 1's
+            // already started operation borrows the one worker headroom slot.
+            while fleet.pending_output_headroom_bytes() == 0 {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            if detach {
+                fleet.detach_with_lifecycle_poll(0, None).unwrap();
+            } else {
+                fleet.stop_with_lifecycle_poll(0).unwrap();
+            }
+            wait_lifecycle(&fleet, 0);
+            if detach {
+                assert!(matches!(
+                    fleet.poll_lifecycle_event(0),
+                    Some(FleetEvent::ResourceSnapshot {
+                        machine: 0,
+                        request: 101,
+                        ..
+                    })
+                ));
+                assert!(fleet.consume_lifecycle_event(0));
+                assert!(fleet.detach_output_memory().retained_bytes > 0);
+                assert!(matches!(
+                    fleet.poll_lifecycle_event(0),
+                    Some(FleetEvent::Detached { machine: 0, .. })
+                ));
+            } else {
+                assert!(matches!(
+                    fleet.poll_lifecycle_event(0),
+                    Some(FleetEvent::Stopped { machine: 0, .. })
+                ));
+            }
+            assert!(fleet.consume_lifecycle_event(0));
+            assert_eq!(fleet.detach_output_memory().retained_bytes, 0);
+            assert_eq!(fleet.pending_output_entries(), 0);
+            assert!(
+                fleet.pending_output_headroom_bytes() > 0,
+                "unrelated output was canceled"
+            );
+            assert!(matches!(
+                next(&fleet),
+                FleetEvent::ResourceSnapshot {
+                    machine: 0,
+                    request: 100,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                next(&fleet),
+                FleetEvent::ResourceSnapshot {
+                    machine: 1,
+                    request: 200,
+                    ..
+                }
+            ));
+            assert!(fleet.try_event().is_none());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fleet.event_inflight_bytes() != 0 || fleet.pending_output_headroom_bytes() != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "pending ownership was not released"
+                );
+                thread::yield_now();
+            }
+            assert_eq!(fleet.pending_output_memory().retained_bytes, 0);
+        }
     }
 
     #[test]
@@ -3427,6 +3692,7 @@ mod tests {
             sender,
             signal: Arc::clone(&signal),
             completions: Arc::new(Mutex::new(BTreeMap::new())),
+            pending: super::pending::PendingCapacity::new(FleetMemoryLimits::default(), 64),
             detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
             detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
             detach_headroom: Arc::new(AtomicUsize::new(0)),
@@ -4866,6 +5132,7 @@ mod tests {
                     sender,
                     signal: Arc::new(FleetEventSignal::default()),
                     completions: Arc::new(Mutex::new(BTreeMap::new())),
+                    pending: super::pending::PendingCapacity::new(FleetMemoryLimits::default(), 64),
                     detach_memory: ByteBudget::new(
                         FleetMemoryLimits::default().detach_output_bytes,
                     ),
@@ -5248,6 +5515,7 @@ mod tests {
                 sender: event_tx,
                 signal: Arc::clone(&signal),
                 completions: Arc::clone(&completions),
+                pending: super::pending::PendingCapacity::new(FleetMemoryLimits::default(), 64),
                 detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
                 detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
                 detach_headroom: Arc::new(AtomicUsize::new(0)),
@@ -5256,6 +5524,7 @@ mod tests {
             let worker_metrics = Arc::clone(&metrics);
             let worker_waiters = Arc::clone(&waiters);
             let worker_mailbox = Arc::clone(&mailbox);
+            let pending_capacity = Arc::clone(&sender.pending);
             let worker = thread::spawn(move || {
                 run_worker(
                     actors,
@@ -5286,6 +5555,7 @@ mod tests {
                 metrics,
                 waiting_publishers: waiters,
                 command_memory,
+                pending: pending_capacity,
                 detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
                 detach_headroom: Arc::new(AtomicUsize::new(0)),
             };
@@ -5386,6 +5656,7 @@ mod tests {
             sender: event_tx,
             signal: Arc::new(FleetEventSignal::default()),
             completions: Arc::clone(&completions),
+            pending: super::pending::PendingCapacity::new(FleetMemoryLimits::default(), 64),
             detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
             detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
             detach_headroom: Arc::new(AtomicUsize::new(0)),
@@ -5508,6 +5779,7 @@ mod tests {
             Vec::new(),
             false,
             FleetMemoryLimits {
+                pending_output_bytes: 1,
                 command_bytes: limit,
                 command_bytes_per_machine: limit,
                 ..FleetMemoryLimits::default()
@@ -5762,6 +6034,36 @@ mod tests {
     }
 
     #[test]
+    fn releasing_a_pause_during_selection_cannot_reorder_a_machines_commands() {
+        let mut mailbox = LaneMailbox::new(8);
+        let resume = Arc::new(AtomicBool::new(false));
+        mailbox.paused.insert(1, Arc::clone(&resume));
+        for (machine, request) in [(1, 10), (2, 20), (1, 11)] {
+            assert!(mailbox
+                .submit(Command::ResourceSnapshot { machine, request })
+                .is_ok());
+        }
+        // A host may acknowledge a refusal between two candidates in one
+        // mailbox scan. Both commands of VM 1 must use the same paused state.
+        let selected = mailbox.next_eligible(None, |machine| {
+            if machine == 2 {
+                resume.store(true, Ordering::Release);
+            }
+            machine == 2
+        });
+        assert!(
+            selected.is_none(),
+            "later command overtook its paused predecessor"
+        );
+        for expected in [10, 11] {
+            assert!(
+                matches!(mailbox.next_eligible(None, |machine| machine == 2).map(|queued| queued.command),
+                Some(Command::ResourceSnapshot { machine: 1, request }) if request == expected)
+            );
+        }
+    }
+
+    #[test]
     fn repeated_tick_does_not_refill_instruction_credit() {
         let machine = ComputerMachine::start(
             crate::execution::fixtures::empty_loop_artifact(1),
@@ -5770,15 +6072,20 @@ mod tests {
             &[],
         )
         .unwrap();
-        let fleet = FleetScheduler::new(vec![(1, machine)], config()).unwrap();
-        fleet.grant(1, 0, 1).unwrap();
-        wait_advances(&fleet, 1);
-        fleet.grant(1, 0, 1).unwrap();
-        thread::sleep(Duration::from_millis(10));
-        assert_eq!(fleet.metrics().retired, 1);
-        fleet.grant(1, 1, 1).unwrap();
-        wait_advances(&fleet, 2);
-        assert_eq!(fleet.metrics().retired, 2);
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            vec![(1, machine)],
+            config(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        for tick in [0, 0, 1] {
+            fleet.grant(1, tick, 1).unwrap();
+            assert!(
+                matches!(next(&fleet), FleetEvent::Quiescent { machine: 1, tick: observed, retired: 1, .. } if observed == tick)
+            );
+            assert_eq!(fleet.metrics().retired, tick + 1);
+        }
     }
 
     #[test]
