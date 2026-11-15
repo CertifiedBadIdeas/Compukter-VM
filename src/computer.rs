@@ -6338,8 +6338,22 @@ mod tests {
         }
     }
 
-    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 7] {
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 9] {
         [
+            (
+                "fleet-compiler-source.cpkt",
+                crate::execution::fixtures::filesystem_write_text_artifact(
+                    "/home/main.kt",
+                    "fun main() = 42",
+                ),
+            ),
+            (
+                "fleet-compiler.cpkt",
+                crate::execution::fixtures::compiler_compile_artifact(
+                    &"/home/main.kt".encode_utf16().collect::<Vec<_>>(),
+                    &"/home/main".encode_utf16().collect::<Vec<_>>(),
+                ),
+            ),
             (
                 "fleet-host-request.cpkt",
                 crate::execution::fixtures::capability_artifact(true, true, 1, 0),

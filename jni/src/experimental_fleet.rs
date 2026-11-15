@@ -233,6 +233,52 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_completeCompilation<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    token: jlong,
+    kind: jint,
+    payload: JByteArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if machine < 0
+            || token <= 0
+            || !(0..=1).contains(&kind)
+            || payload.len(env)? > compukter_vm::ArtifactLimits::default().artifact_bytes
+        {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let payload = bytes(env, &payload)?;
+        let result = if kind == 0 {
+            compukter_vm::experimental_fleet_scheduler::CompilationResult::Artifact(
+                payload.into_boxed_slice(),
+            )
+        } else {
+            let Ok(detail) = String::from_utf8(payload) else {
+                return Ok(code(FfiStatus::InvalidArgument));
+            };
+            compukter_vm::experimental_fleet_scheduler::CompilationResult::Failure(
+                detail.into_boxed_str(),
+            )
+        };
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |fleet| {
+                submit(
+                    fleet
+                        .scheduler
+                        .complete_compilation(machine as u64, token as u64, result),
+                )
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_resolveCost<
     'a,
 >(
@@ -334,6 +380,9 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         if f.pending.is_none() {
             f.pending = match experimental_fleet::poll_event(&f.scheduler) {
                 Ok(None) => None,
+                Ok(Some(experimental_fleet::WireEvent::Compilation(b))) => {
+                    Some([vec![9], b].concat())
+                }
                 Ok(Some(experimental_fleet::WireEvent::Quiescent {
                     machine,
                     tick,

@@ -78,6 +78,7 @@ fn create_machines(
 }
 
 pub enum WireEvent {
+    Compilation(Vec<u8>),
     Quiescent {
         machine: u64,
         tick: u64,
@@ -171,12 +172,16 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
         FleetEvent::Boundary {
             machine,
             tick,
-            outcome: ComputerAdvanceOutcome::CompilationRequested(_),
+            outcome: ComputerAdvanceOutcome::CompilationRequested(request),
         } => {
-            return Ok(Some(WireEvent::Error {
-                machine,
-                message: format!("compilation requested at tick {tick}; unsupported by experiment"),
-            }))
+            let size = crate::wire::compilation_request_size(&request)
+                .ok_or("invalid compilation request")?;
+            let mut bytes = vec![0; 16 + size];
+            bytes[..8].copy_from_slice(&machine.to_le_bytes());
+            bytes[8..16].copy_from_slice(&tick.to_le_bytes());
+            crate::wire::encode_compilation_request_into(&mut bytes[16..], &request)
+                .map_err(|_| "invalid compilation request")?;
+            return Ok(Some(WireEvent::Compilation(bytes)));
         }
         FleetEvent::Boundary {
             machine,

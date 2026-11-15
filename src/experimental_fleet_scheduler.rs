@@ -75,6 +75,11 @@ pub enum ReplyValue {
     Failure(HostFailureKind, Box<str>),
 }
 
+pub enum CompilationResult {
+    Artifact(Box<[u8]>),
+    Failure(Box<str>),
+}
+
 impl ReplyValue {
     fn as_response(&self) -> HostResponse<'_> {
         if let Self::Failure(kind, detail) = self {
@@ -153,6 +158,7 @@ pub enum SubmitError {
     Full,
     Closed,
     InvalidCost,
+    InvalidCompilation,
     InvalidMachine,
     Capacity,
     IdentityExhausted,
@@ -205,6 +211,11 @@ enum Command {
         request: u64,
         units: u32,
     },
+    CompilationComplete {
+        machine: u64,
+        token: u64,
+        result: CompilationResult,
+    },
 }
 
 struct Actor {
@@ -214,6 +225,7 @@ struct Actor {
     remaining: u32,
     tick_retired: u64,
     reported_retired: Option<u64>,
+    compilation_token: Option<u64>,
     requests_left: u32,
     advances_left: u32,
     deadline: Option<Instant>,
@@ -238,6 +250,7 @@ impl Actor {
             remaining: 0,
             tick_retired: 0,
             reported_retired: None,
+            compilation_token: None,
             requests_left: host_budget,
             advances_left: 0,
             deadline: None,
@@ -496,6 +509,29 @@ impl FleetScheduler {
                 task,
                 request,
                 units,
+            },
+        )
+    }
+
+    pub fn complete_compilation(
+        &self,
+        machine: u64,
+        token: u64,
+        result: CompilationResult,
+    ) -> Result<(), SubmitError> {
+        let size = match &result {
+            CompilationResult::Artifact(bytes) => bytes.len(),
+            CompilationResult::Failure(detail) => detail.len(),
+        };
+        if token == 0 || size > crate::ArtifactLimits::default().artifact_bytes {
+            return Err(SubmitError::InvalidCompilation);
+        }
+        self.send(
+            machine,
+            Command::CompilationComplete {
+                machine,
+                token,
+                result,
             },
         )
     }
@@ -774,6 +810,7 @@ fn run_worker(
                     if !actor.pending.is_empty()
                         || !actor.inspecting.is_empty()
                         || !actor.inspected.is_empty()
+                        || actor.compilation_token.is_some()
                     {
                         if !publish(
                             &events,
@@ -874,6 +911,44 @@ fn run_worker(
                     actor.parked = false;
                     ready(machine, actor, &mut queue);
                 }
+                Command::CompilationComplete {
+                    machine,
+                    token,
+                    result,
+                } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    if actor.compilation_token != Some(token) {
+                        continue;
+                    }
+                    actor.compilation_token = None;
+                    let outcome = match result {
+                        CompilationResult::Artifact(bytes) => {
+                            actor.machine.complete_compilation_success(token, &bytes)
+                        }
+                        CompilationResult::Failure(detail) => {
+                            actor.machine.complete_compilation_failure(token, &detail)
+                        }
+                    };
+                    if let Err(error) = outcome {
+                        actor.stopped = true;
+                        if !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::Error {
+                                machine,
+                                message: format!("compilation completion: {error:?}"),
+                            },
+                        ) {
+                            return;
+                        }
+                    } else {
+                        actor.parked = false;
+                        ready(machine, actor, &mut queue);
+                    }
+                }
             }
         }
         let Some(id) = queue.pop_front() else {
@@ -932,6 +1007,22 @@ fn run_worker(
         actor.tick_retired += retired;
         actor.remaining = actor.remaining.saturating_sub(retired as u32);
         match outcome {
+            ComputerAdvanceOutcome::CompilationRequested(request) => {
+                actor.compilation_token = Some(request.token);
+                actor.parked = true;
+                if !publish(
+                    &events,
+                    &stopped,
+                    &waiters,
+                    FleetEvent::Boundary {
+                        machine: id,
+                        tick: actor.tick,
+                        outcome: ComputerAdvanceOutcome::CompilationRequested(request),
+                    },
+                ) {
+                    return;
+                }
+            }
             ComputerAdvanceOutcome::SliceExhausted => {
                 if retired == 0 {
                     // Maintenance can make progress without retiring instructions.
@@ -2409,5 +2500,80 @@ mod tests {
                 retired: 1
             }
         ));
+    }
+
+    #[test]
+    fn compilation_is_parked_until_the_matching_result_arrives() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let source = VirtualPath::parse_utf8("/home/main.kt", &limits).unwrap();
+        let output = VirtualPath::parse_utf8("/home/main", &limits).unwrap();
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&owner, &source, b"fun main() = 42", false)
+            .unwrap();
+        let artifact = crate::execution::fixtures::compiler_compile_artifact(
+            &"/home/main.kt".encode_utf16().collect::<Vec<_>>(),
+            &"/home/main".encode_utf16().collect::<Vec<_>>(),
+        );
+        let machine =
+            ComputerMachine::start_in_filesystem(artifact, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 256).unwrap();
+        let request = match next(&fleet) {
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::CompilationRequested(request),
+                ..
+            } => request,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(request.sources[0].utf8.as_ref(), b"fun main() = 42");
+        fleet
+            .complete_compilation(
+                7,
+                request.token + 1,
+                CompilationResult::Failure("stale".into()),
+            )
+            .unwrap();
+        fleet.detach(7).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::DetachRejected { machine: 7 }
+        ));
+        let compiled = crate::execution::fixtures::two_block_artifact(1, 1);
+        let bytes = crate::test_encode::encode_artifact(compiled.decoded()).unwrap();
+        fleet
+            .complete_compilation(
+                7,
+                request.token,
+                CompilationResult::Artifact(bytes.clone().into_boxed_slice()),
+            )
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(0))),
+                ..
+            }
+        ));
+        fleet.detach(7).unwrap();
+        let computer = match next(&fleet) {
+            FleetEvent::Detached { computer, .. } => computer,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            computer
+                .filesystem_stat(&output)
+                .unwrap()
+                .metadata
+                .executable
+        );
     }
 }
