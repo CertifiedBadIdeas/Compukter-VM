@@ -134,6 +134,7 @@ pub enum WireEvent {
     Stopped {
         machine: u64,
         pending: Vec<(u32, u64)>,
+        filesystem_generation: u64,
     },
 }
 
@@ -236,9 +237,14 @@ pub fn encode_event(event: &WireEvent) -> Vec<u8> {
                 bytes.extend_from_slice(&request.to_le_bytes());
             }
         }
-        WireEvent::Stopped { machine, pending } => {
+        WireEvent::Stopped {
+            machine,
+            pending,
+            filesystem_generation,
+        } => {
             bytes.push(2);
             bytes.extend_from_slice(&machine.to_le_bytes());
+            bytes.extend_from_slice(&filesystem_generation.to_le_bytes());
             bytes.extend_from_slice(&(pending.len() as u32).to_le_bytes());
             for (task, request) in pending {
                 bytes.extend_from_slice(&task.to_le_bytes());
@@ -634,8 +640,16 @@ fn convert_event(event: FleetEvent) -> Result<WireEvent, String> {
                 pending,
             });
         }
-        FleetEvent::Stopped { machine, pending } => {
-            return Ok(WireEvent::Stopped { machine, pending });
+        FleetEvent::Stopped {
+            machine,
+            pending,
+            filesystem_generation,
+        } => {
+            return Ok(WireEvent::Stopped {
+                machine,
+                pending,
+                filesystem_generation,
+            });
         }
         FleetEvent::Requests {
             machine,

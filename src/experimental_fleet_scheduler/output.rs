@@ -404,6 +404,7 @@ mod tests {
         output.complete_stop(FleetStopCompletion {
             machine: 2,
             pending: Vec::new(),
+            filesystem_generation: 0,
             quiescent: None,
             prior_reports: VecDeque::new(),
             report_pending: false,

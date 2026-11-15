@@ -263,6 +263,8 @@ pub enum FleetEvent {
     Stopped {
         machine: u64,
         pending: Vec<(u32, u64)>,
+        /// Captured after accepted commands drain, immediately before destruction.
+        filesystem_generation: u64,
     },
     /// Requests belonging to a finished or replaced process must be discarded by the host.
     ScopeStopped {
@@ -2160,10 +2162,12 @@ fn run_worker(
                         pending.extend(actor.inspected.keys().copied());
                         pending.sort_unstable();
                         pending.dedup();
+                        let filesystem_generation = actor.machine.filesystem_generation();
                         drop(actor);
                         events.complete_stop(FleetStopCompletion {
                             machine,
                             pending,
+                            filesystem_generation,
                             quiescent,
                             prior_reports: VecDeque::new(),
                             report_pending,
@@ -4632,6 +4636,111 @@ mod tests {
     }
 
     #[test]
+    fn stop_captures_generation_after_accepted_mutation_without_ordinary_polling() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        for delivery in 0..3 {
+            let limits = FileSystemLimits::testing();
+            let owner = FileCapability::new(
+                VirtualPath::parse_utf8("/home", &limits).unwrap(),
+                FileRights::OWNER,
+            );
+            let mut filesystem = ComputerFileSystem::with_limits(limits);
+            filesystem
+                .write_file(
+                    &owner,
+                    &VirtualPath::parse_utf8("/home/a", &limits).unwrap(),
+                    b"a",
+                    false,
+                )
+                .unwrap();
+            let artifact = crate::execution::fixtures::two_block_artifact(1, 1);
+            let bytes: Arc<[u8]> =
+                Arc::from(crate::test_encode::encode_artifact(artifact.decoded()).unwrap());
+            let machine = ComputerMachine::start_in_filesystem(
+                artifact,
+                profile(),
+                &[],
+                &[],
+                filesystem,
+                owner,
+            )
+            .unwrap();
+            let expected = machine.filesystem_generation() + 1;
+            let other = ComputerMachine::start(
+                crate::execution::fixtures::two_block_artifact(1, 1),
+                profile(),
+                &[],
+                &[],
+            )
+            .unwrap();
+            let fleet = FleetScheduler::new(
+                vec![(1, machine), (2, other)],
+                FleetConfig {
+                    workers: 1,
+                    event_capacity: 1,
+                    ..config()
+                },
+            )
+            .unwrap();
+            fleet.prepare_deployment(1, 10, bytes).unwrap();
+            let candidate = match next(&fleet) {
+                FleetEvent::Deployment {
+                    result: Ok(DeploymentResult::Prepared(candidate)),
+                    ..
+                } => candidate,
+                other => panic!("{other:?}"),
+            };
+            fleet.resource_snapshot(2, 11).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fleet.event_memory().retained_bytes == 0 {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            fleet
+                .install_deployment(
+                    1,
+                    12,
+                    "/home/demo".into(),
+                    crate::ExecutableRevision::Absent,
+                    candidate,
+                )
+                .unwrap();
+            if delivery == 1 {
+                fleet.stop_with_lifecycle_poll(1).unwrap();
+            } else {
+                fleet.stop(1).unwrap();
+            }
+            wait_lifecycle(&fleet, 1);
+            if delivery == 0 {
+                let stopped = fleet.try_stopped(1).unwrap();
+                assert_eq!(stopped.filesystem_generation, expected);
+                assert!(stopped.pending.is_empty());
+            } else if delivery == 1 {
+                assert!(
+                    matches!(fleet.poll_lifecycle_event(1), Some(FleetEvent::Stopped { filesystem_generation, .. }) if filesystem_generation == expected)
+                );
+                assert!(fleet.consume_lifecycle_event(1));
+            }
+            assert!(matches!(
+                next(&fleet),
+                FleetEvent::ResourceSnapshot {
+                    machine: 2,
+                    request: 11,
+                    ..
+                }
+            ));
+            if delivery == 2 {
+                assert!(
+                    matches!(next(&fleet), FleetEvent::Stopped { filesystem_generation, .. } if filesystem_generation == expected)
+                );
+            }
+            assert!(fleet.try_event().is_none());
+        }
+    }
+
+    #[test]
     fn observes_resources_and_generation_on_the_machine_owner() {
         let machine = ComputerMachine::start(
             crate::execution::fixtures::two_block_artifact(1, 1),
@@ -4898,7 +5007,9 @@ mod tests {
         ));
         fleet.stop(7).unwrap();
         match next(&fleet) {
-            FleetEvent::Stopped { machine, pending } => {
+            FleetEvent::Stopped {
+                machine, pending, ..
+            } => {
                 assert_eq!(machine, 7);
                 assert_eq!(pending, vec![(request.task_id, request.id)]);
             }
@@ -5078,7 +5189,9 @@ mod tests {
             Err(SubmitError::UnknownMachine)
         );
         match next(&fleet) {
-            FleetEvent::Stopped { machine, pending } => {
+            FleetEvent::Stopped {
+                machine, pending, ..
+            } => {
                 assert_eq!(machine, 7);
                 assert_eq!(pending, vec![(request.task_id, request.id)]);
             }

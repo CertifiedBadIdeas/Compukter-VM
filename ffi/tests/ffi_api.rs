@@ -335,7 +335,7 @@ fn fleet_transport_retains_events_until_consumed() {
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     };
-    assert_eq!(event, vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(event, [&[2][..], &[0; 20][..]].concat());
     assert_eq!(transport.poll(), Some(event.as_slice()));
     transport.consume_event();
     assert!(transport.poll().is_none());
@@ -367,7 +367,12 @@ fn experimental_fleet_exposes_typed_stop_events() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match compukter_ffi::experimental_fleet::poll_event(&fleet).unwrap() {
-            Some(WireEvent::Stopped { machine, pending }) => {
+            Some(WireEvent::Stopped {
+                machine,
+                pending,
+                filesystem_generation,
+            }) => {
+                assert_eq!(filesystem_generation, 0);
                 assert_eq!(machine, 0);
                 assert!(pending.is_empty());
                 break;

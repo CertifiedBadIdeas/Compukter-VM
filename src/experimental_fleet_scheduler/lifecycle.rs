@@ -34,6 +34,8 @@ impl CloseRequest {
 pub struct FleetStopCompletion {
     pub machine: u64,
     pub pending: Vec<(u32, u64)>,
+    /// Final filesystem generation after all accepted commands, before the VM is destroyed.
+    pub filesystem_generation: u64,
     /// Final cumulative accounting for the last tick, even if it was already
     /// emitted as an ordinary event. Consumers must reconcile by tick.
     pub quiescent: Option<FleetQuiescent>,
@@ -237,6 +239,7 @@ impl LifecycleCompletion {
                 FleetEvent::Stopped {
                     machine,
                     pending: completion.pending,
+                    filesystem_generation: completion.filesystem_generation,
                 },
                 CompletionLease {
                     remove_owner: true,
