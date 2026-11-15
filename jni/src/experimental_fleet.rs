@@ -186,7 +186,11 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         let deadline = if nanos == -1 {
             None
         } else {
-            Instant::now().checked_add(Duration::from_nanos(nanos as u64))
+            let Some(deadline) = Instant::now().checked_add(Duration::from_nanos(nanos as u64))
+            else {
+                return Ok(code(FfiStatus::InvalidArgument));
+            };
+            Some(deadline)
         };
         let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
         Ok(map
