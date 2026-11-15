@@ -362,6 +362,7 @@ impl Actor {
 
 struct Owners {
     lanes: HashMap<u64, usize>,
+    closing: HashSet<u64>,
     next_id: Option<u64>,
     next_lane: usize,
 }
@@ -476,6 +477,7 @@ impl FleetScheduler {
             lanes,
             owners: Mutex::new(Owners {
                 lanes: owners,
+                closing: HashSet::new(),
                 next_id,
                 next_lane,
             }),
@@ -775,12 +777,12 @@ impl FleetScheduler {
 
     /// Returns the intact machine asynchronously after all pending requests settle.
     pub fn detach(&self, machine: u64) -> Result<(), SubmitError> {
-        self.send(machine, Command::Detach { machine })
+        self.send_action(machine, Command::Detach { machine }, true)
     }
 
     /// Requests asynchronous removal. Completion is reported by `Stopped`.
     pub fn stop(&self, machine: u64) -> Result<(), SubmitError> {
-        self.send(machine, Command::Stop { machine })
+        self.send_action(machine, Command::Stop { machine }, true)
     }
 
     pub fn resolve_cost(
@@ -828,13 +830,23 @@ impl FleetScheduler {
     }
 
     fn send(&self, machine: u64, command: Command) -> Result<(), SubmitError> {
+        self.send_action(machine, command, false)
+    }
+
+    fn send_action(
+        &self,
+        machine: u64,
+        command: Command,
+        closing: bool,
+    ) -> Result<(), SubmitError> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(SubmitError::Closed);
         }
-        let lane = *self
-            .owners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        if owners.closing.contains(&machine) {
+            return Err(SubmitError::UnknownMachine);
+        }
+        let lane = *owners
             .lanes
             .get(&machine)
             .ok_or(SubmitError::UnknownMachine)?;
@@ -844,20 +856,30 @@ impl FleetScheduler {
                 TrySendError::Full(_) => SubmitError::Full,
                 TrySendError::Disconnected(_) => SubmitError::Closed,
             })?;
+        if closing {
+            owners.closing.insert(machine);
+        }
+        drop(owners);
         self.workers[lane].thread().unpark();
         Ok(())
     }
 
     pub fn try_event(&self) -> Option<FleetEvent> {
         let result = self.events.try_recv().ok();
-        if let Some(FleetEvent::Stopped { machine, .. } | FleetEvent::Detached { machine, .. }) =
-            &result
-        {
-            self.owners
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .lanes
-                .remove(machine);
+        match &result {
+            Some(FleetEvent::Stopped { machine, .. } | FleetEvent::Detached { machine, .. }) => {
+                let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+                owners.lanes.remove(machine);
+                owners.closing.remove(machine);
+            }
+            Some(FleetEvent::DetachRejected { machine }) => {
+                self.owners
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .closing
+                    .remove(machine);
+            }
+            _ => {}
         }
         if result.is_some() && self.waiting_publishers.load(Ordering::SeqCst) != 0 {
             for worker in &self.workers {
@@ -2377,6 +2399,10 @@ mod tests {
             event => panic!("{event:?}"),
         };
         fleet.detach(7).unwrap();
+        assert_eq!(
+            fleet.reply(7, request.task_id, request.id, ReplyValue::Unit),
+            Err(SubmitError::UnknownMachine)
+        );
         assert!(matches!(
             next(&fleet),
             FleetEvent::DetachRejected { machine: 7 }
@@ -3118,6 +3144,10 @@ mod tests {
             event => panic!("{event:?}"),
         };
         fleet.stop(7).unwrap();
+        assert_eq!(
+            fleet.resource_snapshot(7, 1),
+            Err(SubmitError::UnknownMachine)
+        );
         match next(&fleet) {
             FleetEvent::Stopped { machine, pending } => {
                 assert_eq!(machine, 7);
