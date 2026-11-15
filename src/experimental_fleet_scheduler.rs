@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -398,13 +398,44 @@ impl Command {
     }
 }
 
-#[derive(Default)]
-struct LaneControl {
+struct LaneMailbox {
+    commands: VecDeque<Command>,
+    capacity: usize,
     /// At most one entry per registered machine; registration is capped at 4096.
     stops: std::collections::BTreeSet<u64>,
-    /// While fenced, new ordinary commands cannot refill the mailbox behind
-    /// commands that the worker has moved into its local deferred queue.
-    fenced: bool,
+}
+
+impl LaneMailbox {
+    fn new(capacity: usize) -> Self {
+        Self {
+            commands: VecDeque::new(),
+            capacity,
+            stops: Default::default(),
+        }
+    }
+
+    fn submit(&mut self, command: Command) -> Result<(), Command> {
+        if self.commands.len() == self.capacity {
+            return Err(command);
+        }
+        self.commands.push_back(command);
+        Ok(())
+    }
+
+    fn next(&mut self) -> Option<Command> {
+        if let Some(machine) = self.stops.first().copied() {
+            if let Some(index) = self
+                .commands
+                .iter()
+                .position(|command| command.machine() == machine)
+            {
+                return self.commands.remove(index);
+            }
+            self.stops.remove(&machine);
+            return Some(Command::Stop { machine });
+        }
+        self.commands.pop_front()
+    }
 }
 
 struct Actor {
@@ -533,8 +564,7 @@ struct EventSender {
 }
 
 pub struct FleetScheduler {
-    lanes: Vec<SyncSender<Command>>,
-    controls: Vec<Arc<Mutex<LaneControl>>>,
+    lanes: Vec<Arc<Mutex<LaneMailbox>>>,
     owners: Mutex<Owners>,
     events: Receiver<FleetEvent>,
     stops: StopCompletions,
@@ -612,13 +642,10 @@ impl FleetScheduler {
         let waiting_publishers = Arc::new(AtomicUsize::new(0));
         let inspections = Arc::new(inspections);
         let mut lanes = Vec::new();
-        let mut controls = Vec::new();
         let mut workers: Vec<JoinHandle<()>> = Vec::new();
         for (lane, actors) in partitions.into_iter().enumerate() {
-            let (tx, rx) = mpsc::sync_channel(config.mailbox_capacity);
-            lanes.push(tx);
-            let control = Arc::new(Mutex::new(LaneControl::default()));
-            controls.push(Arc::clone(&control));
+            let mailbox = Arc::new(Mutex::new(LaneMailbox::new(config.mailbox_capacity)));
+            lanes.push(Arc::clone(&mailbox));
             let events = event_tx.clone();
             let stop = Arc::clone(&stopped);
             let worker_metrics = Arc::clone(&metrics);
@@ -629,8 +656,7 @@ impl FleetScheduler {
                 .spawn(move || {
                     run_worker(
                         actors,
-                        rx,
-                        control,
+                        mailbox,
                         events,
                         stop,
                         worker_metrics,
@@ -661,7 +687,6 @@ impl FleetScheduler {
         let next_lane = owners.len() % config.workers;
         Ok(Self {
             lanes,
-            controls,
             owners: Mutex::new(Owners {
                 lanes: owners,
                 closing: HashSet::new(),
@@ -713,13 +738,11 @@ impl FleetScheduler {
             return Err((SubmitError::IdentityExhausted, computer));
         };
         let lane = owners.next_lane;
-        let control = self.controls[lane]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if control.fenced {
-            return Err((SubmitError::Full, computer));
+        if self.workers[lane].is_finished() {
+            return Err((SubmitError::Closed, computer));
         }
-        match self.lanes[lane].try_send(Command::Add {
+        let mut mailbox = self.lanes[lane].lock().unwrap_or_else(|e| e.into_inner());
+        match mailbox.submit(Command::Add {
             machine: id,
             computer,
             timers,
@@ -732,12 +755,7 @@ impl FleetScheduler {
                 self.workers[lane].thread().unpark();
                 Ok(id)
             }
-            Err(TrySendError::Full(Command::Add { computer, .. })) => {
-                Err((SubmitError::Full, computer))
-            }
-            Err(TrySendError::Disconnected(Command::Add { computer, .. })) => {
-                Err((SubmitError::Closed, computer))
-            }
+            Err(Command::Add { computer, .. }) => Err((SubmitError::Full, computer)),
             Err(_) => unreachable!("only Add was submitted"),
         }
     }
@@ -1161,30 +1179,19 @@ impl FleetScheduler {
             .lanes
             .get(&machine)
             .ok_or(SubmitError::UnknownMachine)?;
-        let mut control = self.controls[lane]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        if self.workers[lane].is_finished() {
+            return Err(SubmitError::Closed);
+        }
+        let mut mailbox = self.lanes[lane].lock().unwrap_or_else(|e| e.into_inner());
         if matches!(command, Command::Stop { .. }) {
-            if self.workers[lane].is_finished() {
-                return Err(SubmitError::Closed);
-            }
-            control.fenced = true;
-            assert!(control.stops.insert(machine), "duplicate stop request");
+            assert!(mailbox.stops.insert(machine), "duplicate stop request");
         } else {
-            if control.fenced {
-                return Err(SubmitError::Full);
-            }
-            self.lanes[lane]
-                .try_send(command)
-                .map_err(|error| match error {
-                    TrySendError::Full(_) => SubmitError::Full,
-                    TrySendError::Disconnected(_) => SubmitError::Closed,
-                })?;
+            mailbox.submit(command).map_err(|_| SubmitError::Full)?;
         }
         if closing {
             owners.closing.insert(machine);
         }
-        drop(control);
+        drop(mailbox);
         drop(owners);
         self.workers[lane].thread().unpark();
         Ok(())
@@ -1390,8 +1397,7 @@ fn report_quiescent(
 
 fn run_worker(
     mut actors: HashMap<u64, Actor>,
-    commands: Receiver<Command>,
-    control: Arc<Mutex<LaneControl>>,
+    mailbox: Arc<Mutex<LaneMailbox>>,
     events: EventSender,
     stopped: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
@@ -1401,36 +1407,10 @@ fn run_worker(
     coordinated_turns: bool,
 ) {
     let mut queue = VecDeque::new();
-    let mut deferred = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
         for _ in 0..4 {
-            let command = {
-                let mut state = control.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(machine) = state.stops.first().copied() {
-                    // No ordinary producer can refill this mailbox while fenced.
-                    // Thus the deferred queue never exceeds its configured capacity.
-                    while let Ok(command) = commands.try_recv() {
-                        deferred.push_back(command);
-                    }
-                    if let Some(index) = deferred
-                        .iter()
-                        .position(|command: &Command| command.machine() == machine)
-                    {
-                        deferred.remove(index).expect("deferred index exists")
-                    } else {
-                        state.stops.remove(&machine);
-                        Command::Stop { machine }
-                    }
-                } else if let Some(command) = deferred.pop_front() {
-                    command
-                } else {
-                    state.fenced = false;
-                    match commands.try_recv() {
-                        Ok(value) => value,
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => return,
-                    }
-                }
+            let Some(command) = mailbox.lock().unwrap_or_else(|e| e.into_inner()).next() else {
+                break;
             };
             match command {
                 Command::Deployment {
@@ -2087,7 +2067,7 @@ fn run_worker(
         }
         // A stop fences further Guest execution until its already-accepted
         // commands have been processed and the actor has been removed.
-        if !control
+        if !mailbox
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .stops
@@ -4021,15 +4001,15 @@ mod tests {
                 },
             );
         }
-        let (commands, command_rx) = mpsc::sync_channel(4);
+        let commands = Arc::new(Mutex::new(LaneMailbox::new(4)));
+        let worker_commands = Arc::clone(&commands);
         let (sender, events) = mpsc::sync_channel(16);
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
         let worker = thread::spawn(move || {
             run_worker(
                 HashMap::from([(1, actor)]),
-                command_rx,
-                Arc::new(Mutex::new(LaneControl::default())),
+                worker_commands,
                 EventSender {
                     sender,
                     signal: Arc::new(FleetEventSignal::default()),
@@ -4043,14 +4023,16 @@ mod tests {
                 false,
             )
         });
-        commands
-            .send(Command::Tick {
+        assert!(commands
+            .lock()
+            .unwrap()
+            .submit(Command::Tick {
                 machine: 1,
                 tick: 1,
                 retirements: 64,
                 deadline: None,
             })
-            .unwrap();
+            .is_ok());
         worker.thread().unpark();
         let event = events.recv_timeout(Duration::from_secs(5)).unwrap();
         match event {
@@ -4364,18 +4346,20 @@ mod tests {
                 actor.reported_retired = Some(9);
             }
             let actors = HashMap::from([(1, actor)]);
-            let (command_tx, command_rx) = mpsc::sync_channel(4);
+            let mailbox = Arc::new(Mutex::new(LaneMailbox::new(4)));
             if !already_reported {
-                command_tx
-                    .try_send(Command::Tick {
+                assert!(mailbox
+                    .lock()
+                    .unwrap()
+                    .submit(Command::Tick {
                         machine: 1,
                         tick: 7,
                         retirements: 64,
                         deadline: None,
                     })
-                    .unwrap();
+                    .is_ok());
             }
-            command_tx.try_send(Command::Stop { machine: 1 }).unwrap();
+            mailbox.lock().unwrap().stops.insert(1);
             let (event_tx, events) = mpsc::sync_channel(1);
             event_tx
                 .try_send(FleetEvent::Error {
@@ -4396,13 +4380,11 @@ mod tests {
             let worker_stopped = Arc::clone(&stopped);
             let worker_metrics = Arc::clone(&metrics);
             let worker_waiters = Arc::clone(&waiters);
-            let control = Arc::new(Mutex::new(LaneControl::default()));
-            let worker_control = Arc::clone(&control);
+            let worker_mailbox = Arc::clone(&mailbox);
             let worker = thread::spawn(move || {
                 run_worker(
                     actors,
-                    command_rx,
-                    worker_control,
+                    worker_mailbox,
                     sender,
                     worker_stopped,
                     worker_metrics,
@@ -4413,8 +4395,7 @@ mod tests {
                 )
             });
             let fleet = FleetScheduler {
-                lanes: vec![command_tx],
-                controls: vec![control],
+                lanes: vec![mailbox],
                 owners: Mutex::new(Owners {
                     lanes: HashMap::from([(1, 0)]),
                     closing: HashSet::from([1]),
@@ -4481,21 +4462,20 @@ mod tests {
             &[],
         )
         .unwrap();
-        let (command_tx, command_rx) = mpsc::sync_channel(8);
+        let mailbox = Arc::new(Mutex::new(LaneMailbox::new(8)));
         for _ in 0..5 {
-            command_tx
-                .try_send(Command::Tick {
+            assert!(mailbox
+                .lock()
+                .unwrap()
+                .submit(Command::Tick {
                     machine: 1,
                     tick: 1,
                     retirements: 64,
                     deadline: None,
                 })
-                .unwrap();
+                .is_ok());
         }
-        let control = Arc::new(Mutex::new(LaneControl {
-            stops: std::collections::BTreeSet::from([1]),
-            fenced: true,
-        }));
+        mailbox.lock().unwrap().stops.insert(1);
         let (event_tx, _events) = mpsc::sync_channel(8);
         let stops = Arc::new(Mutex::new(BTreeMap::new()));
         let sender = EventSender {
@@ -4510,8 +4490,7 @@ mod tests {
         let worker = thread::spawn(move || {
             run_worker(
                 HashMap::from([(1, Actor::new(machine, config().host_budget))]),
-                command_rx,
-                control,
+                mailbox,
                 sender,
                 worker_stopped,
                 worker_metrics,
@@ -4530,7 +4509,6 @@ mod tests {
         stopped.store(true, Ordering::Release);
         worker.thread().unpark();
         worker.join().unwrap();
-        drop(command_tx);
     }
 
     #[test]
@@ -4554,7 +4532,7 @@ mod tests {
             FleetConfig {
                 workers: 1,
                 event_capacity: 1,
-                mailbox_capacity: 2,
+                mailbox_capacity: 3,
                 ..config()
             },
         )
@@ -4568,14 +4546,16 @@ mod tests {
         }
         fleet.resource_snapshot(0, 41).unwrap();
         fleet.resource_snapshot(1, 42).unwrap();
+        fleet.resource_snapshot(0, 43).unwrap();
         fleet.stop(1).unwrap();
-        assert_eq!(fleet.resource_snapshot(0, 43), Err(SubmitError::Full));
+        assert_eq!(fleet.resource_snapshot(0, 44), Err(SubmitError::Full));
 
         let mut target_snapshot = false;
         let mut other_snapshot = false;
+        let mut later_snapshot = false;
         let mut stop = false;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !(target_snapshot && other_snapshot && stop) {
+        while !(target_snapshot && other_snapshot && later_snapshot && stop) {
             if let Some(event) = fleet.try_event() {
                 match event {
                     FleetEvent::ResourceSnapshot {
@@ -4588,6 +4568,17 @@ mod tests {
                         request: 41,
                         ..
                     } => other_snapshot = true,
+                    FleetEvent::ResourceSnapshot {
+                        machine: 0,
+                        request: 43,
+                        ..
+                    } => {
+                        assert!(
+                            other_snapshot,
+                            "commands for the other machine were reordered"
+                        );
+                        later_snapshot = true;
+                    }
                     FleetEvent::Stopped { machine: 1, .. } => {
                         assert!(target_snapshot, "stop overtook an accepted command");
                         stop = true;
@@ -4602,6 +4593,26 @@ mod tests {
                 thread::yield_now();
             }
         }
+    }
+
+    #[test]
+    fn stopping_one_machine_does_not_fence_other_mailbox_submissions() {
+        let mut mailbox = LaneMailbox::new(2);
+        mailbox.stops.insert(1);
+        assert!(mailbox
+            .submit(Command::ResourceSnapshot {
+                machine: 2,
+                request: 42
+            })
+            .is_ok());
+        assert!(matches!(mailbox.next(), Some(Command::Stop { machine: 1 })));
+        assert!(matches!(
+            mailbox.next(),
+            Some(Command::ResourceSnapshot {
+                machine: 2,
+                request: 42
+            })
+        ));
     }
 
     #[test]
