@@ -18,6 +18,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 static NEXT_FLEET_DEPLOYMENT_CANDIDATE: AtomicU64 = AtomicU64::new(1);
+const MAXIMUM_PENDING_TIMERS: usize = 256;
 
 use crate::{
     ComputerAdvanceOutcome, ComputerHostRequest, ComputerMachine, ComputerValue, HostFailure,
@@ -1597,7 +1598,7 @@ fn run_worker(
                         .iter()
                         .any(|key| preserve_timers_at.is_none() || !actor.timers.contains_key(key))
                         || preserve_timers_at.is_some_and(|tick| tick < actor.tick)
-                        || actor.timers.len() > 256
+                        || actor.timers.len() > MAXIMUM_PENDING_TIMERS
                         || !actor.deployment_candidates.is_empty()
                         || !actor.inspecting.is_empty()
                         || !actor.inspected.is_empty()
@@ -2133,6 +2134,33 @@ fn run_worker(
                         && request.operation == 0
                     {
                         match request.arguments.as_ref() {
+                            [ComputerValue::I32(_)]
+                                if actor.timers.len() >= MAXIMUM_PENDING_TIMERS =>
+                            {
+                                actor.pending.remove(&key);
+                                actor.request_scopes.remove(&key);
+                                if let Err(error) = actor.machine.resume_host_request_for(
+                                    request.task_id,
+                                    request.id,
+                                    HostResponse::Failure(HostFailure::new(
+                                        HostFailureKind::Unavailable,
+                                        "Timer pending request limit was reached",
+                                    )),
+                                ) {
+                                    actor.stopped = true;
+                                    if !publish(
+                                        &events,
+                                        &stopped,
+                                        &waiters,
+                                        FleetEvent::Error {
+                                            machine: id,
+                                            message: format!("timer rejection: {error:?}"),
+                                        },
+                                    ) {
+                                        return;
+                                    }
+                                }
+                            }
                             [ComputerValue::I32(delay)] if *delay >= 0 => {
                                 actor.timers.insert(
                                     key,
@@ -3772,6 +3800,69 @@ mod tests {
         assert_eq!(fleet.metrics().advances, advances);
         assert!(fleet.try_event().is_none());
         assert_eq!(fleet.stop(99), Err(SubmitError::UnknownMachine));
+    }
+
+    #[test]
+    fn timer_capacity_returns_guest_visible_failure() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::timer_unit_artifact(2),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut actor = Actor::new(machine, 64);
+        for index in 0..256 {
+            actor.timers.insert(
+                (99, index),
+                ScheduledTimer {
+                    due: 1000,
+                    duration: 2,
+                },
+            );
+        }
+        let (commands, command_rx) = mpsc::sync_channel(4);
+        let (sender, events) = mpsc::sync_channel(16);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let worker = thread::spawn(move || {
+            run_worker(
+                HashMap::from([(1, actor)]),
+                command_rx,
+                EventSender {
+                    sender,
+                    signal: Arc::new(FleetEventSignal::default()),
+                },
+                worker_stopped,
+                Arc::new(Metrics::default()),
+                Arc::new(AtomicUsize::new(0)),
+                config(),
+                Arc::new(Vec::new()),
+                false,
+            )
+        });
+        commands
+            .send(Command::Tick {
+                machine: 1,
+                tick: 1,
+                retirements: 64,
+                deadline: None,
+            })
+            .unwrap();
+        worker.thread().unpark();
+        let event = events.recv_timeout(Duration::from_secs(5)).unwrap();
+        match event {
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::UncaughtException(detail),
+                ..
+            } => {
+                assert!(detail.contains("Timer pending request limit was reached"));
+            }
+            event => panic!("expected guest-visible timer capacity failure, got {event:?}"),
+        }
+        stopped.store(true, Ordering::Release);
+        worker.thread().unpark();
+        worker.join().unwrap();
     }
 
     #[test]
