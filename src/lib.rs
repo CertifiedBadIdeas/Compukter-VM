@@ -44,6 +44,8 @@ mod decode;
 mod deployment;
 pub mod diagnostic;
 mod execution;
+#[cfg(feature = "experimental-fleet-scheduler")]
+pub mod experimental_fleet_scheduler;
 pub mod filesystem;
 pub mod limits;
 mod live_registry;
