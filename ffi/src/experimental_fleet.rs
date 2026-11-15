@@ -147,3 +147,55 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
         WireEvent::Outcome(bytes)
     }))
 }
+
+/// Decode the existing bounded host response wire before sending it to a worker.
+pub fn decode_reply(
+    bytes: &[u8],
+) -> Option<compukter_vm::experimental_fleet_scheduler::ReplyValue> {
+    use crate::bridge::OwnedResponse;
+    use compukter_vm::experimental_fleet_scheduler::ReplyValue;
+    Some(match crate::wire::decode_response(bytes)? {
+        OwnedResponse::SuccessUnit => ReplyValue::Unit,
+        OwnedResponse::SuccessI32(v) => ReplyValue::I32(v),
+        OwnedResponse::SuccessI64(v) => ReplyValue::I64(v),
+        OwnedResponse::SuccessF32(v) => ReplyValue::F32(v),
+        OwnedResponse::SuccessF64(v) => ReplyValue::F64(v),
+        OwnedResponse::SuccessBool(v) => ReplyValue::Bool(v),
+        OwnedResponse::SuccessChar(v) => ReplyValue::Char(v),
+        OwnedResponse::SuccessString(v) => ReplyValue::String(v.into_boxed_slice()),
+        OwnedResponse::SuccessByteArray(v) => ReplyValue::Bytes(v.into_boxed_slice()),
+        OwnedResponse::SuccessRecord(v) => ReplyValue::Record(v),
+        OwnedResponse::Failure { kind, detail } => {
+            ReplyValue::Failure(kind, detail.into_boxed_str())
+        }
+    })
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::decode_reply;
+    use compukter_vm::experimental_fleet_scheduler::ReplyValue;
+    use compukter_vm::{HostRecordMember, HostRecordScalar};
+
+    #[test]
+    fn fleet_decodes_record_reply_with_unchanged_bits_and_rejects_truncation() {
+        let mut bytes = vec![1, 8, 14, 0];
+        bytes.extend_from_slice(b"fixture.Vector");
+        bytes.extend_from_slice(&[1, 1, b'x', 4]);
+        bytes.extend_from_slice(&0x7ff0000000000042u64.to_le_bytes());
+        let Some(ReplyValue::Record(record)) = decode_reply(&bytes) else {
+            panic!("record missing")
+        };
+        assert_eq!(record.type_name.as_str(), "fixture.Vector");
+        assert_eq!(
+            record.fields.as_slice(),
+            &[HostRecordMember {
+                name: "x".into(),
+                value: HostRecordScalar::F64(0x7ff0000000000042)
+            }]
+        );
+        for end in 0..bytes.len() {
+            assert!(decode_reply(&bytes[..end]).is_none());
+        }
+    }
+}

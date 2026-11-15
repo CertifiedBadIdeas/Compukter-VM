@@ -371,3 +371,81 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         }
     })
 }
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_replyWire<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    task: jint,
+    request: jlong,
+    payload: JByteArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if machine < 0 || task < 0 || request < 0 || payload.len(env)? > 65536 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let Some(value) = experimental_fleet::decode_reply(&bytes(env, &payload)?) else {
+            return Ok(code(FfiStatus::InvalidArgument));
+        };
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(
+                    f.scheduler
+                        .reply(machine as u64, task as u32, request as u64, value),
+                )
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_replyFailure<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    task: jint,
+    request: jlong,
+    kind: jint,
+    detail: JByteArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if machine < 0
+            || task < 0
+            || request < 0
+            || detail.len(env)? == 0
+            || detail.len(env)? > compukter_vm::MAXIMUM_HOST_FAILURE_DETAIL_BYTES
+        {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let kind = match kind {
+            0 => compukter_vm::HostFailureKind::EndOfFile,
+            1 => compukter_vm::HostFailureKind::Unavailable,
+            2 => compukter_vm::HostFailureKind::InputOutput,
+            3 => compukter_vm::HostFailureKind::Cancelled,
+            4 => compukter_vm::HostFailureKind::Other,
+            _ => return Ok(code(FfiStatus::InvalidArgument)),
+        };
+        let Ok(detail) = String::from_utf8(bytes(env, &detail)?) else {
+            return Ok(code(FfiStatus::InvalidArgument));
+        };
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(f.scheduler.reply(
+                    machine as u64,
+                    task as u32,
+                    request as u64,
+                    ReplyValue::Failure(kind, detail.into_boxed_str()),
+                ))
+            }))
+    })
+}

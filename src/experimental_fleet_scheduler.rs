@@ -71,11 +71,16 @@ pub enum ReplyValue {
     Char(u16),
     String(Box<[u16]>),
     Bytes(Box<[u8]>),
+    Record(crate::HostRecordValue),
+    Failure(HostFailureKind, Box<str>),
 }
 
 impl ReplyValue {
-    fn as_input(&self) -> HostValueInput<'_> {
-        match self {
+    fn as_response(&self) -> HostResponse<'_> {
+        if let Self::Failure(kind, detail) = self {
+            return HostResponse::Failure(HostFailure::new(*kind, detail));
+        }
+        HostResponse::Success(match self {
             Self::Unit => HostValueInput::Unit,
             Self::I32(v) => HostValueInput::I32(*v),
             Self::I64(v) => HostValueInput::I64(*v),
@@ -85,7 +90,9 @@ impl ReplyValue {
             Self::Char(v) => HostValueInput::Char(*v),
             Self::String(v) => HostValueInput::String(v),
             Self::Bytes(v) => HostValueInput::ByteArray(v),
-        }
+            Self::Record(v) => HostValueInput::Record(v),
+            Self::Failure(..) => unreachable!(),
+        })
     }
 }
 
@@ -548,11 +555,11 @@ fn run_worker(
                         }
                         continue;
                     }
-                    if let Err(error) = actor.machine.resume_host_request_for(
-                        task,
-                        request,
-                        HostResponse::Success(value.as_input()),
-                    ) {
+                    if let Err(error) =
+                        actor
+                            .machine
+                            .resume_host_request_for(task, request, value.as_response())
+                    {
                         actor.stopped = true;
                         if !publish(
                             &events,
