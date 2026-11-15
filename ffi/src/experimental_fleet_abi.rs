@@ -464,3 +464,160 @@ pub unsafe extern "C" fn compukter_experimental_fleet_compilation(
         })
     })
 }
+
+/// Enqueues an observation: 0 terminal update, 1 resources, 2 filesystem generation.
+#[unsafe(no_mangle)]
+pub extern "C" fn compukter_experimental_fleet_observe(
+    handle: u64,
+    machine: u64,
+    request: u64,
+    kind: u32,
+    revision: u64,
+) -> FfiStatus {
+    guarded(|| {
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = all.get(&handle) else {
+            return FfiStatus::StaleHandle;
+        };
+        submission(match kind {
+            0 => fleet.scheduler.terminal_update(machine, request, revision),
+            1 if revision == 0 => fleet.scheduler.resource_snapshot(machine, request),
+            2 if revision == 0 => fleet.scheduler.filesystem_generation(machine, request),
+            _ => return FfiStatus::InvalidArgument,
+        })
+    })
+}
+
+/// Enqueues redstone input (kind 0) or confirms applied output (kind 1).
+#[unsafe(no_mangle)]
+pub extern "C" fn compukter_experimental_fleet_redstone(
+    handle: u64,
+    machine: u64,
+    kind: u32,
+    packet: u32,
+) -> FfiStatus {
+    guarded(|| {
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = all.get(&handle) else {
+            return FfiStatus::StaleHandle;
+        };
+        submission(match kind {
+            0 => fleet.scheduler.redstone_input(machine, packet),
+            1 => fleet.scheduler.confirm_redstone_output(machine, packet),
+            _ => return FfiStatus::InvalidArgument,
+        })
+    })
+}
+
+/// Enqueues a terminal key with an optional nonnegative completion request; -1 omits acknowledgement.
+#[unsafe(no_mangle)]
+pub extern "C" fn compukter_experimental_fleet_terminal_key(
+    handle: u64,
+    machine: u64,
+    key: u32,
+    action: u32,
+    modifiers: u32,
+    request: i64,
+) -> FfiStatus {
+    guarded(|| {
+        if key > u16::MAX as u32 || modifiers > u8::MAX as u32 || request < -1 {
+            return FfiStatus::InvalidArgument;
+        }
+        let Ok(key) = compukter_vm::TerminalKey::try_from(key as u16) else {
+            return FfiStatus::InvalidArgument;
+        };
+        let action = match action {
+            0 => compukter_vm::TerminalKeyAction::Press,
+            1 => compukter_vm::TerminalKeyAction::Repeat,
+            _ => return FfiStatus::InvalidArgument,
+        };
+        let Ok(modifiers) = compukter_vm::TerminalModifiers::new(modifiers as u8) else {
+            return FfiStatus::InvalidArgument;
+        };
+        let event = compukter_vm::TerminalKeyEvent::new(key, action, modifiers);
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = all.get(&handle) else {
+            return FfiStatus::StaleHandle;
+        };
+        submission(if request == -1 {
+            fleet.scheduler.terminal_key(machine, event)
+        } else {
+            fleet
+                .scheduler
+                .terminal_key_checked(machine, request as u64, event)
+        })
+    })
+}
+
+/// Enqueues UTF-8 terminal text with an optional completion acknowledgement.
+///
+/// # Safety
+/// A nonempty payload must name `length` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_terminal_text(
+    handle: u64,
+    machine: u64,
+    payload: *const u8,
+    length: usize,
+    request: i64,
+) -> FfiStatus {
+    guarded(|| {
+        if length > 16384 || request < -1 || (length > 0 && payload.is_null()) {
+            return FfiStatus::InvalidArgument;
+        }
+        let bytes = if length == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(payload, length) }
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return FfiStatus::InvalidArgument;
+        };
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = all.get(&handle) else {
+            return FfiStatus::StaleHandle;
+        };
+        submission(if request == -1 {
+            fleet.scheduler.terminal_text(machine, text.into())
+        } else {
+            fleet
+                .scheduler
+                .terminal_text_checked(machine, request as u64, text.into())
+        })
+    })
+}
+
+/// Enqueues UTF-16 canonical input with an optional completion acknowledgement.
+///
+/// # Safety
+/// A nonempty payload must name `length` readable, aligned u16 values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_canonical_line(
+    handle: u64,
+    machine: u64,
+    payload: *const u16,
+    length: usize,
+    request: i64,
+) -> FfiStatus {
+    guarded(|| {
+        if length > 4096 || request < -1 || (length > 0 && payload.is_null()) {
+            return FfiStatus::InvalidArgument;
+        }
+        let line = if length == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(payload, length) }
+        };
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = all.get(&handle) else {
+            return FfiStatus::StaleHandle;
+        };
+        submission(if request == -1 {
+            fleet.scheduler.canonical_line(machine, line.into())
+        } else {
+            fleet
+                .scheduler
+                .canonical_line_checked(machine, request as u64, line.into())
+        })
+    })
+}
