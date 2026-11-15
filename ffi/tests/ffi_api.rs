@@ -47,6 +47,46 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[cfg(feature = "experimental-fleet-scheduler")]
 #[test]
+fn experimental_fleet_exposes_typed_stop_events() {
+    use compukter_ffi::experimental_fleet::WireEvent;
+    use compukter_vm::experimental_fleet_scheduler::FleetConfig;
+    use std::time::{Duration, Instant};
+    let config = FleetConfig {
+        workers: 1,
+        mailbox_capacity: 4,
+        event_capacity: 4,
+        guest_budget: 64,
+        maintenance_budget: 64,
+        host_budget: 16,
+        maximum_advances_per_tick: 32,
+    };
+    let fleet = compukter_ffi::experimental_fleet::create(
+        &support::executable_minimal_vector(),
+        &EMPTY_CAPABILITY_SCHEMAS,
+        1,
+        config,
+    )
+    .unwrap();
+    fleet.stop(0).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match compukter_ffi::experimental_fleet::poll_event(&fleet).unwrap() {
+            Some(WireEvent::Stopped { machine, pending }) => {
+                assert_eq!(machine, 0);
+                assert!(pending.is_empty());
+                break;
+            }
+            Some(WireEvent::Outcome(_)) => panic!("unexpected outcome"),
+            None => {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[test]
 fn experimental_fleet_validates_schemas_and_publishes_wire_outcomes() {
     use compukter_vm::experimental_fleet_scheduler::FleetConfig;
     use std::time::{Duration, Instant};
