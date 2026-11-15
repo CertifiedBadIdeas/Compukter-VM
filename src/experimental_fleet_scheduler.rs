@@ -12,10 +12,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+mod output;
+use output::WorkerOutput;
 
 static NEXT_FLEET_DEPLOYMENT_CANDIDATE: AtomicU64 = AtomicU64::new(1);
 const MAXIMUM_PENDING_TIMERS: usize = 256;
@@ -273,6 +276,28 @@ pub enum SubmitError {
     InvalidMachine,
     Capacity,
     IdentityExhausted,
+}
+
+impl FleetEvent {
+    fn machine(&self) -> u64 {
+        match self {
+            Self::Deployment { machine, .. }
+            | Self::InputResult { machine, .. }
+            | Self::Filesystem { machine, .. }
+            | Self::ResourceSnapshot { machine, .. }
+            | Self::FilesystemGeneration { machine, .. }
+            | Self::TerminalUpdate { machine, .. }
+            | Self::Quiescent { machine, .. }
+            | Self::Inspect { machine, .. }
+            | Self::Requests { machine, .. }
+            | Self::Boundary { machine, .. }
+            | Self::Detached { machine, .. }
+            | Self::DetachRejected { machine, .. }
+            | Self::Stopped { machine, .. }
+            | Self::ScopeStopped { machine, .. }
+            | Self::Error { machine, .. } => *machine,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -544,6 +569,8 @@ pub struct FleetStopCompletion {
     /// Final cumulative accounting for the last tick, even if it was already
     /// emitted as an ordinary event. Consumers must reconcile by tick.
     pub quiescent: Option<FleetQuiescent>,
+    /// Reports cancelled from ordinary delivery while draining accepted commands.
+    pub prior_reports: VecDeque<FleetQuiescent>,
     report_pending: bool,
 }
 
@@ -1202,6 +1229,14 @@ impl FleetScheduler {
             let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
             let mut entry = stops.first_entry()?;
             let machine = *entry.key();
+            if let Some(report) = entry.get_mut().prior_reports.pop_front() {
+                return Some(FleetEvent::Quiescent {
+                    machine,
+                    tick: report.tick,
+                    retired: report.retired,
+                    timers_pending: report.timers_pending,
+                });
+            }
             if entry.get().report_pending {
                 let report = entry.get().quiescent.expect("pending report exists");
                 entry.get_mut().report_pending = false;
@@ -1281,39 +1316,8 @@ impl Drop for FleetScheduler {
     }
 }
 
-fn publish(
-    sender: &EventSender,
-    stopped: &AtomicBool,
-    waiters: &AtomicUsize,
-    mut event: FleetEvent,
-) -> bool {
-    let mut registered = false;
-    let success = loop {
-        if stopped.load(Ordering::Acquire) {
-            break false;
-        }
-        match sender.sender.try_send(event) {
-            Ok(()) => {
-                sender.signal.notify();
-                break true;
-            }
-            Err(TrySendError::Full(returned)) => {
-                event = returned;
-                if !registered {
-                    waiters.fetch_add(1, Ordering::SeqCst);
-                    registered = true;
-                    // Recheck after registering to avoid a missed wakeup.
-                    continue;
-                }
-                thread::park_timeout(Duration::from_millis(10));
-            }
-            Err(TrySendError::Disconnected(_)) => break false,
-        }
-    };
-    if registered {
-        waiters.fetch_sub(1, Ordering::SeqCst);
-    }
-    success
+fn publish(sender: &WorkerOutput<'_>, stopped: &AtomicBool, event: FleetEvent) -> bool {
+    !stopped.load(Ordering::Acquire) && sender.emit(event)
 }
 
 fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
@@ -1330,20 +1334,30 @@ fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
     }
 }
 
+fn remove_actor(
+    actors: &mut HashMap<u64, Actor>,
+    queue: &mut VecDeque<u64>,
+    id: u64,
+) -> Option<Actor> {
+    let actor = actors.remove(&id)?;
+    // Closing can complete without draining ordinary output. Stale ready entries
+    // must not accumulate across repeated close/attach cycles under backpressure.
+    queue.retain(|queued| *queued != id);
+    Some(actor)
+}
+
 fn report_input(
     machine: u64,
     request: Option<u64>,
     result: Result<(), InputFailure>,
     operation: &str,
-    events: &EventSender,
+    events: &WorkerOutput<'_>,
     stopped: &AtomicBool,
-    waiters: &AtomicUsize,
 ) -> bool {
     match (request, result) {
         (Some(request), result) => publish(
             events,
             stopped,
-            waiters,
             FleetEvent::InputResult {
                 machine,
                 request,
@@ -1358,7 +1372,6 @@ fn report_input(
             publish(
                 events,
                 stopped,
-                waiters,
                 FleetEvent::Error {
                     machine,
                     message: format!("{operation}: {detail}"),
@@ -1372,9 +1385,8 @@ fn report_input(
 fn report_quiescent(
     id: u64,
     actor: &mut Actor,
-    events: &EventSender,
+    events: &WorkerOutput<'_>,
     stopped: &AtomicBool,
-    waiters: &AtomicUsize,
     enabled: bool,
 ) -> bool {
     if !enabled || !actor.tick_initialized || actor.reported_retired == Some(actor.tick_retired) {
@@ -1385,7 +1397,6 @@ fn report_quiescent(
     publish(
         events,
         stopped,
-        waiters,
         FleetEvent::Quiescent {
             machine: id,
             tick: actor.tick,
@@ -1406,11 +1417,27 @@ fn run_worker(
     inspections: Arc<Vec<RequestInspection>>,
     coordinated_turns: bool,
 ) {
+    let events = WorkerOutput::new(events, &waiters);
     let mut queue = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
+        if !events.flush() {
+            return;
+        }
         for _ in 0..4 {
-            let Some(command) = mailbox.lock().unwrap_or_else(|e| e.into_inner()).next() else {
-                break;
+            let command = {
+                let mut mailbox = mailbox.lock().unwrap_or_else(|e| e.into_inner());
+                if events.has_pending() && mailbox.stops.is_empty() {
+                    break;
+                }
+                let Some(command) = mailbox.next() else {
+                    break;
+                };
+                if matches!(command, Command::Stop { .. })
+                    || mailbox.stops.contains(&command.machine())
+                {
+                    events.begin_closing(command.machine());
+                }
+                command
             };
             match command {
                 Command::Deployment {
@@ -1510,7 +1537,6 @@ fn run_worker(
                     if !publish(
                         &events,
                         &stopped,
-                        &waiters,
                         FleetEvent::Deployment {
                             machine,
                             request,
@@ -1568,7 +1594,6 @@ fn run_worker(
                     if !publish(
                         &events,
                         &stopped,
-                        &waiters,
                         FleetEvent::Filesystem {
                             machine,
                             request,
@@ -1613,14 +1638,7 @@ fn run_worker(
                         continue;
                     }
                     if !actor.tick_initialized || tick > actor.tick {
-                        if !report_quiescent(
-                            machine,
-                            actor,
-                            &events,
-                            &stopped,
-                            &waiters,
-                            coordinated_turns,
-                        ) {
+                        if !report_quiescent(machine, actor, &events, &stopped, coordinated_turns) {
                             return;
                         }
                         actor.tick_initialized = true;
@@ -1653,7 +1671,6 @@ fn run_worker(
                             if !publish(
                                 &events,
                                 &stopped,
-                                &waiters,
                                 FleetEvent::Error {
                                     machine,
                                     message: format!("timer completion: {error:?}"),
@@ -1669,14 +1686,7 @@ fn run_worker(
                         ready(machine, actor, &mut queue);
                     }
                     if !actor.queued
-                        && !report_quiescent(
-                            machine,
-                            actor,
-                            &events,
-                            &stopped,
-                            &waiters,
-                            coordinated_turns,
-                        )
+                        && !report_quiescent(machine, actor, &events, &stopped, coordinated_turns)
                     {
                         return;
                     }
@@ -1706,7 +1716,6 @@ fn run_worker(
                         if !publish(
                             &events,
                             &stopped,
-                            &waiters,
                             FleetEvent::Error {
                                 machine,
                                 message: format!("host completion: {error:?}"),
@@ -1737,27 +1746,16 @@ fn run_worker(
                         || !actor.inspected.is_empty()
                         || actor.compilation_token.is_some()
                     {
-                        if !publish(
-                            &events,
-                            &stopped,
-                            &waiters,
-                            FleetEvent::DetachRejected { machine },
-                        ) {
+                        if !publish(&events, &stopped, FleetEvent::DetachRejected { machine }) {
                             return;
                         }
                         continue;
                     }
-                    if !report_quiescent(
-                        machine,
-                        actor,
-                        &events,
-                        &stopped,
-                        &waiters,
-                        coordinated_turns,
-                    ) {
+                    if !report_quiescent(machine, actor, &events, &stopped, coordinated_turns) {
                         return;
                     }
-                    let actor = actors.remove(&machine).expect("checked actor");
+                    let actor =
+                        remove_actor(&mut actors, &mut queue, machine).expect("checked actor");
                     let mut timers: Vec<_> = actor
                         .timers
                         .iter()
@@ -1775,7 +1773,6 @@ fn run_worker(
                     if !publish(
                         &events,
                         &stopped,
-                        &waiters,
                         FleetEvent::Detached {
                             machine,
                             computer: Box::new(actor.machine),
@@ -1786,7 +1783,7 @@ fn run_worker(
                     }
                 }
                 Command::Stop { machine } => {
-                    if let Some(actor) = actors.remove(&machine) {
+                    if let Some(actor) = remove_actor(&mut actors, &mut queue, machine) {
                         let quiescent = if coordinated_turns && actor.tick_initialized {
                             Some(FleetQuiescent {
                                 tick: actor.tick,
@@ -1809,21 +1806,13 @@ fn run_worker(
                         pending.sort_unstable();
                         pending.dedup();
                         drop(actor);
-                        let previous = events
-                            .stops
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(
-                                machine,
-                                FleetStopCompletion {
-                                    machine,
-                                    pending,
-                                    quiescent,
-                                    report_pending,
-                                },
-                            );
-                        assert!(previous.is_none(), "duplicate machine stop completion");
-                        events.signal.notify();
+                        events.complete_stop(FleetStopCompletion {
+                            machine,
+                            pending,
+                            quiescent,
+                            prior_reports: VecDeque::new(),
+                            report_pending,
+                        });
                     }
                 }
                 Command::TerminalKey {
@@ -1842,15 +1831,7 @@ fn run_worker(
                         actor.parked = false;
                         ready(machine, actor, &mut queue);
                     }
-                    if !report_input(
-                        machine,
-                        request,
-                        result,
-                        "terminal key",
-                        &events,
-                        &stopped,
-                        &waiters,
-                    ) {
+                    if !report_input(machine, request, result, "terminal key", &events, &stopped) {
                         return;
                     }
                 }
@@ -1871,15 +1852,7 @@ fn run_worker(
                         actor.parked = false;
                         ready(machine, actor, &mut queue);
                     }
-                    if !report_input(
-                        machine,
-                        request,
-                        result,
-                        "terminal text",
-                        &events,
-                        &stopped,
-                        &waiters,
-                    ) {
+                    if !report_input(machine, request, result, "terminal text", &events, &stopped) {
                         return;
                     }
                 }
@@ -1906,7 +1879,6 @@ fn run_worker(
                         "canonical line",
                         &events,
                         &stopped,
-                        &waiters,
                     ) {
                         return;
                     }
@@ -1924,7 +1896,6 @@ fn run_worker(
                     if !publish(
                         &events,
                         &stopped,
-                        &waiters,
                         FleetEvent::TerminalUpdate {
                             machine,
                             request,
@@ -1942,7 +1913,6 @@ fn run_worker(
                         if !publish(
                             &events,
                             &stopped,
-                            &waiters,
                             FleetEvent::Error {
                                 machine,
                                 message: format!("redstone input: {error:?}"),
@@ -1963,7 +1933,6 @@ fn run_worker(
                         if !publish(
                             &events,
                             &stopped,
-                            &waiters,
                             FleetEvent::Error {
                                 machine,
                                 message: format!("redstone output: {error:?}"),
@@ -1980,7 +1949,6 @@ fn run_worker(
                     if !publish(
                         &events,
                         &stopped,
-                        &waiters,
                         FleetEvent::ResourceSnapshot {
                             machine,
                             request,
@@ -1997,7 +1965,6 @@ fn run_worker(
                     if !publish(
                         &events,
                         &stopped,
-                        &waiters,
                         FleetEvent::FilesystemGeneration {
                             machine,
                             request,
@@ -2050,7 +2017,6 @@ fn run_worker(
                         if !publish(
                             &events,
                             &stopped,
-                            &waiters,
                             FleetEvent::Error {
                                 machine,
                                 message: format!("compilation completion: {error:?}"),
@@ -2075,6 +2041,10 @@ fn run_worker(
         {
             continue;
         }
+        if events.has_pending() {
+            thread::park_timeout(Duration::from_millis(1));
+            continue;
+        }
         let Some(id) = queue.pop_front() else {
             thread::park_timeout(Duration::from_millis(1));
             continue;
@@ -2084,7 +2054,7 @@ fn run_worker(
         };
         actor.queued = false;
         if actor.stopped || actor.remaining == 0 || actor.advances_left == 0 {
-            if !report_quiescent(id, actor, &events, &stopped, &waiters, coordinated_turns) {
+            if !report_quiescent(id, actor, &events, &stopped, coordinated_turns) {
                 return;
             }
             continue;
@@ -2093,7 +2063,7 @@ fn run_worker(
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            if !report_quiescent(id, actor, &events, &stopped, &waiters, coordinated_turns) {
+            if !report_quiescent(id, actor, &events, &stopped, coordinated_turns) {
                 return;
             }
             continue;
@@ -2115,7 +2085,6 @@ fn run_worker(
                 if !publish(
                     &events,
                     &stopped,
-                    &waiters,
                     FleetEvent::Error {
                         machine: id,
                         message: format!("advance: {error:?}"),
@@ -2137,7 +2106,6 @@ fn run_worker(
                 if !publish(
                     &events,
                     &stopped,
-                    &waiters,
                     FleetEvent::Boundary {
                         machine: id,
                         tick: actor.tick,
@@ -2165,7 +2133,6 @@ fn run_worker(
                 if !publish(
                     &events,
                     &stopped,
-                    &waiters,
                     FleetEvent::Boundary {
                         machine: id,
                         tick: actor.tick,
@@ -2206,7 +2173,6 @@ fn run_worker(
                                 if !publish(
                                     &events,
                                     &stopped,
-                                    &waiters,
                                     FleetEvent::Inspect {
                                         machine: id,
                                         tick: actor.tick,
@@ -2231,7 +2197,6 @@ fn run_worker(
                         if !publish(
                             &events,
                             &stopped,
-                            &waiters,
                             FleetEvent::Error {
                                 machine: id,
                                 message: "host request cost must be positive".into(),
@@ -2258,7 +2223,6 @@ fn run_worker(
                             if !publish(
                                 &events,
                                 &stopped,
-                                &waiters,
                                 FleetEvent::Error {
                                     machine: id,
                                     message: format!("host quota failure: {error:?}"),
@@ -2266,6 +2230,7 @@ fn run_worker(
                             ) {
                                 return;
                             }
+                            break;
                         }
                         continue;
                     }
@@ -2302,7 +2267,6 @@ fn run_worker(
                                     if !publish(
                                         &events,
                                         &stopped,
-                                        &waiters,
                                         FleetEvent::Error {
                                             machine: id,
                                             message: format!("timer rejection: {error:?}"),
@@ -2326,7 +2290,6 @@ fn run_worker(
                                 if !publish(
                                     &events,
                                     &stopped,
-                                    &waiters,
                                     FleetEvent::Error {
                                         machine: id,
                                         message: "unsupported timer request".into(),
@@ -2339,6 +2302,9 @@ fn run_worker(
                     } else {
                         fresh.push(request);
                     }
+                    if actor.stopped {
+                        break;
+                    }
                 }
                 let made_request = !fresh.is_empty();
                 metrics
@@ -2348,7 +2314,6 @@ fn run_worker(
                     && !publish(
                         &events,
                         &stopped,
-                        &waiters,
                         FleetEvent::Requests {
                             machine: id,
                             tick: actor.tick,
@@ -2409,7 +2374,6 @@ fn run_worker(
                             if !publish(
                                 &events,
                                 &stopped,
-                                &waiters,
                                 FleetEvent::Error {
                                     machine: id,
                                     message: message.into(),
@@ -2440,7 +2404,6 @@ fn run_worker(
                         && !publish(
                             &events,
                             &stopped,
-                            &waiters,
                             FleetEvent::ScopeStopped {
                                 machine: id,
                                 scope,
@@ -2454,7 +2417,6 @@ fn run_worker(
                 if !publish(
                     &events,
                     &stopped,
-                    &waiters,
                     FleetEvent::Boundary {
                         machine: id,
                         tick: actor.tick,
@@ -2471,7 +2433,6 @@ fn run_worker(
                 if !publish(
                     &events,
                     &stopped,
-                    &waiters,
                     FleetEvent::Boundary {
                         machine: id,
                         tick: actor.tick,
@@ -2482,9 +2443,7 @@ fn run_worker(
                 }
             }
         }
-        if !actor.queued
-            && !report_quiescent(id, actor, &events, &stopped, &waiters, coordinated_turns)
-        {
+        if !actor.queued && !report_quiescent(id, actor, &events, &stopped, coordinated_turns) {
             return;
         }
     }
@@ -2586,10 +2545,11 @@ mod tests {
         };
         let generation = signal.generation();
         assert!(receiver.try_recv().is_err());
+        let waiters = AtomicUsize::new(0);
+        let sender = WorkerOutput::new(sender, &waiters);
         assert!(publish(
             &sender,
             &AtomicBool::new(false),
-            &AtomicUsize::new(0),
             FleetEvent::Quiescent {
                 machine: 1,
                 tick: 2,
@@ -4353,6 +4313,16 @@ mod tests {
                     .unwrap()
                     .submit(Command::Tick {
                         machine: 1,
+                        tick: 6,
+                        retirements: 64,
+                        deadline: None,
+                    })
+                    .is_ok());
+                assert!(mailbox
+                    .lock()
+                    .unwrap()
+                    .submit(Command::Tick {
+                        machine: 1,
                         tick: 7,
                         retirements: 64,
                         deadline: None,
@@ -4420,6 +4390,18 @@ mod tests {
             }
             if targeted {
                 let completion = fleet.try_stopped(1).unwrap();
+                assert_eq!(
+                    completion
+                        .prior_reports
+                        .iter()
+                        .map(|report| report.tick)
+                        .collect::<Vec<_>>(),
+                    if already_reported {
+                        Vec::new()
+                    } else {
+                        vec![6]
+                    }
+                );
                 let report = completion.quiescent.unwrap();
                 assert_eq!(
                     (completion.machine, report.tick, report.retired),
@@ -4435,6 +4417,15 @@ mod tests {
                     Some(FleetEvent::Error { machine: 0, .. })
                 ));
                 if !already_reported {
+                    assert!(matches!(
+                        fleet.try_event(),
+                        Some(FleetEvent::Quiescent {
+                            machine: 1,
+                            tick: 6,
+                            retired: 0,
+                            ..
+                        })
+                    ));
                     assert!(matches!(
                         fleet.try_event(),
                         Some(FleetEvent::Quiescent {
@@ -4463,13 +4454,13 @@ mod tests {
         )
         .unwrap();
         let mailbox = Arc::new(Mutex::new(LaneMailbox::new(8)));
-        for _ in 0..5 {
+        for tick in 1..=5 {
             assert!(mailbox
                 .lock()
                 .unwrap()
                 .submit(Command::Tick {
                     machine: 1,
-                    tick: 1,
+                    tick,
                     retirements: 64,
                     deadline: None,
                 })
@@ -4497,7 +4488,7 @@ mod tests {
                 Arc::new(AtomicUsize::new(0)),
                 config(),
                 Arc::new(Vec::new()),
-                false,
+                true,
             )
         });
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4506,13 +4497,23 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(metrics.advances.load(Ordering::Relaxed), 0);
+        let completion = stops.lock().unwrap().remove(&1).unwrap();
+        assert_eq!(completion.quiescent.unwrap().tick, 5);
+        assert_eq!(
+            completion
+                .prior_reports
+                .iter()
+                .map(|report| report.tick)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
         stopped.store(true, Ordering::Release);
         worker.thread().unpark();
         worker.join().unwrap();
     }
 
     #[test]
-    fn stop_is_accepted_when_mailbox_is_full_and_preserves_accepted_commands() {
+    fn stop_with_a_full_mailbox_preserves_other_machines_observations() {
         let machines = (0..2)
             .map(|id| {
                 (
@@ -4547,22 +4548,16 @@ mod tests {
         fleet.resource_snapshot(0, 41).unwrap();
         fleet.resource_snapshot(1, 42).unwrap();
         fleet.resource_snapshot(0, 43).unwrap();
+        assert_eq!(fleet.lanes[0].lock().unwrap().commands.len(), 3);
         fleet.stop(1).unwrap();
-        assert_eq!(fleet.resource_snapshot(0, 44), Err(SubmitError::Full));
 
-        let mut target_snapshot = false;
         let mut other_snapshot = false;
         let mut later_snapshot = false;
         let mut stop = false;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !(target_snapshot && other_snapshot && later_snapshot && stop) {
+        while !(other_snapshot && later_snapshot && stop) {
             if let Some(event) = fleet.try_event() {
                 match event {
-                    FleetEvent::ResourceSnapshot {
-                        machine: 1,
-                        request: 42,
-                        ..
-                    } => target_snapshot = true,
                     FleetEvent::ResourceSnapshot {
                         machine: 0,
                         request: 41,
@@ -4580,7 +4575,6 @@ mod tests {
                         later_snapshot = true;
                     }
                     FleetEvent::Stopped { machine: 1, .. } => {
-                        assert!(target_snapshot, "stop overtook an accepted command");
                         stop = true;
                     }
                     _ => {}
@@ -4616,7 +4610,57 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue: a full event queue blocks the worker before it can process stop"]
+    fn saturated_fleet_can_stop_every_machine_without_event_pumping() {
+        let machines = (0..32)
+            .map(|id| {
+                (
+                    id,
+                    ComputerMachine::start(
+                        crate::execution::fixtures::two_block_artifact(1, 1),
+                        profile(),
+                        &[],
+                        &[],
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            machines,
+            FleetConfig {
+                workers: 2,
+                event_capacity: 1,
+                ..config()
+            },
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        for id in 0..32 {
+            fleet.grant(id, 1, 64).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fleet.waiting_publishers.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "event output did not saturate");
+            thread::yield_now();
+        }
+        for id in 0..32 {
+            fleet.stop(id).unwrap();
+        }
+        let mut remaining: HashSet<_> = (0..32).collect();
+        while !remaining.is_empty() {
+            remaining.retain(|&id| fleet.try_stopped(id).is_none());
+            assert!(
+                Instant::now() < deadline,
+                "stop storm stalled: {remaining:?}"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(fleet.waiting_publishers.load(Ordering::SeqCst), 0);
+        assert!(fleet.owners.lock().unwrap().lanes.is_empty());
+    }
+
+    #[test]
     fn stopped_machine_completes_while_another_event_publisher_is_blocked() {
         let machines = (0..2)
             .map(|id| {
