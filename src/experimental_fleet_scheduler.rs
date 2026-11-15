@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -137,6 +137,9 @@ pub enum SubmitError {
     Full,
     Closed,
     InvalidCost,
+    InvalidMachine,
+    Capacity,
+    IdentityExhausted,
 }
 
 #[derive(Default)]
@@ -154,6 +157,10 @@ pub struct FleetMetrics {
 }
 
 enum Command {
+    Add {
+        machine: u64,
+        computer: Box<ComputerMachine>,
+    },
     Tick {
         machine: u64,
         tick: u64,
@@ -200,9 +207,38 @@ struct Actor {
     timers: HashMap<(u32, u64), u64>,
 }
 
+impl Actor {
+    fn new(machine: ComputerMachine, host_budget: u32) -> Self {
+        Self {
+            machine,
+            tick: 0,
+            tick_initialized: false,
+            remaining: 0,
+            requests_left: host_budget,
+            advances_left: 0,
+            deadline: None,
+            queued: false,
+            parked: false,
+            stopped: false,
+            pending: HashSet::new(),
+            inspecting: HashSet::new(),
+            scopes: vec![0],
+            request_scopes: HashMap::new(),
+            inspected: HashMap::new(),
+            timers: HashMap::new(),
+        }
+    }
+}
+
+struct Owners {
+    lanes: HashMap<u64, usize>,
+    next_id: Option<u64>,
+    next_lane: usize,
+}
+
 pub struct FleetScheduler {
     lanes: Vec<SyncSender<Command>>,
-    owners: HashMap<u64, usize>,
+    owners: Mutex<Owners>,
     events: Receiver<FleetEvent>,
     stopped: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
@@ -224,6 +260,9 @@ impl FleetScheduler {
         config: FleetConfig,
         inspections: Vec<RequestInspection>,
     ) -> Result<Self, &'static str> {
+        if machines.len() > 4096 {
+            return Err("fleet size exceeds maximum");
+        }
         if config.workers == 0
             || config.mailbox_capacity == 0
             || config.event_capacity == 0
@@ -241,27 +280,7 @@ impl FleetScheduler {
             if owners.insert(id, lane).is_some() {
                 return Err("duplicate machine identity");
             }
-            partitions[lane].insert(
-                id,
-                Actor {
-                    machine,
-                    tick: 0,
-                    tick_initialized: false,
-                    remaining: 0,
-                    requests_left: config.host_budget,
-                    advances_left: 0,
-                    deadline: None,
-                    queued: false,
-                    parked: false,
-                    stopped: false,
-                    pending: HashSet::new(),
-                    inspecting: HashSet::new(),
-                    scopes: vec![0],
-                    request_scopes: HashMap::new(),
-                    inspected: HashMap::new(),
-                    timers: HashMap::new(),
-                },
-            );
+            partitions[lane].insert(id, Actor::new(machine, config.host_budget));
         }
         let (event_tx, events) = mpsc::sync_channel(config.event_capacity);
         let stopped = Arc::new(AtomicBool::new(false));
@@ -306,15 +325,65 @@ impl FleetScheduler {
             };
             workers.push(worker);
         }
+        let next_id = match owners.keys().max() {
+            Some(id) => id.checked_add(1),
+            None => Some(0),
+        };
+        let next_lane = owners.len() % config.workers;
         Ok(Self {
             lanes,
-            owners,
+            owners: Mutex::new(Owners {
+                lanes: owners,
+                next_id,
+                next_lane,
+            }),
             events,
             stopped,
             workers,
             metrics,
             waiting_publishers,
         })
+    }
+
+    /// Takes ownership only after the bounded mailbox accepts the machine. A refusal returns it.
+    /// Machines must not have executed Guest instructions or have pending host operations.
+    pub fn attach(
+        &self,
+        computer: Box<ComputerMachine>,
+    ) -> Result<u64, (SubmitError, Box<ComputerMachine>)> {
+        if !computer.fleet_attachable() {
+            return Err((SubmitError::InvalidMachine, computer));
+        }
+        if self.stopped.load(Ordering::Acquire) {
+            return Err((SubmitError::Closed, computer));
+        }
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        if owners.lanes.len() >= 4096 {
+            return Err((SubmitError::Capacity, computer));
+        }
+        let Some(id) = owners.next_id else {
+            return Err((SubmitError::IdentityExhausted, computer));
+        };
+        let lane = owners.next_lane;
+        match self.lanes[lane].try_send(Command::Add {
+            machine: id,
+            computer,
+        }) {
+            Ok(()) => {
+                owners.next_id = id.checked_add(1);
+                owners.next_lane = (lane + 1) % self.lanes.len();
+                owners.lanes.insert(id, lane);
+                self.workers[lane].thread().unpark();
+                Ok(id)
+            }
+            Err(TrySendError::Full(Command::Add { computer, .. })) => {
+                Err((SubmitError::Full, computer))
+            }
+            Err(TrySendError::Disconnected(Command::Add { computer, .. })) => {
+                Err((SubmitError::Closed, computer))
+            }
+            Err(_) => unreachable!("only Add was submitted"),
+        }
     }
 
     pub fn grant(&self, machine: u64, tick: u64, retirements: u32) -> Result<(), SubmitError> {
@@ -397,6 +466,9 @@ impl FleetScheduler {
         }
         let lane = *self
             .owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lanes
             .get(&machine)
             .ok_or(SubmitError::UnknownMachine)?;
         self.lanes[lane]
@@ -411,6 +483,13 @@ impl FleetScheduler {
 
     pub fn try_event(&self) -> Option<FleetEvent> {
         let result = self.events.try_recv().ok();
+        if let Some(FleetEvent::Stopped { machine, .. }) = &result {
+            self.owners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lanes
+                .remove(machine);
+        }
         if result.is_some() && self.waiting_publishers.load(Ordering::SeqCst) != 0 {
             for worker in &self.workers {
                 worker.thread().unpark();
@@ -498,6 +577,11 @@ fn run_worker(
                 Err(TryRecvError::Disconnected) => return,
             };
             match command {
+                Command::Add { machine, computer } => {
+                    assert!(actors
+                        .insert(machine, Actor::new(*computer, config.host_budget))
+                        .is_none());
+                }
                 Command::Tick {
                     machine,
                     tick,
@@ -1264,6 +1348,56 @@ mod tests {
     }
 
     #[test]
+    fn machines_can_join_a_running_fleet_without_reusing_identities() {
+        let fleet = FleetScheduler::new(vec![], config()).unwrap();
+        let make = || {
+            ComputerMachine::start(
+                crate::execution::fixtures::two_block_artifact(1, 1),
+                profile(),
+                &[],
+                &[],
+            )
+            .unwrap()
+        };
+        let first = fleet.attach(Box::new(make())).unwrap();
+        fleet.grant(first, 1, 64).unwrap();
+        assert!(
+            matches!(next(&fleet), FleetEvent::Boundary { machine, outcome: ComputerAdvanceOutcome::Halted(_), .. } if machine == first)
+        );
+        fleet.stop(first).unwrap();
+        assert!(matches!(next(&fleet), FleetEvent::Stopped { machine, .. } if machine == first));
+        let second = fleet.attach(Box::new(make())).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fleet.grant(first, 2, 64), Err(SubmitError::UnknownMachine));
+        fleet.grant(second, 2, 64).unwrap();
+        assert!(
+            matches!(next(&fleet), FleetEvent::Boundary { machine, outcome: ComputerAdvanceOutcome::Halted(_), .. } if machine == second)
+        );
+    }
+
+    #[test]
+    fn attach_refusal_returns_the_original_machine() {
+        let fleet = FleetScheduler::new(vec![], config()).unwrap();
+        let mut machine = ComputerMachine::start(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        machine.advance(1, 1, 1).unwrap();
+        let (reason, mut returned) = fleet.attach(Box::new(machine)).unwrap_err();
+        assert_eq!(reason, SubmitError::InvalidMachine);
+        loop {
+            match returned.advance(64, 64, 64).unwrap() {
+                ComputerAdvanceOutcome::Halted(_) => break,
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn halted_machines_run_on_workers_with_bounded_credit() {
         let machines = (0..16)
             .map(|id| {
@@ -1399,9 +1533,10 @@ mod tests {
             }
             event => panic!("{event:?}"),
         }
-        fleet
-            .resolve_cost(7, request.task_id, request.id, 1)
-            .unwrap();
+        assert_eq!(
+            fleet.resolve_cost(7, request.task_id, request.id, 1),
+            Err(SubmitError::UnknownMachine)
+        );
         thread::sleep(Duration::from_millis(10));
         assert!(fleet.try_event().is_none());
     }
@@ -1575,10 +1710,11 @@ mod tests {
             event => panic!("unexpected event {event:?}"),
         }
         let advances = fleet.metrics().advances;
-        fleet
-            .reply(7, request.task_id, request.id, ReplyValue::Unit)
-            .unwrap();
-        fleet.grant(7, 2, 64).unwrap();
+        assert_eq!(
+            fleet.reply(7, request.task_id, request.id, ReplyValue::Unit),
+            Err(SubmitError::UnknownMachine)
+        );
+        assert_eq!(fleet.grant(7, 2, 64), Err(SubmitError::UnknownMachine));
         thread::sleep(Duration::from_millis(10));
         assert_eq!(fleet.metrics().advances, advances);
         assert!(fleet.try_event().is_none());

@@ -393,6 +393,15 @@ struct CompilationTransaction {
 }
 
 impl ComputerMachine {
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    pub(crate) fn fleet_attachable(&self) -> bool {
+        self.sessions.len() == 1
+            && self.sessions[0].scope_id == 0
+            && self.external_requests.is_empty()
+            && self.pending_compilation.is_none()
+            && self.resource_snapshot().executed_instructions == 0
+    }
+
     #[cfg(feature = "program-sharing-benchmark")]
     #[allow(dead_code)]
     pub(crate) fn shared_code_identity(&self) -> (usize, Option<usize>) {
