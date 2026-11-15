@@ -382,10 +382,9 @@ pub(crate) fn advance_with_retirement_limit(
 ) -> Result<(OwnedOutcome, u64), BridgeError> {
     sessions()
         .with(handle, |session| {
-            let before = session.computer.resource_snapshot().retired_instructions;
-            let outcome = session
+            let (outcome, retired) = session
                 .computer
-                .advance_with_retirement_limit(
+                .advance_with_retirement_count(
                     guest_budget,
                     maintenance_budget,
                     host_request_budget,
@@ -393,11 +392,6 @@ pub(crate) fn advance_with_retirement_limit(
                 )
                 .map_err(copy_error)?;
             session.restored_host_state = Vec::new();
-            let retired = session
-                .computer
-                .resource_snapshot()
-                .retired_instructions
-                .saturating_sub(before);
             if let ComputerAdvanceOutcome::CompilationRequested(request) = outcome {
                 let token = request.token;
                 session.compilation = Some(request);

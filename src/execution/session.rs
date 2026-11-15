@@ -327,7 +327,31 @@ impl Session {
         maintenance_budget: u32,
         retirement_limit: u32,
     ) -> Result<AdvanceOutcome<'_>, RunError> {
+        self.advance_with_retired(guest_budget, maintenance_budget, retirement_limit)
+            .map(|(outcome, _)| outcome)
+    }
+
+    pub(crate) fn advance_with_retired(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+        retirement_limit: u32,
+    ) -> Result<(AdvanceOutcome<'_>, u32), RunError> {
         let mut remaining_retirements = retirement_limit;
+        let outcome = self.advance_with_remaining_retirements(
+            guest_budget,
+            maintenance_budget,
+            &mut remaining_retirements,
+        )?;
+        Ok((outcome, retirement_limit - remaining_retirements))
+    }
+
+    fn advance_with_remaining_retirements<'a>(
+        &'a mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+        remaining_retirements: &mut u32,
+    ) -> Result<AdvanceOutcome<'a>, RunError> {
         if let Some(terminal) = self.terminal {
             return Ok(match terminal {
                 SessionTerminal::HostFailed(kind) => AdvanceOutcome::HostFailed(HostFailure::new(
@@ -342,7 +366,7 @@ impl Session {
             });
         }
         if let Some(outcome) = self.machine.terminal_outcome() {
-            return self.map_machine_outcome(outcome, 0, 0, &mut remaining_retirements);
+            return self.map_machine_outcome(outcome, 0, 0, remaining_retirements);
         }
         // Outbound arguments still belong to the currently suspended Guest call.
         // Finish copying them before replies can temporarily switch to another task.
@@ -360,7 +384,7 @@ impl Session {
             && !self.machine.record_response_pending()
             && (self.machine.collection_active() || self.machine.has_pending_guest_instruction())
         {
-            return self.run_and_map(guest_budget, maintenance_budget, &mut remaining_retirements);
+            return self.run_and_map(guest_budget, maintenance_budget, remaining_retirements);
         }
         if !self.resuming_host_reference && !self.machine.record_response_pending() {
             while let Some(reply) = self.replies.pop_front() {
@@ -428,7 +452,7 @@ impl Session {
             if matches!(outcome, super::error::Outcome::SliceExhausted) {
                 return Ok(AdvanceOutcome::SliceExhausted);
             }
-            return self.map_machine_outcome(outcome, 0, 0, &mut remaining_retirements);
+            return self.map_machine_outcome(outcome, 0, 0, remaining_retirements);
         }
         if !self.machine.has_active_task()
             && !self.pending_requests.is_empty()
@@ -478,10 +502,10 @@ impl Session {
                         .consumed_maintenance_cost()
                         .saturating_sub(before_maintenance) as u32,
                 ),
-                &mut remaining_retirements,
+                remaining_retirements,
             );
         }
-        self.run_and_map(guest_budget, maintenance_budget, &mut remaining_retirements)
+        self.run_and_map(guest_budget, maintenance_budget, remaining_retirements)
     }
 
     fn run_and_map(
@@ -809,6 +833,10 @@ impl Session {
             .checked_sub(1)
             .expect("an internal response is always accepted");
         Ok(())
+    }
+
+    pub(crate) fn retired_instructions(&self) -> u64 {
+        self.machine.retired_instructions()
     }
 
     pub fn accounting(&self) -> AccountingSnapshot {

@@ -1142,6 +1142,47 @@ impl ComputerMachine {
         host_request_budget: u32,
         retirement_limit: u32,
     ) -> Result<ComputerAdvanceOutcome, ComputerError> {
+        self.advance_with_retirement_count_inner(
+            guest_budget,
+            maintenance_budget,
+            host_request_budget,
+            retirement_limit,
+            &mut 0,
+        )
+    }
+
+    /// Advances the computer and returns the retired instruction count for this call.
+    pub fn advance_with_retirement_count(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+        host_request_budget: u32,
+        retirement_limit: u32,
+    ) -> Result<(ComputerAdvanceOutcome, u64), ComputerError> {
+        // Match the saturating lifetime counter even if process accounting has saturated.
+        let total = self.sessions.iter().fold(
+            self.retired_execution.retired_instructions,
+            |total, frame| total.saturating_add(frame.session.retired_instructions()),
+        );
+        let mut retired = 0;
+        let outcome = self.advance_with_retirement_count_inner(
+            guest_budget,
+            maintenance_budget,
+            host_request_budget,
+            retirement_limit,
+            &mut retired,
+        )?;
+        Ok((outcome, u64::from(retired).min(u64::MAX - total)))
+    }
+
+    fn advance_with_retirement_count_inner(
+        &mut self,
+        guest_budget: u32,
+        maintenance_budget: u32,
+        host_request_budget: u32,
+        retirement_limit: u32,
+        retired: &mut u32,
+    ) -> Result<ComputerAdvanceOutcome, ComputerError> {
         if let Some(scope) = self.pending_termination {
             if let Some(index) = self
                 .sessions
@@ -1191,13 +1232,14 @@ impl ComputerMachine {
         let scope_id = self.active_frame().scope_id;
         let external_requests = &self.external_requests;
         let (internal, mut external) = {
-            let outcome = self
+            let (outcome, count) = self
                 .sessions
                 .last_mut()
                 .expect("a computer always has a root process")
                 .session
-                .advance_with_retirement_limit(guest_budget, maintenance_budget, retirement_limit)
+                .advance_with_retired(guest_budget, maintenance_budget, retirement_limit)
                 .map_err(ComputerError::Run)?;
+            *retired = count;
             match outcome {
                 AdvanceOutcome::HostRequestBatch(batch) => {
                     if batch.is_empty() {
@@ -3850,13 +3892,21 @@ mod tests {
         )
         .unwrap();
         while computer.sessions.len() == 1 {
+            let before = computer.resource_snapshot().retired_instructions;
+            let (outcome, retired) = computer
+                .advance_with_retirement_count(64, 64, u32::MAX, 64)
+                .unwrap();
             assert!(matches!(
-                computer.advance(64, 64, u32::MAX).unwrap(),
+                outcome,
                 ComputerAdvanceOutcome::SliceExhausted
                     | ComputerAdvanceOutcome::ProcessEntered(_)
                     | ComputerAdvanceOutcome::ProcessReplaced { .. }
                     | ComputerAdvanceOutcome::ProcessExited(_)
             ));
+            assert_eq!(
+                retired,
+                computer.resource_snapshot().retired_instructions - before
+            );
         }
         let with_child = computer.resource_snapshot();
         assert_eq!(
@@ -3871,16 +3921,21 @@ mod tests {
 
         while computer.sessions.len() == 2 {
             let before = computer.resource_snapshot();
+            let (outcome, retired) = computer
+                .advance_with_retirement_count(64, 64, u32::MAX, 1)
+                .unwrap();
             assert!(matches!(
-                computer
-                    .advance_with_retirement_limit(64, 64, u32::MAX, 1)
-                    .unwrap(),
+                outcome,
                 ComputerAdvanceOutcome::SliceExhausted
                     | ComputerAdvanceOutcome::ProcessReplaced { .. }
                     | ComputerAdvanceOutcome::ProcessExited(_)
             ));
             let after = computer.resource_snapshot();
             assert!(after.executed_instructions >= before.executed_instructions);
+            assert_eq!(
+                retired,
+                after.retired_instructions - before.retired_instructions
+            );
             assert!(after.retired_instructions - before.retired_instructions <= 1);
         }
         let without_child = computer.resource_snapshot();
@@ -3893,6 +3948,42 @@ mod tests {
         assert!(
             without_child.mutable_execution_resident_bytes
                 < with_child.mutable_execution_resident_bytes
+        );
+    }
+
+    #[test]
+    fn per_advance_retirement_count_preserves_saturated_lifetime_accounting() {
+        let mut computer = ComputerMachine::start(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        computer.retired_execution.retired_instructions = u64::MAX - 1;
+        let before = computer.resource_snapshot().retired_instructions;
+        let (_, retired) = computer
+            .advance_with_retirement_count(64, 64, u32::MAX, 64)
+            .unwrap();
+        assert_eq!(1, retired);
+        assert_eq!(
+            retired,
+            computer
+                .resource_snapshot()
+                .retired_instructions
+                .saturating_sub(before)
+        );
+        let before = computer.resource_snapshot().retired_instructions;
+        let (_, retired) = computer
+            .advance_with_retirement_count(64, 64, u32::MAX, 64)
+            .unwrap();
+        assert_eq!(0, retired);
+        assert_eq!(
+            retired,
+            computer
+                .resource_snapshot()
+                .retired_instructions
+                .saturating_sub(before)
         );
     }
 
