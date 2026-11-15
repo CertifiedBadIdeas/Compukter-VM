@@ -398,10 +398,16 @@ impl ComputerMachine {
         !self.sessions.is_empty()
             && self.external_requests.is_empty()
             && self.pending_compilation.is_none()
-            && self
-                .sessions
-                .iter()
-                .all(|frame| frame.session.fleet_quiescent(frame.pending_process))
+            && self.sessions.iter().enumerate().all(|(index, frame)| {
+                frame.session.fleet_quiescent(|task, request| {
+                    let identity = Some((task, request));
+                    frame.pending_process == identity
+                        || frame.pending_terminal_event == identity
+                        || frame.pending_stdio_read == identity
+                        || (index + 1 == self.sessions.len()
+                            && self.redstone.contains_waiter(task, request))
+                })
+            })
     }
 
     #[cfg(feature = "experimental-fleet-scheduler")]

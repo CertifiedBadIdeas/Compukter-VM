@@ -2160,6 +2160,48 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_waiting_for_terminal_input_can_move_between_owners() {
+        let mut machine = ComputerMachine::start(
+            crate::execution::fixtures::stdio_conformance_artifact(&[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        loop {
+            match machine.advance(64, 64, 64).unwrap() {
+                ComputerAdvanceOutcome::WaitingForTerminalEvent => break,
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let fleet = FleetScheduler::new(vec![], config()).unwrap();
+        let first = fleet.attach(Box::new(machine)).unwrap();
+        fleet.detach(first).unwrap();
+        let machine = match next(&fleet) {
+            FleetEvent::Detached { machine, computer } if machine == first => computer,
+            other => panic!("{other:?}"),
+        };
+        let second = fleet.attach(machine).unwrap();
+        fleet.grant(second, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                ..
+            }
+        ));
+        fleet.canonical_line(second, Box::new([])).unwrap();
+        assert!(matches!(
+            grant_until_terminal_outcome(&fleet, second),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn terminal_text_and_enter_resume_a_parked_machine() {
         let machine = ComputerMachine::start(
             crate::execution::fixtures::stdio_conformance_artifact(&[]),
@@ -2331,6 +2373,33 @@ mod tests {
             }
         }
         panic!("redstone wait did not resume");
+    }
+
+    #[test]
+    fn a_machine_with_a_redstone_wait_can_join_a_fleet() {
+        let mut machine = ComputerMachine::start(
+            crate::execution::fixtures::redstone_i32_artifact(1, true, &[0]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                machine.advance(64, 64, 64).unwrap(),
+                ComputerAdvanceOutcome::SliceExhausted
+            ));
+        }
+        let fleet = FleetScheduler::new(vec![], config()).unwrap();
+        let id = fleet.attach(Box::new(machine)).unwrap();
+        fleet.redstone_input(id, 1 | (9 << 6)).unwrap();
+        assert!(matches!(
+            grant_until_terminal_outcome(&fleet, id),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(9))),
+                ..
+            }
+        ));
     }
 
     #[test]
