@@ -78,6 +78,7 @@ fn create_machines(
 }
 
 pub enum WireEvent {
+    TerminalUpdate(Vec<u8>),
     Compilation(Vec<u8>),
     Quiescent {
         machine: u64,
@@ -114,6 +115,19 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
         return Ok(None);
     };
     let (machine, tick, outcome, inspection) = match event {
+        FleetEvent::TerminalUpdate {
+            machine,
+            request,
+            update,
+        } => {
+            let mut bytes = vec![0; 16 + 256 * 1024];
+            bytes[..8].copy_from_slice(&machine.to_le_bytes());
+            bytes[8..16].copy_from_slice(&request.to_le_bytes());
+            let size = crate::wire::encode_terminal_update_into(&mut bytes[16..], &update)
+                .map_err(|_| "terminal update exceeds limit")?;
+            bytes.truncate(16 + size);
+            return Ok(Some(WireEvent::TerminalUpdate(bytes)));
+        }
         FleetEvent::Quiescent {
             machine,
             tick,

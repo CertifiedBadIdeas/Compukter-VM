@@ -103,6 +103,11 @@ impl ReplyValue {
 
 #[derive(Debug)]
 pub enum FleetEvent {
+    TerminalUpdate {
+        machine: u64,
+        request: u64,
+        update: crate::TerminalUpdate,
+    },
     /// Cumulative retirement count when this tick has no immediately runnable work.
     /// A host completion can make the same tick runnable again and produce another report.
     Quiescent {
@@ -213,6 +218,11 @@ enum Command {
     CanonicalLine {
         machine: u64,
         line: Box<[u16]>,
+    },
+    TerminalUpdate {
+        machine: u64,
+        request: u64,
+        base_revision: u64,
     },
     Cost {
         machine: u64,
@@ -485,6 +495,23 @@ impl FleetScheduler {
             return Err(SubmitError::InvalidInput);
         }
         self.send(machine, Command::CanonicalLine { machine, line })
+    }
+
+    /// Commits pending terminal writes and returns a delta or full state asynchronously.
+    pub fn terminal_update(
+        &self,
+        machine: u64,
+        request: u64,
+        base_revision: u64,
+    ) -> Result<(), SubmitError> {
+        self.send(
+            machine,
+            Command::TerminalUpdate {
+                machine,
+                request,
+                base_revision,
+            },
+        )
     }
 
     pub fn reply(
@@ -961,6 +988,29 @@ fn run_worker(
                     } else {
                         actor.parked = false;
                         ready(machine, actor, &mut queue);
+                    }
+                }
+                Command::TerminalUpdate {
+                    machine,
+                    request,
+                    base_revision,
+                } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    actor.machine.terminal_mut().commit();
+                    let update = actor.machine.terminal().changes_since(base_revision);
+                    if !publish(
+                        &events,
+                        &stopped,
+                        &waiters,
+                        FleetEvent::TerminalUpdate {
+                            machine,
+                            request,
+                            update,
+                        },
+                    ) {
+                        return;
                     }
                 }
                 Command::Cost {
@@ -2017,6 +2067,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn terminal_updates_commit_writes_and_preserve_revision() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::stdio_conformance_artifact(&[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                ..
+            }
+        ));
+        fleet.terminal_update(7, 5, u64::MAX).unwrap();
+        let revision = match next(&fleet) {
+            FleetEvent::TerminalUpdate {
+                machine: 7,
+                request: 5,
+                update: crate::TerminalUpdate::Full(snapshot),
+            } => snapshot.revision(),
+            other => panic!("{other:?}"),
+        };
+        fleet.terminal_update(7, 6, revision).unwrap();
+        assert!(
+            matches!(next(&fleet), FleetEvent::TerminalUpdate { machine: 7, request: 6, update: crate::TerminalUpdate::Unchanged { revision: r } } if r == revision)
+        );
     }
 
     #[test]

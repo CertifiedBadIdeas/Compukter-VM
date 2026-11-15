@@ -44,6 +44,33 @@ fn submit(result: Result<(), SubmitError>) -> jint {
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_terminalUpdate<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    request: jlong,
+    revision: jlong,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0 || request < 0 || revision < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(
+                    f.scheduler
+                        .terminal_update(machine as u64, request as u64, revision as u64),
+                )
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_create<
     'a,
 >(
@@ -380,6 +407,9 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         if f.pending.is_none() {
             f.pending = match experimental_fleet::poll_event(&f.scheduler) {
                 Ok(None) => None,
+                Ok(Some(experimental_fleet::WireEvent::TerminalUpdate(b))) => {
+                    Some([vec![10], b].concat())
+                }
                 Ok(Some(experimental_fleet::WireEvent::Compilation(b))) => {
                     Some([vec![9], b].concat())
                 }
