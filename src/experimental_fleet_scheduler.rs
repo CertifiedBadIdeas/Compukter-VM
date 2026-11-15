@@ -23,9 +23,9 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug)]
-struct RequestCost {
+struct RequestCost<'a> {
     pub units: u32,
-    pub over_budget_detail: &'static str,
+    pub over_budget_detail: &'a str,
 }
 
 /// Host operations whose cost must be determined asynchronously by the host.
@@ -36,7 +36,7 @@ pub struct RequestInspection {
     pub abi_major: u16,
     pub abi_minor: u16,
     pub operation: u32,
-    pub over_budget_detail: &'static str,
+    pub over_budget_detail: Box<str>,
 }
 
 impl RequestInspection {
@@ -704,7 +704,7 @@ fn run_worker(
                         if let Some(&units) = actor.inspected.get(&key) {
                             RequestCost {
                                 units,
-                                over_budget_detail: rule.over_budget_detail,
+                                over_budget_detail: &rule.over_budget_detail,
                             }
                         } else {
                             if actor.inspecting.insert(key) {
@@ -1032,7 +1032,7 @@ mod tests {
                 abi_major: 1,
                 abi_minor: 0,
                 operation: 0,
-                over_budget_detail: "group exceeds budget",
+                over_budget_detail: "group exceeds budget".into(),
             }],
         )
         .unwrap();
@@ -1088,7 +1088,7 @@ mod tests {
                 abi_major: 1,
                 abi_minor: 0,
                 operation: 0,
-                over_budget_detail: "group exceeds budget",
+                over_budget_detail: "group exceeds budget".into(),
             }],
         )
         .unwrap();
@@ -1161,7 +1161,7 @@ mod tests {
                 abi_major: 1,
                 abi_minor: 0,
                 operation: 0,
-                over_budget_detail: "group exceeds budget",
+                over_budget_detail: "group exceeds budget".into(),
             }],
         )
         .unwrap();

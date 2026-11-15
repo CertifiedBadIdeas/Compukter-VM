@@ -91,6 +91,7 @@ name = "compukter-jni"
 version = "0.28.0"
 dependencies = [
  "compukter-ffi",
+ "compukter-vm",
  "jni",
 ]
 

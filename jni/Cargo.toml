@@ -8,6 +8,10 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+experimental-fleet-scheduler = ["compukter-ffi/experimental-fleet-scheduler", "dep:compukter-vm"]
+
 [dependencies]
 compukter-ffi = { path = "../ffi" }
+compukter-vm = { path = "..", optional = true }
 jni = "0.22.4"

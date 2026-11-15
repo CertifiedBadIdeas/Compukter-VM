@@ -17,6 +17,8 @@
  */
 
 mod advance_scratch;
+#[cfg(feature = "experimental-fleet-scheduler")]
+mod experimental_fleet;
 
 use advance_scratch::AdvanceScratchPool;
 use compukter_ffi::{
