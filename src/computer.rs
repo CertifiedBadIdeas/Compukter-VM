@@ -395,11 +395,18 @@ struct CompilationTransaction {
 impl ComputerMachine {
     #[cfg(feature = "experimental-fleet-scheduler")]
     pub(crate) fn fleet_attachable(&self) -> bool {
-        self.sessions.len() == 1
-            && self.sessions[0].scope_id == 0
+        !self.sessions.is_empty()
             && self.external_requests.is_empty()
             && self.pending_compilation.is_none()
-            && self.sessions[0].session.fleet_quiescent()
+            && self
+                .sessions
+                .iter()
+                .all(|frame| frame.session.fleet_quiescent(frame.pending_process))
+    }
+
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    pub(crate) fn fleet_process_scopes(&self) -> Vec<u64> {
+        self.sessions.iter().map(|frame| frame.scope_id).collect()
     }
 
     #[cfg(feature = "program-sharing-benchmark")]

@@ -221,6 +221,7 @@ struct Actor {
 
 impl Actor {
     fn new(machine: ComputerMachine, host_budget: u32) -> Self {
+        let scopes = machine.fleet_process_scopes();
         Self {
             machine,
             tick: 0,
@@ -234,7 +235,7 @@ impl Actor {
             stopped: false,
             pending: HashSet::new(),
             inspecting: HashSet::new(),
-            scopes: vec![0],
+            scopes,
             request_scopes: HashMap::new(),
             inspected: HashMap::new(),
             timers: HashMap::new(),
@@ -358,7 +359,7 @@ impl FleetScheduler {
     }
 
     /// Takes ownership only after the bounded mailbox accepts the machine. A refusal returns it.
-    /// Machines must have one root scope and no pending or in-flight host operations.
+    /// Machines must have no pending or in-flight external host operations.
     pub fn attach(
         &self,
         computer: Box<ComputerMachine>,
@@ -1321,6 +1322,60 @@ mod tests {
             next(&fleet),
             FleetEvent::Boundary {
                 outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(37))),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_machine_with_a_live_child_can_join_a_fleet() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let mut filesystem = ComputerFileSystem::with_limits(limits.clone());
+        let child = crate::execution::fixtures::two_block_artifact(1, 1);
+        let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        filesystem
+            .write_file(
+                &owner,
+                &VirtualPath::parse_utf8("/home/child", &limits).unwrap(),
+                &bytes,
+                true,
+            )
+            .unwrap();
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let mut machine =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        loop {
+            match machine.advance(64, 64, 64).unwrap() {
+                ComputerAdvanceOutcome::ProcessEntered(1) => break,
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let fleet = FleetScheduler::new(vec![], config()).unwrap();
+        let id = fleet.attach(Box::new(machine)).unwrap();
+        fleet.grant(id, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessExited(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(0))),
                 ..
             }
         ));

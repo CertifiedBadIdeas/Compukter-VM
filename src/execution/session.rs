@@ -103,8 +103,12 @@ impl core::fmt::Debug for Session {
 
 impl Session {
     #[cfg(feature = "experimental-fleet-scheduler")]
-    pub(crate) fn fleet_quiescent(&self) -> bool {
-        self.pending_requests.is_empty()
+    pub(crate) fn fleet_quiescent(&self, process_request: Option<(TaskId, RequestId)>) -> bool {
+        self.pending_requests.requests().len() == usize::from(process_request.is_some())
+            && self.pending_requests.requests().iter().all(|request| {
+                let identity = request.identity();
+                process_request == Some((identity.task(), identity.request()))
+            })
             && self.preparing_request.is_none()
             && !self.resuming_host_reference
             && self.replies.is_empty()
