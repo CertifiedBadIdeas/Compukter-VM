@@ -53,8 +53,12 @@ impl<'a> WorkerOutput<'a> {
         let mut pending = self.pending.borrow_mut();
         let had_pending = !pending.is_empty();
         while let Some(event) = pending.pop_front() {
+            let bytes = observation_bytes(&event);
             match self.transport.sender.try_send(event) {
-                Ok(()) => self.transport.signal.notify(),
+                Ok(()) => {
+                    self.transport.sender.release_inflight(bytes);
+                    self.transport.signal.notify();
+                }
                 Err(TrySendError::Full(event)) => {
                     pending.push_front(event);
                     break;
@@ -97,6 +101,9 @@ impl<'a> WorkerOutput<'a> {
         let mut unrelated = VecDeque::new();
         while let Some(event) = pending.pop_front() {
             if event.machine() == machine {
+                self.transport
+                    .sender
+                    .release_inflight(observation_bytes(&event));
                 output.retain(event);
             } else {
                 unrelated.push_back(event);
@@ -200,6 +207,9 @@ impl<'a> WorkerOutput<'a> {
                 Err(TrySendError::Disconnected(_)) => return false,
                 Err(TrySendError::Full(event)) => {
                     self.waiters.fetch_add(1, Ordering::SeqCst);
+                    self.transport
+                        .sender
+                        .retain_inflight(observation_bytes(&event));
                     pending.push_back(event);
                 }
             }
@@ -210,6 +220,9 @@ impl<'a> WorkerOutput<'a> {
                 pending.len() < 3,
                 "worker operation exceeded output batch bound"
             );
+            self.transport
+                .sender
+                .retain_inflight(observation_bytes(&event));
             pending.push_back(event);
         }
         true
@@ -276,6 +289,8 @@ impl ClosingOutput {
 impl Drop for WorkerOutput<'_> {
     fn drop(&mut self) {
         if !self.pending.get_mut().is_empty() {
+            let bytes = self.pending.get_mut().iter().map(observation_bytes).sum();
+            self.transport.sender.release_inflight(bytes);
             self.waiters.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -287,7 +302,7 @@ mod tests {
     use crate::experimental_fleet_scheduler::{FleetEventSignal, FleetMemoryLimits};
     use crate::{ComputerAdvanceOutcome, ComputerValue};
     use std::collections::BTreeMap;
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn detach_charges_large_payloads_without_copying_and_releases_all_reservations() {
@@ -296,7 +311,11 @@ mod tests {
             (512 * 1024, 64 * 1024, true),
             (512 * 1024, 512 * 1024, false),
         ] {
-            let (sender, _receiver) = mpsc::sync_channel(1);
+            let (sender, _receiver) = super::super::event_queue::channel(
+                1,
+                FleetMemoryLimits::default().event_bytes,
+                FleetMemoryLimits::default().event_bytes_per_machine,
+            );
             let waiters = AtomicUsize::new(0);
             let memory = ByteBudget::new(global_limit);
             let headroom = Arc::new(AtomicUsize::new(0));
@@ -372,7 +391,11 @@ mod tests {
 
     #[test]
     fn backpressure_preserves_large_payload_ownership_and_order() {
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = super::super::event_queue::channel(
+            1,
+            FleetMemoryLimits::default().event_bytes,
+            FleetMemoryLimits::default().event_bytes_per_machine,
+        );
         let waiters = AtomicUsize::new(0);
         let output = WorkerOutput::new(
             EventSender {
@@ -403,6 +426,7 @@ mod tests {
             timers_pending: false
         }));
         assert_eq!(waiters.load(Ordering::SeqCst), 1);
+        assert!(receiver.inflight_bytes() >= 256 * 1024);
         output.begin_closing(2, CloseRequest::Stop);
         output.complete_stop(FleetStopCompletion {
             machine: 2,
@@ -437,5 +461,6 @@ mod tests {
             })
         ));
         assert_eq!(waiters.load(Ordering::SeqCst), 0);
+        assert_eq!(receiver.inflight_bytes(), 0);
     }
 }

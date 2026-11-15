@@ -16,6 +16,13 @@ pub struct FleetMemoryLimits {
     /// on workers. VM state, allocator metadata and queue capacity slack are separate.
     pub command_bytes: usize,
     pub command_bytes_per_machine: usize,
+    /// Ordinary queued observations, including event envelopes and retained
+    /// payloads. Collection/allocator slack and worker in-flight batches are
+    /// separate. One oversized event may bypass these limits only while the
+    /// queue is otherwise empty; it occupies separately reported headroom and
+    /// blocks further ordinary publication until consumed.
+    pub event_bytes: usize,
+    pub event_bytes_per_machine: usize,
     /// Observation values, payloads and reservation handles retained while
     /// draining detach. Allocator metadata, collection slack and detached VM
     /// state are separate. One in-flight operation per worker is separate
@@ -29,6 +36,8 @@ impl Default for FleetMemoryLimits {
     fn default() -> Self {
         let artifact = crate::ArtifactLimits::default().artifact_bytes;
         Self {
+            event_bytes: 4 * artifact,
+            event_bytes_per_machine: 2 * artifact,
             command_bytes: 4 * artifact,
             command_bytes_per_machine: 2 * artifact,
             detach_output_bytes: 4 * artifact,

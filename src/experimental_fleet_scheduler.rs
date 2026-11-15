@@ -12,11 +12,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod event_queue;
+use event_queue::{EventReceiver, EventSender as QueueSender};
 mod output;
 use output::WorkerOutput;
 mod memory;
@@ -650,7 +651,7 @@ impl FleetEventSignal {
 
 #[derive(Clone)]
 struct EventSender {
-    sender: SyncSender<FleetEvent>,
+    sender: QueueSender,
     signal: Arc<FleetEventSignal>,
     completions: LifecycleCompletions,
     detach_memory: Arc<ByteBudget>,
@@ -661,7 +662,7 @@ struct EventSender {
 pub struct FleetScheduler {
     lanes: Vec<Arc<Mutex<LaneMailbox>>>,
     owners: Mutex<Owners>,
-    events: Receiver<FleetEvent>,
+    events: EventReceiver,
     completions: LifecycleCompletions,
     event_signal: Arc<FleetEventSignal>,
     stopped: Arc<AtomicBool>,
@@ -716,6 +717,8 @@ impl FleetScheduler {
     ) -> Result<Self, &'static str> {
         if memory_limits.command_bytes == 0
             || memory_limits.command_bytes_per_machine == 0
+            || memory_limits.event_bytes == 0
+            || memory_limits.event_bytes_per_machine == 0
             || memory_limits.detach_output_bytes == 0
             || memory_limits.detach_output_bytes_per_machine == 0
         {
@@ -749,7 +752,11 @@ impl FleetScheduler {
             }
             partitions[lane].insert(id, Actor::new(machine, config.host_budget));
         }
-        let (event_tx, events) = mpsc::sync_channel(config.event_capacity);
+        let (event_tx, events) = event_queue::channel(
+            config.event_capacity,
+            memory_limits.event_bytes,
+            memory_limits.event_bytes_per_machine,
+        );
         let event_signal = Arc::new(FleetEventSignal::default());
         // At most one completion exists per registered machine; registration is capped.
         let completions = Arc::new(Mutex::new(BTreeMap::new()));
@@ -1528,6 +1535,23 @@ impl FleetScheduler {
             retired: self.metrics.retired.load(Ordering::Relaxed),
             requests: self.metrics.requests.load(Ordering::Relaxed),
         }
+    }
+
+    /// Ordinary queued observations only; worker in-flight output and lifecycle
+    /// escrow are separate. Oversized delivery uses separately reported headroom.
+    pub fn event_memory(&self) -> FleetMemoryUsage {
+        self.events.memory()
+    }
+
+    /// Produced output waiting on workers, bounded to one operation per worker.
+    /// These bytes are separate from admitted events and lifecycle escrow.
+    pub fn event_inflight_bytes(&self) -> usize {
+        self.events.inflight_bytes()
+    }
+
+    /// At most one oversized event may occupy the ordinary queue.
+    pub fn event_headroom_bytes(&self) -> usize {
+        self.events.headroom_bytes()
     }
 
     pub fn command_memory(&self) -> FleetMemoryUsage {
@@ -2871,6 +2895,102 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_bypasses_ordinary_byte_pressure_and_preserves_published_output() {
+        // The first case fills bytes with ample entry capacity. The second uses
+        // the oversized delivery path. Neither may require ordinary polling.
+        for limit in [std::mem::size_of::<FleetEvent>() + 32, 1] {
+            let machines = (0..2)
+                .map(|id| {
+                    (
+                        id,
+                        ComputerMachine::start(
+                            crate::execution::fixtures::two_block_artifact(1, 1),
+                            profile(),
+                            &[],
+                            &[],
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            let fleet = FleetScheduler::new_with_memory_limits(
+                machines,
+                FleetConfig {
+                    workers: 1,
+                    event_capacity: 64,
+                    ..config()
+                },
+                Vec::new(),
+                false,
+                FleetMemoryLimits {
+                    event_bytes: limit,
+                    event_bytes_per_machine: limit,
+                    ..FleetMemoryLimits::default()
+                },
+            )
+            .unwrap();
+            fleet.resource_snapshot(0, 100).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fleet.event_memory().retained_bytes == 0 && fleet.event_headroom_bytes() == 0 {
+                assert!(Instant::now() < deadline, "first observation not published");
+                thread::yield_now();
+            }
+            if limit > 1 {
+                assert!(fleet.event_memory().retained_bytes > 0);
+                assert_eq!(fleet.event_headroom_bytes(), 0);
+            } else {
+                assert!(fleet.event_headroom_bytes() > 0);
+            }
+            fleet.resource_snapshot(1, 200).unwrap();
+            while fleet.event_inflight_bytes() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "second observation did not encounter byte pressure"
+                );
+                thread::yield_now();
+            }
+            assert!(fleet.event_memory().retained_bytes <= limit);
+            fleet.detach_with_lifecycle_poll(1, None).unwrap();
+            wait_lifecycle(&fleet, 1);
+            assert!(matches!(
+                fleet.poll_lifecycle_event(1),
+                Some(FleetEvent::ResourceSnapshot {
+                    machine: 1,
+                    request: 200,
+                    ..
+                })
+            ));
+            assert!(fleet.consume_lifecycle_event(1));
+            assert!(matches!(
+                fleet.poll_lifecycle_event(1),
+                Some(FleetEvent::Detached { machine: 1, .. })
+            ));
+            assert!(fleet.consume_lifecycle_event(1));
+            assert_eq!(fleet.event_inflight_bytes(), 0);
+            assert_eq!(fleet.detach_output_memory().retained_bytes, 0);
+            fleet.stop_with_lifecycle_poll(0).unwrap();
+            wait_lifecycle(&fleet, 0);
+            assert!(matches!(
+                fleet.poll_lifecycle_event(0),
+                Some(FleetEvent::Stopped { machine: 0, .. })
+            ));
+            assert!(fleet.consume_lifecycle_event(0));
+            assert!(matches!(
+                next(&fleet),
+                FleetEvent::ResourceSnapshot {
+                    machine: 0,
+                    request: 100,
+                    ..
+                }
+            ));
+            assert!(fleet.try_event().is_none());
+            assert_eq!(fleet.event_memory().retained_bytes, 0);
+            assert_eq!(fleet.event_headroom_bytes(), 0);
+            assert_eq!(fleet.event_inflight_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn detach_completes_with_full_command_and_event_queues_without_polling() {
         let command_limit = 2 * std::mem::size_of::<QueuedCommand>();
         let fleet = saturated_fleet(
@@ -3298,7 +3418,11 @@ mod tests {
     #[test]
     fn event_signal_observes_publication_between_poll_and_wait() {
         let signal = Arc::new(FleetEventSignal::default());
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = event_queue::channel(
+            1,
+            FleetMemoryLimits::default().event_bytes,
+            FleetMemoryLimits::default().event_bytes_per_machine,
+        );
         let sender = EventSender {
             sender,
             signal: Arc::clone(&signal),
@@ -4727,7 +4851,11 @@ mod tests {
         }
         let commands = Arc::new(Mutex::new(LaneMailbox::new(4)));
         let worker_commands = Arc::clone(&commands);
-        let (sender, events) = mpsc::sync_channel(16);
+        let (sender, events) = event_queue::channel(
+            16,
+            FleetMemoryLimits::default().event_bytes,
+            FleetMemoryLimits::default().event_bytes_per_machine,
+        );
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
         let worker = thread::spawn(move || {
@@ -5100,7 +5228,11 @@ mod tests {
                     .is_ok());
             }
             mailbox.lock().unwrap().closes.insert(1, CloseRequest::Stop);
-            let (event_tx, events) = mpsc::sync_channel(1);
+            let (event_tx, events) = event_queue::channel(
+                1,
+                FleetMemoryLimits::default().event_bytes,
+                FleetMemoryLimits::default().event_bytes_per_machine,
+            );
             event_tx
                 .try_send(FleetEvent::Error {
                     machine: 0,
@@ -5244,7 +5376,11 @@ mod tests {
                 .is_ok());
         }
         mailbox.lock().unwrap().closes.insert(1, CloseRequest::Stop);
-        let (event_tx, _events) = mpsc::sync_channel(8);
+        let (event_tx, _events) = event_queue::channel(
+            8,
+            FleetMemoryLimits::default().event_bytes,
+            FleetMemoryLimits::default().event_bytes_per_machine,
+        );
         let completions = Arc::new(Mutex::new(BTreeMap::new()));
         let sender = EventSender {
             sender: event_tx,
