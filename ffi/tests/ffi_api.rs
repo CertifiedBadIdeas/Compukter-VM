@@ -47,6 +47,73 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[cfg(feature = "experimental-fleet-scheduler")]
 #[test]
+fn checkpoint_detach_selector_preserves_session_until_terminal_delivery() {
+    use compukter_ffi::experimental_fleet_abi::*;
+    use std::time::{Duration, Instant};
+    let config = [1, 4, 1, 64, 64, 16, 32, 0];
+    let mut fleet = 0;
+    assert_eq!(
+        unsafe { compukter_experimental_fleet_create(config.as_ptr(), &mut fleet) },
+        FfiStatus::Ok
+    );
+    let session = create_machine(&terminal_artifact());
+    let mut machine = 0;
+    assert_eq!(
+        unsafe { compukter_experimental_fleet_attach(fleet, session, &mut machine) },
+        FfiStatus::Ok
+    );
+    assert_eq!(
+        compukter_experimental_fleet_request_lifecycle(fleet, machine, 3, 0),
+        FfiStatus::Ok
+    );
+    let mut written = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = unsafe {
+            compukter_experimental_fleet_poll_lifecycle(
+                fleet,
+                machine,
+                std::ptr::null_mut(),
+                0,
+                &mut written,
+            )
+        };
+        if status == FfiStatus::BufferTooSmall {
+            break;
+        }
+        assert_eq!(status, FfiStatus::Ok);
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let mut restored = 0;
+    assert_eq!(
+        unsafe { compukter_experimental_fleet_recover(fleet, machine, &mut restored) },
+        FfiStatus::BusyHandle
+    );
+    let mut output = vec![0; written];
+    assert_eq!(
+        unsafe {
+            compukter_experimental_fleet_poll_lifecycle(
+                fleet,
+                machine,
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written,
+            )
+        },
+        FfiStatus::Ok
+    );
+    assert_eq!(output[0], 6);
+    assert_eq!(
+        unsafe { compukter_experimental_fleet_recover(fleet, machine, &mut restored) },
+        FfiStatus::Ok
+    );
+    assert_eq!(compukter_close(restored), FfiStatus::Ok);
+    assert_eq!(compukter_experimental_fleet_close(fleet), FfiStatus::Ok);
+}
+
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[test]
 fn independent_lifecycle_retries_preserve_both_poll_streams_and_session_ownership() {
     use compukter_ffi::experimental_fleet_abi::*;
     use std::time::{Duration, Instant};

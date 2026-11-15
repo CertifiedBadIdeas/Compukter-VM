@@ -65,6 +65,9 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             2 if fleet.owns_session(machine as u64) => fleet
                 .scheduler
                 .detach_with_lifecycle_poll(machine as u64, Some(tick as u64)),
+            3 if fleet.owns_session(machine as u64) => fleet
+                .scheduler
+                .detach_for_checkpoint(machine as u64, tick as u64),
             _ => return Ok(code(FfiStatus::InvalidArgument)),
         }))
     })

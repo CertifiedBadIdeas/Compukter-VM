@@ -9,22 +9,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::memory::{OutputHeadroom, Reservation};
-use super::{Command, ComputerMachine, FleetEvent, FleetTimer};
+use super::{Command, ComputerMachine, DetachMode, FleetEvent, FleetTimer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CloseRequest {
     Stop,
-    Detach { preserve_timers_at: Option<u64> },
+    Detach { mode: DetachMode },
 }
 
 impl CloseRequest {
     pub(super) fn command(self, machine: u64) -> Command {
         match self {
             Self::Stop => Command::Stop { machine },
-            Self::Detach { preserve_timers_at } => Command::Detach {
-                machine,
-                preserve_timers_at,
-            },
+            Self::Detach { mode } => Command::Detach { machine, mode },
         }
     }
 }

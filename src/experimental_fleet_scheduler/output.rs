@@ -307,7 +307,7 @@ mod tests {
             assert!(output.begin_closing(
                 1,
                 CloseRequest::Detach {
-                    preserve_timers_at: None
+                    mode: super::super::DetachMode::Quiescent
                 }
             ));
             assert_eq!(output.overflowed_detach().is_some(), overflow);

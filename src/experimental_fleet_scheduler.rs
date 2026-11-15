@@ -327,6 +327,23 @@ pub struct FleetMetrics {
     pub requests: u64,
 }
 
+/// The checkpoint path settles external waits instead of requiring a host-side request mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetachMode {
+    Quiescent,
+    TimersAt(u64),
+    CheckpointAt(u64),
+}
+
+impl DetachMode {
+    fn timer_tick(self) -> Option<u64> {
+        match self {
+            Self::Quiescent => None,
+            Self::TimersAt(tick) | Self::CheckpointAt(tick) => Some(tick),
+        }
+    }
+}
+
 enum Command {
     Deployment {
         machine: u64,
@@ -361,7 +378,7 @@ enum Command {
     },
     Detach {
         machine: u64,
-        preserve_timers_at: Option<u64>,
+        mode: DetachMode,
     },
     TerminalKey {
         machine: u64,
@@ -1261,7 +1278,7 @@ impl FleetScheduler {
             machine,
             Command::Detach {
                 machine,
-                preserve_timers_at: None,
+                mode: DetachMode::Quiescent,
             },
             Some(LifecycleReader::Ordinary),
         )
@@ -1273,7 +1290,7 @@ impl FleetScheduler {
             machine,
             Command::Detach {
                 machine,
-                preserve_timers_at: Some(tick),
+                mode: DetachMode::TimersAt(tick),
             },
             Some(LifecycleReader::Ordinary),
         )
@@ -1307,7 +1324,21 @@ impl FleetScheduler {
             machine,
             Command::Detach {
                 machine,
-                preserve_timers_at,
+                mode: preserve_timers_at.map_or(DetachMode::Quiescent, DetachMode::TimersAt),
+            },
+            Some(LifecycleReader::Independent),
+        )
+    }
+
+    /// Drain accepted commands and return execution for checkpointing without running Guest.
+    /// Unacknowledged external waits receive Unavailable; timers and compiler input survive.
+    /// Completion and any undelivered prefix retain the existing bounded lifecycle ownership.
+    pub fn detach_for_checkpoint(&self, machine: u64, tick: u64) -> Result<(), SubmitError> {
+        self.send_action(
+            machine,
+            Command::Detach {
+                machine,
+                mode: DetachMode::CheckpointAt(tick),
             },
             Some(LifecycleReader::Independent),
         )
@@ -1384,9 +1415,7 @@ impl FleetScheduler {
         let mut mailbox = self.lanes[lane].lock().unwrap_or_else(|e| e.into_inner());
         let close = match command {
             Command::Stop { .. } => Some(CloseRequest::Stop),
-            Command::Detach {
-                preserve_timers_at, ..
-            } => Some(CloseRequest::Detach { preserve_timers_at }),
+            Command::Detach { mode, .. } => Some(CloseRequest::Detach { mode }),
             _ => None,
         };
         if let Some(close) = close {
@@ -2082,23 +2111,22 @@ fn run_worker(
                     actor.parked = false;
                     ready(machine, actor, &mut queue);
                 }
-                Command::Detach {
-                    machine,
-                    preserve_timers_at,
-                } => {
+                Command::Detach { machine, mode } => {
                     let Some(actor) = actors.get_mut(&machine) else {
                         continue;
                     };
-                    if actor
-                        .pending
-                        .iter()
-                        .any(|key| preserve_timers_at.is_none() || !actor.timers.contains_key(key))
-                        || preserve_timers_at.is_some_and(|tick| tick < actor.tick)
+                    let preserve_timers_at = mode.timer_tick();
+                    let checkpoint = matches!(mode, DetachMode::CheckpointAt(_));
+                    // Validate before settlement: a rejected request must not change execution.
+                    if preserve_timers_at.is_some_and(|tick| tick < actor.tick)
                         || actor.timers.len() > MAXIMUM_PENDING_TIMERS
-                        || !actor.deployment_candidates.is_empty()
-                        || !actor.inspecting.is_empty()
-                        || !actor.inspected.is_empty()
-                        || actor.compilation_token.is_some()
+                        || (!checkpoint
+                            && (actor.pending.iter().any(|key| {
+                                preserve_timers_at.is_none() || !actor.timers.contains_key(key)
+                            }) || !actor.deployment_candidates.is_empty()
+                                || !actor.inspecting.is_empty()
+                                || !actor.inspected.is_empty()
+                                || actor.compilation_token.is_some()))
                     {
                         events.complete_detach(
                             machine,
@@ -2110,6 +2138,49 @@ fn run_worker(
                             ),
                         );
                         continue;
+                    }
+                    if checkpoint {
+                        // Use the machine's full route table, including requests not yet published
+                        // or waiting for cost inspection. No Guest instructions execute here.
+                        let timers = &actor.timers;
+                        if let Err(error) =
+                            actor
+                                .machine
+                                .settle_fleet_checkpoint_requests(|task, request| {
+                                    timers.contains_key(&(task, request))
+                                })
+                        {
+                            actor.stopped = true;
+                            if !publish(
+                                &events,
+                                &stopped,
+                                FleetEvent::Error {
+                                    machine,
+                                    message: format!("checkpoint request settlement: {error:?}"),
+                                },
+                            ) {
+                                return;
+                            }
+                            events.complete_detach(
+                                machine,
+                                FleetDetachResult::Rejected(FleetDetachRejection::Busy),
+                                fence_detach(
+                                    Some(actor),
+                                    &mut mailbox.lock().unwrap_or_else(|e| e.into_inner()),
+                                    machine,
+                                ),
+                            );
+                            continue;
+                        }
+                        actor.pending.retain(|key| actor.timers.contains_key(key));
+                        actor
+                            .request_scopes
+                            .retain(|key, _| actor.timers.contains_key(key));
+                        actor.inspecting.clear();
+                        actor.inspected.clear();
+                        actor.deployment_candidates.clear();
+                        actor.deployment_bytes = 0;
+                        // The computer retains the exact compilation transaction for checkpoint replay.
                     }
                     if !report_quiescent(machine, actor, &events, &stopped, coordinated_turns) {
                         return;
@@ -3575,6 +3646,221 @@ mod tests {
         while !observed {
             observed = matches!(next(&fleet), FleetEvent::ResourceSnapshot { machine, request: 81, .. } if machine == id);
         }
+    }
+
+    #[test]
+    fn checkpoint_detach_settles_undelivered_requests_without_draining_other_output() {
+        let fleet = saturated_fleet(FleetMemoryLimits::default(), true);
+        let advances = fleet.metrics().advances;
+        fleet.detach_for_checkpoint(1, 1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        let completion = fleet.try_detached(1).unwrap();
+        assert!(completion
+            .observations
+            .iter()
+            .any(|event| matches!(event, FleetEvent::Requests { machine: 1, .. })));
+        let FleetDetachResult::Detached {
+            mut computer,
+            timers,
+        } = completion.result
+        else {
+            panic!("checkpoint refused")
+        };
+        assert!(timers.is_empty());
+        assert_eq!(advances, fleet.metrics().advances);
+        assert_eq!(0, fleet.detach_output_memory().retained_bytes);
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary { machine: 0, .. }
+        ));
+        let outcome = computer.advance(64, 64, 64).unwrap();
+        assert!(
+            matches!(outcome, ComputerAdvanceOutcome::UncaughtException(ref detail) if detail.contains("hibernated")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_detach_cancels_cost_inspection_without_a_host_request_registry() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let computer = ComputerMachine::start(
+            crate::execution::fixtures::two_unit_capability_calls_artifact(),
+            profile(),
+            &[binding],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new_with_request_inspections(
+            vec![(1, computer)],
+            config(),
+            vec![RequestInspection {
+                namespace: "app".into(),
+                name: "entry".into(),
+                abi_major: 1,
+                abi_minor: 0,
+                operation: 0,
+                over_budget_detail: "over budget".into(),
+            }],
+        )
+        .unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        assert!(matches!(next(&fleet), FleetEvent::Inspect { .. }));
+        fleet.resource_snapshot(1, 77).unwrap();
+        let retired = match next(&fleet) {
+            FleetEvent::ResourceSnapshot {
+                request: 77,
+                snapshot,
+                ..
+            } => snapshot.retired_instructions,
+            other => panic!("{other:?}"),
+        };
+        fleet.detach_for_checkpoint(1, 1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        let completion = fleet.try_detached(1).unwrap();
+        let FleetDetachResult::Detached { mut computer, .. } = completion.result else {
+            panic!("inspection blocked checkpoint")
+        };
+        assert_eq!(retired, computer.resource_snapshot().retired_instructions);
+        let outcome = computer.advance(64, 64, 64).unwrap();
+        assert!(
+            matches!(outcome, ComputerAdvanceOutcome::UncaughtException(ref detail) if detail.contains("hibernated")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_detach_drains_accepted_reply_without_executing_the_next_host_call() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let computer = ComputerMachine::start(
+            crate::execution::fixtures::two_unit_capability_calls_artifact(),
+            profile(),
+            &[binding],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            vec![(1, computer)],
+            config(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        let request = match next(&fleet) {
+            FleetEvent::Requests { requests, .. } => requests.into_iter().next().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let retired = match next(&fleet) {
+            FleetEvent::Quiescent { retired, .. } => retired,
+            other => panic!("{other:?}"),
+        };
+        fleet
+            .reply(1, request.task_id, request.id, ReplyValue::Unit)
+            .unwrap();
+        fleet.detach_for_checkpoint(1, 1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        let FleetDetachResult::Detached { mut computer, .. } =
+            fleet.try_detached(1).unwrap().result
+        else {
+            panic!("checkpoint refused")
+        };
+        assert_eq!(retired, computer.resource_snapshot().retired_instructions);
+        assert_eq!(
+            Err(crate::ComputerError::InvalidRequestId),
+            computer.resume_host_request_for(
+                request.task_id,
+                request.id,
+                HostResponse::Success(HostValueInput::Unit)
+            )
+        );
+        let second = match computer.advance(64, 64, 64).unwrap() {
+            ComputerAdvanceOutcome::HostRequestBatch(batch) => batch.requests.into_vec().remove(0),
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(second.id, request.id);
+    }
+
+    #[test]
+    fn checkpoint_detach_rejects_stale_tick_before_canceling_waits() {
+        let fleet = saturated_fleet(FleetMemoryLimits::default(), true);
+        fleet.detach_for_checkpoint(1, 0).unwrap();
+        wait_lifecycle(&fleet, 1);
+        let completion = fleet.try_detached(1).unwrap();
+        assert!(matches!(
+            completion.result,
+            FleetDetachResult::Rejected(FleetDetachRejection::Busy)
+        ));
+        let request = completion
+            .observations
+            .into_iter()
+            .find_map(|event| match event {
+                FleetEvent::Requests { mut requests, .. } => Some(requests.remove(0)),
+                _ => None,
+            })
+            .unwrap();
+        fleet
+            .reply(1, request.task_id, request.id, ReplyValue::Unit)
+            .unwrap();
+        fleet.detach_for_checkpoint(1, 1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert!(matches!(
+            fleet.try_detached(1).unwrap().result,
+            FleetDetachResult::Detached { .. }
+        ));
+    }
+
+    #[test]
+    fn checkpoint_detach_preserves_timer_remaining_ticks() {
+        let computer = ComputerMachine::start(
+            crate::execution::fixtures::timer_unit_artifact(2),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            vec![(1, computer)],
+            config(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                timers_pending: true,
+                ..
+            }
+        ));
+        fleet.detach_for_checkpoint(1, 2).unwrap();
+        wait_lifecycle(&fleet, 1);
+        let FleetDetachResult::Detached { computer, timers } =
+            fleet.try_detached(1).unwrap().result
+        else {
+            panic!("timer blocked checkpoint")
+        };
+        assert_eq!(1, timers.len());
+        assert_eq!((2, 1), (timers[0].duration, timers[0].remaining));
+        let machine = fleet.attach_with_timers(computer, 100, timers).unwrap();
+        fleet.grant(machine, 100, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                timers_pending: true,
+                ..
+            }
+        ));
+        fleet.grant(machine, 101, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6350,6 +6636,90 @@ mod tests {
                 retired: 1,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn checkpoint_detach_preserves_exact_compiler_input_without_completion() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let source = VirtualPath::parse_utf8("/home/main.kt", &limits).unwrap();
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&owner, &source, b"fun main() = 42", false)
+            .unwrap();
+        let artifact = crate::execution::fixtures::compiler_compile_artifact(
+            &"/home/main.kt".encode_utf16().collect::<Vec<_>>(),
+            &"/home/main".encode_utf16().collect::<Vec<_>>(),
+        );
+        let machine =
+            ComputerMachine::start_in_filesystem(artifact, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 256).unwrap();
+        let request = match next(&fleet) {
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::CompilationRequested(request),
+                ..
+            } => request,
+            other => panic!("{other:?}"),
+        };
+
+        fleet.detach_for_checkpoint(7, 1).unwrap();
+        wait_lifecycle(&fleet, 7);
+        let FleetDetachResult::Detached { computer, timers } =
+            fleet.try_detached(7).unwrap().result
+        else {
+            panic!("compiler wait blocked checkpoint")
+        };
+        assert!(timers.is_empty());
+        let id = crate::ComputerId::from_bytes([7; 16]);
+        let bytes = computer
+            .checkpoint(
+                id,
+                b"host-state",
+                crate::ComputerCheckpointLimits::default(),
+            )
+            .unwrap();
+        let limits = FileSystemLimits::testing();
+        let capability = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&capability, &source, b"fun main() = 42", false)
+            .unwrap();
+        let (mut computer, host_state) = ComputerMachine::restore_checkpoint(
+            crate::ComputerRestoreEnvironment {
+                id,
+                profile: profile(),
+                process_limits: crate::ProcessLimits::default(),
+                addon_bindings: &[],
+                filesystem,
+                initial_file_capability: capability,
+            },
+            &bytes,
+            crate::ComputerCheckpointLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(host_state, b"host-state");
+        let pending = computer
+            .pending_compilation_request()
+            .expect("compiler input was lost");
+        assert_eq!(request, pending);
+        computer
+            .complete_compilation_failure(pending.token, "resubmitted after restoration")
+            .unwrap();
+        assert!(matches!(
+            computer.advance(64, 64, 64).unwrap(),
+            ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(1)))
         ));
     }
 

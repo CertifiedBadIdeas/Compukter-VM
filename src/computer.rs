@@ -2103,8 +2103,16 @@ impl ComputerMachine {
             .iter()
             .position(|route| route.task_id == task_id && route.external_id == request_id)
             .ok_or(ComputerError::InvalidRequestId)?;
+        self.resume_external_route_at(route_index, response)
+    }
+
+    fn resume_external_route_at(
+        &mut self,
+        route_index: usize,
+        response: HostResponse<'_>,
+    ) -> Result<(), ComputerError> {
         let route = &self.external_requests[route_index];
-        let task = TaskId::new(task_id).ok_or(ComputerError::InvalidRequestId)?;
+        let task = TaskId::new(route.task_id).ok_or(ComputerError::InvalidRequestId)?;
         let internal_id =
             RequestId::new(route.internal_id).ok_or(ComputerError::InvalidRequestId)?;
         let frame = self
@@ -2117,6 +2125,28 @@ impl ComputerMachine {
             .resume_for(task, internal_id, response)
             .map_err(ComputerError::Resume)?;
         self.external_requests.swap_remove(route_index);
+        Ok(())
+    }
+
+    /// Resolve every unacknowledged external route exactly once without advancing execution.
+    /// Reverse indexes avoid repeated route-table searches; preserved timer routes remain intact.
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    pub(crate) fn settle_fleet_checkpoint_requests(
+        &mut self,
+        preserve: impl Fn(u32, u64) -> bool,
+    ) -> Result<(), ComputerError> {
+        for index in (0..self.external_requests.len()).rev() {
+            let route = &self.external_requests[index];
+            if !preserve(route.task_id, route.external_id) {
+                self.resume_external_route_at(
+                    index,
+                    HostResponse::Failure(HostFailure::new(
+                        HostFailureKind::Unavailable,
+                        "Computer hibernated before the external request completed",
+                    )),
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -4371,6 +4401,63 @@ mod tests {
                 ));
                 assert_eq!(None, halt(&mut computer));
             }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    fn checkpoint_settlement_retains_preserved_routes_at_either_position() {
+        for preserved_index in 0..2 {
+            let operations = [
+                OperationSchema::asynchronous(&[], HostValueType::I32),
+                OperationSchema::asynchronous(&[], HostValueType::Unit),
+            ];
+            let addon = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+            let mut computer = ComputerMachine::start(
+                crate::execution::fixtures::two_task_host_artifact(),
+                profile(),
+                &[addon],
+                &[],
+            )
+            .unwrap();
+            let batch = match computer.advance(64, 64, u32::MAX).unwrap() {
+                ComputerAdvanceOutcome::HostRequestBatch(batch) => batch,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(batch.requests.len(), 2);
+            let preserved = &batch.requests[preserved_index];
+            let canceled = &batch.requests[1 - preserved_index];
+            let retired = computer.resource_snapshot().retired_instructions;
+            computer
+                .settle_fleet_checkpoint_requests(|task, request| {
+                    task == preserved.task_id && request == preserved.id
+                })
+                .unwrap();
+            assert_eq!(retired, computer.resource_snapshot().retired_instructions);
+            assert_eq!(
+                Err(ComputerError::InvalidRequestId),
+                computer.resume_host_request_for(
+                    canceled.task_id,
+                    canceled.id,
+                    HostResponse::Success(HostValueInput::Unit)
+                )
+            );
+            let response = if preserved.operation == 0 {
+                HostValueInput::I32(123)
+            } else {
+                HostValueInput::Unit
+            };
+            computer
+                .resume_host_request_for(
+                    preserved.task_id,
+                    preserved.id,
+                    HostResponse::Success(response),
+                )
+                .unwrap();
+            // Repeating settlement on a route table with no external waits is harmless.
+            computer
+                .settle_fleet_checkpoint_requests(|_, _| false)
+                .unwrap();
         }
     }
 

@@ -309,7 +309,7 @@ pub extern "C" fn compukter_experimental_fleet_stop(handle: u64, machine: u64) -
 }
 
 /// Atomically fences a machine and selects independent lifecycle delivery.
-/// kind: 0 stop, 1 detach, 2 detach with timers at `tick`.
+/// kind: 0 stop, 1 detach, 2 detach with timers, 3 settle and detach for checkpoint at `tick`.
 #[unsafe(no_mangle)]
 pub extern "C" fn compukter_experimental_fleet_request_lifecycle(
     handle: u64,
@@ -330,6 +330,9 @@ pub extern "C" fn compukter_experimental_fleet_request_lifecycle(
             2 if fleet.owns_session(machine) => fleet
                 .scheduler
                 .detach_with_lifecycle_poll(machine, Some(tick)),
+            3 if fleet.owns_session(machine) => {
+                fleet.scheduler.detach_for_checkpoint(machine, tick)
+            }
             _ => return FfiStatus::InvalidArgument,
         })
     })
