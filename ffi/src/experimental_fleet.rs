@@ -78,6 +78,13 @@ fn create_machines(
 }
 
 pub enum WireEvent {
+    Filesystem {
+        machine: u64,
+        request: u64,
+        kind: u8,
+        status: crate::FfiStatus,
+        bytes: Vec<u8>,
+    },
     ResourceSnapshot(Vec<u8>),
     FilesystemGeneration {
         machine: u64,
@@ -121,6 +128,41 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
         return Ok(None);
     };
     let (machine, tick, outcome, inspection) = match event {
+        FleetEvent::Filesystem {
+            machine,
+            request,
+            result,
+        } => {
+            use compukter_vm::experimental_fleet_scheduler::FilesystemResult;
+            let (kind, status, bytes) = match result {
+                Ok(FilesystemResult::Stat(stat)) => (
+                    0,
+                    crate::FfiStatus::Ok,
+                    crate::wire::encode_filesystem_stat(&stat),
+                ),
+                Ok(FilesystemResult::List(list)) => {
+                    match crate::wire::encode_filesystem_list(&list) {
+                        Some(bytes) if bytes.len() <= 1_048_576 - 22 => {
+                            (1, crate::FfiStatus::Ok, bytes)
+                        }
+                        _ => (3, crate::FfiStatus::FilesystemLimitExceeded, Vec::new()),
+                    }
+                }
+                Ok(FilesystemResult::Read(chunk)) => (
+                    2,
+                    crate::FfiStatus::Ok,
+                    crate::wire::encode_filesystem_chunk(&chunk),
+                ),
+                Err(error) => (3, crate::ffi_api::file_read_status(error), Vec::new()),
+            };
+            return Ok(Some(WireEvent::Filesystem {
+                machine,
+                request,
+                kind,
+                status,
+                bytes,
+            }));
+        }
         FleetEvent::ResourceSnapshot {
             machine,
             request,

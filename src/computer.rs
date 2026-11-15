@@ -802,6 +802,11 @@ impl ComputerMachine {
         })
     }
 
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    pub(crate) fn parse_inspection_path(&self, path: &str) -> Result<VirtualPath, FileSystemError> {
+        VirtualPath::parse_utf8(path, self.filesystem.limits())
+    }
+
     pub fn filesystem_list(
         &self,
         path: &VirtualPath,

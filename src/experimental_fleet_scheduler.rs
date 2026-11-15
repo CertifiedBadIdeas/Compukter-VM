@@ -80,6 +80,28 @@ pub enum CompilationResult {
     Failure(Box<str>),
 }
 
+#[derive(Debug)]
+pub enum FilesystemResult {
+    Stat(crate::ComputerFileStat),
+    List(crate::ComputerDirectoryListing),
+    Read(crate::ComputerFileChunk),
+}
+
+enum FilesystemQuery {
+    Stat(Box<str>),
+    List {
+        path: Box<str>,
+        cursor: Option<Box<str>>,
+        maximum: u32,
+    },
+    Read {
+        path: Box<str>,
+        offset: u64,
+        maximum: u32,
+        generation: u64,
+    },
+}
+
 impl ReplyValue {
     fn as_response(&self) -> HostResponse<'_> {
         if let Self::Failure(kind, detail) = self {
@@ -103,6 +125,11 @@ impl ReplyValue {
 
 #[derive(Debug)]
 pub enum FleetEvent {
+    Filesystem {
+        machine: u64,
+        request: u64,
+        result: Result<FilesystemResult, crate::ComputerFileReadError>,
+    },
     ResourceSnapshot {
         machine: u64,
         request: u64,
@@ -195,6 +222,11 @@ pub struct FleetMetrics {
 }
 
 enum Command {
+    Filesystem {
+        machine: u64,
+        request: u64,
+        query: FilesystemQuery,
+    },
     Add {
         machine: u64,
         computer: Box<ComputerMachine>,
@@ -565,6 +597,75 @@ impl FleetScheduler {
         self.send(machine, Command::FilesystemGeneration { machine, request })
     }
 
+    pub fn file_stat(&self, machine: u64, request: u64, path: Box<str>) -> Result<(), SubmitError> {
+        if path.len() > 4096 {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(
+            machine,
+            Command::Filesystem {
+                machine,
+                request,
+                query: FilesystemQuery::Stat(path),
+            },
+        )
+    }
+
+    pub fn file_list(
+        &self,
+        machine: u64,
+        request: u64,
+        path: Box<str>,
+        cursor: Option<Box<str>>,
+        maximum: u32,
+    ) -> Result<(), SubmitError> {
+        if path.len() > 4096
+            || cursor.as_ref().is_some_and(|name| name.len() > 4096)
+            || !(1..=256).contains(&maximum)
+        {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(
+            machine,
+            Command::Filesystem {
+                machine,
+                request,
+                query: FilesystemQuery::List {
+                    path,
+                    cursor,
+                    maximum,
+                },
+            },
+        )
+    }
+
+    pub fn file_read(
+        &self,
+        machine: u64,
+        request: u64,
+        path: Box<str>,
+        offset: u64,
+        maximum: u32,
+        generation: u64,
+    ) -> Result<(), SubmitError> {
+        if path.len() > 4096 || !(1..=32768).contains(&maximum) {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(
+            machine,
+            Command::Filesystem {
+                machine,
+                request,
+                query: FilesystemQuery::Read {
+                    path,
+                    offset,
+                    maximum,
+                    generation,
+                },
+            },
+        )
+    }
+
     pub fn reply(
         &self,
         machine: u64,
@@ -789,6 +890,64 @@ fn run_worker(
                 Err(TryRecvError::Disconnected) => return,
             };
             match command {
+                Command::Filesystem {
+                    machine,
+                    request,
+                    query,
+                } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    let result = match query {
+                        FilesystemQuery::Stat(path) => actor
+                            .machine
+                            .parse_inspection_path(&path)
+                            .and_then(|path| actor.machine.filesystem_stat(&path))
+                            .map(FilesystemResult::Stat)
+                            .map_err(Into::into),
+                        FilesystemQuery::List {
+                            path,
+                            cursor,
+                            maximum,
+                        } => actor
+                            .machine
+                            .parse_inspection_path(&path)
+                            .map_err(crate::ComputerFileReadError::from)
+                            .and_then(|path| {
+                                actor
+                                    .machine
+                                    .filesystem_list(&path, cursor.as_deref(), maximum)
+                            })
+                            .map(FilesystemResult::List),
+                        FilesystemQuery::Read {
+                            path,
+                            offset,
+                            maximum,
+                            generation,
+                        } => actor
+                            .machine
+                            .parse_inspection_path(&path)
+                            .map_err(crate::ComputerFileReadError::from)
+                            .and_then(|path| {
+                                actor
+                                    .machine
+                                    .filesystem_read(&path, offset, maximum, generation)
+                            })
+                            .map(FilesystemResult::Read),
+                    };
+                    if !publish(
+                        &events,
+                        &stopped,
+                        &waiters,
+                        FleetEvent::Filesystem {
+                            machine,
+                            request,
+                            result,
+                        },
+                    ) {
+                        return;
+                    }
+                }
                 Command::Add { machine, computer } => {
                     assert!(actors
                         .insert(machine, Actor::new(*computer, config.host_budget))
@@ -2340,6 +2499,61 @@ mod tests {
         assert!(
             matches!(next(&fleet), FleetEvent::FilesystemGeneration { machine: 7, request: 12, generation: actual } if actual == generation)
         );
+    }
+
+    #[test]
+    fn filesystem_queries_preserve_content_and_stale_generation_errors() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let path = VirtualPath::parse_utf8("/home/a", &limits).unwrap();
+        let mut fs = ComputerFileSystem::with_limits(limits);
+        fs.write_file(&owner, &path, b"hello", false).unwrap();
+        let machine = ComputerMachine::start_in_filesystem(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            profile(),
+            &[],
+            &[],
+            fs,
+            owner,
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.file_stat(7, 1, "/home/a".into()).unwrap();
+        let generation = match next(&fleet) {
+            FleetEvent::Filesystem {
+                machine: 7,
+                request: 1,
+                result: Ok(FilesystemResult::Stat(stat)),
+            } => stat.metadata.generation,
+            other => panic!("{other:?}"),
+        };
+        fleet.file_list(7, 2, "/home".into(), None, 32).unwrap();
+        assert!(
+            matches!(next(&fleet), FleetEvent::Filesystem { machine: 7, request: 2, result: Ok(FilesystemResult::List(list)) } if list.entries.iter().any(|entry| entry.name.as_ref() == "a"))
+        );
+        fleet
+            .file_read(7, 3, "/home/a".into(), 0, 32, generation)
+            .unwrap();
+        assert!(
+            matches!(next(&fleet), FleetEvent::Filesystem { machine: 7, request: 3, result: Ok(FilesystemResult::Read(chunk)) } if chunk.bytes.as_ref() == b"hello")
+        );
+        fleet
+            .file_read(7, 4, "/home/a".into(), 0, 32, generation + 1)
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Filesystem {
+                machine: 7,
+                request: 4,
+                result: Err(crate::ComputerFileReadError::StaleGeneration { .. })
+            }
+        ));
     }
 
     #[test]

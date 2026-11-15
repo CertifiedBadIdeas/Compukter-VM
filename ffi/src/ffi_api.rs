@@ -1776,32 +1776,32 @@ unsafe fn write_dynamic_output(
 fn file_inspection_status(error: FileInspectionBridgeError) -> FfiStatus {
     match error {
         FileInspectionBridgeError::Session(error) => handle_status(error),
-        FileInspectionBridgeError::File(error) => match error {
-            compukter_vm::ComputerFileReadError::StaleGeneration { .. } => {
-                FfiStatus::FilesystemStale
+        FileInspectionBridgeError::File(error) => file_read_status(error),
+    }
+}
+
+pub(crate) fn file_read_status(error: compukter_vm::ComputerFileReadError) -> FfiStatus {
+    match error {
+        compukter_vm::ComputerFileReadError::StaleGeneration { .. } => FfiStatus::FilesystemStale,
+        compukter_vm::ComputerFileReadError::InvalidRange => FfiStatus::FilesystemInvalidRange,
+        compukter_vm::ComputerFileReadError::LimitExceeded => FfiStatus::FilesystemLimitExceeded,
+        compukter_vm::ComputerFileReadError::FileSystem(error) => match error {
+            compukter_vm::FileSystemError::InvalidPath => FfiStatus::FilesystemInvalidPath,
+            compukter_vm::FileSystemError::NotFound => FfiStatus::FilesystemNotFound,
+            compukter_vm::FileSystemError::NotDirectory => FfiStatus::FilesystemNotDirectory,
+            compukter_vm::FileSystemError::IsDirectory => FfiStatus::FilesystemIsDirectory,
+            compukter_vm::FileSystemError::ReadOnly => FfiStatus::FilesystemReadOnly,
+            compukter_vm::FileSystemError::PermissionDenied => {
+                FfiStatus::FilesystemPermissionDenied
             }
-            compukter_vm::ComputerFileReadError::InvalidRange => FfiStatus::FilesystemInvalidRange,
-            compukter_vm::ComputerFileReadError::LimitExceeded => {
-                FfiStatus::FilesystemLimitExceeded
-            }
-            compukter_vm::ComputerFileReadError::FileSystem(error) => match error {
-                compukter_vm::FileSystemError::InvalidPath => FfiStatus::FilesystemInvalidPath,
-                compukter_vm::FileSystemError::NotFound => FfiStatus::FilesystemNotFound,
-                compukter_vm::FileSystemError::NotDirectory => FfiStatus::FilesystemNotDirectory,
-                compukter_vm::FileSystemError::IsDirectory => FfiStatus::FilesystemIsDirectory,
-                compukter_vm::FileSystemError::ReadOnly => FfiStatus::FilesystemReadOnly,
-                compukter_vm::FileSystemError::PermissionDenied => {
-                    FfiStatus::FilesystemPermissionDenied
-                }
-                compukter_vm::FileSystemError::QuotaExceeded => FfiStatus::FilesystemLimitExceeded,
-                compukter_vm::FileSystemError::Busy => FfiStatus::FilesystemBusy,
-                compukter_vm::FileSystemError::StorageFaulted => FfiStatus::FilesystemFaulted,
-                compukter_vm::FileSystemError::Closed => FfiStatus::FilesystemClosed,
-                compukter_vm::FileSystemError::AlreadyExists
-                | compukter_vm::FileSystemError::NotExecutable
-                | compukter_vm::FileSystemError::NotEmpty
-                | compukter_vm::FileSystemError::StaleHandle => FfiStatus::FilesystemOther,
-            },
+            compukter_vm::FileSystemError::QuotaExceeded => FfiStatus::FilesystemLimitExceeded,
+            compukter_vm::FileSystemError::Busy => FfiStatus::FilesystemBusy,
+            compukter_vm::FileSystemError::StorageFaulted => FfiStatus::FilesystemFaulted,
+            compukter_vm::FileSystemError::Closed => FfiStatus::FilesystemClosed,
+            compukter_vm::FileSystemError::AlreadyExists
+            | compukter_vm::FileSystemError::NotExecutable
+            | compukter_vm::FileSystemError::NotEmpty
+            | compukter_vm::FileSystemError::StaleHandle => FfiStatus::FilesystemOther,
         },
     }
 }

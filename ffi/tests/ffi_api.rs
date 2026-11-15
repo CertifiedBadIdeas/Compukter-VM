@@ -80,6 +80,7 @@ fn experimental_fleet_exposes_typed_stop_events() {
             Some(WireEvent::Inspection(_)) => panic!("unexpected inspection"),
             Some(WireEvent::Compilation(_)) => panic!("unexpected compilation"),
             Some(WireEvent::TerminalUpdate(_)) => panic!("unexpected terminal update"),
+            Some(WireEvent::Filesystem { .. }) => panic!("unexpected filesystem result"),
             Some(WireEvent::ResourceSnapshot(_)) | Some(WireEvent::FilesystemGeneration { .. }) => {
                 panic!("unexpected observation")
             }

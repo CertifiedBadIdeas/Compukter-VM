@@ -44,6 +44,68 @@ fn submit(result: Result<(), SubmitError>) -> jint {
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_filesystemQuery<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    request: jlong,
+    kind: jint,
+    path: JByteArray<'a>,
+    cursor: JByteArray<'a>,
+    offset: jlong,
+    maximum: jint,
+    generation: jlong,
+) -> jint {
+    status(&mut env, |env| {
+        if machine < 0
+            || request < 0
+            || offset < 0
+            || maximum < 0
+            || generation < 0
+            || path.len(env)? > 4096
+            || cursor.len(env)? > 4096
+        {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let (Ok(path), Ok(cursor)) = (
+            String::from_utf8(bytes(env, &path)?),
+            String::from_utf8(bytes(env, &cursor)?),
+        ) else {
+            return Ok(code(FfiStatus::InvalidArgument));
+        };
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(match kind {
+                    0 if cursor.is_empty() && offset == 0 && maximum == 0 && generation == 0 => f
+                        .scheduler
+                        .file_stat(machine as u64, request as u64, path.into_boxed_str()),
+                    1 if offset == 0 && generation == 0 => f.scheduler.file_list(
+                        machine as u64,
+                        request as u64,
+                        path.into_boxed_str(),
+                        (!cursor.is_empty()).then(|| cursor.into_boxed_str()),
+                        maximum as u32,
+                    ),
+                    2 if cursor.is_empty() => f.scheduler.file_read(
+                        machine as u64,
+                        request as u64,
+                        path.into_boxed_str(),
+                        offset as u64,
+                        maximum as u32,
+                        generation as u64,
+                    ),
+                    _ => return code(FfiStatus::InvalidArgument),
+                })
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_resourceSnapshot<
     'a,
 >(
@@ -508,6 +570,21 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         if f.pending.is_none() {
             f.pending = match experimental_fleet::poll_event(&f.scheduler) {
                 Ok(None) => None,
+                Ok(Some(experimental_fleet::WireEvent::Filesystem {
+                    machine,
+                    request,
+                    kind,
+                    status,
+                    bytes,
+                })) => {
+                    let mut encoded = vec![13];
+                    encoded.extend_from_slice(&machine.to_le_bytes());
+                    encoded.extend_from_slice(&request.to_le_bytes());
+                    encoded.push(kind);
+                    encoded.extend_from_slice(&(status as u32).to_le_bytes());
+                    encoded.extend_from_slice(&bytes);
+                    Some(encoded)
+                }
                 Ok(Some(experimental_fleet::WireEvent::ResourceSnapshot(b))) => {
                     Some([vec![11], b].concat())
                 }
