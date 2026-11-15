@@ -630,7 +630,12 @@ fn publish(
 }
 
 fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
-    if !actor.queued && !actor.stopped && actor.remaining > 0 && actor.advances_left > 0 {
+    if !actor.queued
+        && !actor.stopped
+        && actor.compilation_token.is_none()
+        && actor.remaining > 0
+        && actor.advances_left > 0
+    {
         actor.queued = true;
         actor.reported_retired = None;
         queue.push_back(id);
@@ -2535,6 +2540,17 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(request.sources[0].utf8.as_ref(), b"fun main() = 42");
+        let advances = fleet.metrics().advances;
+        fleet
+            .terminal_key(
+                7,
+                crate::TerminalKeyEvent::new(
+                    crate::TerminalKey::Enter,
+                    crate::TerminalKeyAction::Press,
+                    crate::TerminalModifiers::default(),
+                ),
+            )
+            .unwrap();
         fleet
             .complete_compilation(
                 7,
@@ -2547,6 +2563,7 @@ mod tests {
             next(&fleet),
             FleetEvent::DetachRejected { machine: 7 }
         ));
+        assert_eq!(fleet.metrics().advances, advances);
         let compiled = crate::execution::fixtures::two_block_artifact(1, 1);
         let bytes = crate::test_encode::encode_artifact(compiled.decoded()).unwrap();
         fleet
