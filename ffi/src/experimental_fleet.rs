@@ -110,6 +110,7 @@ pub enum WireEvent {
         machine: u64,
         tick: u64,
         retired: u64,
+        timers_pending: bool,
     },
     Outcome(Vec<u8>),
     Inspection(Vec<u8>),
@@ -205,11 +206,13 @@ pub fn encode_event(event: &WireEvent) -> Vec<u8> {
             machine,
             tick,
             retired,
+            timers_pending,
         } => {
             bytes.push(8);
             bytes.extend_from_slice(&machine.to_le_bytes());
             bytes.extend_from_slice(&tick.to_le_bytes());
             bytes.extend_from_slice(&retired.to_le_bytes());
+            bytes.push(u8::from(*timers_pending));
         }
         WireEvent::Outcome(body) => {
             bytes.push(0);
@@ -547,11 +550,13 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             machine,
             tick,
             retired,
+            timers_pending,
         } => {
             return Ok(Some(WireEvent::Quiescent {
                 machine,
                 tick,
                 retired,
+                timers_pending,
             }))
         }
         FleetEvent::Inspect {

@@ -217,6 +217,7 @@ pub enum FleetEvent {
         machine: u64,
         tick: u64,
         retired: u64,
+        timers_pending: bool,
     },
     Inspect {
         machine: u64,
@@ -1263,6 +1264,7 @@ fn report_quiescent(
             machine: id,
             tick: actor.tick,
             retired: actor.tick_retired,
+            timers_pending: !actor.timers.is_empty(),
         },
     )
 }
@@ -2449,6 +2451,7 @@ mod tests {
                 machine: 1,
                 tick: 2,
                 retired: 3,
+                timers_pending: false,
             }
         ));
         assert!(signal.wait(generation, Duration::ZERO));
@@ -3900,6 +3903,47 @@ mod tests {
     }
 
     #[test]
+    fn quiescent_report_exposes_pending_timer_until_it_wakes() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::timer_unit_artifact(2),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            vec![(1, machine)],
+            config(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                timers_pending: true,
+                ..
+            }
+        ));
+        fleet.grant(1, 3, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                timers_pending: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn timer_wakes_only_when_its_tick_arrives() {
         let machine = ComputerMachine::start(
             crate::execution::fixtures::timer_unit_artifact(2),
@@ -4189,7 +4233,8 @@ mod tests {
             FleetEvent::Quiescent {
                 machine: 1,
                 tick: 3,
-                retired: 2
+                retired: 2,
+                ..
             }
         ));
         fleet.grant(2, 3, 1).unwrap();
@@ -4198,7 +4243,8 @@ mod tests {
             FleetEvent::Quiescent {
                 machine: 2,
                 tick: 3,
-                retired: 1
+                retired: 1,
+                ..
             }
         ));
         fleet.grant(1, 4, 1).unwrap();
@@ -4207,7 +4253,8 @@ mod tests {
             FleetEvent::Quiescent {
                 machine: 1,
                 tick: 4,
-                retired: 1
+                retired: 1,
+                ..
             }
         ));
     }
@@ -4240,6 +4287,7 @@ mod tests {
                 machine: 7,
                 tick: 1,
                 retired,
+                ..
             } => retired,
             other => panic!("{other:?}"),
         };
@@ -4269,6 +4317,7 @@ mod tests {
                 machine: 7,
                 tick: 1,
                 retired,
+                ..
             } => assert!(retired > before),
             other => panic!("{other:?}"),
         }
@@ -4296,7 +4345,8 @@ mod tests {
             FleetEvent::Quiescent {
                 machine: 1,
                 tick: 1,
-                retired: 0
+                retired: 0,
+                ..
             }
         ));
         fleet.grant(1, 2, 1).unwrap();
@@ -4305,7 +4355,8 @@ mod tests {
             FleetEvent::Quiescent {
                 machine: 1,
                 tick: 2,
-                retired: 1
+                retired: 1,
+                ..
             }
         ));
     }
