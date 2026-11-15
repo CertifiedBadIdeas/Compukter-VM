@@ -1305,8 +1305,8 @@ fn run_worker(
                         .pending
                         .iter()
                         .any(|key| preserve_timers_at.is_none() || !actor.timers.contains_key(key))
-                        || preserve_timers_at
-                            .is_some_and(|tick| actor.tick_initialized && tick < actor.tick)
+                        || preserve_timers_at.is_some_and(|tick| tick < actor.tick)
+                        || actor.timers.len() > 256
                         || !actor.inspecting.is_empty()
                         || !actor.inspected.is_empty()
                         || actor.compilation_token.is_some()
@@ -3322,6 +3322,8 @@ mod tests {
         let (reason, machine) = fleet.attach_with_timers(machine, 100, invalid).unwrap_err();
         assert_eq!(reason, SubmitError::InvalidMachine);
         let id = fleet.attach_with_timers(machine, 100, timers).unwrap();
+        fleet.detach_with_timers(id, 99).unwrap();
+        assert!(matches!(next(&fleet), FleetEvent::DetachRejected { machine } if machine == id));
         fleet.grant(id, 100, 64).unwrap();
         thread::sleep(Duration::from_millis(10));
         assert!(fleet.try_event().is_none());
