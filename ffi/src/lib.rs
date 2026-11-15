@@ -23,6 +23,8 @@ mod wire;
 
 #[cfg(feature = "experimental-fleet-scheduler")]
 pub mod experimental_fleet;
+#[cfg(feature = "experimental-fleet-scheduler")]
+pub mod experimental_fleet_abi;
 
 pub const COMPUKTER_FFI_ABI_VERSION: u32 = 28;
 

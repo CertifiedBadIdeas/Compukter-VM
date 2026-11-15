@@ -47,6 +47,113 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[cfg(feature = "experimental-fleet-scheduler")]
 #[test]
+fn fleet_c_abi_transfers_session_and_retries_event_without_losing_ownership() {
+    use compukter_ffi::experimental_fleet_abi::*;
+    use std::time::{Duration, Instant};
+    let config = [1, 4, 4, 64, 64, 16, 32, 1];
+    let mut fleet = 0;
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_experimental_fleet_create(config.as_ptr(), &mut fleet)
+    });
+    let session = create_machine(&terminal_artifact());
+    let mut machine = 0;
+    let invalid = [0u8; 1];
+    assert_eq!(FfiStatus::InvalidArgument, unsafe {
+        compukter_experimental_fleet_attach_timers(
+            fleet,
+            session,
+            1,
+            invalid.as_ptr(),
+            invalid.len(),
+            &mut machine,
+        )
+    });
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_experimental_fleet_attach(fleet, session, &mut machine)
+    });
+    assert_eq!(FfiStatus::StaleHandle, compukter_close(session));
+    assert_eq!(
+        FfiStatus::BusyHandle,
+        compukter_experimental_fleet_close(fleet)
+    );
+    assert_eq!(
+        FfiStatus::Ok,
+        compukter_experimental_fleet_detach(fleet, machine)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut written = 0;
+    loop {
+        match unsafe {
+            compukter_experimental_fleet_poll(fleet, std::ptr::null_mut(), 0, &mut written)
+        } {
+            FfiStatus::BufferTooSmall => break,
+            FfiStatus::Ok => {
+                assert_eq!(written, 0);
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            status => panic!("unexpected status {status:?}"),
+        }
+    }
+    assert_eq!(written, 9);
+    let mut event = vec![0; written];
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_experimental_fleet_poll(fleet, event.as_mut_ptr(), event.len(), &mut written)
+    });
+    assert_eq!(event[0], 6);
+    assert_eq!(u64::from_le_bytes(event[1..9].try_into().unwrap()), machine);
+    let mut recovered = 0;
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_experimental_fleet_recover(fleet, machine, &mut recovered)
+    });
+    assert_eq!(FfiStatus::Ok, compukter_experimental_fleet_close(fleet));
+    assert_eq!(
+        FfiStatus::StaleHandle,
+        compukter_experimental_fleet_close(fleet)
+    );
+    assert_eq!(FfiStatus::Ok, compukter_close(recovered));
+}
+
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[test]
+fn fleet_transport_retains_events_until_consumed() {
+    use compukter_ffi::experimental_fleet::{create, FleetTransport};
+    use compukter_vm::experimental_fleet_scheduler::FleetConfig;
+    use std::time::{Duration, Instant};
+    let config = FleetConfig {
+        workers: 1,
+        mailbox_capacity: 4,
+        event_capacity: 4,
+        guest_budget: 64,
+        maintenance_budget: 64,
+        host_budget: 16,
+        maximum_advances_per_tick: 32,
+    };
+    let scheduler = create(
+        &support::executable_minimal_vector(),
+        &EMPTY_CAPABILITY_SCHEMAS,
+        1,
+        config,
+    )
+    .unwrap();
+    let mut transport = FleetTransport::new(scheduler);
+    transport.scheduler.stop(0).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let event = loop {
+        if let Some(bytes) = transport.poll() {
+            break bytes.to_vec();
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert_eq!(event, vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(transport.poll(), Some(event.as_slice()));
+    transport.consume_event();
+    assert!(transport.poll().is_none());
+}
+
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[test]
 fn experimental_fleet_exposes_typed_stop_events() {
     use compukter_ffi::experimental_fleet::WireEvent;
     use compukter_vm::experimental_fleet_scheduler::FleetConfig;

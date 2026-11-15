@@ -8,7 +8,7 @@
 use crate::{bytes, chars, ints, status, write_handle, write_long};
 use compukter_ffi::{experimental_fleet, FfiStatus};
 use compukter_vm::experimental_fleet_scheduler::{
-    FleetConfig, FleetScheduler, FleetTimer, ReplyValue, RequestInspection, SubmitError,
+    FleetConfig, ReplyValue, RequestInspection, SubmitError,
 };
 use jni::{
     objects::{JByteArray, JCharArray, JClass, JIntArray, JLongArray},
@@ -20,12 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-struct Fleet {
-    scheduler: FleetScheduler,
-    pending: Option<Vec<u8>>,
-    detached: HashMap<u64, Box<compukter_vm::ComputerMachine>>,
-    sessions: HashMap<u64, experimental_fleet::SessionMetadata>,
-}
+type Fleet = experimental_fleet::FleetTransport;
 static FLEETS: OnceLock<Mutex<HashMap<u64, Fleet>>> = OnceLock::new();
 static NEXT: AtomicU64 = AtomicU64::new(1);
 fn fleets() -> &'static Mutex<HashMap<u64, Fleet>> {
@@ -420,15 +415,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             return Ok(code(FfiStatus::BusyHandle));
         }
         write_handle(env, &output, id)?;
-        map.insert(
-            id,
-            Fleet {
-                scheduler,
-                pending: None,
-                detached: HashMap::new(),
-                sessions: HashMap::new(),
-            },
-        );
+        map.insert(id, Fleet::new(scheduler));
         Ok(code(FfiStatus::Ok))
     })
 }
@@ -635,146 +622,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         let Some(f) = map.get_mut(&(handle as u64)) else {
             return Ok(code(FfiStatus::StaleHandle));
         };
-        if f.pending.is_none() {
-            f.pending = match experimental_fleet::poll_event(&f.scheduler) {
-                Ok(None) => None,
-                Ok(Some(experimental_fleet::WireEvent::Deployment {
-                    machine,
-                    request,
-                    kind,
-                    status,
-                    value,
-                })) => {
-                    let mut bytes = vec![17];
-                    bytes.extend_from_slice(&machine.to_le_bytes());
-                    bytes.extend_from_slice(&request.to_le_bytes());
-                    bytes.push(kind);
-                    bytes.extend_from_slice(&(status as u32).to_le_bytes());
-                    bytes.extend_from_slice(&value.to_le_bytes());
-                    Some(bytes)
-                }
-                Ok(Some(experimental_fleet::WireEvent::InputResult {
-                    machine,
-                    request,
-                    status,
-                })) => {
-                    let mut bytes = vec![14];
-                    bytes.extend_from_slice(&machine.to_le_bytes());
-                    bytes.extend_from_slice(&request.to_le_bytes());
-                    bytes.extend_from_slice(&(status as u32).to_le_bytes());
-                    Some(bytes)
-                }
-                Ok(Some(experimental_fleet::WireEvent::Filesystem {
-                    machine,
-                    request,
-                    kind,
-                    status,
-                    bytes,
-                })) => {
-                    let mut encoded = vec![13];
-                    encoded.extend_from_slice(&machine.to_le_bytes());
-                    encoded.extend_from_slice(&request.to_le_bytes());
-                    encoded.push(kind);
-                    encoded.extend_from_slice(&(status as u32).to_le_bytes());
-                    encoded.extend_from_slice(&bytes);
-                    Some(encoded)
-                }
-                Ok(Some(experimental_fleet::WireEvent::ResourceSnapshot(b))) => {
-                    Some([vec![11], b].concat())
-                }
-                Ok(Some(experimental_fleet::WireEvent::FilesystemGeneration {
-                    machine,
-                    request,
-                    generation,
-                })) => {
-                    let mut bytes = vec![12];
-                    bytes.extend_from_slice(&machine.to_le_bytes());
-                    bytes.extend_from_slice(&request.to_le_bytes());
-                    bytes.extend_from_slice(&generation.to_le_bytes());
-                    Some(bytes)
-                }
-                Ok(Some(experimental_fleet::WireEvent::TerminalUpdate(b))) => {
-                    Some([vec![10], b].concat())
-                }
-                Ok(Some(experimental_fleet::WireEvent::Compilation(b))) => {
-                    Some([vec![9], b].concat())
-                }
-                Ok(Some(experimental_fleet::WireEvent::Quiescent {
-                    machine,
-                    tick,
-                    retired,
-                })) => {
-                    let mut bytes = vec![8];
-                    bytes.extend_from_slice(&machine.to_le_bytes());
-                    bytes.extend_from_slice(&tick.to_le_bytes());
-                    bytes.extend_from_slice(&retired.to_le_bytes());
-                    Some(bytes)
-                }
-                Ok(Some(experimental_fleet::WireEvent::Outcome(b))) => Some([vec![0], b].concat()),
-                Ok(Some(experimental_fleet::WireEvent::Inspection(b))) => {
-                    Some([vec![1], b].concat())
-                }
-                Ok(Some(experimental_fleet::WireEvent::ScopeStopped {
-                    machine,
-                    scope,
-                    pending,
-                })) => {
-                    let mut b = vec![4];
-                    b.extend_from_slice(&machine.to_le_bytes());
-                    b.extend_from_slice(&scope.to_le_bytes());
-                    b.extend_from_slice(&(pending.len() as u32).to_le_bytes());
-                    for (task, request) in pending {
-                        b.extend_from_slice(&task.to_le_bytes());
-                        b.extend_from_slice(&request.to_le_bytes());
-                    }
-                    Some(b)
-                }
-                Ok(Some(experimental_fleet::WireEvent::Stopped { machine, pending })) => {
-                    f.sessions.remove(&machine);
-                    let mut b = vec![2];
-                    b.extend_from_slice(&machine.to_le_bytes());
-                    b.extend_from_slice(&(pending.len() as u32).to_le_bytes());
-                    for (task, request) in pending {
-                        b.extend_from_slice(&task.to_le_bytes());
-                        b.extend_from_slice(&request.to_le_bytes());
-                    }
-                    Some(b)
-                }
-                Ok(Some(experimental_fleet::WireEvent::Detached {
-                    machine,
-                    computer,
-                    timers,
-                })) => {
-                    f.detached.insert(machine, computer);
-                    let mut bytes = vec![if timers.is_empty() { 6 } else { 16 }];
-                    bytes.extend_from_slice(&machine.to_le_bytes());
-                    if !timers.is_empty() {
-                        bytes.extend_from_slice(&(timers.len() as u32).to_le_bytes());
-                        for timer in timers {
-                            bytes.extend_from_slice(&timer.task.to_le_bytes());
-                            bytes.extend_from_slice(&timer.request.to_le_bytes());
-                            bytes.extend_from_slice(&timer.scope.to_le_bytes());
-                            bytes.extend_from_slice(&timer.duration.to_le_bytes());
-                            bytes.extend_from_slice(&timer.remaining.to_le_bytes());
-                        }
-                    }
-                    Some(bytes)
-                }
-                Ok(Some(experimental_fleet::WireEvent::DetachRejected { machine })) => {
-                    let mut bytes = vec![7];
-                    bytes.extend_from_slice(&machine.to_le_bytes());
-                    Some(bytes)
-                }
-                Ok(Some(experimental_fleet::WireEvent::Error { machine, message })) => {
-                    let mut bytes = vec![3];
-                    bytes.extend_from_slice(&machine.to_le_bytes());
-                    bytes.extend_from_slice(message.as_bytes());
-                    Some(bytes)
-                }
-                Err(e) => Some([vec![5], e.into_bytes()].concat()),
-            };
-        }
-        let Some(b) = f.pending.as_ref() else {
+        let Some(b) = f.poll() else {
             write_long(env, &written, 0)?;
             return Ok(code(FfiStatus::Ok));
         };
@@ -784,7 +632,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         }
         let signed = unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<i8>(), b.len()) };
         output.set_region(env, 0, signed)?;
-        f.pending = None;
+        f.consume_event();
         Ok(code(FfiStatus::Ok))
     })
 }
@@ -800,7 +648,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             let mut map = fleets().lock().unwrap_or_else(|e| e.into_inner());
             if map
                 .get(&(handle as u64))
-                .is_some_and(|fleet| !fleet.sessions.is_empty())
+                .is_some_and(|fleet| !fleet.can_close())
             {
                 return Ok(code(FfiStatus::BusyHandle));
             }
@@ -1026,15 +874,10 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         let Some(fleet) = map.get_mut(&(handle as u64)) else {
             return Ok(code(FfiStatus::StaleHandle));
         };
-        if fleet.sessions.try_reserve(1).is_err() || fleet.detached.try_reserve(1).is_err() {
-            return Ok(code(FfiStatus::Internal));
-        }
-        let (machine, metadata) =
-            match experimental_fleet::attach_session(&fleet.scheduler, session as u64) {
-                Ok(value) => value,
-                Err(status) => return Ok(code(status)),
-            };
-        fleet.sessions.insert(machine, metadata);
+        let machine = match fleet.attach(session as u64, 0, Vec::new()) {
+            Ok(machine) => machine,
+            Err(status) => return Ok(code(status)),
+        };
         write_handle(env, &output, machine)?;
         Ok(code(FfiStatus::Ok))
     })
@@ -1057,38 +900,17 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             return Ok(code(FfiStatus::InvalidArgument));
         }
         let data = bytes(env, &packed)?;
-        if data.len() % 32 != 0 {
+        let Some(timers) = experimental_fleet::decode_timers(&data) else {
             return Ok(code(FfiStatus::InvalidArgument));
-        }
-        let timers = data
-            .as_chunks::<32>()
-            .0
-            .iter()
-            .map(|item| FleetTimer {
-                task: u32::from_le_bytes(item[0..4].try_into().unwrap()),
-                request: u64::from_le_bytes(item[4..12].try_into().unwrap()),
-                scope: u64::from_le_bytes(item[12..20].try_into().unwrap()),
-                duration: u32::from_le_bytes(item[20..24].try_into().unwrap()),
-                remaining: u64::from_le_bytes(item[24..32].try_into().unwrap()),
-            })
-            .collect();
+        };
         let mut map = fleets().lock().unwrap_or_else(|e| e.into_inner());
         let Some(fleet) = map.get_mut(&(handle as u64)) else {
             return Ok(code(FfiStatus::StaleHandle));
         };
-        if fleet.sessions.try_reserve(1).is_err() || fleet.detached.try_reserve(1).is_err() {
-            return Ok(code(FfiStatus::Internal));
-        }
-        let (machine, metadata) = match experimental_fleet::attach_session_with_timers(
-            &fleet.scheduler,
-            session as u64,
-            tick as u64,
-            timers,
-        ) {
-            Ok(value) => value,
+        let machine = match fleet.attach(session as u64, tick as u64, timers) {
+            Ok(machine) => machine,
             Err(status) => return Ok(code(status)),
         };
-        fleet.sessions.insert(machine, metadata);
         write_handle(env, &output, machine)?;
         Ok(code(FfiStatus::Ok))
     })
@@ -1112,7 +934,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         Ok(map
             .get(&(handle as u64))
             .map_or(code(FfiStatus::StaleHandle), |fleet| {
-                if !fleet.sessions.contains_key(&(machine as u64)) {
+                if !fleet.owns_session(machine as u64) {
                     return code(FfiStatus::InvalidArgument);
                 }
                 submit(
@@ -1141,7 +963,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         Ok(map
             .get(&(handle as u64))
             .map_or(code(FfiStatus::StaleHandle), |f| {
-                if !f.sessions.contains_key(&(machine as u64)) {
+                if !f.owns_session(machine as u64) {
                     return code(FfiStatus::InvalidArgument);
                 }
                 submit(f.scheduler.detach(machine as u64))
@@ -1167,22 +989,12 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         let Some(fleet) = map.get_mut(&(handle as u64)) else {
             return Ok(code(FfiStatus::StaleHandle));
         };
-        let key = machine as u64;
-        if !fleet.detached.contains_key(&key) || !fleet.sessions.contains_key(&key) {
-            return Ok(code(FfiStatus::InvalidArgument));
-        }
-        let computer = fleet.detached.remove(&key).expect("checked computer");
-        let metadata = fleet.sessions.remove(&key).expect("checked metadata");
-        match experimental_fleet::restore_session(computer, metadata) {
+        match fleet.recover(machine as u64) {
             Ok(session) => {
                 write_handle(env, &output, session)?;
                 Ok(code(FfiStatus::Ok))
             }
-            Err((error, computer, metadata)) => {
-                fleet.detached.insert(key, computer);
-                fleet.sessions.insert(key, metadata);
-                Ok(code(error))
-            }
+            Err(status) => Ok(code(status)),
         }
     })
 }
