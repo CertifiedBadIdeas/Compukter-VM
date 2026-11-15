@@ -124,7 +124,7 @@ impl<'a> WorkerOutput<'a> {
             .completions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(machine, completion);
+            .insert(machine, super::lifecycle::LifecycleSlot::new(completion));
         assert!(previous.is_none(), "duplicate machine lifecycle completion");
         self.transport.signal.notify();
     }
@@ -346,8 +346,12 @@ mod tests {
                 assert!(memory.snapshot().retained_bytes >= 256 * 1024);
                 assert_eq!(headroom.load(Ordering::Acquire), 0);
             }
-            let LifecycleCompletion::Detach(mut completion) =
-                completions.lock().unwrap().remove(&1).unwrap()
+            let LifecycleCompletion::Detach(mut completion) = completions
+                .lock()
+                .unwrap()
+                .remove(&1)
+                .unwrap()
+                .into_completion()
             else {
                 panic!("detach completion missing");
             };

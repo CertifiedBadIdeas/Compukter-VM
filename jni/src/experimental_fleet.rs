@@ -39,6 +39,38 @@ fn submit(result: Result<(), SubmitError>) -> jint {
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_requestLifecycle<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    kind: jint,
+    tick: jlong,
+) -> jint {
+    status(&mut env, |_| {
+        if tick < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = all.get(&(handle as u64)) else {
+            return Ok(code(FfiStatus::StaleHandle));
+        };
+        Ok(submit(match kind {
+            0 => fleet.scheduler.stop_with_lifecycle_poll(machine as u64),
+            1 if fleet.owns_session(machine as u64) => fleet
+                .scheduler
+                .detach_with_lifecycle_poll(machine as u64, None),
+            2 if fleet.owns_session(machine as u64) => fleet
+                .scheduler
+                .detach_with_lifecycle_poll(machine as u64, Some(tick as u64)),
+            _ => return Ok(code(FfiStatus::InvalidArgument)),
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_deployment<
     'a,
 >(
@@ -667,27 +699,63 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
     written: JLongArray<'a>,
 ) -> jint {
     status(&mut env, |env| {
-        if written.len(env)? != 1 {
-            return Ok(code(FfiStatus::InvalidArgument));
-        }
-        let capacity = output.len(env)?;
-        let mut map = fleets().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(f) = map.get_mut(&(handle as u64)) else {
-            return Ok(code(FfiStatus::StaleHandle));
-        };
-        let Some(b) = f.poll() else {
-            write_long(env, &written, 0)?;
-            return Ok(code(FfiStatus::Ok));
-        };
-        write_long(env, &written, b.len())?;
-        if capacity < b.len() {
-            return Ok(code(FfiStatus::BufferTooSmall));
-        }
-        let signed = unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<i8>(), b.len()) };
-        output.set_region(env, 0, signed)?;
-        f.consume_event();
-        Ok(code(FfiStatus::Ok))
+        copy_poll(env, handle, None, output, written)
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_pollLifecycle<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    output: JByteArray<'a>,
+    written: JLongArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        copy_poll(env, handle, Some(machine as u64), output, written)
+    })
+}
+
+fn copy_poll(
+    env: &jni::Env<'_>,
+    handle: jlong,
+    machine: Option<u64>,
+    output: JByteArray<'_>,
+    written: JLongArray<'_>,
+) -> jni::errors::Result<jint> {
+    if written.len(env)? != 1 {
+        return Ok(code(FfiStatus::InvalidArgument));
+    }
+    let capacity = output.len(env)?;
+    let mut map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(fleet) = map.get_mut(&(handle as u64)) else {
+        return Ok(code(FfiStatus::StaleHandle));
+    };
+    let event = match machine {
+        Some(machine) => match fleet.poll_lifecycle(machine) {
+            Ok(event) => event,
+            Err(status) => return Ok(code(status)),
+        },
+        None => fleet.poll(),
+    };
+    let Some(bytes) = event else {
+        write_long(env, &written, 0)?;
+        return Ok(code(FfiStatus::Ok));
+    };
+    write_long(env, &written, bytes.len())?;
+    if capacity < bytes.len() {
+        return Ok(code(FfiStatus::BufferTooSmall));
+    }
+    let signed = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) };
+    output.set_region(env, 0, signed)?;
+    match machine {
+        Some(machine) => fleet.consume_lifecycle_event(machine),
+        None => fleet.consume_event(),
+    }
+    Ok(code(FfiStatus::Ok))
 }
 
 #[unsafe(no_mangle)]

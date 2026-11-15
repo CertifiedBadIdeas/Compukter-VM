@@ -80,7 +80,100 @@ pub(super) enum LifecycleCompletion {
     Detach(FleetDetachCompletion),
 }
 
-pub(super) type LifecycleCompletions = Arc<Mutex<BTreeMap<u64, LifecycleCompletion>>>;
+pub(super) type LifecycleCompletions = Arc<Mutex<BTreeMap<u64, LifecycleSlot>>>;
+
+/// A claimed stream cannot also be drained by ordinary polling. The final
+/// delivery retains the ownership fence and memory reservations until ack.
+pub(super) struct LifecycleSlot {
+    completion: Option<LifecycleCompletion>,
+    delivery: Delivery,
+}
+
+enum Delivery {
+    Unclaimed,
+    Ready,
+    Observation,
+    Terminal(CompletionLease),
+}
+
+struct CompletionLease {
+    remove_owner: bool,
+    resume: Option<Arc<AtomicBool>>,
+    reservations: Vec<(Reservation, Reservation)>,
+    headroom: Option<OutputHeadroom>,
+}
+
+impl CompletionLease {
+    fn release(self) -> bool {
+        drop(self.reservations);
+        drop(self.headroom);
+        if let Some(resume) = self.resume {
+            resume.store(true, Ordering::Release);
+        }
+        self.remove_owner
+    }
+}
+
+impl LifecycleSlot {
+    pub(super) fn new(completion: LifecycleCompletion) -> Self {
+        Self {
+            completion: Some(completion),
+            delivery: Delivery::Unclaimed,
+        }
+    }
+
+    pub(super) fn unclaimed(&self) -> Option<&LifecycleCompletion> {
+        matches!(self.delivery, Delivery::Unclaimed)
+            .then_some(self.completion.as_ref())
+            .flatten()
+    }
+
+    pub(super) fn into_completion(self) -> LifecycleCompletion {
+        assert!(matches!(self.delivery, Delivery::Unclaimed));
+        self.completion.expect("unclaimed completion exists")
+    }
+
+    pub(super) fn ordinary_observation(&mut self) -> Option<FleetEvent> {
+        assert!(matches!(self.delivery, Delivery::Unclaimed));
+        self.completion
+            .as_mut()
+            .expect("unclaimed completion exists")
+            .next_observation()
+    }
+
+    pub(super) fn poll(&mut self, machine: u64) -> Option<FleetEvent> {
+        if matches!(self.delivery, Delivery::Observation | Delivery::Terminal(_)) {
+            return None;
+        }
+        self.delivery = Delivery::Ready;
+        if let Some(event) = self.completion.as_mut()?.next_observation() {
+            self.delivery = Delivery::Observation;
+            return Some(event);
+        }
+        let (event, lease) = self.completion.take()?.into_delivery(machine);
+        self.delivery = Delivery::Terminal(lease);
+        Some(event)
+    }
+
+    /// None means no delivery, false an observation, true the terminal event.
+    pub(super) fn acknowledge(&mut self) -> Option<bool> {
+        match self.delivery {
+            Delivery::Observation => {
+                self.delivery = Delivery::Ready;
+                Some(false)
+            }
+            Delivery::Terminal(_) => Some(true),
+            Delivery::Unclaimed | Delivery::Ready => None,
+        }
+    }
+
+    pub(super) fn finish(self) -> bool {
+        let Delivery::Terminal(lease) = self.delivery else {
+            unreachable!("terminal delivery required")
+        };
+        lease.release()
+    }
+}
 
 impl FleetDetachCompletion {
     pub(super) fn new(
@@ -133,21 +226,44 @@ impl LifecycleCompletion {
     }
 
     pub(super) fn into_event(self, machine: u64) -> FleetEvent {
+        let (event, lease) = self.into_delivery(machine);
+        lease.release();
+        event
+    }
+
+    fn into_delivery(self, machine: u64) -> (FleetEvent, CompletionLease) {
         match self {
-            Self::Stop(completion) => FleetEvent::Stopped {
-                machine,
-                pending: completion.pending,
-            },
-            Self::Detach(mut completion) => {
-                completion.release();
-                match completion.result {
+            Self::Stop(completion) => (
+                FleetEvent::Stopped {
+                    machine,
+                    pending: completion.pending,
+                },
+                CompletionLease {
+                    remove_owner: true,
+                    resume: None,
+                    reservations: Vec::new(),
+                    headroom: None,
+                },
+            ),
+            Self::Detach(completion) => {
+                let remove_owner = matches!(completion.result, FleetDetachResult::Detached { .. });
+                let event = match completion.result {
                     FleetDetachResult::Detached { computer, timers } => FleetEvent::Detached {
                         machine,
                         computer,
                         timers,
                     },
                     FleetDetachResult::Rejected(_) => FleetEvent::DetachRejected { machine },
-                }
+                };
+                (
+                    event,
+                    CompletionLease {
+                        remove_owner,
+                        resume: completion.resume,
+                        reservations: completion.reservations,
+                        headroom: completion.headroom,
+                    },
+                )
             }
         }
     }

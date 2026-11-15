@@ -308,6 +308,33 @@ pub extern "C" fn compukter_experimental_fleet_stop(handle: u64, machine: u64) -
     })
 }
 
+/// Atomically fences a machine and selects independent lifecycle delivery.
+/// kind: 0 stop, 1 detach, 2 detach with timers at `tick`.
+#[unsafe(no_mangle)]
+pub extern "C" fn compukter_experimental_fleet_request_lifecycle(
+    handle: u64,
+    machine: u64,
+    kind: u32,
+    tick: u64,
+) -> FfiStatus {
+    guarded(|| {
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = all.get(&handle) else {
+            return FfiStatus::StaleHandle;
+        };
+        submission(match kind {
+            0 => fleet.scheduler.stop_with_lifecycle_poll(machine),
+            1 if fleet.owns_session(machine) => {
+                fleet.scheduler.detach_with_lifecycle_poll(machine, None)
+            }
+            2 if fleet.owns_session(machine) => fleet
+                .scheduler
+                .detach_with_lifecycle_poll(machine, Some(tick)),
+            _ => return FfiStatus::InvalidArgument,
+        })
+    })
+}
+
 /// Recovers a detached session; refusal retains it in the fleet.
 ///
 /// # Safety
@@ -401,6 +428,34 @@ pub unsafe extern "C" fn compukter_experimental_fleet_poll(
     capacity: usize,
     written: *mut usize,
 ) -> FfiStatus {
+    unsafe { poll_into(handle, None, output, capacity, written) }
+}
+
+/// Reads one event from a machine's claimed lifecycle stream. This bypasses the
+/// ordinary queue. Small-buffer retries retain the same event and native fence.
+/// Continue until Detached, DetachRejected or Stopped; older ordinary events
+/// remain in the ordinary queue. Successful copy acknowledges one event.
+///
+/// # Safety
+/// Same output requirements as `compukter_experimental_fleet_poll`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_poll_lifecycle(
+    handle: u64,
+    machine: u64,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> FfiStatus {
+    unsafe { poll_into(handle, Some(machine), output, capacity, written) }
+}
+
+unsafe fn poll_into(
+    handle: u64,
+    machine: Option<u64>,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> FfiStatus {
     guarded(|| {
         if written.is_null() || (capacity > 0 && output.is_null()) {
             return FfiStatus::InvalidArgument;
@@ -409,7 +464,14 @@ pub unsafe extern "C" fn compukter_experimental_fleet_poll(
         let Some(fleet) = all.get_mut(&handle) else {
             return FfiStatus::StaleHandle;
         };
-        let Some(event) = fleet.poll() else {
+        let event = match machine {
+            Some(machine) => match fleet.poll_lifecycle(machine) {
+                Ok(event) => event,
+                Err(status) => return status,
+            },
+            None => fleet.poll(),
+        };
+        let Some(event) = event else {
             unsafe { written.write(0) };
             return FfiStatus::Ok;
         };
@@ -418,7 +480,10 @@ pub unsafe extern "C" fn compukter_experimental_fleet_poll(
             return FfiStatus::BufferTooSmall;
         }
         unsafe { std::ptr::copy_nonoverlapping(event.as_ptr(), output, event.len()) };
-        fleet.consume_event();
+        match machine {
+            Some(machine) => fleet.consume_lifecycle_event(machine),
+            None => fleet.consume_event(),
+        }
         FfiStatus::Ok
     })
 }

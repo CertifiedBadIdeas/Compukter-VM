@@ -47,6 +47,195 @@ const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
 #[cfg(feature = "experimental-fleet-scheduler")]
 #[test]
+fn independent_lifecycle_retries_preserve_both_poll_streams_and_session_ownership() {
+    use compukter_ffi::experimental_fleet_abi::*;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let config = [1, 4, 1, 64, 64, 16, 32, 0];
+    let mut fleet = 0;
+    assert_eq!(
+        unsafe { compukter_experimental_fleet_create(config.as_ptr(), &mut fleet) },
+        FfiStatus::Ok
+    );
+    let mut machines = [0; 2];
+    for machine in &mut machines {
+        let session = create_machine(&terminal_artifact());
+        assert_eq!(
+            unsafe { compukter_experimental_fleet_attach(fleet, session, machine) },
+            FfiStatus::Ok
+        );
+        assert_eq!(compukter_close(session), FfiStatus::StaleHandle);
+    }
+    let [a, b] = machines;
+    assert_eq!(
+        compukter_experimental_fleet_observe(fleet, a, 100, 1, 0),
+        FfiStatus::Ok
+    );
+    assert_eq!(
+        compukter_experimental_fleet_observe(fleet, b, 200, 1, 0),
+        FfiStatus::Ok
+    );
+    while compukter_experimental_fleet_observe(fleet, b, 201, 1, 0) == FfiStatus::BusyHandle {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let mut accepted = 0;
+    loop {
+        match compukter_experimental_fleet_observe(fleet, a, 300 + accepted, 1, 0) {
+            FfiStatus::Ok => accepted += 1,
+            FfiStatus::BusyHandle if accepted >= 3 => break,
+            FfiStatus::BusyHandle => std::thread::yield_now(),
+            status => panic!("unexpected query status {status:?}"),
+        }
+        assert!(Instant::now() < deadline);
+    }
+    let mut written = 0;
+    assert_eq!(
+        unsafe { compukter_experimental_fleet_poll(fleet, std::ptr::null_mut(), 0, &mut written) },
+        FfiStatus::BufferTooSmall
+    );
+    let ordinary_length = written;
+    assert_eq!(
+        compukter_experimental_fleet_request_lifecycle(fleet, b, 99, 0),
+        FfiStatus::InvalidArgument
+    );
+    assert_eq!(
+        compukter_experimental_fleet_request_lifecycle(fleet, b, 1, 0),
+        FfiStatus::Ok
+    );
+    let mut saw_query = false;
+    loop {
+        let status = unsafe {
+            compukter_experimental_fleet_poll_lifecycle(
+                fleet,
+                b,
+                std::ptr::null_mut(),
+                0,
+                &mut written,
+            )
+        };
+        if status == FfiStatus::Ok {
+            assert_eq!(written, 0);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+            continue;
+        }
+        assert_eq!(status, FfiStatus::BufferTooSmall);
+        let length = written;
+        assert_eq!(
+            unsafe {
+                compukter_experimental_fleet_poll_lifecycle(
+                    fleet,
+                    b,
+                    std::ptr::null_mut(),
+                    1,
+                    &mut written,
+                )
+            },
+            FfiStatus::InvalidArgument
+        );
+        assert_eq!(
+            unsafe {
+                compukter_experimental_fleet_poll_lifecycle(
+                    fleet,
+                    b,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut written,
+                )
+            },
+            FfiStatus::BufferTooSmall
+        );
+        assert_eq!(written, length);
+        let mut recovered = 0;
+        assert_eq!(
+            unsafe { compukter_experimental_fleet_recover(fleet, b, &mut recovered) },
+            FfiStatus::BusyHandle
+        );
+        assert_eq!(
+            compukter_experimental_fleet_close(fleet),
+            FfiStatus::BusyHandle
+        );
+        let mut event = vec![0; length];
+        assert_eq!(
+            unsafe {
+                compukter_experimental_fleet_poll_lifecycle(
+                    fleet,
+                    b,
+                    event.as_mut_ptr(),
+                    length,
+                    &mut written,
+                )
+            },
+            FfiStatus::Ok
+        );
+        assert_eq!(u64::from_le_bytes(event[1..9].try_into().unwrap()), b);
+        if event[0] == 6 {
+            break;
+        }
+        assert_eq!(event[0], 11);
+        saw_query |= u64::from_le_bytes(event[9..17].try_into().unwrap()) == 201;
+    }
+    assert!(
+        saw_query,
+        "accepted query was lost during independent detach"
+    );
+    let mut recovered = 0;
+    assert_eq!(
+        unsafe { compukter_experimental_fleet_recover(fleet, b, &mut recovered) },
+        FfiStatus::Ok
+    );
+    let mut duplicate = 0;
+    assert_eq!(
+        unsafe { compukter_experimental_fleet_recover(fleet, b, &mut duplicate) },
+        FfiStatus::InvalidArgument
+    );
+    let mut ordinary = vec![0; ordinary_length];
+    assert_eq!(
+        unsafe {
+            compukter_experimental_fleet_poll(
+                fleet,
+                ordinary.as_mut_ptr(),
+                ordinary.len(),
+                &mut written,
+            )
+        },
+        FfiStatus::Ok
+    );
+    assert_eq!(ordinary[0], 11);
+    assert_eq!(u64::from_le_bytes(ordinary[1..9].try_into().unwrap()), a);
+    assert_eq!(u64::from_le_bytes(ordinary[9..17].try_into().unwrap()), 100);
+    assert_eq!(
+        compukter_experimental_fleet_request_lifecycle(fleet, a, 0, 0),
+        FfiStatus::Ok
+    );
+    let mut stopped = [0; 128];
+    loop {
+        assert_eq!(
+            unsafe {
+                compukter_experimental_fleet_poll_lifecycle(
+                    fleet,
+                    a,
+                    stopped.as_mut_ptr(),
+                    stopped.len(),
+                    &mut written,
+                )
+            },
+            FfiStatus::Ok
+        );
+        if written > 0 {
+            assert_eq!(stopped[0], 2);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(compukter_experimental_fleet_close(fleet), FfiStatus::Ok);
+    assert_eq!(compukter_close(recovered), FfiStatus::Ok);
+}
+
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[test]
 fn fleet_c_abi_transfers_session_and_retries_event_without_losing_ownership() {
     use compukter_ffi::experimental_fleet_abi::*;
     use std::time::{Duration, Instant};

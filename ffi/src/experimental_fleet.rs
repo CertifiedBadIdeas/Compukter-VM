@@ -312,6 +312,7 @@ pub struct FleetTransport {
     sessions: HashMap<u64, SessionMetadata>,
     detached: HashMap<u64, Box<ComputerMachine>>,
     pending: Option<Vec<u8>>,
+    lifecycle_pending: HashMap<u64, Vec<u8>>,
 }
 
 impl FleetTransport {
@@ -321,6 +322,7 @@ impl FleetTransport {
             sessions: HashMap::new(),
             detached: HashMap::new(),
             pending: None,
+            lifecycle_pending: HashMap::new(),
         }
     }
 
@@ -331,6 +333,10 @@ impl FleetTransport {
         tick: u64,
         timers: Vec<compukter_vm::experimental_fleet_scheduler::FleetTimer>,
     ) -> Result<u64, crate::FfiStatus> {
+        // Includes detached sessions awaiting recovery, not only worker actors.
+        if self.sessions.len() >= 4096 {
+            return Err(crate::FfiStatus::BusyHandle);
+        }
         self.sessions
             .try_reserve(1)
             .map_err(|_| crate::FfiStatus::Internal)?;
@@ -355,11 +361,14 @@ impl FleetTransport {
     }
 
     pub fn can_close(&self) -> bool {
-        self.sessions.is_empty()
+        self.sessions.is_empty() && self.pending.is_none() && self.lifecycle_pending.is_empty()
     }
 
     /// A failed recovery leaves both the machine and its metadata available for retry.
     pub fn recover(&mut self, machine: u64) -> Result<u64, crate::FfiStatus> {
+        if self.lifecycle_pending.contains_key(&machine) {
+            return Err(crate::FfiStatus::BusyHandle);
+        }
         if !self.detached.contains_key(&machine) || !self.sessions.contains_key(&machine) {
             return Err(crate::FfiStatus::InvalidArgument);
         }
@@ -379,21 +388,7 @@ impl FleetTransport {
         if self.pending.is_none() {
             self.pending = match poll_event(&self.scheduler) {
                 Ok(None) => None,
-                Ok(Some(event)) => {
-                    let encoded = encode_event(&event);
-                    match event {
-                        WireEvent::Stopped { machine, .. } => {
-                            self.sessions.remove(&machine);
-                        }
-                        WireEvent::Detached {
-                            machine, computer, ..
-                        } => {
-                            self.detached.insert(machine, computer);
-                        }
-                        _ => {}
-                    }
-                    Some(encoded)
-                }
+                Ok(Some(event)) => Some(self.retain_event(event)),
                 Err(error) => Some(encode_poll_error(&error)),
             };
         }
@@ -403,13 +398,58 @@ impl FleetTransport {
     pub fn consume_event(&mut self) {
         self.pending = None;
     }
+
+    fn retain_event(&mut self, event: WireEvent) -> Vec<u8> {
+        let encoded = encode_event(&event);
+        match event {
+            WireEvent::Stopped { machine, .. } => {
+                self.sessions.remove(&machine);
+            }
+            WireEvent::Detached {
+                machine, computer, ..
+            } => {
+                self.detached.insert(machine, computer);
+            }
+            _ => {}
+        }
+        encoded
+    }
+
+    /// One encoded event per claimed machine; the native slot retains its
+    /// remaining output, reservations and fence until the terminal delivery ack.
+    pub fn poll_lifecycle(&mut self, machine: u64) -> Result<Option<&[u8]>, crate::FfiStatus> {
+        if !self.lifecycle_pending.contains_key(&machine) {
+            self.lifecycle_pending
+                .try_reserve(1)
+                .map_err(|_| crate::FfiStatus::Internal)?;
+            let Some(event) = self.scheduler.poll_lifecycle_event(machine) else {
+                return Ok(None);
+            };
+            let encoded = match convert_event(event) {
+                Ok(event) => self.retain_event(event),
+                Err(error) => encode_poll_error(&error),
+            };
+            self.lifecycle_pending.insert(machine, encoded);
+        }
+        Ok(self.lifecycle_pending.get(&machine).map(Vec::as_slice))
+    }
+
+    pub fn consume_lifecycle_event(&mut self, machine: u64) {
+        if self.lifecycle_pending.remove(&machine).is_some() {
+            assert!(
+                self.scheduler.consume_lifecycle_event(machine),
+                "native lifecycle delivery missing"
+            );
+        }
+    }
 }
 
 /// Preserves lifecycle notifications separately from the VM outcome wire.
 pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
-    let Some(event) = fleet.try_event() else {
-        return Ok(None);
-    };
+    fleet.try_event().map(convert_event).transpose()
+}
+
+fn convert_event(event: FleetEvent) -> Result<WireEvent, String> {
     let (machine, tick, outcome, inspection) = match event {
         FleetEvent::Deployment {
             machine,
@@ -440,13 +480,13 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
                     0,
                 ),
             };
-            return Ok(Some(WireEvent::Deployment {
+            return Ok(WireEvent::Deployment {
                 machine,
                 request,
                 kind,
                 status,
                 value,
-            }));
+            });
         }
         FleetEvent::InputResult {
             machine,
@@ -470,11 +510,11 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
                 Err(InputFailure::Canonical(C::Terminal)) => crate::FfiStatus::InputTerminal,
                 Err(InputFailure::Canonical(C::Resume)) => crate::FfiStatus::InputResume,
             };
-            return Ok(Some(WireEvent::InputResult {
+            return Ok(WireEvent::InputResult {
                 machine,
                 request,
                 status,
-            }));
+            });
         }
         FleetEvent::Filesystem {
             machine,
@@ -503,13 +543,13 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
                 ),
                 Err(error) => (3, crate::ffi_api::file_read_status(error), Vec::new()),
             };
-            return Ok(Some(WireEvent::Filesystem {
+            return Ok(WireEvent::Filesystem {
                 machine,
                 request,
                 kind,
                 status,
                 bytes,
-            }));
+            });
         }
         FleetEvent::ResourceSnapshot {
             machine,
@@ -520,18 +560,18 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             bytes.extend_from_slice(&machine.to_le_bytes());
             bytes.extend_from_slice(&request.to_le_bytes());
             bytes.extend_from_slice(&crate::wire::encode_resource_snapshot(snapshot));
-            return Ok(Some(WireEvent::ResourceSnapshot(bytes)));
+            return Ok(WireEvent::ResourceSnapshot(bytes));
         }
         FleetEvent::FilesystemGeneration {
             machine,
             request,
             generation,
         } => {
-            return Ok(Some(WireEvent::FilesystemGeneration {
+            return Ok(WireEvent::FilesystemGeneration {
                 machine,
                 request,
                 generation,
-            }))
+            })
         }
         FleetEvent::TerminalUpdate {
             machine,
@@ -544,7 +584,7 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             let size = crate::wire::encode_terminal_update_into(&mut bytes[16..], &update)
                 .map_err(|_| "terminal update exceeds limit")?;
             bytes.truncate(16 + size);
-            return Ok(Some(WireEvent::TerminalUpdate(bytes)));
+            return Ok(WireEvent::TerminalUpdate(bytes));
         }
         FleetEvent::Quiescent {
             machine,
@@ -552,12 +592,12 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             retired,
             timers_pending,
         } => {
-            return Ok(Some(WireEvent::Quiescent {
+            return Ok(WireEvent::Quiescent {
                 machine,
                 tick,
                 retired,
                 timers_pending,
-            }))
+            })
         }
         FleetEvent::Inspect {
             machine,
@@ -576,28 +616,26 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             computer,
             timers,
         } => {
-            return Ok(Some(WireEvent::Detached {
+            return Ok(WireEvent::Detached {
                 machine,
                 computer,
                 timers,
-            }));
+            });
         }
-        FleetEvent::DetachRejected { machine } => {
-            return Ok(Some(WireEvent::DetachRejected { machine }))
-        }
+        FleetEvent::DetachRejected { machine } => return Ok(WireEvent::DetachRejected { machine }),
         FleetEvent::ScopeStopped {
             machine,
             scope,
             pending,
         } => {
-            return Ok(Some(WireEvent::ScopeStopped {
+            return Ok(WireEvent::ScopeStopped {
                 machine,
                 scope,
                 pending,
-            }));
+            });
         }
         FleetEvent::Stopped { machine, pending } => {
-            return Ok(Some(WireEvent::Stopped { machine, pending }));
+            return Ok(WireEvent::Stopped { machine, pending });
         }
         FleetEvent::Requests {
             machine,
@@ -623,27 +661,25 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             bytes[8..16].copy_from_slice(&tick.to_le_bytes());
             crate::wire::encode_compilation_request_into(&mut bytes[16..], &request)
                 .map_err(|_| "invalid compilation request")?;
-            return Ok(Some(WireEvent::Compilation(bytes)));
+            return Ok(WireEvent::Compilation(bytes));
         }
         FleetEvent::Boundary {
             machine,
             tick,
             outcome,
         } => (machine, tick, outcome, false),
-        FleetEvent::Error { machine, message } => {
-            return Ok(Some(WireEvent::Error { machine, message }))
-        }
+        FleetEvent::Error { machine, message } => return Ok(WireEvent::Error { machine, message }),
     };
     let encoded = crate::wire::encode_outcome(crate::bridge::copy_outcome(outcome));
     let mut bytes = Vec::with_capacity(16 + encoded.len());
     bytes.extend_from_slice(&machine.to_le_bytes());
     bytes.extend_from_slice(&tick.to_le_bytes());
     bytes.extend_from_slice(&encoded);
-    Ok(Some(if inspection {
+    Ok(if inspection {
         WireEvent::Inspection(bytes)
     } else {
         WireEvent::Outcome(bytes)
-    }))
+    })
 }
 
 /// Decode the existing bounded host response wire before sending it to a worker.

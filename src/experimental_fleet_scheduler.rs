@@ -601,9 +601,15 @@ impl Actor {
 
 struct Owners {
     lanes: HashMap<u64, usize>,
-    closing: HashSet<u64>,
+    closing: HashMap<u64, LifecycleReader>,
     next_id: Option<u64>,
     next_lane: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LifecycleReader {
+    Ordinary,
+    Independent,
 }
 
 /// A generation-based notification that can be waited on independently of the fleet lock.
@@ -814,7 +820,7 @@ impl FleetScheduler {
             lanes,
             owners: Mutex::new(Owners {
                 lanes: owners,
-                closing: HashSet::new(),
+                closing: HashMap::new(),
                 next_id,
                 next_lane,
             }),
@@ -1221,7 +1227,7 @@ impl FleetScheduler {
                 machine,
                 preserve_timers_at: None,
             },
-            true,
+            Some(LifecycleReader::Ordinary),
         )
     }
 
@@ -1233,13 +1239,42 @@ impl FleetScheduler {
                 machine,
                 preserve_timers_at: Some(tick),
             },
-            true,
+            Some(LifecycleReader::Ordinary),
         )
     }
 
     /// Requests asynchronous removal. Completion is reported by `Stopped`.
     pub fn stop(&self, machine: u64) -> Result<(), SubmitError> {
-        self.send_action(machine, Command::Stop { machine }, true)
+        self.send_action(
+            machine,
+            Command::Stop { machine },
+            Some(LifecycleReader::Ordinary),
+        )
+    }
+
+    /// Select independent delivery atomically with the close fence, so an
+    /// ordinary event pump cannot consume the completion before the first poll.
+    pub fn stop_with_lifecycle_poll(&self, machine: u64) -> Result<(), SubmitError> {
+        self.send_action(
+            machine,
+            Command::Stop { machine },
+            Some(LifecycleReader::Independent),
+        )
+    }
+
+    pub fn detach_with_lifecycle_poll(
+        &self,
+        machine: u64,
+        preserve_timers_at: Option<u64>,
+    ) -> Result<(), SubmitError> {
+        self.send_action(
+            machine,
+            Command::Detach {
+                machine,
+                preserve_timers_at,
+            },
+            Some(LifecycleReader::Independent),
+        )
     }
 
     pub fn resolve_cost(
@@ -1287,20 +1322,20 @@ impl FleetScheduler {
     }
 
     fn send(&self, machine: u64, command: Command) -> Result<(), SubmitError> {
-        self.send_action(machine, command, false)
+        self.send_action(machine, command, None)
     }
 
     fn send_action(
         &self,
         machine: u64,
         command: Command,
-        closing: bool,
+        reader: Option<LifecycleReader>,
     ) -> Result<(), SubmitError> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(SubmitError::Closed);
         }
         let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
-        if owners.closing.contains(&machine) {
+        if owners.closing.contains_key(&machine) {
             return Err(SubmitError::UnknownMachine);
         }
         let lane = *owners
@@ -1326,8 +1361,8 @@ impl FleetScheduler {
         } else {
             mailbox.submit(command).map_err(|_| SubmitError::Full)?;
         }
-        if closing {
-            owners.closing.insert(machine);
+        if let Some(reader) = reader {
+            owners.closing.insert(machine, reader);
         }
         drop(mailbox);
         drop(owners);
@@ -1337,13 +1372,24 @@ impl FleetScheduler {
 
     pub fn try_event(&self) -> Option<FleetEvent> {
         let result = self.events.try_recv().ok().or_else(|| {
+            let owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
             let mut completions = self.completions.lock().unwrap_or_else(|e| e.into_inner());
-            let mut entry = completions.first_entry()?;
-            let machine = *entry.key();
-            if let Some(event) = entry.get_mut().next_observation() {
+            let machine = *completions
+                .iter()
+                .find(|(machine, slot)| {
+                    slot.unclaimed().is_some()
+                        && owners.closing.get(machine) != Some(&LifecycleReader::Independent)
+                })?
+                .0;
+            let std::collections::btree_map::Entry::Occupied(mut entry) =
+                completions.entry(machine)
+            else {
+                unreachable!()
+            };
+            if let Some(event) = entry.get_mut().ordinary_observation() {
                 return Some(event);
             }
-            Some(entry.remove().into_event(machine))
+            Some(entry.remove().into_completion().into_event(machine))
         });
         match &result {
             Some(FleetEvent::Stopped { machine, .. } | FleetEvent::Detached { machine, .. }) => {
@@ -1380,12 +1426,14 @@ impl FleetScheduler {
         let completion = {
             let mut completions = self.completions.lock().unwrap_or_else(|e| e.into_inner());
             if !matches!(
-                completions.get(&machine),
+                completions.get(&machine).and_then(|slot| slot.unclaimed()),
                 Some(LifecycleCompletion::Stop(_))
             ) {
                 return None;
             }
-            let LifecycleCompletion::Stop(completion) = completions.remove(&machine)? else {
+            let LifecycleCompletion::Stop(completion) =
+                completions.remove(&machine)?.into_completion()
+            else {
                 unreachable!()
             };
             completion
@@ -1403,12 +1451,14 @@ impl FleetScheduler {
         let mut completion = {
             let mut completions = self.completions.lock().unwrap_or_else(|e| e.into_inner());
             if !matches!(
-                completions.get(&machine),
+                completions.get(&machine).and_then(|slot| slot.unclaimed()),
                 Some(LifecycleCompletion::Detach(_))
             ) {
                 return None;
             }
-            let LifecycleCompletion::Detach(completion) = completions.remove(&machine)? else {
+            let LifecycleCompletion::Detach(completion) =
+                completions.remove(&machine)?.into_completion()
+            else {
                 unreachable!()
             };
             completion
@@ -1424,6 +1474,48 @@ impl FleetScheduler {
             self.workers[lane].thread().unpark();
         }
         Some(completion)
+    }
+
+    /// Claims one machine's lifecycle stream, bypassing the ordinary event queue.
+    /// Each returned event requires `consume_lifecycle_event` after successful
+    /// delivery. Until then the slot, memory budget and ownership fence remain.
+    /// Older already-published ordinary observations stay in the ordinary queue.
+    pub fn poll_lifecycle_event(&self, machine: u64) -> Option<FleetEvent> {
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        *owners.closing.get_mut(&machine)? = LifecycleReader::Independent;
+        self.completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&machine)?
+            .poll(machine)
+    }
+
+    /// Acknowledges exactly one event returned by `poll_lifecycle_event`.
+    pub fn consume_lifecycle_event(&self, machine: u64) -> bool {
+        let mut completions = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(terminal) = completions
+            .get_mut(&machine)
+            .and_then(|slot| slot.acknowledge())
+        else {
+            return false;
+        };
+        if !terminal {
+            return true;
+        }
+        let slot = completions
+            .remove(&machine)
+            .expect("acknowledged completion exists");
+        drop(completions);
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        let lane = owners.lanes.get(&machine).copied();
+        if slot.finish() {
+            owners.lanes.remove(&machine);
+        }
+        owners.closing.remove(&machine);
+        if let Some(lane) = lane {
+            self.workers[lane].thread().unpark();
+        }
+        true
     }
 
     pub fn event_signal(&self) -> Arc<FleetEventSignal> {
@@ -2857,6 +2949,84 @@ mod tests {
             next(&fleet),
             FleetEvent::Requests { machine: 1, .. }
         ));
+    }
+
+    #[test]
+    fn lifecycle_stream_holds_the_fence_and_memory_until_terminal_ack() {
+        let fleet = saturated_fleet(FleetMemoryLimits::default(), true);
+        fleet.resource_snapshot(1, 101).unwrap();
+        fleet.detach_with_lifecycle_poll(1, None).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary { machine: 0, .. }
+        ));
+        assert!(
+            fleet.try_event().is_none(),
+            "ordinary reader stole independent output"
+        );
+        assert!(fleet.detach_output_memory().retained_bytes > 0);
+        assert!(matches!(
+            fleet.poll_lifecycle_event(1),
+            Some(FleetEvent::Requests { .. })
+        ));
+        assert!(
+            fleet.poll_lifecycle_event(1).is_none(),
+            "unacknowledged observation was skipped"
+        );
+        assert!(fleet.try_detached(1).is_none(), "claimed stream was stolen");
+        assert!(fleet.consume_lifecycle_event(1));
+        assert!(!fleet.consume_lifecycle_event(1), "duplicate ack succeeded");
+        assert!(matches!(
+            fleet.poll_lifecycle_event(1),
+            Some(FleetEvent::ResourceSnapshot { request: 101, .. })
+        ));
+        assert!(fleet.consume_lifecycle_event(1));
+        assert!(matches!(
+            fleet.poll_lifecycle_event(1),
+            Some(FleetEvent::DetachRejected { machine: 1 })
+        ));
+        assert!(fleet.detach_output_memory().retained_bytes > 0);
+        assert_eq!(fleet.grant(1, 2, 64), Err(SubmitError::UnknownMachine));
+        assert!(fleet.try_event().is_none());
+        assert!(fleet.consume_lifecycle_event(1));
+        assert_eq!(fleet.detach_output_memory().retained_bytes, 0);
+        assert!(fleet.grant(1, 2, 64).is_ok());
+        assert!(!fleet.consume_lifecycle_event(1));
+    }
+
+    #[test]
+    fn lifecycle_stream_retains_worker_headroom_through_small_buffer_retries() {
+        let fleet = saturated_fleet(
+            FleetMemoryLimits {
+                detach_output_bytes: 1,
+                detach_output_bytes_per_machine: 1,
+                ..FleetMemoryLimits::default()
+            },
+            false,
+        );
+        fleet.detach_with_lifecycle_poll(1, None).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert!(matches!(
+            fleet.poll_lifecycle_event(1),
+            Some(FleetEvent::Boundary { machine: 1, .. })
+        ));
+        assert!(fleet.consume_lifecycle_event(1));
+        assert!(matches!(
+            fleet.poll_lifecycle_event(1),
+            Some(FleetEvent::DetachRejected { machine: 1 })
+        ));
+        assert!(fleet.detach_headroom_bytes() > 0);
+        fleet.stop_with_lifecycle_poll(0).unwrap();
+        wait_lifecycle(&fleet, 0);
+        assert!(matches!(
+            fleet.poll_lifecycle_event(0),
+            Some(FleetEvent::Stopped { machine: 0, .. })
+        ));
+        assert!(fleet.consume_lifecycle_event(0));
+        assert!(fleet.detach_headroom_bytes() > 0);
+        assert!(fleet.consume_lifecycle_event(1));
+        assert_eq!(fleet.detach_headroom_bytes(), 0);
     }
 
     #[test]
@@ -4972,7 +5142,7 @@ mod tests {
                 lanes: vec![mailbox],
                 owners: Mutex::new(Owners {
                     lanes: HashMap::from([(1, 0)]),
-                    closing: HashSet::from([1]),
+                    closing: HashMap::from([(1, LifecycleReader::Ordinary)]),
                     next_id: Some(2),
                     next_lane: 0,
                 }),
@@ -5107,7 +5277,12 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(metrics.advances.load(Ordering::Relaxed), 0);
-        let LifecycleCompletion::Stop(completion) = completions.lock().unwrap().remove(&1).unwrap()
+        let LifecycleCompletion::Stop(completion) = completions
+            .lock()
+            .unwrap()
+            .remove(&1)
+            .unwrap()
+            .into_completion()
         else {
             panic!("expected stop")
         };
