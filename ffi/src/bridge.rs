@@ -311,7 +311,7 @@ pub(crate) fn create_boot_in_store(
         .map_err(|error| CreateInStoreError::Create(CreateError::Handle(error)))
 }
 
-fn with_capability_bindings<T>(
+pub(crate) fn with_capability_bindings<T>(
     schemas: &[DecodedCapabilitySchema],
     action: impl FnOnce(&[CapabilityBinding<'_>]) -> T,
 ) -> T {
@@ -983,7 +983,7 @@ fn attach_failure_trace(outcome: &mut OwnedOutcome, computer: &ComputerMachine) 
     }
 }
 
-fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
+pub(crate) fn copy_outcome(outcome: ComputerAdvanceOutcome) -> OwnedOutcome {
     match outcome {
         ComputerAdvanceOutcome::SliceExhausted => OwnedOutcome::SliceExhausted,
         ComputerAdvanceOutcome::ProcessEntered(id) => OwnedOutcome::ProcessEntered(id),
@@ -1087,7 +1087,7 @@ fn copy_input_error(_error: TerminalInputError) -> BridgeError {
     BridgeError::InvalidOperation
 }
 
-fn profile() -> ExecutionProfile {
+pub(crate) fn profile() -> ExecutionProfile {
     ExecutionProfile {
         heap_bytes: 256 * 1024,
         frame_storage_bytes: 1024 * 1024,

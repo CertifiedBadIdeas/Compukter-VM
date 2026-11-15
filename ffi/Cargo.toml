@@ -11,5 +11,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 compukter-vm = { path = ".." }
 
+[features]
+experimental-fleet-scheduler = ["compukter-vm/experimental-fleet-scheduler"]
+
 [dev-dependencies]
 sha2 = "0.10"

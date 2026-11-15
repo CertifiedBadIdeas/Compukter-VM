@@ -21,6 +21,9 @@ mod ffi_api;
 mod handle_table;
 mod wire;
 
+#[cfg(feature = "experimental-fleet-scheduler")]
+pub mod experimental_fleet;
+
 pub const COMPUKTER_FFI_ABI_VERSION: u32 = 28;
 
 pub use ffi_api::{

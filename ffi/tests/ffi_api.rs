@@ -45,6 +45,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const EMPTY_CAPABILITY_SCHEMAS: [u8; 2] = [1, 0];
 
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[test]
+fn experimental_fleet_validates_schemas_and_publishes_wire_outcomes() {
+    use compukter_vm::experimental_fleet_scheduler::FleetConfig;
+    use std::time::{Duration, Instant};
+    let config = FleetConfig {
+        workers: 1,
+        mailbox_capacity: 4,
+        event_capacity: 4,
+        guest_budget: 64,
+        maintenance_budget: 64,
+        host_budget: 16,
+    };
+    let artifact = support::executable_minimal_vector();
+    assert!(compukter_ffi::experimental_fleet::create(&artifact, &[1], 1, config).is_err());
+    assert!(compukter_ffi::experimental_fleet::create(
+        &artifact,
+        &EMPTY_CAPABILITY_SCHEMAS,
+        0,
+        config
+    )
+    .is_err());
+    let fleet =
+        compukter_ffi::experimental_fleet::create(&artifact, &EMPTY_CAPABILITY_SCHEMAS, 1, config)
+            .unwrap();
+    fleet.grant(0, 1, 64).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let event = loop {
+        if let Some(event) = compukter_ffi::experimental_fleet::poll(&fleet).unwrap() {
+            break event;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert_eq!(&event[..8], &0_u64.to_le_bytes());
+    assert_eq!(&event[8..16], &1_u64.to_le_bytes());
+    assert_eq!(event[16], 4); // Halted in the ordinary VM outcome wire.
+}
+
 #[test]
 fn c_abi_publishes_its_exact_version() {
     assert_eq!(28, COMPUKTER_FFI_ABI_VERSION);
