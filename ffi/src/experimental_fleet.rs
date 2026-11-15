@@ -78,6 +78,11 @@ fn create_machines(
 }
 
 pub enum WireEvent {
+    InputResult {
+        machine: u64,
+        request: u64,
+        status: crate::FfiStatus,
+    },
     Filesystem {
         machine: u64,
         request: u64,
@@ -128,6 +133,34 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
         return Ok(None);
     };
     let (machine, tick, outcome, inspection) = match event {
+        FleetEvent::InputResult {
+            machine,
+            request,
+            result,
+        } => {
+            use compukter_vm::experimental_fleet_scheduler::InputFailure;
+            use compukter_vm::CanonicalLineSubmissionError as C;
+            let status = match result {
+                Ok(()) => crate::FfiStatus::Ok,
+                Err(InputFailure::Terminal(_)) => crate::FfiStatus::InvalidArgument,
+                Err(InputFailure::Canonical(C::NoPendingRead)) => {
+                    crate::FfiStatus::InputNoPendingRead
+                }
+                Err(InputFailure::Canonical(C::InputBusy)) => crate::FfiStatus::InputBusy,
+                Err(InputFailure::Canonical(C::PartialInput)) => crate::FfiStatus::InputPartial,
+                Err(InputFailure::Canonical(C::UnsupportedCodeUnit)) => {
+                    crate::FfiStatus::InputUnsupportedCodeUnit
+                }
+                Err(InputFailure::Canonical(C::LineTooLong)) => crate::FfiStatus::InputLineTooLong,
+                Err(InputFailure::Canonical(C::Terminal)) => crate::FfiStatus::InputTerminal,
+                Err(InputFailure::Canonical(C::Resume)) => crate::FfiStatus::InputResume,
+            };
+            return Ok(Some(WireEvent::InputResult {
+                machine,
+                request,
+                status,
+            }));
+        }
         FleetEvent::Filesystem {
             machine,
             request,

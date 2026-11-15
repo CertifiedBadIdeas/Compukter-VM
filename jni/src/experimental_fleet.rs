@@ -570,6 +570,17 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         if f.pending.is_none() {
             f.pending = match experimental_fleet::poll_event(&f.scheduler) {
                 Ok(None) => None,
+                Ok(Some(experimental_fleet::WireEvent::InputResult {
+                    machine,
+                    request,
+                    status,
+                })) => {
+                    let mut bytes = vec![14];
+                    bytes.extend_from_slice(&machine.to_le_bytes());
+                    bytes.extend_from_slice(&request.to_le_bytes());
+                    bytes.extend_from_slice(&(status as u32).to_le_bytes());
+                    Some(bytes)
+                }
                 Ok(Some(experimental_fleet::WireEvent::Filesystem {
                     machine,
                     request,
@@ -797,9 +808,11 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
     key: jint,
     action: jint,
     modifiers: jint,
+    request: jlong,
 ) -> jint {
     status(&mut env, |_| {
         if machine < 0
+            || request < -1
             || !(0..=u16::MAX as jint).contains(&key)
             || !(0..=u8::MAX as jint).contains(&modifiers)
         {
@@ -821,7 +834,12 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         Ok(map
             .get(&(handle as u64))
             .map_or(code(FfiStatus::StaleHandle), |f| {
-                submit(f.scheduler.terminal_key(machine as u64, event))
+                submit(if request == -1 {
+                    f.scheduler.terminal_key(machine as u64, event)
+                } else {
+                    f.scheduler
+                        .terminal_key_checked(machine as u64, request as u64, event)
+                })
             }))
     })
 }
@@ -835,9 +853,10 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
     handle: jlong,
     machine: jlong,
     points: JIntArray<'a>,
+    request: jlong,
 ) -> jint {
     status(&mut env, |env| {
-        if machine < 0 || points.len(env)? > 4096 {
+        if machine < 0 || request < -1 || points.len(env)? > 4096 {
             return Ok(code(FfiStatus::InvalidArgument));
         }
         let Some(text) = ints(env, &points)?
@@ -851,10 +870,13 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         Ok(map
             .get(&(handle as u64))
             .map_or(code(FfiStatus::StaleHandle), |f| {
-                submit(
+                let text = text.into_boxed_str();
+                submit(if request == -1 {
+                    f.scheduler.terminal_text(machine as u64, text)
+                } else {
                     f.scheduler
-                        .terminal_text(machine as u64, text.into_boxed_str()),
-                )
+                        .terminal_text_checked(machine as u64, request as u64, text)
+                })
             }))
     })
 }
@@ -868,9 +890,10 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
     handle: jlong,
     machine: jlong,
     line: JCharArray<'a>,
+    request: jlong,
 ) -> jint {
     status(&mut env, |env| {
-        if machine < 0 || line.len(env)? > 4096 {
+        if machine < 0 || request < -1 || line.len(env)? > 4096 {
             return Ok(code(FfiStatus::InvalidArgument));
         }
         let line = chars(env, &line)?.into_boxed_slice();
@@ -878,7 +901,12 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         Ok(map
             .get(&(handle as u64))
             .map_or(code(FfiStatus::StaleHandle), |f| {
-                submit(f.scheduler.canonical_line(machine as u64, line))
+                submit(if request == -1 {
+                    f.scheduler.canonical_line(machine as u64, line)
+                } else {
+                    f.scheduler
+                        .canonical_line_checked(machine as u64, request as u64, line)
+                })
             }))
     })
 }

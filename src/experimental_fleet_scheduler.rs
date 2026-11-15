@@ -87,6 +87,12 @@ pub enum FilesystemResult {
     Read(crate::ComputerFileChunk),
 }
 
+#[derive(Debug)]
+pub enum InputFailure {
+    Terminal(crate::TerminalInputError),
+    Canonical(crate::CanonicalLineSubmissionError),
+}
+
 enum FilesystemQuery {
     Stat(Box<str>),
     List {
@@ -125,6 +131,11 @@ impl ReplyValue {
 
 #[derive(Debug)]
 pub enum FleetEvent {
+    InputResult {
+        machine: u64,
+        request: u64,
+        result: Result<(), InputFailure>,
+    },
     Filesystem {
         machine: u64,
         request: u64,
@@ -252,14 +263,17 @@ enum Command {
     TerminalKey {
         machine: u64,
         event: crate::TerminalKeyEvent,
+        request: Option<u64>,
     },
     TerminalText {
         machine: u64,
         text: Box<str>,
+        request: Option<u64>,
     },
     CanonicalLine {
         machine: u64,
         line: Box<[u16]>,
+        request: Option<u64>,
     },
     TerminalUpdate {
         machine: u64,
@@ -541,21 +555,96 @@ impl FleetScheduler {
         machine: u64,
         event: crate::TerminalKeyEvent,
     ) -> Result<(), SubmitError> {
-        self.send(machine, Command::TerminalKey { machine, event })
+        self.send(
+            machine,
+            Command::TerminalKey {
+                machine,
+                event,
+                request: None,
+            },
+        )
+    }
+
+    pub fn terminal_key_checked(
+        &self,
+        machine: u64,
+        request: u64,
+        event: crate::TerminalKeyEvent,
+    ) -> Result<(), SubmitError> {
+        self.send(
+            machine,
+            Command::TerminalKey {
+                machine,
+                event,
+                request: Some(request),
+            },
+        )
     }
 
     pub fn terminal_text(&self, machine: u64, text: Box<str>) -> Result<(), SubmitError> {
         if text.chars().count() > 4096 {
             return Err(SubmitError::InvalidInput);
         }
-        self.send(machine, Command::TerminalText { machine, text })
+        self.send(
+            machine,
+            Command::TerminalText {
+                machine,
+                text,
+                request: None,
+            },
+        )
+    }
+
+    pub fn terminal_text_checked(
+        &self,
+        machine: u64,
+        request: u64,
+        text: Box<str>,
+    ) -> Result<(), SubmitError> {
+        if text.chars().count() > 4096 {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(
+            machine,
+            Command::TerminalText {
+                machine,
+                text,
+                request: Some(request),
+            },
+        )
     }
 
     pub fn canonical_line(&self, machine: u64, line: Box<[u16]>) -> Result<(), SubmitError> {
         if line.len() > 4096 {
             return Err(SubmitError::InvalidInput);
         }
-        self.send(machine, Command::CanonicalLine { machine, line })
+        self.send(
+            machine,
+            Command::CanonicalLine {
+                machine,
+                line,
+                request: None,
+            },
+        )
+    }
+
+    pub fn canonical_line_checked(
+        &self,
+        machine: u64,
+        request: u64,
+        line: Box<[u16]>,
+    ) -> Result<(), SubmitError> {
+        if line.len() > 4096 {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(
+            machine,
+            Command::CanonicalLine {
+                machine,
+                line,
+                request: Some(request),
+            },
+        )
     }
 
     /// Commits pending terminal writes and returns a delta or full state asynchronously.
@@ -842,6 +931,45 @@ fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
         actor.queued = true;
         actor.reported_retired = None;
         queue.push_back(id);
+    }
+}
+
+fn report_input(
+    machine: u64,
+    request: Option<u64>,
+    result: Result<(), InputFailure>,
+    operation: &str,
+    events: &SyncSender<FleetEvent>,
+    stopped: &AtomicBool,
+    waiters: &AtomicUsize,
+) -> bool {
+    match (request, result) {
+        (Some(request), result) => publish(
+            events,
+            stopped,
+            waiters,
+            FleetEvent::InputResult {
+                machine,
+                request,
+                result,
+            },
+        ),
+        (None, Err(error)) => {
+            let detail = match error {
+                InputFailure::Terminal(error) => format!("{error:?}"),
+                InputFailure::Canonical(error) => format!("{error:?}"),
+            };
+            publish(
+                events,
+                stopped,
+                waiters,
+                FleetEvent::Error {
+                    machine,
+                    message: format!("{operation}: {detail}"),
+                },
+            )
+        }
+        (None, Ok(())) => true,
     }
 }
 
@@ -1147,67 +1275,89 @@ fn run_worker(
                         }
                     }
                 }
-                Command::TerminalKey { machine, event } => {
+                Command::TerminalKey {
+                    machine,
+                    event,
+                    request,
+                } => {
                     let Some(actor) = actors.get_mut(&machine) else {
                         continue;
                     };
-                    if let Err(error) = actor.machine.submit_terminal_key(event) {
-                        if !publish(
-                            &events,
-                            &stopped,
-                            &waiters,
-                            FleetEvent::Error {
-                                machine,
-                                message: format!("terminal key: {error:?}"),
-                            },
-                        ) {
-                            return;
-                        }
-                    } else {
+                    let result = actor
+                        .machine
+                        .submit_terminal_key(event)
+                        .map_err(InputFailure::Terminal);
+                    if result.is_ok() {
                         actor.parked = false;
                         ready(machine, actor, &mut queue);
                     }
+                    if !report_input(
+                        machine,
+                        request,
+                        result,
+                        "terminal key",
+                        &events,
+                        &stopped,
+                        &waiters,
+                    ) {
+                        return;
+                    }
                 }
-                Command::TerminalText { machine, text } => {
+                Command::TerminalText {
+                    machine,
+                    text,
+                    request,
+                } => {
                     let Some(actor) = actors.get_mut(&machine) else {
                         continue;
                     };
-                    if let Err(error) = actor.machine.terminal_mut().push_text(&text) {
-                        if !publish(
-                            &events,
-                            &stopped,
-                            &waiters,
-                            FleetEvent::Error {
-                                machine,
-                                message: format!("terminal text: {error:?}"),
-                            },
-                        ) {
-                            return;
-                        }
-                    } else {
+                    let result = actor
+                        .machine
+                        .terminal_mut()
+                        .push_text(&text)
+                        .map_err(InputFailure::Terminal);
+                    if result.is_ok() {
                         actor.parked = false;
                         ready(machine, actor, &mut queue);
                     }
+                    if !report_input(
+                        machine,
+                        request,
+                        result,
+                        "terminal text",
+                        &events,
+                        &stopped,
+                        &waiters,
+                    ) {
+                        return;
+                    }
                 }
-                Command::CanonicalLine { machine, line } => {
+                Command::CanonicalLine {
+                    machine,
+                    line,
+                    request,
+                } => {
                     let Some(actor) = actors.get_mut(&machine) else {
                         continue;
                     };
-                    if let Err(error) = actor.machine.submit_canonical_line(&line) {
-                        if !publish(
-                            &events,
-                            &stopped,
-                            &waiters,
-                            FleetEvent::Error {
-                                machine,
-                                message: format!("canonical line: {error:?}"),
-                            },
-                        ) {
-                            return;
-                        }
-                    } else {
+                    let result = actor
+                        .machine
+                        .submit_canonical_line(&line)
+                        .map_err(InputFailure::Canonical);
+                    if result.is_ok() {
                         actor.parked = false;
                         ready(machine, actor, &mut queue);
+                    }
+                    if !report_input(
+                        machine,
+                        request,
+                        result,
+                        "canonical line",
+                        &events,
+                        &stopped,
+                        &waiters,
+                    ) {
+                        return;
                     }
                 }
                 Command::TerminalUpdate {
@@ -2309,6 +2459,53 @@ mod tests {
         fleet
             .canonical_line(7, "hello".encode_utf16().collect())
             .unwrap();
+        assert!(matches!(
+            grant_until_terminal_outcome(&fleet, 7),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn checked_input_reports_the_actual_result_with_request_identity() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::stdio_conformance_artifact(&[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.canonical_line_checked(7, 31, Box::new([])).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::InputResult {
+                machine: 7,
+                request: 31,
+                result: Err(InputFailure::Canonical(
+                    crate::CanonicalLineSubmissionError::NoPendingRead
+                ))
+            }
+        ));
+        fleet.grant(7, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                ..
+            }
+        ));
+        fleet.canonical_line_checked(7, 32, Box::new([])).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::InputResult {
+                machine: 7,
+                request: 32,
+                result: Ok(())
+            }
+        ));
         assert!(matches!(
             grant_until_terminal_outcome(&fleet, 7),
             FleetEvent::Boundary {
