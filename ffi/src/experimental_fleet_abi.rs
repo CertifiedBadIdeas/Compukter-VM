@@ -323,3 +323,144 @@ pub extern "C" fn compukter_experimental_fleet_close(handle: u64) -> FfiStatus {
         }
     })
 }
+
+/// Completes an asynchronous host request with the ordinary host-response wire.
+///
+/// # Safety
+/// A nonempty payload must name `length` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_reply(
+    handle: u64,
+    machine: u64,
+    task: u32,
+    request: u64,
+    payload: *const u8,
+    length: usize,
+) -> FfiStatus {
+    guarded(|| {
+        if task == 0 || request == 0 || length > 65536 || (length > 0 && payload.is_null()) {
+            return FfiStatus::InvalidArgument;
+        }
+        let bytes = if length == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(payload, length) }
+        };
+        let Some(value) = experimental_fleet::decode_reply(bytes) else {
+            return FfiStatus::InvalidArgument;
+        };
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&handle).map_or(FfiStatus::StaleHandle, |fleet| {
+            submission(fleet.scheduler.reply(machine, task, request, value))
+        })
+    })
+}
+
+/// Completes an asynchronous host request with a bounded failure.
+///
+/// # Safety
+/// `detail` must name `length` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_reply_failure(
+    handle: u64,
+    machine: u64,
+    task: u32,
+    request: u64,
+    kind: u32,
+    detail: *const u8,
+    length: usize,
+) -> FfiStatus {
+    guarded(|| {
+        use compukter_vm::{experimental_fleet_scheduler::ReplyValue, HostFailureKind as K};
+        if task == 0
+            || request == 0
+            || length == 0
+            || length > compukter_vm::MAXIMUM_HOST_FAILURE_DETAIL_BYTES
+            || detail.is_null()
+        {
+            return FfiStatus::InvalidArgument;
+        }
+        let kind = match kind {
+            0 => K::EndOfFile,
+            1 => K::Unavailable,
+            2 => K::InputOutput,
+            3 => K::Cancelled,
+            4 => K::Other,
+            _ => return FfiStatus::InvalidArgument,
+        };
+        let bytes = unsafe { std::slice::from_raw_parts(detail, length) };
+        let Ok(detail) = std::str::from_utf8(bytes) else {
+            return FfiStatus::InvalidArgument;
+        };
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&handle).map_or(FfiStatus::StaleHandle, |fleet| {
+            submission(fleet.scheduler.reply(
+                machine,
+                task,
+                request,
+                ReplyValue::Failure(kind, detail.into()),
+            ))
+        })
+    })
+}
+
+/// Completes host-side cost inspection for an outstanding request.
+#[unsafe(no_mangle)]
+pub extern "C" fn compukter_experimental_fleet_resolve_cost(
+    handle: u64,
+    machine: u64,
+    task: u32,
+    request: u64,
+    units: u32,
+) -> FfiStatus {
+    guarded(|| {
+        if task == 0 || request == 0 || units == 0 {
+            return FfiStatus::InvalidArgument;
+        }
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&handle).map_or(FfiStatus::StaleHandle, |fleet| {
+            submission(fleet.scheduler.resolve_cost(machine, task, request, units))
+        })
+    })
+}
+
+/// Completes a pending compiler transaction with an artifact (kind 0) or UTF-8 diagnostic (kind 1).
+///
+/// # Safety
+/// A nonempty payload must name `length` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_compilation(
+    handle: u64,
+    machine: u64,
+    token: u64,
+    kind: u32,
+    payload: *const u8,
+    length: usize,
+) -> FfiStatus {
+    guarded(|| {
+        use compukter_vm::experimental_fleet_scheduler::CompilationResult;
+        if token == 0
+            || length > compukter_vm::ArtifactLimits::default().artifact_bytes
+            || (length > 0 && payload.is_null())
+        {
+            return FfiStatus::InvalidArgument;
+        }
+        let bytes = if length == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(payload, length) }
+        };
+        let result = match kind {
+            0 => CompilationResult::Artifact(bytes.into()),
+            1 => match std::str::from_utf8(bytes) {
+                Ok(detail) => CompilationResult::Failure(detail.into()),
+                Err(_) => return FfiStatus::InvalidArgument,
+            },
+            _ => return FfiStatus::InvalidArgument,
+        };
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&handle).map_or(FfiStatus::StaleHandle, |fleet| {
+            submission(fleet.scheduler.complete_compilation(machine, token, result))
+        })
+    })
+}
