@@ -336,6 +336,59 @@ pub unsafe extern "C" fn compukter_experimental_fleet_recover(
     })
 }
 
+/// Captures the event generation before polling. The caller may then wait on that generation.
+///
+/// # Safety
+/// `output` must point to one writable u64.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_event_generation(
+    handle: u64,
+    output: *mut u64,
+) -> FfiStatus {
+    guarded(|| {
+        if output.is_null() {
+            return FfiStatus::InvalidArgument;
+        }
+        let signal = {
+            let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(fleet) = all.get(&handle) else {
+                return FfiStatus::StaleHandle;
+            };
+            fleet.scheduler.event_signal()
+        };
+        unsafe { output.write(signal.generation()) };
+        FfiStatus::Ok
+    })
+}
+
+/// Waits without holding the fleet registry lock. A zero result means timeout or close.
+///
+/// # Safety
+/// `output` must point to one writable u32.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_wait_events(
+    handle: u64,
+    generation: u64,
+    timeout_ms: u32,
+    output: *mut u32,
+) -> FfiStatus {
+    guarded(|| {
+        if output.is_null() || timeout_ms > 60_000 {
+            return FfiStatus::InvalidArgument;
+        }
+        let signal = {
+            let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(fleet) = all.get(&handle) else {
+                return FfiStatus::StaleHandle;
+            };
+            fleet.scheduler.event_signal()
+        };
+        let changed = signal.wait(generation, Duration::from_millis(timeout_ms.into()));
+        unsafe { output.write(u32::from(changed)) };
+        FfiStatus::Ok
+    })
+}
+
 /// Reads one event. A small output buffer does not consume the event.
 ///
 /// # Safety

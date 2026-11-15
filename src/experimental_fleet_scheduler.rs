@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -434,10 +434,53 @@ struct Owners {
     next_lane: usize,
 }
 
+/// A generation-based notification that can be waited on independently of the fleet lock.
+/// Capture a generation before draining the event queue, then wait for it to change.
+#[derive(Default)]
+pub struct FleetEventSignal {
+    state: Mutex<(u64, bool)>,
+    changed: Condvar,
+}
+
+impl FleetEventSignal {
+    pub fn generation(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+
+    /// Returns true when an event was published, false on timeout or fleet closure.
+    pub fn wait(&self, generation: u64, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.0 == generation && !state.1)
+            .unwrap_or_else(|e| e.into_inner());
+        state.0 != generation
+    }
+
+    fn notify(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 = state.0.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct EventSender {
+    sender: SyncSender<FleetEvent>,
+    signal: Arc<FleetEventSignal>,
+}
+
 pub struct FleetScheduler {
     lanes: Vec<SyncSender<Command>>,
     owners: Mutex<Owners>,
     events: Receiver<FleetEvent>,
+    event_signal: Arc<FleetEventSignal>,
     stopped: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
     metrics: Arc<Metrics>,
@@ -492,6 +535,11 @@ impl FleetScheduler {
             partitions[lane].insert(id, Actor::new(machine, config.host_budget));
         }
         let (event_tx, events) = mpsc::sync_channel(config.event_capacity);
+        let event_signal = Arc::new(FleetEventSignal::default());
+        let event_tx = EventSender {
+            sender: event_tx,
+            signal: Arc::clone(&event_signal),
+        };
         let stopped = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(Metrics::default());
         let waiting_publishers = Arc::new(AtomicUsize::new(0));
@@ -549,6 +597,7 @@ impl FleetScheduler {
                 next_lane,
             }),
             events,
+            event_signal,
             stopped,
             workers,
             metrics,
@@ -1071,6 +1120,10 @@ impl FleetScheduler {
         result
     }
 
+    pub fn event_signal(&self) -> Arc<FleetEventSignal> {
+        Arc::clone(&self.event_signal)
+    }
+
     pub fn metrics(&self) -> FleetMetrics {
         FleetMetrics {
             advances: self.metrics.advances.load(Ordering::Relaxed),
@@ -1083,6 +1136,7 @@ impl FleetScheduler {
 impl Drop for FleetScheduler {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        self.event_signal.close();
         for worker in &self.workers {
             worker.thread().unpark();
         }
@@ -1093,7 +1147,7 @@ impl Drop for FleetScheduler {
 }
 
 fn publish(
-    sender: &SyncSender<FleetEvent>,
+    sender: &EventSender,
     stopped: &AtomicBool,
     waiters: &AtomicUsize,
     mut event: FleetEvent,
@@ -1103,8 +1157,11 @@ fn publish(
         if stopped.load(Ordering::Acquire) {
             break false;
         }
-        match sender.try_send(event) {
-            Ok(()) => break true,
+        match sender.sender.try_send(event) {
+            Ok(()) => {
+                sender.signal.notify();
+                break true;
+            }
             Err(TrySendError::Full(returned)) => {
                 event = returned;
                 if !registered {
@@ -1143,7 +1200,7 @@ fn report_input(
     request: Option<u64>,
     result: Result<(), InputFailure>,
     operation: &str,
-    events: &SyncSender<FleetEvent>,
+    events: &EventSender,
     stopped: &AtomicBool,
     waiters: &AtomicUsize,
 ) -> bool {
@@ -1180,7 +1237,7 @@ fn report_input(
 fn report_quiescent(
     id: u64,
     actor: &mut Actor,
-    events: &SyncSender<FleetEvent>,
+    events: &EventSender,
     stopped: &AtomicBool,
     waiters: &AtomicUsize,
     enabled: bool,
@@ -1205,7 +1262,7 @@ fn report_quiescent(
 fn run_worker(
     mut actors: HashMap<u64, Actor>,
     commands: Receiver<Command>,
-    events: SyncSender<FleetEvent>,
+    events: EventSender,
     stopped: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
     waiters: Arc<AtomicUsize>,
@@ -2328,6 +2385,43 @@ mod tests {
             }
         }
         panic!("no terminal outcome: {:?}", fleet.metrics());
+    }
+
+    #[test]
+    fn event_signal_observes_publication_between_poll_and_wait() {
+        let signal = Arc::new(FleetEventSignal::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let sender = EventSender {
+            sender,
+            signal: Arc::clone(&signal),
+        };
+        let generation = signal.generation();
+        assert!(receiver.try_recv().is_err());
+        assert!(publish(
+            &sender,
+            &AtomicBool::new(false),
+            &AtomicUsize::new(0),
+            FleetEvent::Quiescent {
+                machine: 1,
+                tick: 2,
+                retired: 3,
+            }
+        ));
+        assert!(signal.wait(generation, Duration::ZERO));
+        assert!(receiver.try_recv().is_ok());
+        assert!(!signal.wait(signal.generation(), Duration::ZERO));
+    }
+
+    #[test]
+    fn closing_fleet_wakes_event_waiter_without_holding_fleet() {
+        let fleet = FleetScheduler::new(Vec::new(), config()).unwrap();
+        let signal = fleet.event_signal();
+        let generation = signal.generation();
+        let waiter_signal = Arc::clone(&signal);
+        let waiter = thread::spawn(move || waiter_signal.wait(generation, Duration::from_secs(5)));
+        drop(fleet);
+        assert!(!waiter.join().unwrap());
+        assert!(!signal.wait(generation, Duration::from_secs(5)));
     }
 
     #[test]

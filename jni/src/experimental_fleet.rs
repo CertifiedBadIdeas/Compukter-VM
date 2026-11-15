@@ -606,6 +606,59 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_eventGeneration<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    output: JLongArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if output.len(env)? != 1 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let signal = {
+            let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(fleet) = map.get(&(handle as u64)) else {
+                return Ok(code(FfiStatus::StaleHandle));
+            };
+            fleet.scheduler.event_signal()
+        };
+        output.set_region(env, 0, &[signal.generation() as jlong])?;
+        Ok(code(FfiStatus::Ok))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_waitEvents<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    generation: jlong,
+    timeout_ms: jint,
+    output: JLongArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if output.len(env)? != 1 || !(0..=60_000).contains(&timeout_ms) {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let signal = {
+            let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(fleet) = map.get(&(handle as u64)) else {
+                return Ok(code(FfiStatus::StaleHandle));
+            };
+            fleet.scheduler.event_signal()
+        };
+        let changed = signal.wait(generation as u64, Duration::from_millis(timeout_ms as u64));
+        output.set_region(env, 0, &[i64::from(changed)])?;
+        Ok(code(FfiStatus::Ok))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_poll<'a>(
     mut env: EnvUnowned<'a>,
     _: JClass<'a>,
