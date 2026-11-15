@@ -331,8 +331,15 @@ impl FleetTransport {
         self.sessions
             .try_reserve(1)
             .map_err(|_| crate::FfiStatus::Internal)?;
+        // All attached sessions may detach before the host recovers any of them.
+        // Reserve their slots before taking ownership so polling cannot need to grow this map.
+        let detached_slots = self
+            .sessions
+            .len()
+            .saturating_add(1)
+            .saturating_sub(self.detached.len());
         self.detached
-            .try_reserve(1)
+            .try_reserve(detached_slots)
             .map_err(|_| crate::FfiStatus::Internal)?;
         let (machine, metadata) =
             attach_session_with_timers(&self.scheduler, session, tick, timers)?;
