@@ -11,7 +11,7 @@
 //! the host. Unsupported lifecycle outcomes are surfaced instead of interpreted.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -30,6 +30,7 @@ pub struct FleetConfig {
     pub guest_budget: u32,
     pub maintenance_budget: u32,
     pub host_budget: u32,
+    pub maximum_advances_per_tick: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +121,7 @@ struct Actor {
     tick_initialized: bool,
     remaining: u32,
     requests_left: u32,
+    advances_left: u32,
     queued: bool,
     parked: bool,
     stopped: bool,
@@ -134,6 +136,7 @@ pub struct FleetScheduler {
     stopped: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
     metrics: Arc<Metrics>,
+    waiting_publishers: Arc<AtomicUsize>,
 }
 
 impl FleetScheduler {
@@ -146,6 +149,7 @@ impl FleetScheduler {
             || config.event_capacity == 0
             || config.guest_budget == 0
             || config.host_budget == 0
+            || config.maximum_advances_per_tick == 0
         {
             return Err("invalid fleet configuration");
         }
@@ -165,6 +169,7 @@ impl FleetScheduler {
                     tick_initialized: false,
                     remaining: 0,
                     requests_left: config.host_budget,
+                    advances_left: 0,
                     queued: false,
                     parked: false,
                     stopped: false,
@@ -176,6 +181,7 @@ impl FleetScheduler {
         let (event_tx, events) = mpsc::sync_channel(config.event_capacity);
         let stopped = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(Metrics::default());
+        let waiting_publishers = Arc::new(AtomicUsize::new(0));
         let mut lanes = Vec::new();
         let mut workers: Vec<JoinHandle<()>> = Vec::new();
         for (lane, actors) in partitions.into_iter().enumerate() {
@@ -184,10 +190,12 @@ impl FleetScheduler {
             let events = event_tx.clone();
             let stop = Arc::clone(&stopped);
             let worker_metrics = Arc::clone(&metrics);
+            let waiting = Arc::clone(&waiting_publishers);
             let worker = match thread::Builder::new()
                 .name(format!("experimental-vm-{lane}"))
-                .spawn(move || run_worker(actors, rx, events, stop, worker_metrics, config))
-            {
+                .spawn(move || {
+                    run_worker(actors, rx, events, stop, worker_metrics, waiting, config)
+                }) {
                 Ok(worker) => worker,
                 Err(_) => {
                     stopped.store(true, Ordering::Release);
@@ -209,6 +217,7 @@ impl FleetScheduler {
             stopped,
             workers,
             metrics,
+            waiting_publishers,
         })
     }
 
@@ -261,7 +270,7 @@ impl FleetScheduler {
 
     pub fn try_event(&self) -> Option<FleetEvent> {
         let result = self.events.try_recv().ok();
-        if result.is_some() {
+        if result.is_some() && self.waiting_publishers.load(Ordering::SeqCst) != 0 {
             for worker in &self.workers {
                 worker.thread().unpark();
             }
@@ -290,24 +299,40 @@ impl Drop for FleetScheduler {
     }
 }
 
-fn publish(sender: &SyncSender<FleetEvent>, stopped: &AtomicBool, mut event: FleetEvent) -> bool {
-    loop {
+fn publish(
+    sender: &SyncSender<FleetEvent>,
+    stopped: &AtomicBool,
+    waiters: &AtomicUsize,
+    mut event: FleetEvent,
+) -> bool {
+    let mut registered = false;
+    let success = loop {
         if stopped.load(Ordering::Acquire) {
-            return false;
+            break false;
         }
         match sender.try_send(event) {
-            Ok(()) => return true,
+            Ok(()) => break true,
             Err(TrySendError::Full(returned)) => {
                 event = returned;
+                if !registered {
+                    waiters.fetch_add(1, Ordering::SeqCst);
+                    registered = true;
+                    // Recheck after registering to avoid a missed wakeup.
+                    continue;
+                }
                 thread::park_timeout(Duration::from_millis(10));
             }
-            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Disconnected(_)) => break false,
         }
+    };
+    if registered {
+        waiters.fetch_sub(1, Ordering::SeqCst);
     }
+    success
 }
 
 fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
-    if !actor.queued && !actor.stopped && actor.remaining > 0 {
+    if !actor.queued && !actor.stopped && actor.remaining > 0 && actor.advances_left > 0 {
         actor.queued = true;
         queue.push_back(id);
     }
@@ -319,6 +344,7 @@ fn run_worker(
     events: SyncSender<FleetEvent>,
     stopped: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
+    waiters: Arc<AtomicUsize>,
     config: FleetConfig,
 ) {
     let mut queue = VecDeque::new();
@@ -344,6 +370,7 @@ fn run_worker(
                         actor.tick = tick;
                         actor.remaining = retirements;
                         actor.requests_left = config.host_budget;
+                        actor.advances_left = config.maximum_advances_per_tick;
                     }
                     let mut due: Vec<_> = actor
                         .timers
@@ -363,6 +390,7 @@ fn run_worker(
                             if !publish(
                                 &events,
                                 &stopped,
+                                &waiters,
                                 FleetEvent::Error {
                                     machine,
                                     message: format!("timer completion: {error:?}"),
@@ -391,6 +419,7 @@ fn run_worker(
                         if !publish(
                             &events,
                             &stopped,
+                            &waiters,
                             FleetEvent::Error {
                                 machine,
                                 message: "reply does not match a pending request".into(),
@@ -409,6 +438,7 @@ fn run_worker(
                         if !publish(
                             &events,
                             &stopped,
+                            &waiters,
                             FleetEvent::Error {
                                 machine,
                                 message: format!("host completion: {error:?}"),
@@ -429,9 +459,10 @@ fn run_worker(
         };
         let actor = actors.get_mut(&id).expect("queued machine");
         actor.queued = false;
-        if actor.stopped || actor.remaining == 0 {
+        if actor.stopped || actor.remaining == 0 || actor.advances_left == 0 {
             continue;
         }
+        actor.advances_left -= 1;
         let (outcome, retired) = match actor.machine.advance_with_retirement_count(
             config.guest_budget,
             config.maintenance_budget,
@@ -444,6 +475,7 @@ fn run_worker(
                 if !publish(
                     &events,
                     &stopped,
+                    &waiters,
                     FleetEvent::Error {
                         machine: id,
                         message: format!("advance: {error:?}"),
@@ -498,6 +530,7 @@ fn run_worker(
                                 if !publish(
                                     &events,
                                     &stopped,
+                                    &waiters,
                                     FleetEvent::Error {
                                         machine: id,
                                         message: "unsupported timer request".into(),
@@ -519,6 +552,7 @@ fn run_worker(
                     && !publish(
                         &events,
                         &stopped,
+                        &waiters,
                         FleetEvent::Requests {
                             machine: id,
                             tick: actor.tick,
@@ -543,6 +577,7 @@ fn run_worker(
                 if !publish(
                     &events,
                     &stopped,
+                    &waiters,
                     FleetEvent::Boundary {
                         machine: id,
                         tick: actor.tick,
@@ -596,6 +631,7 @@ mod tests {
             guest_budget: 64,
             maintenance_budget: 64,
             host_budget: 64,
+            maximum_advances_per_tick: 32,
         }
     }
     fn next(fleet: &FleetScheduler) -> FleetEvent {
@@ -765,6 +801,56 @@ mod tests {
     }
 
     #[test]
+    fn draining_a_full_event_queue_releases_waiting_workers() {
+        let machines = (0..4)
+            .map(|id| {
+                (
+                    id,
+                    ComputerMachine::start(
+                        crate::execution::fixtures::two_block_artifact(1, 1),
+                        profile(),
+                        &[],
+                        &[],
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let fleet = FleetScheduler::new(
+            machines,
+            FleetConfig {
+                workers: 4,
+                event_capacity: 1,
+                ..config()
+            },
+        )
+        .unwrap();
+        for id in 0..4 {
+            fleet.grant(id, 1, 64).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fleet.waiting_publishers.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "no publisher waited for the full queue"
+            );
+            thread::yield_now();
+        }
+        let mut completed = HashSet::new();
+        for _ in 0..4 {
+            match next(&fleet) {
+                FleetEvent::Boundary {
+                    machine,
+                    outcome: ComputerAdvanceOutcome::Halted(_),
+                    ..
+                } => assert!(completed.insert(machine)),
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+        assert_eq!(completed.len(), 4);
+    }
+
+    #[test]
     fn full_event_queue_does_not_block_shutdown() {
         let machines = (0..4)
             .map(|id| {
@@ -795,6 +881,34 @@ mod tests {
         let start = Instant::now();
         drop(fleet);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn advance_limit_is_reset_only_by_a_new_tick() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::empty_loop_artifact(1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(
+            vec![(1, machine)],
+            FleetConfig {
+                guest_budget: 1,
+                maximum_advances_per_tick: 2,
+                ..config()
+            },
+        )
+        .unwrap();
+        fleet.grant(1, 0, 100).unwrap();
+        wait_advances(&fleet, 2);
+        fleet.grant(1, 0, 100).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(fleet.metrics().advances, 2);
+        fleet.grant(1, 1, 100).unwrap();
+        wait_advances(&fleet, 4);
+        assert_eq!(fleet.metrics().advances, 4);
     }
 
     #[test]

@@ -57,6 +57,7 @@ fn experimental_fleet_validates_schemas_and_publishes_wire_outcomes() {
         guest_budget: 64,
         maintenance_budget: 64,
         host_budget: 16,
+        maximum_advances_per_tick: 32,
     };
     let artifact = support::executable_minimal_vector();
     assert!(compukter_ffi::experimental_fleet::create(&artifact, &[1], 1, config).is_err());
