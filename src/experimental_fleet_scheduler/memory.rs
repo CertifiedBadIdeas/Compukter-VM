@@ -5,7 +5,7 @@
  */
 
 use std::mem::size_of;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::{Command, CompilationResult, DeploymentCommand, FilesystemQuery, ReplyValue};
@@ -16,6 +16,13 @@ pub struct FleetMemoryLimits {
     /// on workers. VM state, allocator metadata and queue capacity slack are separate.
     pub command_bytes: usize,
     pub command_bytes_per_machine: usize,
+    /// Observation values, payloads and reservation handles retained while
+    /// draining detach. Allocator metadata, collection slack and detached VM
+    /// state are separate. One in-flight operation per worker is separate
+    /// headroom; exhaustion rejects detach and pauses ordinary worker execution
+    /// until that completion is consumed. Ordinary queue output is separate.
+    pub detach_output_bytes: usize,
+    pub detach_output_bytes_per_machine: usize,
 }
 
 impl Default for FleetMemoryLimits {
@@ -24,12 +31,14 @@ impl Default for FleetMemoryLimits {
         Self {
             command_bytes: 4 * artifact,
             command_bytes_per_machine: 2 * artifact,
+            detach_output_bytes: 4 * artifact,
+            detach_output_bytes_per_machine: 2 * artifact,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct FleetCommandMemory {
+pub struct FleetMemoryUsage {
     pub retained_bytes: usize,
     pub peak_bytes: usize,
     pub limit_bytes: usize,
@@ -65,9 +74,9 @@ impl ByteBudget {
         })
     }
 
-    pub(super) fn snapshot(&self) -> FleetCommandMemory {
+    pub(super) fn snapshot(&self) -> FleetMemoryUsage {
         let retained_bytes = self.used.load(Ordering::Acquire);
-        FleetCommandMemory {
+        FleetMemoryUsage {
             retained_bytes,
             peak_bytes: self.peak.load(Ordering::Relaxed).max(retained_bytes),
             limit_bytes: self.limit,
@@ -83,6 +92,41 @@ pub(super) struct Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// One operation's output may already exist when its escrow budget fills. Its
+/// worker lends this headroom to the completion and cannot produce more ordinary
+/// output until the host takes ownership of it. Stop processing remains possible.
+pub(super) struct OutputHeadroom {
+    available: Arc<AtomicBool>,
+    retained: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl OutputHeadroom {
+    pub(super) fn retain(
+        available: Arc<AtomicBool>,
+        retained: Arc<AtomicUsize>,
+        bytes: usize,
+    ) -> Self {
+        assert!(
+            available.swap(false, Ordering::AcqRel),
+            "worker headroom already retained"
+        );
+        retained.fetch_add(bytes, Ordering::AcqRel);
+        Self {
+            available,
+            retained,
+            bytes,
+        }
+    }
+}
+
+impl Drop for OutputHeadroom {
+    fn drop(&mut self) {
+        self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.available.store(true, Ordering::Release);
     }
 }
 
@@ -132,6 +176,128 @@ pub(super) fn command_payload_bytes(command: &Command) -> Option<usize> {
         | Command::FilesystemGeneration { .. }
         | Command::Cost { .. } => Some(0),
     }
+}
+
+/// Storage owned by an ordinary observation. Detached VM state belongs to the
+/// lifecycle owner, not the transport budget, and must never enter this path.
+pub(super) fn observation_bytes(event: &super::FleetEvent) -> usize {
+    use super::{FilesystemResult, FleetEvent};
+    use crate::{
+        ComputerAdvanceOutcome as Outcome, ComputerHostMerge, ComputerHostRequest, ComputerValue,
+    };
+    fn value_bytes(value: &ComputerValue) -> usize {
+        match value {
+            ComputerValue::String(text) => text.len() * size_of::<u16>(),
+            ComputerValue::ByteArray(bytes) => bytes.len(),
+            ComputerValue::I32(_)
+            | ComputerValue::I64(_)
+            | ComputerValue::F32(_)
+            | ComputerValue::F64(_)
+            | ComputerValue::Bool(_)
+            | ComputerValue::Char(_) => 0,
+        }
+    }
+    fn request_bytes(request: &ComputerHostRequest) -> usize {
+        request.namespace.len()
+            + request.name.len()
+            + std::mem::size_of_val(&*request.arguments)
+            + request.arguments.iter().map(value_bytes).sum::<usize>()
+            + match &request.merge {
+                ComputerHostMerge::Ordinary => 0,
+                ComputerHostMerge::LastWriteWins { entries, .. } => {
+                    std::mem::size_of_val(&**entries)
+                }
+            }
+    }
+    let payload = match event {
+        FleetEvent::Filesystem {
+            result: Ok(result), ..
+        } => match result {
+            FilesystemResult::Stat(_) => 0,
+            FilesystemResult::Read(chunk) => chunk.bytes.len(),
+            FilesystemResult::List(list) => {
+                std::mem::size_of_val(&*list.entries)
+                    + list
+                        .entries
+                        .iter()
+                        .map(|entry| entry.name.len())
+                        .sum::<usize>()
+            }
+        },
+        FleetEvent::TerminalUpdate { update, .. } => {
+            use crate::{TerminalChange, TerminalUpdate};
+            match update {
+                TerminalUpdate::Unchanged { .. } => 0,
+                TerminalUpdate::Full(snapshot) => {
+                    std::mem::size_of_val(snapshot.cells())
+                        + std::mem::size_of_val(snapshot.history_cells())
+                }
+                TerminalUpdate::Delta(delta) => {
+                    std::mem::size_of_val(delta.changes())
+                        + delta
+                            .changes()
+                            .iter()
+                            .map(|change| match change {
+                                TerminalChange::Patch { cells, .. }
+                                | TerminalChange::HistoryAppend { cells, .. }
+                                | TerminalChange::HistoryReplace { cells, .. } => {
+                                    std::mem::size_of_val(&**cells)
+                                }
+                                TerminalChange::Fill { .. }
+                                | TerminalChange::Scroll { .. }
+                                | TerminalChange::Cursor { .. }
+                                | TerminalChange::Reset => 0,
+                            })
+                            .sum::<usize>()
+                }
+            }
+        }
+        FleetEvent::Inspect { request, .. } => request_bytes(request),
+        FleetEvent::Requests { requests, .. } => {
+            requests.capacity() * size_of::<ComputerHostRequest>()
+                + requests.iter().map(request_bytes).sum::<usize>()
+        }
+        FleetEvent::Boundary { outcome, .. } => match outcome {
+            Outcome::Halted(value) => value.as_ref().map_or(0, value_bytes),
+            Outcome::UncaughtException(detail) => detail.capacity(),
+            Outcome::HostFailed(failure) => failure.detail().len(),
+            Outcome::CompilationRequested(request) => {
+                std::mem::size_of_val(&*request.sources)
+                    + request
+                        .sources
+                        .iter()
+                        .map(|source| source.path.len() + source.utf8.len())
+                        .sum::<usize>()
+            }
+            Outcome::HostRequestBatch(batch) => {
+                std::mem::size_of_val(&*batch.requests)
+                    + batch.requests.iter().map(request_bytes).sum::<usize>()
+            }
+            Outcome::SliceExhausted
+            | Outcome::ProcessEntered(_)
+            | Outcome::ProcessExited(_)
+            | Outcome::ProcessReplaced { .. }
+            | Outcome::WaitingForHostQuota
+            | Outcome::WaitingForTerminalEvent
+            | Outcome::AllocationExhausted(_)
+            | Outcome::QuotaExhausted(_)
+            | Outcome::Crashed(_)
+            | Outcome::Faulted(_) => 0,
+        },
+        FleetEvent::Stopped { pending, .. } | FleetEvent::ScopeStopped { pending, .. } => {
+            pending.capacity() * size_of::<(u32, u64)>()
+        }
+        FleetEvent::Error { message, .. } => message.capacity(),
+        FleetEvent::Deployment { .. }
+        | FleetEvent::InputResult { .. }
+        | FleetEvent::Filesystem { result: Err(_), .. }
+        | FleetEvent::ResourceSnapshot { .. }
+        | FleetEvent::FilesystemGeneration { .. }
+        | FleetEvent::Quiescent { .. }
+        | FleetEvent::DetachRejected { .. } => 0,
+        FleetEvent::Detached { .. } => panic!("detached VM is not an ordinary observation"),
+    };
+    size_of::<super::FleetEvent>() + payload
 }
 
 #[cfg(test)]

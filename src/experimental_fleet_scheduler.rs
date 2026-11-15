@@ -21,7 +21,13 @@ mod output;
 use output::WorkerOutput;
 mod memory;
 use memory::{ByteBudget, Reservation};
-pub use memory::{FleetCommandMemory, FleetMemoryLimits};
+mod lifecycle;
+use lifecycle::{CloseRequest, LifecycleCompletion, LifecycleCompletions};
+pub use lifecycle::{
+    FleetDetachCompletion, FleetDetachRejection, FleetDetachResult, FleetQuiescent,
+    FleetStopCompletion,
+};
+pub use memory::{FleetMemoryLimits, FleetMemoryUsage};
 
 static NEXT_FLEET_DEPLOYMENT_CANDIDATE: AtomicU64 = AtomicU64::new(1);
 const MAXIMUM_PENDING_TIMERS: usize = 256;
@@ -432,8 +438,9 @@ struct LaneMailbox {
     memory: Arc<ByteBudget>,
     machine_limit: usize,
     machine_memory: HashMap<u64, Arc<ByteBudget>>,
+    paused: HashMap<u64, Arc<AtomicBool>>,
     /// At most one entry per registered machine; registration is capped at 4096.
-    stops: std::collections::BTreeSet<u64>,
+    closes: BTreeMap<u64, CloseRequest>,
 }
 
 struct QueuedCommand {
@@ -460,7 +467,8 @@ impl LaneMailbox {
             memory,
             machine_limit,
             machine_memory: HashMap::new(),
-            stops: Default::default(),
+            paused: HashMap::new(),
+            closes: Default::default(),
         }
     }
 
@@ -498,8 +506,18 @@ impl LaneMailbox {
         Ok(())
     }
 
+    #[cfg(test)]
     fn next(&mut self) -> Option<QueuedCommand> {
-        if let Some(machine) = self.stops.first().copied() {
+        self.next_for(None)
+    }
+
+    fn next_for(&mut self, active: Option<u64>) -> Option<QueuedCommand> {
+        self.paused
+            .retain(|_, resume| !resume.load(Ordering::Acquire));
+        let close = active
+            .and_then(|id| self.closes.get_key_value(&id))
+            .or_else(|| self.closes.first_key_value());
+        if let Some((&machine, &close)) = close {
             if let Some(index) = self
                 .commands
                 .iter()
@@ -507,13 +525,20 @@ impl LaneMailbox {
             {
                 return self.commands.remove(index);
             }
-            self.stops.remove(&machine);
+            self.closes.remove(&machine);
             return Some(QueuedCommand {
-                command: Command::Stop { machine },
+                command: close.command(machine),
                 _memory: None,
             });
         }
-        self.commands.pop_front()
+        if self.paused.is_empty() {
+            return self.commands.pop_front();
+        }
+        let index = self
+            .commands
+            .iter()
+            .position(|queued| !self.paused.contains_key(&queued.command.machine()))?;
+        self.commands.remove(index)
     }
 }
 
@@ -532,6 +557,7 @@ struct Actor {
     queued: bool,
     parked: bool,
     stopped: bool,
+    detach_fence: Option<Arc<AtomicBool>>,
     pending: HashSet<(u32, u64)>,
     inspecting: HashSet<(u32, u64)>,
     scopes: Vec<u64>,
@@ -560,6 +586,7 @@ impl Actor {
             queued: false,
             parked: false,
             stopped: false,
+            detach_fence: None,
             pending: HashSet::new(),
             inspecting: HashSet::new(),
             scopes,
@@ -615,46 +642,29 @@ impl FleetEventSignal {
     }
 }
 
-/// The last accounting report is retained alongside the stop result so that
-/// stopping does not depend on space in the ordinary event queue.
-pub struct FleetStopCompletion {
-    pub machine: u64,
-    pub pending: Vec<(u32, u64)>,
-    /// Final cumulative accounting for the last tick, even if it was already
-    /// emitted as an ordinary event. Consumers must reconcile by tick.
-    pub quiescent: Option<FleetQuiescent>,
-    /// Reports cancelled from ordinary delivery while draining accepted commands.
-    pub prior_reports: VecDeque<FleetQuiescent>,
-    report_pending: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FleetQuiescent {
-    pub tick: u64,
-    pub retired: u64,
-    pub timers_pending: bool,
-}
-
-type StopCompletions = Arc<Mutex<BTreeMap<u64, FleetStopCompletion>>>;
-
 #[derive(Clone)]
 struct EventSender {
     sender: SyncSender<FleetEvent>,
     signal: Arc<FleetEventSignal>,
-    stops: StopCompletions,
+    completions: LifecycleCompletions,
+    detach_memory: Arc<ByteBudget>,
+    detach_machine_limit: usize,
+    detach_headroom: Arc<AtomicUsize>,
 }
 
 pub struct FleetScheduler {
     lanes: Vec<Arc<Mutex<LaneMailbox>>>,
     owners: Mutex<Owners>,
     events: Receiver<FleetEvent>,
-    stops: StopCompletions,
+    completions: LifecycleCompletions,
     event_signal: Arc<FleetEventSignal>,
     stopped: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
     metrics: Arc<Metrics>,
     waiting_publishers: Arc<AtomicUsize>,
     command_memory: Arc<ByteBudget>,
+    detach_memory: Arc<ByteBudget>,
+    detach_headroom: Arc<AtomicUsize>,
 }
 
 impl FleetScheduler {
@@ -698,7 +708,11 @@ impl FleetScheduler {
         coordinated_turns: bool,
         memory_limits: FleetMemoryLimits,
     ) -> Result<Self, &'static str> {
-        if memory_limits.command_bytes == 0 || memory_limits.command_bytes_per_machine == 0 {
+        if memory_limits.command_bytes == 0
+            || memory_limits.command_bytes_per_machine == 0
+            || memory_limits.detach_output_bytes == 0
+            || memory_limits.detach_output_bytes_per_machine == 0
+        {
             return Err("invalid fleet memory limits");
         }
         if machines.len() > 4096 {
@@ -732,11 +746,16 @@ impl FleetScheduler {
         let (event_tx, events) = mpsc::sync_channel(config.event_capacity);
         let event_signal = Arc::new(FleetEventSignal::default());
         // At most one completion exists per registered machine; registration is capped.
-        let stops = Arc::new(Mutex::new(BTreeMap::new()));
+        let completions = Arc::new(Mutex::new(BTreeMap::new()));
+        let detach_memory = ByteBudget::new(memory_limits.detach_output_bytes);
+        let detach_headroom = Arc::new(AtomicUsize::new(0));
         let event_tx = EventSender {
             sender: event_tx,
             signal: Arc::clone(&event_signal),
-            stops: Arc::clone(&stops),
+            completions: Arc::clone(&completions),
+            detach_memory: Arc::clone(&detach_memory),
+            detach_machine_limit: memory_limits.detach_output_bytes_per_machine,
+            detach_headroom: Arc::clone(&detach_headroom),
         };
         let stopped = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(Metrics::default());
@@ -800,13 +819,15 @@ impl FleetScheduler {
                 next_lane,
             }),
             events,
-            stops,
+            completions,
             event_signal,
             stopped,
             workers,
             metrics,
             waiting_publishers,
             command_memory,
+            detach_memory,
+            detach_headroom,
         })
     }
 
@@ -1290,8 +1311,18 @@ impl FleetScheduler {
             return Err(SubmitError::Closed);
         }
         let mut mailbox = self.lanes[lane].lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(command, Command::Stop { .. }) {
-            assert!(mailbox.stops.insert(machine), "duplicate stop request");
+        let close = match command {
+            Command::Stop { .. } => Some(CloseRequest::Stop),
+            Command::Detach {
+                preserve_timers_at, ..
+            } => Some(CloseRequest::Detach { preserve_timers_at }),
+            _ => None,
+        };
+        if let Some(close) = close {
+            assert!(
+                mailbox.closes.insert(machine, close).is_none(),
+                "duplicate close request"
+            );
         } else {
             mailbox.submit(command).map_err(|_| SubmitError::Full)?;
         }
@@ -1306,33 +1337,13 @@ impl FleetScheduler {
 
     pub fn try_event(&self) -> Option<FleetEvent> {
         let result = self.events.try_recv().ok().or_else(|| {
-            let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
-            let mut entry = stops.first_entry()?;
+            let mut completions = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut entry = completions.first_entry()?;
             let machine = *entry.key();
-            if let Some(report) = entry.get_mut().prior_reports.pop_front() {
-                return Some(FleetEvent::Quiescent {
-                    machine,
-                    tick: report.tick,
-                    retired: report.retired,
-                    timers_pending: report.timers_pending,
-                });
+            if let Some(event) = entry.get_mut().next_observation() {
+                return Some(event);
             }
-            if entry.get().report_pending {
-                let report = entry.get().quiescent.expect("pending report exists");
-                entry.get_mut().report_pending = false;
-                Some(FleetEvent::Quiescent {
-                    machine,
-                    tick: report.tick,
-                    retired: report.retired,
-                    timers_pending: report.timers_pending,
-                })
-            } else {
-                let completion = entry.remove();
-                Some(FleetEvent::Stopped {
-                    machine,
-                    pending: completion.pending,
-                })
-            }
+            Some(entry.remove().into_event(machine))
         });
         match &result {
             Some(FleetEvent::Stopped { machine, .. } | FleetEvent::Detached { machine, .. }) => {
@@ -1349,7 +1360,13 @@ impl FleetScheduler {
             }
             _ => {}
         }
-        if result.is_some() && self.waiting_publishers.load(Ordering::SeqCst) != 0 {
+        if result.is_some()
+            && (self.waiting_publishers.load(Ordering::SeqCst) != 0
+                || matches!(
+                    result,
+                    Some(FleetEvent::DetachRejected { .. } | FleetEvent::Detached { .. })
+                ))
+        {
             for worker in &self.workers {
                 worker.thread().unpark();
             }
@@ -1361,12 +1378,51 @@ impl FleetScheduler {
     /// The caller must cancel or disregard older events for this machine.
     pub fn try_stopped(&self, machine: u64) -> Option<FleetStopCompletion> {
         let completion = {
-            let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
-            stops.remove(&machine)?
+            let mut completions = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(
+                completions.get(&machine),
+                Some(LifecycleCompletion::Stop(_))
+            ) {
+                return None;
+            }
+            let LifecycleCompletion::Stop(completion) = completions.remove(&machine)? else {
+                unreachable!()
+            };
+            completion
         };
         let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         owners.lanes.remove(&machine);
         owners.closing.remove(&machine);
+        Some(completion)
+    }
+
+    /// Consume detachment without draining the ordinary queue. Process the
+    /// returned observations before resuming a rejected machine; older published
+    /// events remain in the ordinary queue. Taking a result releases its fence.
+    pub fn try_detached(&self, machine: u64) -> Option<FleetDetachCompletion> {
+        let mut completion = {
+            let mut completions = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(
+                completions.get(&machine),
+                Some(LifecycleCompletion::Detach(_))
+            ) {
+                return None;
+            }
+            let LifecycleCompletion::Detach(completion) = completions.remove(&machine)? else {
+                unreachable!()
+            };
+            completion
+        };
+        completion.release();
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        let lane = owners.lanes.get(&machine).copied();
+        owners.closing.remove(&machine);
+        if matches!(completion.result, FleetDetachResult::Detached { .. }) {
+            owners.lanes.remove(&machine);
+        }
+        if let Some(lane) = lane {
+            self.workers[lane].thread().unpark();
+        }
         Some(completion)
     }
 
@@ -1382,8 +1438,17 @@ impl FleetScheduler {
         }
     }
 
-    pub fn command_memory(&self) -> FleetCommandMemory {
+    pub fn command_memory(&self) -> FleetMemoryUsage {
         self.command_memory.snapshot()
+    }
+
+    /// Unbudgeted in-flight output, bounded to one operation per worker.
+    pub fn detach_headroom_bytes(&self) -> usize {
+        self.detach_headroom.load(Ordering::Acquire)
+    }
+
+    pub fn detach_output_memory(&self) -> FleetMemoryUsage {
+        self.detach_memory.snapshot()
     }
 }
 
@@ -1434,6 +1499,19 @@ fn remove_actor(
         .machine_memory
         .remove(&id);
     Some(actor)
+}
+
+fn fence_detach(
+    actor: Option<&mut Actor>,
+    mailbox: &mut LaneMailbox,
+    machine: u64,
+) -> Option<Arc<AtomicBool>> {
+    let resume = Arc::new(AtomicBool::new(false));
+    if let Some(actor) = actor {
+        actor.detach_fence = Some(Arc::clone(&resume));
+    }
+    mailbox.paused.insert(machine, Arc::clone(&resume));
+    Some(resume)
 }
 
 fn report_input(
@@ -1516,17 +1594,38 @@ fn run_worker(
         for _ in 0..4 {
             let queued = {
                 let mut mailbox = mailbox.lock().unwrap_or_else(|e| e.into_inner());
-                if events.has_pending() && mailbox.stops.is_empty() {
+                if let Some(machine) = events.overflowed_detach() {
+                    mailbox.closes.remove(&machine);
+                    events.complete_detach(
+                        machine,
+                        FleetDetachResult::Rejected(FleetDetachRejection::OutputCapacity),
+                        fence_detach(actors.get_mut(&machine), &mut mailbox, machine),
+                    );
+                }
+                if events.has_pending() && mailbox.closes.is_empty() {
                     break;
                 }
-                let Some(queued) = mailbox.next() else {
+                let active = events.closing_machine();
+                let close = active
+                    .and_then(|id| mailbox.closes.get_key_value(&id))
+                    .or_else(|| mailbox.closes.first_key_value())
+                    .map(|(&machine, &close)| (machine, close));
+                if let Some((machine, close)) = close {
+                    if !events.begin_closing(machine, close) {
+                        mailbox.closes.remove(&machine);
+                        events.reject_detach(
+                            machine,
+                            fence_detach(actors.get_mut(&machine), &mut mailbox, machine),
+                        );
+                        continue;
+                    }
+                    if events.overflowed_detach().is_some() {
+                        continue;
+                    }
+                }
+                let Some(queued) = mailbox.next_for(active) else {
                     break;
                 };
-                if matches!(queued.command, Command::Stop { .. })
-                    || mailbox.stops.contains(&queued.command.machine())
-                {
-                    events.begin_closing(queued.command.machine());
-                }
                 queued
             };
             let QueuedCommand { command, _memory } = queued;
@@ -1837,9 +1936,15 @@ fn run_worker(
                         || !actor.inspected.is_empty()
                         || actor.compilation_token.is_some()
                     {
-                        if !publish(&events, &stopped, FleetEvent::DetachRejected { machine }) {
-                            return;
-                        }
+                        events.complete_detach(
+                            machine,
+                            FleetDetachResult::Rejected(FleetDetachRejection::Busy),
+                            fence_detach(
+                                Some(actor),
+                                &mut mailbox.lock().unwrap_or_else(|e| e.into_inner()),
+                                machine,
+                            ),
+                        );
                         continue;
                     }
                     if !report_quiescent(machine, actor, &events, &stopped, coordinated_turns) {
@@ -1861,17 +1966,14 @@ fn run_worker(
                         })
                         .collect();
                     timers.sort_unstable_by_key(|timer| (timer.task, timer.request));
-                    if !publish(
-                        &events,
-                        &stopped,
-                        FleetEvent::Detached {
-                            machine,
+                    events.complete_detach(
+                        machine,
+                        FleetDetachResult::Detached {
                             computer: Box::new(actor.machine),
                             timers,
                         },
-                    ) {
-                        return;
-                    }
+                        None,
+                    );
                 }
                 Command::Stop { machine } => {
                     if let Some(actor) = remove_actor(&mut actors, &mut queue, &mailbox, machine) {
@@ -2127,7 +2229,7 @@ fn run_worker(
         if !mailbox
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .stops
+            .closes
             .is_empty()
         {
             continue;
@@ -2144,6 +2246,24 @@ fn run_worker(
             continue;
         };
         actor.queued = false;
+        if let Some(fence) = &actor.detach_fence {
+            if !fence.load(Ordering::Acquire) {
+                actor.queued = true;
+                queue.push_back(id);
+                if queue.iter().all(|id| {
+                    actors.get(id).is_none_or(|actor| {
+                        actor
+                            .detach_fence
+                            .as_ref()
+                            .is_some_and(|fence| !fence.load(Ordering::Acquire))
+                    })
+                }) {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                continue;
+            }
+            actor.detach_fence = None;
+        }
         if actor.stopped || actor.remaining == 0 || actor.advances_left == 0 {
             if !report_quiescent(id, actor, &events, &stopped, coordinated_turns) {
                 return;
@@ -2605,6 +2725,386 @@ mod tests {
         }
     }
 
+    fn wait_lifecycle(fleet: &FleetScheduler, machine: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fleet.completions.lock().unwrap().contains_key(&machine) {
+            assert!(Instant::now() < deadline, "lifecycle completion blocked");
+            thread::yield_now();
+        }
+    }
+
+    fn saturated_fleet(memory_limits: FleetMemoryLimits, host_request: bool) -> FleetScheduler {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let machines = (0..2)
+            .map(|id| {
+                let (artifact, bindings) = if id == 1 && host_request {
+                    (
+                        crate::execution::fixtures::two_unit_capability_calls_artifact(),
+                        vec![binding],
+                    )
+                } else {
+                    (
+                        crate::execution::fixtures::two_block_artifact(1, 1),
+                        Vec::new(),
+                    )
+                };
+                (
+                    id,
+                    ComputerMachine::start(artifact, profile(), &bindings, &[]).unwrap(),
+                )
+            })
+            .collect();
+        let fleet = FleetScheduler::new_with_memory_limits(
+            machines,
+            FleetConfig {
+                workers: 1,
+                event_capacity: 1,
+                mailbox_capacity: 2,
+                ..config()
+            },
+            Vec::new(),
+            false,
+            memory_limits,
+        )
+        .unwrap();
+        fleet.grant(0, 1, 64).unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fleet.waiting_publishers.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "output did not saturate");
+            thread::yield_now();
+        }
+        fleet
+    }
+
+    #[test]
+    fn detach_completes_with_full_command_and_event_queues_without_polling() {
+        let command_limit = 2 * std::mem::size_of::<QueuedCommand>();
+        let fleet = saturated_fleet(
+            FleetMemoryLimits {
+                command_bytes: command_limit,
+                command_bytes_per_machine: command_limit,
+                ..FleetMemoryLimits::default()
+            },
+            false,
+        );
+        fleet.resource_snapshot(1, 41).unwrap();
+        fleet.resource_snapshot(0, 42).unwrap();
+        assert_eq!(fleet.command_memory().retained_bytes, command_limit);
+        fleet.detach(1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert!(fleet.try_stopped(1).is_none(), "wrong poll consumed detach");
+        assert!(fleet.detach_output_memory().retained_bytes > 0);
+        let completion = fleet.try_detached(1).unwrap();
+        assert!(completion
+            .observations
+            .iter()
+            .all(|event| event.machine() == 1));
+        assert!(completion
+            .observations
+            .iter()
+            .any(|event| matches!(event, FleetEvent::ResourceSnapshot { request: 41, .. })));
+        let FleetDetachResult::Detached { computer, timers } = completion.result else {
+            panic!("eligible machine was not detached");
+        };
+        assert!(timers.is_empty());
+        assert!(computer.resource_snapshot().retired_instructions > 0);
+        assert_eq!(fleet.detach_output_memory().retained_bytes, 0);
+        assert_eq!(fleet.grant(1, 2, 64), Err(SubmitError::UnknownMachine));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary { machine: 0, .. }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::ResourceSnapshot {
+                machine: 0,
+                request: 42,
+                ..
+            }
+        ));
+        assert!(fleet.attach(computer).is_ok());
+    }
+
+    #[test]
+    fn rejected_detach_preserves_undelivered_host_requests_and_query_results() {
+        let fleet = saturated_fleet(FleetMemoryLimits::default(), true);
+        fleet.resource_snapshot(1, 51).unwrap();
+        fleet.detach(1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert_eq!(fleet.grant(1, 2, 64), Err(SubmitError::UnknownMachine));
+        let completion = fleet.try_detached(1).unwrap();
+        assert!(matches!(completion.result, FleetDetachResult::Rejected(_)));
+        let mut observations = completion.observations.into_iter();
+        let FleetEvent::Requests { requests, .. } = observations.next().unwrap() else {
+            panic!("undelivered host request was lost");
+        };
+        assert!(matches!(
+            observations.next(),
+            Some(FleetEvent::ResourceSnapshot { request: 51, .. })
+        ));
+        assert!(observations.next().is_none());
+        let request = &requests[0];
+        fleet
+            .reply(1, request.task_id, request.id, ReplyValue::Unit)
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary { machine: 0, .. }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Requests { machine: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn detach_memory_exhaustion_keeps_commands_and_does_not_block_stop() {
+        let fleet = saturated_fleet(
+            FleetMemoryLimits {
+                detach_output_bytes: 1,
+                detach_output_bytes_per_machine: 1,
+                ..FleetMemoryLimits::default()
+            },
+            false,
+        );
+        fleet.resource_snapshot(1, 61).unwrap();
+        fleet.detach(1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert_eq!(
+            fleet.lanes[0].lock().unwrap().commands.len(),
+            1,
+            "commands kept running after detach exhausted its output budget"
+        );
+        assert_eq!(fleet.detach_output_memory().retained_bytes, 0);
+        assert!(fleet.detach_headroom_bytes() > 0);
+        fleet.stop(0).unwrap();
+        wait_lifecycle(&fleet, 0);
+        assert!(fleet.try_stopped(0).is_some());
+        let completion = fleet.try_detached(1).unwrap();
+        assert!(matches!(
+            completion.result,
+            FleetDetachResult::Rejected(FleetDetachRejection::OutputCapacity)
+        ));
+        assert_eq!(fleet.detach_headroom_bytes(), 0);
+        assert!(matches!(
+            completion.observations.front(),
+            Some(FleetEvent::Boundary { machine: 1, .. })
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary { machine: 0, .. }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::ResourceSnapshot {
+                machine: 1,
+                request: 61,
+                ..
+            }
+        ));
+        fleet.detach(1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert!(matches!(
+            fleet.try_detached(1).unwrap().result,
+            FleetDetachResult::Detached { .. }
+        ));
+    }
+
+    #[test]
+    fn detach_pressure_preserves_order_through_the_ordinary_polling_api() {
+        let limit =
+            std::mem::size_of::<FleetEvent>() + std::mem::size_of::<(Reservation, Reservation)>();
+        let fleet = saturated_fleet(
+            FleetMemoryLimits {
+                detach_output_bytes: limit,
+                detach_output_bytes_per_machine: limit,
+                ..FleetMemoryLimits::default()
+            },
+            false,
+        );
+        fleet.resource_snapshot(1, 71).unwrap();
+        fleet.resource_snapshot(1, 72).unwrap();
+        fleet.detach(1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert_eq!(fleet.detach_output_memory().retained_bytes, limit);
+        assert!(fleet.detach_headroom_bytes() > 0);
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary { machine: 0, .. }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary { machine: 1, .. }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::ResourceSnapshot {
+                machine: 1,
+                request: 71,
+                ..
+            }
+        ));
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::DetachRejected { machine: 1 }
+        ));
+        assert_eq!(fleet.detach_output_memory().retained_bytes, 0);
+        assert_eq!(fleet.detach_headroom_bytes(), 0);
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::ResourceSnapshot {
+                machine: 1,
+                request: 72,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn worker_headroom_cannot_accumulate_across_unclaimed_detach_refusals() {
+        let fleet = saturated_fleet(
+            FleetMemoryLimits {
+                detach_output_bytes: 1,
+                detach_output_bytes_per_machine: 1,
+                ..FleetMemoryLimits::default()
+            },
+            false,
+        );
+        fleet.detach(1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        let headroom = fleet.detach_headroom_bytes();
+        assert!(headroom > 0);
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let id = fleet.attach(Box::new(machine)).unwrap();
+        fleet.resource_snapshot(id, 81).unwrap();
+        fleet.detach(id).unwrap();
+        wait_lifecycle(&fleet, id);
+        assert_eq!(fleet.detach_headroom_bytes(), headroom);
+        let completion = fleet.try_detached(1).unwrap();
+        assert!(matches!(
+            completion.result,
+            FleetDetachResult::Rejected(FleetDetachRejection::OutputCapacity)
+        ));
+        fleet.stop(1).unwrap();
+        wait_lifecycle(&fleet, 1);
+        assert_eq!(
+            fleet.lanes[0].lock().unwrap().commands.len(),
+            2,
+            "unclaimed refusal released the attach/command fence"
+        );
+        assert_eq!(fleet.detach_headroom_bytes(), 0);
+        let completion = fleet.try_detached(id).unwrap();
+        assert!(matches!(
+            completion.result,
+            FleetDetachResult::Rejected(FleetDetachRejection::OutputCapacity)
+        ));
+        assert!(completion.observations.is_empty());
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary { machine: 0, .. }
+        ));
+        // Stop completion can be observed before the query; it has its own slot.
+        let mut observed = false;
+        while !observed {
+            observed = matches!(next(&fleet), FleetEvent::ResourceSnapshot { machine, request: 81, .. } if machine == id);
+        }
+    }
+
+    #[test]
+    fn saturated_detach_returns_timer_state_without_pumping_observations() {
+        let timer = ComputerMachine::start(
+            crate::execution::fixtures::timer_unit_artifact(2),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let idle = ComputerMachine::start(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            vec![(0, idle), (1, timer)],
+            FleetConfig {
+                workers: 1,
+                event_capacity: 1,
+                ..config()
+            },
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        wait_advances(&fleet, 2);
+        fleet.resource_snapshot(0, 91).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fleet.waiting_publishers.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "output did not saturate");
+            thread::yield_now();
+        }
+        fleet.detach_with_timers(1, 2).unwrap();
+        wait_lifecycle(&fleet, 1);
+        let completion = fleet.try_detached(1).unwrap();
+        let FleetDetachResult::Detached { computer, timers } = completion.result else {
+            panic!("timer detach refused");
+        };
+        assert_eq!(timers.len(), 1);
+        assert_eq!((timers[0].duration, timers[0].remaining), (2, 1));
+        assert!(fleet.attach_with_timers(computer, 100, timers).is_ok());
+    }
+
+    #[test]
+    fn a_new_close_cannot_interrupt_the_active_machines_fence() {
+        let mut mailbox = LaneMailbox::new(4);
+        for tick in 1..=2 {
+            assert!(mailbox
+                .submit(Command::Tick {
+                    machine: 9,
+                    tick,
+                    retirements: 1,
+                    deadline: None,
+                })
+                .is_ok());
+        }
+        mailbox.closes.insert(9, CloseRequest::Stop);
+        assert!(matches!(
+            mailbox.next().map(|queued| queued.command),
+            Some(Command::Tick {
+                machine: 9,
+                tick: 1,
+                ..
+            })
+        ));
+        mailbox.closes.insert(1, CloseRequest::Stop);
+        assert!(matches!(
+            mailbox.next_for(Some(9)).map(|queued| queued.command),
+            Some(Command::Tick {
+                machine: 9,
+                tick: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mailbox.next_for(Some(9)).map(|queued| queued.command),
+            Some(Command::Stop { machine: 9 })
+        ));
+        assert!(matches!(
+            mailbox.next().map(|queued| queued.command),
+            Some(Command::Stop { machine: 1 })
+        ));
+    }
+
     fn grant_until_terminal_outcome(fleet: &FleetScheduler, machine: u64) -> FleetEvent {
         for tick in 2..300 {
             fleet.grant(machine, tick, 512).unwrap();
@@ -2632,7 +3132,10 @@ mod tests {
         let sender = EventSender {
             sender,
             signal: Arc::clone(&signal),
-            stops: Arc::new(Mutex::new(BTreeMap::new())),
+            completions: Arc::new(Mutex::new(BTreeMap::new())),
+            detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
+            detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
+            detach_headroom: Arc::new(AtomicUsize::new(0)),
         };
         let generation = signal.generation();
         assert!(receiver.try_recv().is_err());
@@ -4064,7 +4567,13 @@ mod tests {
                 EventSender {
                     sender,
                     signal: Arc::new(FleetEventSignal::default()),
-                    stops: Arc::new(Mutex::new(BTreeMap::new())),
+                    completions: Arc::new(Mutex::new(BTreeMap::new())),
+                    detach_memory: ByteBudget::new(
+                        FleetMemoryLimits::default().detach_output_bytes,
+                    ),
+                    detach_machine_limit: FleetMemoryLimits::default()
+                        .detach_output_bytes_per_machine,
+                    detach_headroom: Arc::new(AtomicUsize::new(0)),
                 },
                 worker_stopped,
                 Arc::new(Metrics::default()),
@@ -4420,7 +4929,7 @@ mod tests {
                     })
                     .is_ok());
             }
-            mailbox.lock().unwrap().stops.insert(1);
+            mailbox.lock().unwrap().closes.insert(1, CloseRequest::Stop);
             let (event_tx, events) = mpsc::sync_channel(1);
             event_tx
                 .try_send(FleetEvent::Error {
@@ -4429,14 +4938,17 @@ mod tests {
                 })
                 .unwrap();
             let signal = Arc::new(FleetEventSignal::default());
-            let stops = Arc::new(Mutex::new(BTreeMap::new()));
+            let completions = Arc::new(Mutex::new(BTreeMap::new()));
             let stopped = Arc::new(AtomicBool::new(false));
             let metrics = Arc::new(Metrics::default());
             let waiters = Arc::new(AtomicUsize::new(0));
             let sender = EventSender {
                 sender: event_tx,
                 signal: Arc::clone(&signal),
-                stops: Arc::clone(&stops),
+                completions: Arc::clone(&completions),
+                detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
+                detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
+                detach_headroom: Arc::new(AtomicUsize::new(0)),
             };
             let worker_stopped = Arc::clone(&stopped);
             let worker_metrics = Arc::clone(&metrics);
@@ -4465,16 +4977,18 @@ mod tests {
                     next_lane: 0,
                 }),
                 events,
-                stops,
+                completions,
                 event_signal: signal,
                 stopped,
                 workers: vec![worker],
                 metrics,
                 waiting_publishers: waiters,
                 command_memory,
+                detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
+                detach_headroom: Arc::new(AtomicUsize::new(0)),
             };
             let deadline = Instant::now() + Duration::from_secs(5);
-            while fleet.stops.lock().unwrap().is_empty() {
+            while fleet.completions.lock().unwrap().is_empty() {
                 assert!(
                     Instant::now() < deadline,
                     "stop blocked on final accounting"
@@ -4559,13 +5073,16 @@ mod tests {
                 })
                 .is_ok());
         }
-        mailbox.lock().unwrap().stops.insert(1);
+        mailbox.lock().unwrap().closes.insert(1, CloseRequest::Stop);
         let (event_tx, _events) = mpsc::sync_channel(8);
-        let stops = Arc::new(Mutex::new(BTreeMap::new()));
+        let completions = Arc::new(Mutex::new(BTreeMap::new()));
         let sender = EventSender {
             sender: event_tx,
             signal: Arc::new(FleetEventSignal::default()),
-            stops: Arc::clone(&stops),
+            completions: Arc::clone(&completions),
+            detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
+            detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
+            detach_headroom: Arc::new(AtomicUsize::new(0)),
         };
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
@@ -4585,12 +5102,15 @@ mod tests {
             )
         });
         let deadline = Instant::now() + Duration::from_secs(5);
-        while stops.lock().unwrap().is_empty() {
+        while completions.lock().unwrap().is_empty() {
             assert!(Instant::now() < deadline, "stop did not finish");
             thread::yield_now();
         }
         assert_eq!(metrics.advances.load(Ordering::Relaxed), 0);
-        let completion = stops.lock().unwrap().remove(&1).unwrap();
+        let LifecycleCompletion::Stop(completion) = completions.lock().unwrap().remove(&1).unwrap()
+        else {
+            panic!("expected stop")
+        };
         assert_eq!(completion.quiescent.unwrap().tick, 5);
         assert_eq!(
             completion
@@ -4679,6 +5199,7 @@ mod tests {
             FleetMemoryLimits {
                 command_bytes: limit,
                 command_bytes_per_machine: limit,
+                ..FleetMemoryLimits::default()
             },
         )
         .unwrap();
@@ -4737,7 +5258,7 @@ mod tests {
     #[test]
     fn stopping_one_machine_does_not_fence_other_mailbox_submissions() {
         let mut mailbox = LaneMailbox::new(2);
-        mailbox.stops.insert(1);
+        mailbox.closes.insert(1, CloseRequest::Stop);
         assert!(mailbox
             .submit(Command::ResourceSnapshot {
                 machine: 2,
