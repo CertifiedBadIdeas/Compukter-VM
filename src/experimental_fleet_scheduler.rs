@@ -22,14 +22,31 @@ use crate::{
     HostFailureKind, HostResponse, HostValueInput,
 };
 
-/// Host-owned classification of a request's per-tick cost. Implementations must
-/// be non-blocking and return a positive cost; the VM does not decode host ABIs.
-pub type RequestCostPolicy = dyn Fn(&ComputerHostRequest) -> RequestCost + Send + Sync;
-
 #[derive(Clone, Copy, Debug)]
-pub struct RequestCost {
+struct RequestCost {
     pub units: u32,
     pub over_budget_detail: &'static str,
+}
+
+/// Host operations whose cost must be determined asynchronously by the host.
+#[derive(Clone, Debug)]
+pub struct RequestInspection {
+    pub namespace: Box<str>,
+    pub name: Box<str>,
+    pub abi_major: u16,
+    pub abi_minor: u16,
+    pub operation: u32,
+    pub over_budget_detail: &'static str,
+}
+
+impl RequestInspection {
+    fn matches(&self, request: &ComputerHostRequest) -> bool {
+        self.namespace == request.namespace
+            && self.name == request.name
+            && self.abi_major == request.abi_major
+            && self.abi_minor == request.abi_minor
+            && self.operation == request.operation
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +91,11 @@ impl ReplyValue {
 
 #[derive(Debug)]
 pub enum FleetEvent {
+    Inspect {
+        machine: u64,
+        tick: u64,
+        request: ComputerHostRequest,
+    },
     Requests {
         machine: u64,
         tick: u64,
@@ -101,6 +123,7 @@ pub enum SubmitError {
     UnknownMachine,
     Full,
     Closed,
+    InvalidCost,
 }
 
 #[derive(Default)]
@@ -133,6 +156,12 @@ enum Command {
     Stop {
         machine: u64,
     },
+    Cost {
+        machine: u64,
+        task: u32,
+        request: u64,
+        units: u32,
+    },
 }
 
 struct Actor {
@@ -147,6 +176,8 @@ struct Actor {
     parked: bool,
     stopped: bool,
     pending: HashSet<(u32, u64)>,
+    inspecting: HashSet<(u32, u64)>,
+    inspected: HashMap<(u32, u64), u32>,
     timers: HashMap<(u32, u64), u64>,
 }
 
@@ -165,22 +196,14 @@ impl FleetScheduler {
         machines: Vec<(u64, ComputerMachine)>,
         config: FleetConfig,
     ) -> Result<Self, &'static str> {
-        Self::new_with_request_cost(
-            machines,
-            config,
-            Arc::new(|_| RequestCost {
-                units: 1,
-                over_budget_detail: "Host request exceeds per-tick budget",
-            }),
-        )
+        Self::new_with_request_inspections(machines, config, Vec::new())
     }
 
-    /// Construct a fleet using a host-supplied cost policy. `new` charges one
-    /// unit per request and is only suitable when all operations have that cost.
-    pub fn new_with_request_cost(
+    /// Inspect configured operations through events; no host code runs on VM workers.
+    pub fn new_with_request_inspections(
         machines: Vec<(u64, ComputerMachine)>,
         config: FleetConfig,
-        request_cost: Arc<RequestCostPolicy>,
+        inspections: Vec<RequestInspection>,
     ) -> Result<Self, &'static str> {
         if config.workers == 0
             || config.mailbox_capacity == 0
@@ -213,6 +236,8 @@ impl FleetScheduler {
                     parked: false,
                     stopped: false,
                     pending: HashSet::new(),
+                    inspecting: HashSet::new(),
+                    inspected: HashMap::new(),
                     timers: HashMap::new(),
                 },
             );
@@ -221,6 +246,7 @@ impl FleetScheduler {
         let stopped = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(Metrics::default());
         let waiting_publishers = Arc::new(AtomicUsize::new(0));
+        let inspections = Arc::new(inspections);
         let mut lanes = Vec::new();
         let mut workers: Vec<JoinHandle<()>> = Vec::new();
         for (lane, actors) in partitions.into_iter().enumerate() {
@@ -230,7 +256,7 @@ impl FleetScheduler {
             let stop = Arc::clone(&stopped);
             let worker_metrics = Arc::clone(&metrics);
             let waiting = Arc::clone(&waiting_publishers);
-            let request_cost = Arc::clone(&request_cost);
+            let inspections = Arc::clone(&inspections);
             let worker = match thread::Builder::new()
                 .name(format!("experimental-vm-{lane}"))
                 .spawn(move || {
@@ -242,7 +268,7 @@ impl FleetScheduler {
                         worker_metrics,
                         waiting,
                         config,
-                        request_cost,
+                        inspections,
                     )
                 }) {
                 Ok(worker) => worker,
@@ -313,6 +339,27 @@ impl FleetScheduler {
     /// Requests asynchronous removal. Completion is reported by `Stopped`.
     pub fn stop(&self, machine: u64) -> Result<(), SubmitError> {
         self.send(machine, Command::Stop { machine })
+    }
+
+    pub fn resolve_cost(
+        &self,
+        machine: u64,
+        task: u32,
+        request: u64,
+        units: u32,
+    ) -> Result<(), SubmitError> {
+        if units == 0 {
+            return Err(SubmitError::InvalidCost);
+        }
+        self.send(
+            machine,
+            Command::Cost {
+                machine,
+                task,
+                request,
+                units,
+            },
+        )
     }
 
     fn send(&self, machine: u64, command: Command) -> Result<(), SubmitError> {
@@ -411,7 +458,7 @@ fn run_worker(
     metrics: Arc<Metrics>,
     waiters: Arc<AtomicUsize>,
     config: FleetConfig,
-    request_cost: Arc<RequestCostPolicy>,
+    inspections: Arc<Vec<RequestInspection>>,
 ) {
     let mut queue = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
@@ -531,7 +578,10 @@ fn run_worker(
                             .copied()
                             .filter(|key| !actor.timers.contains_key(key))
                             .collect();
+                        pending.extend(actor.inspecting.iter().copied());
+                        pending.extend(actor.inspected.keys().copied());
                         pending.sort_unstable();
+                        pending.dedup();
                         drop(actor);
                         if !publish(
                             &events,
@@ -542,6 +592,34 @@ fn run_worker(
                             return;
                         }
                     }
+                }
+                Command::Cost {
+                    machine,
+                    task,
+                    request,
+                    units,
+                } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    let key = (task, request);
+                    if !actor.inspecting.remove(&key) {
+                        if !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::Error {
+                                machine,
+                                message: "cost does not match an inspection".into(),
+                            },
+                        ) {
+                            return;
+                        }
+                        continue;
+                    }
+                    actor.inspected.insert(key, units);
+                    actor.parked = false;
+                    ready(machine, actor, &mut queue);
                 }
             }
         }
@@ -568,7 +646,9 @@ fn run_worker(
             config.maintenance_budget,
             actor
                 .requests_left
-                .saturating_add(actor.pending.len() as u32),
+                .saturating_add(actor.pending.len() as u32)
+                .saturating_add(actor.inspecting.len() as u32)
+                .saturating_add(actor.inspected.len() as u32),
             actor.remaining,
         ) {
             Ok(value) => value,
@@ -618,7 +698,40 @@ fn run_worker(
                         budget_exhausted = true;
                         break;
                     }
-                    let cost = request_cost(&request);
+                    let cost = if let Some(rule) =
+                        inspections.iter().find(|rule| rule.matches(&request))
+                    {
+                        if let Some(&units) = actor.inspected.get(&key) {
+                            RequestCost {
+                                units,
+                                over_budget_detail: rule.over_budget_detail,
+                            }
+                        } else {
+                            if actor.inspecting.insert(key) {
+                                discovered = true;
+                                if !publish(
+                                    &events,
+                                    &stopped,
+                                    &waiters,
+                                    FleetEvent::Inspect {
+                                        machine: id,
+                                        tick: actor.tick,
+                                        request,
+                                    },
+                                ) {
+                                    return;
+                                }
+                            }
+                            // Preserve the order of this native request batch until
+                            // the host has classified the earlier request.
+                            break;
+                        }
+                    } else {
+                        RequestCost {
+                            units: 1,
+                            over_budget_detail: "Host request exceeds per-tick budget",
+                        }
+                    };
                     if cost.units == 0 {
                         actor.stopped = true;
                         if !publish(
@@ -635,6 +748,7 @@ fn run_worker(
                         break;
                     }
                     if cost.units > config.host_budget {
+                        actor.inspected.remove(&key);
                         actor.requests_left -= 1;
                         discovered = true;
                         if let Err(error) = actor.machine.resume_host_request_for(
@@ -665,6 +779,7 @@ fn run_worker(
                         continue;
                     }
                     actor.requests_left -= cost.units;
+                    actor.inspected.remove(&key);
                     actor.pending.insert(key);
                     discovered = true;
                     if request.namespace.as_ref() == "compukter"
@@ -887,7 +1002,71 @@ mod tests {
     }
 
     #[test]
-    fn host_supplied_group_cost_defers_the_entire_request_until_the_next_tick() {
+    fn inspection_does_not_block_other_machines_and_stop_discards_late_cost() {
+        let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &ops);
+        let waiting = ComputerMachine::start(
+            crate::execution::fixtures::two_unit_capability_calls_artifact(),
+            profile(),
+            &[binding],
+            &[],
+        )
+        .unwrap();
+        let independent = ComputerMachine::start(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new_with_request_inspections(
+            vec![(7, waiting), (8, independent)],
+            FleetConfig {
+                workers: 1,
+                event_capacity: 1,
+                ..config()
+            },
+            vec![RequestInspection {
+                namespace: "app".into(),
+                name: "entry".into(),
+                abi_major: 1,
+                abi_minor: 0,
+                operation: 0,
+                over_budget_detail: "group exceeds budget",
+            }],
+        )
+        .unwrap();
+        fleet.grant(7, 1, 64).unwrap();
+        let request = match next(&fleet) {
+            FleetEvent::Inspect { request, .. } => request,
+            event => panic!("{event:?}"),
+        };
+        fleet.grant(8, 1, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                machine: 8,
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+        fleet.stop(7).unwrap();
+        match next(&fleet) {
+            FleetEvent::Stopped { machine, pending } => {
+                assert_eq!(machine, 7);
+                assert_eq!(pending, vec![(request.task_id, request.id)]);
+            }
+            event => panic!("{event:?}"),
+        }
+        fleet
+            .resolve_cost(7, request.task_id, request.id, 1)
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert!(fleet.try_event().is_none());
+    }
+
+    #[test]
+    fn host_inspection_defers_admission_and_preserves_tick_budget() {
         let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
         let binding = CapabilityBinding::new("app", "entry", 1, 0, &ops);
         let machine = ComputerMachine::start(
@@ -897,39 +1076,56 @@ mod tests {
             &[],
         )
         .unwrap();
-        let fleet = FleetScheduler::new_with_request_cost(
+        let fleet = FleetScheduler::new_with_request_inspections(
             vec![(7, machine)],
             FleetConfig {
                 host_budget: 3,
                 ..config()
             },
-            Arc::new(|_| RequestCost {
-                units: 2,
+            vec![RequestInspection {
+                namespace: "app".into(),
+                name: "entry".into(),
+                abi_major: 1,
+                abi_minor: 0,
+                operation: 0,
                 over_budget_detail: "group exceeds budget",
-            }),
+            }],
         )
         .unwrap();
         fleet.grant(7, 1, 64).unwrap();
         let first = match next(&fleet) {
-            FleetEvent::Requests { requests, .. } => requests[0].clone(),
+            FleetEvent::Inspect { request, .. } => request,
             event => panic!("{event:?}"),
         };
+        assert_eq!(
+            fleet.resolve_cost(7, first.task_id, first.id, 0),
+            Err(SubmitError::InvalidCost)
+        );
+        wait_advances(&fleet, 2);
+        assert!(fleet.try_event().is_none());
+        fleet.resolve_cost(7, first.task_id, first.id, 2).unwrap();
+        match next(&fleet) {
+            FleetEvent::Requests { requests, .. } => assert_eq!(requests[0].id, first.id),
+            event => panic!("{event:?}"),
+        }
         fleet
             .reply(7, first.task_id, first.id, ReplyValue::Unit)
             .unwrap();
-        wait_advances(&fleet, 3);
-        fleet.grant(7, 1, 64).unwrap();
+        let second = match next(&fleet) {
+            FleetEvent::Inspect { request, .. } => request,
+            event => panic!("{event:?}"),
+        };
+        fleet.resolve_cost(7, second.task_id, second.id, 2).unwrap();
         thread::sleep(Duration::from_millis(10));
         assert!(fleet.try_event().is_none());
         fleet.grant(7, 2, 64).unwrap();
-        let second = match next(&fleet) {
+        match next(&fleet) {
             FleetEvent::Requests { tick, requests, .. } => {
                 assert_eq!(tick, 2);
-                requests[0].clone()
+                assert_eq!(requests[0].id, second.id);
             }
             event => panic!("{event:?}"),
-        };
-        assert_ne!(first.id, second.id);
+        }
         fleet
             .reply(7, second.task_id, second.id, ReplyValue::Unit)
             .unwrap();
@@ -953,19 +1149,30 @@ mod tests {
             &[],
         )
         .unwrap();
-        let fleet = FleetScheduler::new_with_request_cost(
+        let fleet = FleetScheduler::new_with_request_inspections(
             vec![(7, machine)],
             FleetConfig {
                 host_budget: 3,
                 ..config()
             },
-            Arc::new(|_| RequestCost {
-                units: 4,
+            vec![RequestInspection {
+                namespace: "app".into(),
+                name: "entry".into(),
+                abi_major: 1,
+                abi_minor: 0,
+                operation: 0,
                 over_budget_detail: "group exceeds budget",
-            }),
+            }],
         )
         .unwrap();
         fleet.grant(7, 1, 64).unwrap();
+        let request = match next(&fleet) {
+            FleetEvent::Inspect { request, .. } => request,
+            event => panic!("{event:?}"),
+        };
+        fleet
+            .resolve_cost(7, request.task_id, request.id, 4)
+            .unwrap();
         match next(&fleet) {
             FleetEvent::Boundary {
                 outcome: ComputerAdvanceOutcome::UncaughtException(detail),

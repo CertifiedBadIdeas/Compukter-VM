@@ -77,6 +77,7 @@ fn experimental_fleet_exposes_typed_stop_events() {
                 break;
             }
             Some(WireEvent::Outcome(_)) => panic!("unexpected outcome"),
+            Some(WireEvent::Inspection(_)) => panic!("unexpected inspection"),
             None => {
                 assert!(Instant::now() < deadline);
                 std::thread::yield_now();
