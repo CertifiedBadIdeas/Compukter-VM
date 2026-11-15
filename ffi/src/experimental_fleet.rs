@@ -78,6 +78,12 @@ fn create_machines(
 }
 
 pub enum WireEvent {
+    ResourceSnapshot(Vec<u8>),
+    FilesystemGeneration {
+        machine: u64,
+        request: u64,
+        generation: u64,
+    },
     TerminalUpdate(Vec<u8>),
     Compilation(Vec<u8>),
     Quiescent {
@@ -115,6 +121,28 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
         return Ok(None);
     };
     let (machine, tick, outcome, inspection) = match event {
+        FleetEvent::ResourceSnapshot {
+            machine,
+            request,
+            snapshot,
+        } => {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&machine.to_le_bytes());
+            bytes.extend_from_slice(&request.to_le_bytes());
+            bytes.extend_from_slice(&crate::wire::encode_resource_snapshot(snapshot));
+            return Ok(Some(WireEvent::ResourceSnapshot(bytes)));
+        }
+        FleetEvent::FilesystemGeneration {
+            machine,
+            request,
+            generation,
+        } => {
+            return Ok(Some(WireEvent::FilesystemGeneration {
+                machine,
+                request,
+                generation,
+            }))
+        }
         FleetEvent::TerminalUpdate {
             machine,
             request,

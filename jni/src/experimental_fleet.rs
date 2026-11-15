@@ -44,6 +44,58 @@ fn submit(result: Result<(), SubmitError>) -> jint {
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_resourceSnapshot<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    request: jlong,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0 || request < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(
+                    f.scheduler
+                        .resource_snapshot(machine as u64, request as u64),
+                )
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_filesystemGeneration<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    request: jlong,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0 || request < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(
+                    f.scheduler
+                        .filesystem_generation(machine as u64, request as u64),
+                )
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_redstoneInput<
     'a,
 >(
@@ -456,6 +508,20 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         if f.pending.is_none() {
             f.pending = match experimental_fleet::poll_event(&f.scheduler) {
                 Ok(None) => None,
+                Ok(Some(experimental_fleet::WireEvent::ResourceSnapshot(b))) => {
+                    Some([vec![11], b].concat())
+                }
+                Ok(Some(experimental_fleet::WireEvent::FilesystemGeneration {
+                    machine,
+                    request,
+                    generation,
+                })) => {
+                    let mut bytes = vec![12];
+                    bytes.extend_from_slice(&machine.to_le_bytes());
+                    bytes.extend_from_slice(&request.to_le_bytes());
+                    bytes.extend_from_slice(&generation.to_le_bytes());
+                    Some(bytes)
+                }
                 Ok(Some(experimental_fleet::WireEvent::TerminalUpdate(b))) => {
                     Some([vec![10], b].concat())
                 }

@@ -103,6 +103,16 @@ impl ReplyValue {
 
 #[derive(Debug)]
 pub enum FleetEvent {
+    ResourceSnapshot {
+        machine: u64,
+        request: u64,
+        snapshot: crate::ComputerResourceSnapshot,
+    },
+    FilesystemGeneration {
+        machine: u64,
+        request: u64,
+        generation: u64,
+    },
     TerminalUpdate {
         machine: u64,
         request: u64,
@@ -231,6 +241,14 @@ enum Command {
     RedstoneOutput {
         machine: u64,
         packed: u32,
+    },
+    ResourceSnapshot {
+        machine: u64,
+        request: u64,
+    },
+    FilesystemGeneration {
+        machine: u64,
+        request: u64,
     },
     Cost {
         machine: u64,
@@ -534,6 +552,14 @@ impl FleetScheduler {
             return Err(SubmitError::InvalidInput);
         }
         self.send(machine, Command::RedstoneOutput { machine, packed })
+    }
+
+    pub fn resource_snapshot(&self, machine: u64, request: u64) -> Result<(), SubmitError> {
+        self.send(machine, Command::ResourceSnapshot { machine, request })
+    }
+
+    pub fn filesystem_generation(&self, machine: u64, request: u64) -> Result<(), SubmitError> {
+        self.send(machine, Command::FilesystemGeneration { machine, request })
     }
 
     pub fn reply(
@@ -1072,6 +1098,40 @@ fn run_worker(
                         ) {
                             return;
                         }
+                    }
+                }
+                Command::ResourceSnapshot { machine, request } => {
+                    let Some(actor) = actors.get(&machine) else {
+                        continue;
+                    };
+                    if !publish(
+                        &events,
+                        &stopped,
+                        &waiters,
+                        FleetEvent::ResourceSnapshot {
+                            machine,
+                            request,
+                            snapshot: actor.machine.resource_snapshot(),
+                        },
+                    ) {
+                        return;
+                    }
+                }
+                Command::FilesystemGeneration { machine, request } => {
+                    let Some(actor) = actors.get(&machine) else {
+                        continue;
+                    };
+                    if !publish(
+                        &events,
+                        &stopped,
+                        &waiters,
+                        FleetEvent::FilesystemGeneration {
+                            machine,
+                            request,
+                            generation: actor.machine.filesystem_generation(),
+                        },
+                    ) {
+                        return;
                     }
                 }
                 Command::Cost {
@@ -2202,6 +2262,28 @@ mod tests {
         }
         assert_eq!(outcomes.get(&1), Some(&11));
         assert_eq!(outcomes.get(&2), Some(&0x1234_5678));
+    }
+
+    #[test]
+    fn observes_resources_and_generation_on_the_machine_owner() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let expected = machine.resource_snapshot();
+        let generation = machine.filesystem_generation();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.resource_snapshot(7, 11).unwrap();
+        fleet.filesystem_generation(7, 12).unwrap();
+        assert!(
+            matches!(next(&fleet), FleetEvent::ResourceSnapshot { machine: 7, request: 11, snapshot } if snapshot == expected)
+        );
+        assert!(
+            matches!(next(&fleet), FleetEvent::FilesystemGeneration { machine: 7, request: 12, generation: actual } if actual == generation)
+        );
     }
 
     #[test]
