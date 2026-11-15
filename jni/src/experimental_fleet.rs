@@ -64,8 +64,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
     status(&mut env, |env| {
         if output.len(env)? != 1
             || config.len(env)? != 7
-            || count <= 0
-            || count > 4096
+            || !(0..=4096).contains(&count)
             || artifact.len(env)? > compukter_vm::ArtifactLimits::default().artifact_bytes
             || schemas.len(env)? > 65536
             || namespace.len(env)? > 256

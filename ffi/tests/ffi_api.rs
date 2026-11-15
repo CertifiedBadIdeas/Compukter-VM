@@ -107,13 +107,10 @@ fn experimental_fleet_validates_schemas_and_publishes_wire_outcomes() {
     };
     let artifact = support::executable_minimal_vector();
     assert!(compukter_ffi::experimental_fleet::create(&artifact, &[1], 1, config).is_err());
-    assert!(compukter_ffi::experimental_fleet::create(
-        &artifact,
-        &EMPTY_CAPABILITY_SCHEMAS,
-        0,
-        config
-    )
-    .is_err());
+    assert!(
+        compukter_ffi::experimental_fleet::create(&[], &EMPTY_CAPABILITY_SCHEMAS, 0, config)
+            .is_ok()
+    );
     let fleet =
         compukter_ffi::experimental_fleet::create(&artifact, &EMPTY_CAPABILITY_SCHEMAS, 1, config)
             .unwrap();

@@ -43,11 +43,14 @@ fn create_machines(
     schemas: &[u8],
     count: usize,
 ) -> Result<Vec<(u64, ComputerMachine)>, String> {
-    if count == 0 || count > 4096 {
-        return Err("fleet size must be between 1 and 4096".into());
+    if count > 4096 {
+        return Err("fleet size must be between 0 and 4096".into());
     }
     let schemas =
         crate::wire::decode_capability_schemas(schemas).ok_or("invalid capability schemas")?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let artifact = verify_artifact(Arc::from(artifact), ArtifactLimits::default())
         .map_err(|error| format!("artifact verification: {error:?}"))?;
     let machines = crate::bridge::with_capability_bindings(&schemas, |bindings| {
