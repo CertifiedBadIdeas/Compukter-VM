@@ -477,9 +477,13 @@ impl FleetEventSignal {
 pub struct FleetStopCompletion {
     pub machine: u64,
     pub pending: Vec<(u32, u64)>,
+    /// Final cumulative accounting for the last tick, even if it was already
+    /// emitted as an ordinary event. Consumers must reconcile by tick.
     pub quiescent: Option<FleetQuiescent>,
+    report_pending: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FleetQuiescent {
     pub tick: u64,
     pub retired: u64,
@@ -1131,7 +1135,9 @@ impl FleetScheduler {
             let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
             let mut entry = stops.first_entry()?;
             let machine = *entry.key();
-            if let Some(report) = entry.get_mut().quiescent.take() {
+            if entry.get().report_pending {
+                let report = entry.get().quiescent.expect("pending report exists");
+                entry.get_mut().report_pending = false;
                 Some(FleetEvent::Quiescent {
                     machine,
                     tick: report.tick,
@@ -1716,10 +1722,7 @@ fn run_worker(
                 }
                 Command::Stop { machine } => {
                     if let Some(actor) = actors.remove(&machine) {
-                        let quiescent = if coordinated_turns
-                            && actor.tick_initialized
-                            && actor.reported_retired != Some(actor.tick_retired)
-                        {
+                        let quiescent = if coordinated_turns && actor.tick_initialized {
                             Some(FleetQuiescent {
                                 tick: actor.tick,
                                 retired: actor.tick_retired,
@@ -1728,6 +1731,8 @@ fn run_worker(
                         } else {
                             None
                         };
+                        let report_pending = quiescent.is_some()
+                            && actor.reported_retired != Some(actor.tick_retired);
                         let mut pending: Vec<_> = actor
                             .pending
                             .iter()
@@ -1749,6 +1754,7 @@ fn run_worker(
                                     machine,
                                     pending,
                                     quiescent,
+                                    report_pending,
                                 },
                             );
                         assert!(previous.is_none(), "duplicate machine stop completion");
@@ -4244,7 +4250,9 @@ mod tests {
 
     #[test]
     fn stop_keeps_final_accounting_when_the_event_queue_is_full() {
-        for targeted in [false, true] {
+        for (targeted, already_reported) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let computer = ComputerMachine::start(
                 crate::execution::fixtures::two_block_artifact(1, 1),
                 profile(),
@@ -4252,16 +4260,25 @@ mod tests {
                 &[],
             )
             .unwrap();
-            let actors = HashMap::from([(1, Actor::new(computer, config().host_budget))]);
+            let mut actor = Actor::new(computer, config().host_budget);
+            if already_reported {
+                actor.tick_initialized = true;
+                actor.tick = 7;
+                actor.tick_retired = 9;
+                actor.reported_retired = Some(9);
+            }
+            let actors = HashMap::from([(1, actor)]);
             let (command_tx, command_rx) = mpsc::sync_channel(4);
-            command_tx
-                .try_send(Command::Tick {
-                    machine: 1,
-                    tick: 7,
-                    retirements: 64,
-                    deadline: None,
-                })
-                .unwrap();
+            if !already_reported {
+                command_tx
+                    .try_send(Command::Tick {
+                        machine: 1,
+                        tick: 7,
+                        retirements: 64,
+                        deadline: None,
+                    })
+                    .unwrap();
+            }
             command_tx.try_send(Command::Stop { machine: 1 }).unwrap();
             let (event_tx, events) = mpsc::sync_channel(1);
             event_tx
@@ -4323,7 +4340,10 @@ mod tests {
             if targeted {
                 let completion = fleet.try_stopped(1).unwrap();
                 let report = completion.quiescent.unwrap();
-                assert_eq!((completion.machine, report.tick, report.retired), (1, 7, 0));
+                assert_eq!(
+                    (completion.machine, report.tick, report.retired),
+                    (1, 7, if already_reported { 9 } else { 0 })
+                );
                 assert!(matches!(
                     fleet.try_event(),
                     Some(FleetEvent::Error { machine: 0, .. })
@@ -4333,15 +4353,17 @@ mod tests {
                     fleet.try_event(),
                     Some(FleetEvent::Error { machine: 0, .. })
                 ));
-                assert!(matches!(
-                    fleet.try_event(),
-                    Some(FleetEvent::Quiescent {
-                        machine: 1,
-                        tick: 7,
-                        retired: 0,
-                        ..
-                    })
-                ));
+                if !already_reported {
+                    assert!(matches!(
+                        fleet.try_event(),
+                        Some(FleetEvent::Quiescent {
+                            machine: 1,
+                            tick: 7,
+                            retired: 0,
+                            ..
+                        })
+                    ));
+                }
                 assert!(matches!(
                     fleet.try_event(),
                     Some(FleetEvent::Stopped { machine: 1, .. })
@@ -4396,13 +4418,19 @@ mod tests {
             );
             thread::yield_now();
         }
-        let mut seen = HashSet::new();
-        for _ in 0..2 {
-            if let FleetEvent::Boundary { machine, .. } = next(&fleet) {
-                seen.insert(machine);
+        // Closing machine 0 may cancel its undelivered events, but it must
+        // never consume or discard the event belonging to machine 1.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(
+                fleet.try_event(),
+                Some(FleetEvent::Boundary { machine: 1, .. })
+            ) {
+                break;
             }
+            assert!(Instant::now() < deadline, "unrelated event was lost");
+            thread::yield_now();
         }
-        assert!(seen.contains(&1), "unrelated event was lost");
     }
 
     #[test]
