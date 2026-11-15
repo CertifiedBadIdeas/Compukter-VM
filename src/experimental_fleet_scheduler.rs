@@ -516,6 +516,12 @@ impl FleetScheduler {
         if machines.len() > 4096 {
             return Err("fleet size exceeds maximum");
         }
+        if machines
+            .iter()
+            .any(|(_, machine)| !machine.fleet_attachable_with_timers(&[]))
+        {
+            return Err("machine has untracked external requests");
+        }
         if config.workers == 0
             || config.mailbox_capacity == 0
             || config.event_capacity == 0
@@ -3022,6 +3028,24 @@ mod tests {
             ComputerAdvanceOutcome::Halted(_)
         ));
         assert_eq!(fleet.grant(id, 2, 64), Err(SubmitError::UnknownMachine));
+    }
+
+    #[test]
+    fn initial_machines_reject_untracked_external_requests() {
+        let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &ops);
+        let mut machine = ComputerMachine::start(
+            crate::execution::fixtures::two_unit_capability_calls_artifact(),
+            profile(),
+            &[binding],
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            machine.advance(64, 64, 64).unwrap(),
+            ComputerAdvanceOutcome::HostRequestBatch(_)
+        ));
+        assert!(FleetScheduler::new(vec![(7, machine)], config()).is_err());
     }
 
     #[test]
