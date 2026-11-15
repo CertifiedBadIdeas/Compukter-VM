@@ -24,6 +24,7 @@ struct Fleet {
     scheduler: FleetScheduler,
     pending: Option<Vec<u8>>,
     detached: HashMap<u64, Box<compukter_vm::ComputerMachine>>,
+    sessions: HashMap<u64, experimental_fleet::SessionMetadata>,
 }
 static FLEETS: OnceLock<Mutex<HashMap<u64, Fleet>>> = OnceLock::new();
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -162,6 +163,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                 scheduler,
                 pending: None,
                 detached: HashMap::new(),
+                sessions: HashMap::new(),
             },
         );
         Ok(code(FfiStatus::Ok))
@@ -343,6 +345,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                     Some(b)
                 }
                 Ok(Some(experimental_fleet::WireEvent::Stopped { machine, pending })) => {
+                    f.sessions.remove(&machine);
                     let mut b = vec![2];
                     b.extend_from_slice(&machine.to_le_bytes());
                     b.extend_from_slice(&(pending.len() as u32).to_le_bytes());
@@ -354,15 +357,13 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                 }
                 Ok(Some(experimental_fleet::WireEvent::Detached { machine, computer })) => {
                     f.detached.insert(machine, computer);
-                    let mut bytes = vec![3];
+                    let mut bytes = vec![6];
                     bytes.extend_from_slice(&machine.to_le_bytes());
-                    bytes.extend_from_slice(b"unexpected detached machine");
                     Some(bytes)
                 }
                 Ok(Some(experimental_fleet::WireEvent::DetachRejected { machine })) => {
-                    let mut bytes = vec![3];
+                    let mut bytes = vec![7];
                     bytes.extend_from_slice(&machine.to_le_bytes());
-                    bytes.extend_from_slice(b"detach rejected: pending host requests");
                     Some(bytes)
                 }
                 Ok(Some(experimental_fleet::WireEvent::Error { machine, message })) => {
@@ -525,5 +526,100 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             .map_or(code(FfiStatus::StaleHandle), |f| {
                 submit(f.scheduler.terminal_key(machine as u64, event))
             }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_attachSession<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    session: jlong,
+    output: JLongArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if output.len(env)? != 1 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let mut map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = map.get_mut(&(handle as u64)) else {
+            return Ok(code(FfiStatus::StaleHandle));
+        };
+        if fleet.sessions.try_reserve(1).is_err() || fleet.detached.try_reserve(1).is_err() {
+            return Ok(code(FfiStatus::Internal));
+        }
+        let (machine, metadata) =
+            match experimental_fleet::attach_session(&fleet.scheduler, session as u64) {
+                Ok(value) => value,
+                Err(status) => return Ok(code(status)),
+            };
+        fleet.sessions.insert(machine, metadata);
+        write_handle(env, &output, machine)?;
+        Ok(code(FfiStatus::Ok))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_detach<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                if !f.sessions.contains_key(&(machine as u64)) {
+                    return code(FfiStatus::InvalidArgument);
+                }
+                submit(f.scheduler.detach(machine as u64))
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_restoreSession<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    output: JLongArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if machine < 0 || output.len(env)? != 1 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let mut map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = map.get_mut(&(handle as u64)) else {
+            return Ok(code(FfiStatus::StaleHandle));
+        };
+        let key = machine as u64;
+        if !fleet.detached.contains_key(&key) || !fleet.sessions.contains_key(&key) {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let computer = fleet.detached.remove(&key).expect("checked computer");
+        let metadata = fleet.sessions.remove(&key).expect("checked metadata");
+        match experimental_fleet::restore_session(computer, metadata) {
+            Ok(session) => {
+                write_handle(env, &output, session)?;
+                Ok(code(FfiStatus::Ok))
+            }
+            Err((error, computer, metadata)) => {
+                fleet.detached.insert(key, computer);
+                fleet.sessions.insert(key, metadata);
+                Ok(code(error))
+            }
+        }
     })
 }

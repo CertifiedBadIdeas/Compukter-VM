@@ -46,6 +46,35 @@ impl<T> HandleTable<T> {
         encode_handle(index, generation)
     }
 
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    pub(crate) fn insert_owned(&self, value: Box<T>) -> Result<u64, (HandleError, Box<T>)> {
+        let mut slots = match self.slots.lock() {
+            Ok(slots) => slots,
+            Err(_) => return Err((HandleError::Poisoned, value)),
+        };
+        if let Some((index, slot)) = slots
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.value.is_none())
+        {
+            let handle = match encode_handle(index, slot.generation) {
+                Ok(handle) => handle,
+                Err(error) => return Err((error, value)),
+            };
+            slot.value = Some(Arc::new(Mutex::new(Some(*value))));
+            return Ok(handle);
+        }
+        let handle = match encode_handle(slots.len(), 1) {
+            Ok(handle) => handle,
+            Err(error) => return Err((error, value)),
+        };
+        slots.push(Slot {
+            generation: 1,
+            value: Some(Arc::new(Mutex::new(Some(*value)))),
+        });
+        Ok(handle)
+    }
+
     pub(crate) fn with<R>(
         &self,
         handle: u64,

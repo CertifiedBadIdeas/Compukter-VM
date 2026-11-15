@@ -219,3 +219,25 @@ mod reply_tests {
         }
     }
 }
+
+/// Opaque bridge state retained while a session's computer belongs to a fleet.
+pub struct SessionMetadata(crate::bridge::FleetSessionMetadata);
+
+/// On refusal the original session handle remains valid and owns the machine.
+pub fn attach_session(
+    fleet: &FleetScheduler,
+    handle: u64,
+) -> Result<(u64, SessionMetadata), crate::FfiStatus> {
+    let (machine, metadata) = crate::bridge::attach_fleet_session(fleet, handle)?;
+    Ok((machine, SessionMetadata(metadata)))
+}
+
+/// On failure both the machine and its metadata are returned for retry.
+#[allow(clippy::result_large_err)]
+pub fn restore_session(
+    computer: Box<ComputerMachine>,
+    metadata: SessionMetadata,
+) -> Result<u64, (crate::FfiStatus, Box<ComputerMachine>, SessionMetadata)> {
+    crate::bridge::restore_fleet_session(computer, metadata.0)
+        .map_err(|(status, computer, metadata)| (status, computer, SessionMetadata(metadata)))
+}

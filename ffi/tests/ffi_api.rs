@@ -134,6 +134,86 @@ fn experimental_fleet_validates_schemas_and_publishes_wire_outcomes() {
     assert_eq!(event[16], 4); // Halted in the ordinary VM outcome wire.
 }
 
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[test]
+fn stored_session_can_transfer_to_fleet_and_return_with_checkpoint_identity() {
+    use compukter_ffi::experimental_fleet::{
+        attach_session, poll_event, restore_session, WireEvent,
+    };
+    use compukter_vm::experimental_fleet_scheduler::{FleetConfig, FleetScheduler};
+    use std::time::{Duration, Instant};
+    let root = TestRoot::new();
+    let store = open_store(root.path());
+    let artifact = terminal_artifact();
+    let image = empty_rom();
+    let id = [7u8; 16];
+    let mut created = vec![0; compukter_max_create_bytes()];
+    let mut written = 0;
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_create_in_store(
+            store,
+            id.as_ptr(),
+            image.as_ptr(),
+            image.len(),
+            artifact.as_ptr(),
+            artifact.len(),
+            EMPTY_CAPABILITY_SCHEMAS.as_ptr(),
+            EMPTY_CAPABILITY_SCHEMAS.len(),
+            created.as_mut_ptr(),
+            created.len(),
+            &mut written,
+        )
+    });
+    assert_eq!(created[0], 0);
+    let old = u64::from_le_bytes(created[1..9].try_into().unwrap());
+    let fleet = FleetScheduler::new(
+        vec![],
+        FleetConfig {
+            workers: 1,
+            mailbox_capacity: 4,
+            event_capacity: 4,
+            guest_budget: 64,
+            maintenance_budget: 64,
+            host_budget: 16,
+            maximum_advances_per_tick: 32,
+        },
+    )
+    .unwrap();
+    let (machine, metadata) = match attach_session(&fleet, old) {
+        Ok(value) => value,
+        Err(error) => panic!("{error:?}"),
+    };
+    assert_eq!(FfiStatus::StaleHandle, compukter_close(old));
+    fleet.detach(machine).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let computer = loop {
+        match poll_event(&fleet).unwrap() {
+            Some(WireEvent::Detached {
+                machine: actual,
+                computer,
+            }) => {
+                assert_eq!(actual, machine);
+                break computer;
+            }
+            Some(_) => panic!("unexpected fleet event"),
+            None => {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+    };
+    let restored = match restore_session(computer, metadata) {
+        Ok(handle) => handle,
+        Err((status, _, _)) => panic!("{status:?}"),
+    };
+    assert_ne!(restored, old);
+    assert_eq!(FfiStatus::Ok, unsafe {
+        compukter_checkpoint_save(restored, store, id.as_ptr(), std::ptr::null(), 0)
+    });
+    assert_eq!(FfiStatus::Ok, compukter_close(restored));
+    assert_eq!(FfiStatus::Ok, compukter_store_close(store));
+}
+
 #[test]
 fn c_abi_publishes_its_exact_version() {
     assert_eq!(28, COMPUKTER_FFI_ABI_VERSION);

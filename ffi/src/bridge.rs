@@ -107,6 +107,125 @@ struct BridgeSession {
     restored_host_state: Vec<u8>,
 }
 
+#[cfg(feature = "experimental-fleet-scheduler")]
+pub(crate) struct FleetSessionMetadata {
+    filesystem_limits: FileSystemLimits,
+    store_identity: Option<(u64, ComputerId)>,
+    restored_host_state: Vec<u8>,
+}
+
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[allow(clippy::result_large_err)] // consume_if returns the entire session on refusal.
+pub(crate) fn attach_fleet_session(
+    fleet: &compukter_vm::experimental_fleet_scheduler::FleetScheduler,
+    handle: u64,
+) -> Result<(u64, FleetSessionMetadata), crate::FfiStatus> {
+    use compukter_vm::experimental_fleet_scheduler::SubmitError;
+    sessions()
+        .consume_if(handle, |session| {
+            let BridgeSession {
+                computer,
+                compilation,
+                filesystem_limits,
+                store_identity,
+                restored_host_state,
+            } = session;
+            if compilation.is_some() {
+                return Err((
+                    crate::FfiStatus::InvalidArgument,
+                    BridgeSession {
+                        computer,
+                        compilation,
+                        filesystem_limits,
+                        store_identity,
+                        restored_host_state,
+                    },
+                ));
+            }
+            match fleet.attach(Box::new(computer)) {
+                Ok(machine) => Ok((
+                    machine,
+                    FleetSessionMetadata {
+                        filesystem_limits,
+                        store_identity,
+                        restored_host_state,
+                    },
+                )),
+                Err((error, computer)) => {
+                    let status = match error {
+                        SubmitError::Full | SubmitError::Capacity => crate::FfiStatus::BusyHandle,
+                        SubmitError::Closed => crate::FfiStatus::StaleHandle,
+                        SubmitError::IdentityExhausted => crate::FfiStatus::HandleExhausted,
+                        _ => crate::FfiStatus::InvalidArgument,
+                    };
+                    Err((
+                        status,
+                        BridgeSession {
+                            computer: *computer,
+                            compilation,
+                            filesystem_limits,
+                            store_identity,
+                            restored_host_state,
+                        },
+                    ))
+                }
+            }
+        })
+        .map_err(fleet_handle_status)?
+}
+
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[allow(clippy::result_large_err)] // Preserve all metadata if handle allocation fails.
+pub(crate) fn restore_fleet_session(
+    computer: Box<ComputerMachine>,
+    metadata: FleetSessionMetadata,
+) -> Result<u64, (crate::FfiStatus, Box<ComputerMachine>, FleetSessionMetadata)> {
+    let FleetSessionMetadata {
+        filesystem_limits,
+        store_identity,
+        restored_host_state,
+    } = metadata;
+    let compilation = computer.pending_compilation_request();
+    let session = Box::new(BridgeSession {
+        computer: *computer,
+        compilation,
+        filesystem_limits,
+        store_identity,
+        restored_host_state,
+    });
+    sessions()
+        .insert_owned(session)
+        .map_err(|(error, session)| {
+            let BridgeSession {
+                computer,
+                filesystem_limits,
+                store_identity,
+                restored_host_state,
+                ..
+            } = *session;
+            (
+                fleet_handle_status(error),
+                Box::new(computer),
+                FleetSessionMetadata {
+                    filesystem_limits,
+                    store_identity,
+                    restored_host_state,
+                },
+            )
+        })
+}
+
+#[cfg(feature = "experimental-fleet-scheduler")]
+fn fleet_handle_status(error: HandleError) -> crate::FfiStatus {
+    match error {
+        HandleError::Invalid => crate::FfiStatus::InvalidHandle,
+        HandleError::Stale => crate::FfiStatus::StaleHandle,
+        HandleError::Busy => crate::FfiStatus::BusyHandle,
+        HandleError::Exhausted => crate::FfiStatus::HandleExhausted,
+        HandleError::Poisoned => crate::FfiStatus::Internal,
+    }
+}
+
 impl BridgeSession {
     fn new(computer: ComputerMachine, filesystem_limits: FileSystemLimits) -> Self {
         Self {
