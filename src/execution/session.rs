@@ -102,6 +102,14 @@ impl core::fmt::Debug for Session {
 }
 
 impl Session {
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    pub(crate) fn fleet_quiescent(&self) -> bool {
+        self.pending_requests.is_empty()
+            && self.preparing_request.is_none()
+            && !self.resuming_host_reference
+            && self.replies.is_empty()
+    }
+
     #[cfg(feature = "jit-diagnostics")]
     pub(crate) fn jit_call_report(&self) -> String {
         self.machine.jit_call_report()

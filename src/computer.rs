@@ -399,7 +399,7 @@ impl ComputerMachine {
             && self.sessions[0].scope_id == 0
             && self.external_requests.is_empty()
             && self.pending_compilation.is_none()
-            && self.resource_snapshot().executed_instructions == 0
+            && self.sessions[0].session.fleet_quiescent()
     }
 
     #[cfg(feature = "program-sharing-benchmark")]

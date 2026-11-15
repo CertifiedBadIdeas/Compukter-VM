@@ -358,7 +358,7 @@ impl FleetScheduler {
     }
 
     /// Takes ownership only after the bounded mailbox accepts the machine. A refusal returns it.
-    /// Machines must not have executed Guest instructions or have pending host operations.
+    /// Machines must have one root scope and no pending or in-flight host operations.
     pub fn attach(
         &self,
         computer: Box<ComputerMachine>,
@@ -1444,6 +1444,40 @@ mod tests {
     #[test]
     fn attach_refusal_returns_the_original_machine() {
         let fleet = FleetScheduler::new(vec![], config()).unwrap();
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let mut machine = ComputerMachine::start(
+            crate::execution::fixtures::two_unit_capability_calls_artifact(),
+            profile(),
+            &[binding],
+            &[],
+        )
+        .unwrap();
+        let request = loop {
+            match machine.advance(64, 64, 64).unwrap() {
+                ComputerAdvanceOutcome::HostRequestBatch(batch) => break batch.requests[0].clone(),
+                ComputerAdvanceOutcome::SliceExhausted => {}
+                other => panic!("{other:?}"),
+            }
+        };
+        let (reason, mut returned) = fleet.attach(Box::new(machine)).unwrap_err();
+        assert_eq!(reason, SubmitError::InvalidMachine);
+        returned
+            .resume_host_request_for(
+                request.task_id,
+                request.id,
+                HostResponse::Success(HostValueInput::Unit),
+            )
+            .unwrap();
+        assert!(matches!(
+            returned.advance(64, 64, 64).unwrap(),
+            ComputerAdvanceOutcome::HostRequestBatch(_)
+        ));
+    }
+
+    #[test]
+    fn an_executed_quiescent_machine_can_join_a_fleet() {
+        let fleet = FleetScheduler::new(vec![], config()).unwrap();
         let mut machine = ComputerMachine::start(
             crate::execution::fixtures::two_block_artifact(1, 1),
             profile(),
@@ -1452,15 +1486,12 @@ mod tests {
         )
         .unwrap();
         machine.advance(1, 1, 1).unwrap();
-        let (reason, mut returned) = fleet.attach(Box::new(machine)).unwrap_err();
-        assert_eq!(reason, SubmitError::InvalidMachine);
-        loop {
-            match returned.advance(64, 64, 64).unwrap() {
-                ComputerAdvanceOutcome::Halted(_) => break,
-                ComputerAdvanceOutcome::SliceExhausted => {}
-                other => panic!("{other:?}"),
-            }
-        }
+        assert!(machine.resource_snapshot().executed_instructions > 0);
+        let id = fleet.attach(Box::new(machine)).unwrap();
+        fleet.grant(id, 1, 64).unwrap();
+        assert!(
+            matches!(next(&fleet), FleetEvent::Boundary { machine, outcome: ComputerAdvanceOutcome::Halted(_), .. } if machine == id)
+        );
     }
 
     #[test]
