@@ -472,7 +472,21 @@ impl FleetEventSignal {
     }
 }
 
-type StopCompletions = Arc<Mutex<BTreeMap<u64, Vec<(u32, u64)>>>>;
+/// The last accounting report is retained alongside the stop result so that
+/// stopping does not depend on space in the ordinary event queue.
+pub struct FleetStopCompletion {
+    pub machine: u64,
+    pub pending: Vec<(u32, u64)>,
+    pub quiescent: Option<FleetQuiescent>,
+}
+
+pub struct FleetQuiescent {
+    pub tick: u64,
+    pub retired: u64,
+    pub timers_pending: bool,
+}
+
+type StopCompletions = Arc<Mutex<BTreeMap<u64, FleetStopCompletion>>>;
 
 #[derive(Clone)]
 struct EventSender {
@@ -1114,11 +1128,23 @@ impl FleetScheduler {
 
     pub fn try_event(&self) -> Option<FleetEvent> {
         let result = self.events.try_recv().ok().or_else(|| {
-            self.stops
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pop_first()
-                .map(|(machine, pending)| FleetEvent::Stopped { machine, pending })
+            let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+            let mut entry = stops.first_entry()?;
+            let machine = *entry.key();
+            if let Some(report) = entry.get_mut().quiescent.take() {
+                Some(FleetEvent::Quiescent {
+                    machine,
+                    tick: report.tick,
+                    retired: report.retired,
+                    timers_pending: report.timers_pending,
+                })
+            } else {
+                let completion = entry.remove();
+                Some(FleetEvent::Stopped {
+                    machine,
+                    pending: completion.pending,
+                })
+            }
         });
         match &result {
             Some(FleetEvent::Stopped { machine, .. } | FleetEvent::Detached { machine, .. }) => {
@@ -1145,15 +1171,15 @@ impl FleetScheduler {
 
     /// Consume one machine's stop completion without draining ordinary events.
     /// The caller must cancel or disregard older events for this machine.
-    pub fn try_stopped(&self, machine: u64) -> Option<FleetEvent> {
-        let pending = {
+    pub fn try_stopped(&self, machine: u64) -> Option<FleetStopCompletion> {
+        let completion = {
             let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
             stops.remove(&machine)?
         };
         let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         owners.lanes.remove(&machine);
         owners.closing.remove(&machine);
-        Some(FleetEvent::Stopped { machine, pending })
+        Some(completion)
     }
 
     pub fn event_signal(&self) -> Arc<FleetEventSignal> {
@@ -1689,17 +1715,19 @@ fn run_worker(
                     }
                 }
                 Command::Stop { machine } => {
-                    if let Some(mut actor) = actors.remove(&machine) {
-                        if !report_quiescent(
-                            machine,
-                            &mut actor,
-                            &events,
-                            &stopped,
-                            &waiters,
-                            coordinated_turns,
-                        ) {
-                            return;
-                        }
+                    if let Some(actor) = actors.remove(&machine) {
+                        let quiescent = if coordinated_turns
+                            && actor.tick_initialized
+                            && actor.reported_retired != Some(actor.tick_retired)
+                        {
+                            Some(FleetQuiescent {
+                                tick: actor.tick,
+                                retired: actor.tick_retired,
+                                timers_pending: !actor.timers.is_empty(),
+                            })
+                        } else {
+                            None
+                        };
                         let mut pending: Vec<_> = actor
                             .pending
                             .iter()
@@ -1715,7 +1743,14 @@ fn run_worker(
                             .stops
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .insert(machine, pending);
+                            .insert(
+                                machine,
+                                FleetStopCompletion {
+                                    machine,
+                                    pending,
+                                    quiescent,
+                                },
+                            );
                         assert!(previous.is_none(), "duplicate machine stop completion");
                         events.signal.notify();
                     }
@@ -4189,7 +4224,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(event) = fleet.try_stopped(1) {
-                assert!(matches!(event, FleetEvent::Stopped { machine: 1, .. }));
+                assert_eq!(event.machine, 1);
                 break;
             }
             assert!(Instant::now() < deadline, "stop completion did not arrive");
@@ -4205,6 +4240,169 @@ mod tests {
         ));
         assert!(fleet.try_event().is_none());
         assert_eq!(fleet.stop(1), Err(SubmitError::UnknownMachine));
+    }
+
+    #[test]
+    fn stop_keeps_final_accounting_when_the_event_queue_is_full() {
+        for targeted in [false, true] {
+            let computer = ComputerMachine::start(
+                crate::execution::fixtures::two_block_artifact(1, 1),
+                profile(),
+                &[],
+                &[],
+            )
+            .unwrap();
+            let actors = HashMap::from([(1, Actor::new(computer, config().host_budget))]);
+            let (command_tx, command_rx) = mpsc::sync_channel(4);
+            command_tx
+                .try_send(Command::Tick {
+                    machine: 1,
+                    tick: 7,
+                    retirements: 64,
+                    deadline: None,
+                })
+                .unwrap();
+            command_tx.try_send(Command::Stop { machine: 1 }).unwrap();
+            let (event_tx, events) = mpsc::sync_channel(1);
+            event_tx
+                .try_send(FleetEvent::Error {
+                    machine: 0,
+                    message: "occupied".into(),
+                })
+                .unwrap();
+            let signal = Arc::new(FleetEventSignal::default());
+            let stops = Arc::new(Mutex::new(BTreeMap::new()));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let metrics = Arc::new(Metrics::default());
+            let waiters = Arc::new(AtomicUsize::new(0));
+            let sender = EventSender {
+                sender: event_tx,
+                signal: Arc::clone(&signal),
+                stops: Arc::clone(&stops),
+            };
+            let worker_stopped = Arc::clone(&stopped);
+            let worker_metrics = Arc::clone(&metrics);
+            let worker_waiters = Arc::clone(&waiters);
+            let worker = thread::spawn(move || {
+                run_worker(
+                    actors,
+                    command_rx,
+                    sender,
+                    worker_stopped,
+                    worker_metrics,
+                    worker_waiters,
+                    config(),
+                    Arc::new(Vec::new()),
+                    true,
+                )
+            });
+            let fleet = FleetScheduler {
+                lanes: vec![command_tx],
+                owners: Mutex::new(Owners {
+                    lanes: HashMap::from([(1, 0)]),
+                    closing: HashSet::from([1]),
+                    next_id: Some(2),
+                    next_lane: 0,
+                }),
+                events,
+                stops,
+                event_signal: signal,
+                stopped,
+                workers: vec![worker],
+                metrics,
+                waiting_publishers: waiters,
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fleet.stops.lock().unwrap().is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "stop blocked on final accounting"
+                );
+                thread::yield_now();
+            }
+            if targeted {
+                let completion = fleet.try_stopped(1).unwrap();
+                let report = completion.quiescent.unwrap();
+                assert_eq!((completion.machine, report.tick, report.retired), (1, 7, 0));
+                assert!(matches!(
+                    fleet.try_event(),
+                    Some(FleetEvent::Error { machine: 0, .. })
+                ));
+            } else {
+                assert!(matches!(
+                    fleet.try_event(),
+                    Some(FleetEvent::Error { machine: 0, .. })
+                ));
+                assert!(matches!(
+                    fleet.try_event(),
+                    Some(FleetEvent::Quiescent {
+                        machine: 1,
+                        tick: 7,
+                        retired: 0,
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    fleet.try_event(),
+                    Some(FleetEvent::Stopped { machine: 1, .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "known issue: a full event queue blocks the worker before it can process stop"]
+    fn stopped_machine_completes_while_another_event_publisher_is_blocked() {
+        let machines = (0..2)
+            .map(|id| {
+                (
+                    id,
+                    ComputerMachine::start(
+                        crate::execution::fixtures::two_block_artifact(1, 1),
+                        profile(),
+                        &[],
+                        &[],
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let fleet = FleetScheduler::new(
+            machines,
+            FleetConfig {
+                workers: 1,
+                event_capacity: 1,
+                ..config()
+            },
+        )
+        .unwrap();
+        fleet.grant(0, 1, 64).unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fleet.waiting_publishers.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "publisher did not block");
+            thread::yield_now();
+        }
+        fleet.stop(0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(event) = fleet.try_stopped(0) {
+                assert_eq!(event.machine, 0);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stop was blocked by another machine's event"
+            );
+            thread::yield_now();
+        }
+        let mut seen = HashSet::new();
+        for _ in 0..2 {
+            if let FleetEvent::Boundary { machine, .. } = next(&fleet) {
+                seen.insert(machine);
+            }
+        }
+        assert!(seen.contains(&1), "unrelated event was lost");
     }
 
     #[test]
