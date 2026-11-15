@@ -6338,8 +6338,12 @@ mod tests {
         }
     }
 
-    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 9] {
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 10] {
         [
+            (
+                "fleet-terminal.cpkt",
+                crate::execution::fixtures::stdio_conformance_artifact(&[]),
+            ),
             (
                 "fleet-compiler-source.cpkt",
                 crate::execution::fixtures::filesystem_write_text_artifact(

@@ -5,13 +5,13 @@
  */
 
 //! Private experimental transport. No worker calls into the JVM.
-use crate::{bytes, status, write_handle, write_long};
+use crate::{bytes, chars, ints, status, write_handle, write_long};
 use compukter_ffi::{experimental_fleet, FfiStatus};
 use compukter_vm::experimental_fleet_scheduler::{
     FleetConfig, FleetScheduler, ReplyValue, RequestInspection, SubmitError,
 };
 use jni::{
-    objects::{JByteArray, JClass, JIntArray, JLongArray},
+    objects::{JByteArray, JCharArray, JClass, JIntArray, JLongArray},
     sys::{jint, jlong},
     EnvUnowned,
 };
@@ -600,6 +600,63 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             .get(&(handle as u64))
             .map_or(code(FfiStatus::StaleHandle), |f| {
                 submit(f.scheduler.terminal_key(machine as u64, event))
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_terminalText<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    points: JIntArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if machine < 0 || points.len(env)? > 4096 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let Some(text) = ints(env, &points)?
+            .into_iter()
+            .map(char::from_u32)
+            .collect::<Option<String>>()
+        else {
+            return Ok(code(FfiStatus::InvalidArgument));
+        };
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(
+                    f.scheduler
+                        .terminal_text(machine as u64, text.into_boxed_str()),
+                )
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_canonicalLine<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    line: JCharArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if machine < 0 || line.len(env)? > 4096 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let line = chars(env, &line)?.into_boxed_slice();
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(f.scheduler.canonical_line(machine as u64, line))
             }))
     })
 }

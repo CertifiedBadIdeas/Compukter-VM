@@ -159,6 +159,7 @@ pub enum SubmitError {
     Closed,
     InvalidCost,
     InvalidCompilation,
+    InvalidInput,
     InvalidMachine,
     Capacity,
     IdentityExhausted,
@@ -204,6 +205,14 @@ enum Command {
     TerminalKey {
         machine: u64,
         event: crate::TerminalKeyEvent,
+    },
+    TerminalText {
+        machine: u64,
+        text: Box<str>,
+    },
+    CanonicalLine {
+        machine: u64,
+        line: Box<[u16]>,
     },
     Cost {
         machine: u64,
@@ -462,6 +471,20 @@ impl FleetScheduler {
         event: crate::TerminalKeyEvent,
     ) -> Result<(), SubmitError> {
         self.send(machine, Command::TerminalKey { machine, event })
+    }
+
+    pub fn terminal_text(&self, machine: u64, text: Box<str>) -> Result<(), SubmitError> {
+        if text.chars().count() > 4096 {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(machine, Command::TerminalText { machine, text })
+    }
+
+    pub fn canonical_line(&self, machine: u64, line: Box<[u16]>) -> Result<(), SubmitError> {
+        if line.len() > 4096 {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(machine, Command::CanonicalLine { machine, line })
     }
 
     pub fn reply(
@@ -889,6 +912,48 @@ fn run_worker(
                             FleetEvent::Error {
                                 machine,
                                 message: format!("terminal key: {error:?}"),
+                            },
+                        ) {
+                            return;
+                        }
+                    } else {
+                        actor.parked = false;
+                        ready(machine, actor, &mut queue);
+                    }
+                }
+                Command::TerminalText { machine, text } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    if let Err(error) = actor.machine.terminal_mut().push_text(&text) {
+                        if !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::Error {
+                                machine,
+                                message: format!("terminal text: {error:?}"),
+                            },
+                        ) {
+                            return;
+                        }
+                    } else {
+                        actor.parked = false;
+                        ready(machine, actor, &mut queue);
+                    }
+                }
+                Command::CanonicalLine { machine, line } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    if let Err(error) = actor.machine.submit_canonical_line(&line) {
+                        if !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::Error {
+                                machine,
+                                message: format!("canonical line: {error:?}"),
                             },
                         ) {
                             return;
@@ -1390,7 +1455,8 @@ mod tests {
             }
             assert!(
                 Instant::now() < limit,
-                "timed out waiting for scheduler event"
+                "timed out waiting for scheduler event: {:?}",
+                fleet.metrics()
             );
             thread::yield_now();
         }
@@ -1401,6 +1467,17 @@ mod tests {
             assert!(Instant::now() < limit, "timed out waiting for VM advance");
             thread::yield_now();
         }
+    }
+
+    fn grant_until_terminal_outcome(fleet: &FleetScheduler, machine: u64) -> FleetEvent {
+        for tick in 2..300 {
+            fleet.grant(machine, tick, 512).unwrap();
+            thread::sleep(Duration::from_millis(1));
+            if let Some(event) = fleet.try_event() {
+                return event;
+            }
+        }
+        panic!("no terminal outcome: {:?}", fleet.metrics());
     }
 
     #[test]
@@ -1855,6 +1932,88 @@ mod tests {
             next(&fleet),
             FleetEvent::Boundary {
                 outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(0))),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn canonical_line_resumes_a_parked_machine() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::stdio_conformance_artifact(&[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(
+            vec![(7, machine)],
+            FleetConfig {
+                guest_budget: 1024,
+                ..config()
+            },
+        )
+        .unwrap();
+        fleet.grant(7, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                ..
+            }
+        ));
+        fleet
+            .canonical_line(7, "hello".encode_utf16().collect())
+            .unwrap();
+        assert!(matches!(
+            grant_until_terminal_outcome(&fleet, 7),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_text_and_enter_resume_a_parked_machine() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::stdio_conformance_artifact(&[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(
+            vec![(7, machine)],
+            FleetConfig {
+                guest_budget: 1024,
+                ..config()
+            },
+        )
+        .unwrap();
+        fleet.grant(7, 1, 512).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                ..
+            }
+        ));
+        fleet.terminal_text(7, "hello".into()).unwrap();
+        fleet
+            .terminal_key(
+                7,
+                crate::TerminalKeyEvent::new(
+                    crate::TerminalKey::Enter,
+                    crate::TerminalKeyAction::Press,
+                    crate::TerminalModifiers::default(),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            grant_until_terminal_outcome(&fleet, 7),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
                 ..
             }
         ));
