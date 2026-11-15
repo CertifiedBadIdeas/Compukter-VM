@@ -6338,8 +6338,12 @@ mod tests {
         }
     }
 
-    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 6] {
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 7] {
         [
+            (
+                "fleet-host-request.cpkt",
+                crate::execution::fixtures::capability_artifact(true, true, 1, 0),
+            ),
             (
                 "filesystem-write.cpkt",
                 crate::execution::fixtures::filesystem_conformance_artifact(),
