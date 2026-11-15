@@ -108,6 +108,7 @@ pub enum WireEvent {
     Detached {
         machine: u64,
         computer: Box<ComputerMachine>,
+        timers: Vec<compukter_vm::experimental_fleet_scheduler::FleetTimer>,
     },
     DetachRejected {
         machine: u64,
@@ -254,8 +255,16 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             }),
             true,
         ),
-        FleetEvent::Detached { machine, computer } => {
-            return Ok(Some(WireEvent::Detached { machine, computer }))
+        FleetEvent::Detached {
+            machine,
+            computer,
+            timers,
+        } => {
+            return Ok(Some(WireEvent::Detached {
+                machine,
+                computer,
+                timers,
+            }));
         }
         FleetEvent::DetachRejected { machine } => {
             return Ok(Some(WireEvent::DetachRejected { machine }))
@@ -352,7 +361,18 @@ pub fn attach_session(
     fleet: &FleetScheduler,
     handle: u64,
 ) -> Result<(u64, SessionMetadata), crate::FfiStatus> {
-    let (machine, metadata) = crate::bridge::attach_fleet_session(fleet, handle)?;
+    attach_session_with_timers(fleet, handle, 0, Vec::new())
+}
+
+/// Transfers an owned session with validated timer metadata; refusal leaves it intact.
+pub fn attach_session_with_timers(
+    fleet: &FleetScheduler,
+    handle: u64,
+    base_tick: u64,
+    timers: Vec<compukter_vm::experimental_fleet_scheduler::FleetTimer>,
+) -> Result<(u64, SessionMetadata), crate::FfiStatus> {
+    let (machine, metadata) =
+        crate::bridge::attach_fleet_session(fleet, handle, base_tick, timers)?;
     Ok((machine, SessionMetadata(metadata)))
 }
 

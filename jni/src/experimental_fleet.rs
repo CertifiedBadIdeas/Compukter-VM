@@ -8,7 +8,7 @@
 use crate::{bytes, chars, ints, status, write_handle, write_long};
 use compukter_ffi::{experimental_fleet, FfiStatus};
 use compukter_vm::experimental_fleet_scheduler::{
-    FleetConfig, FleetScheduler, ReplyValue, RequestInspection, SubmitError,
+    FleetConfig, FleetScheduler, FleetTimer, ReplyValue, RequestInspection, SubmitError,
 };
 use jni::{
     objects::{JByteArray, JCharArray, JClass, JIntArray, JLongArray},
@@ -657,10 +657,24 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                     }
                     Some(b)
                 }
-                Ok(Some(experimental_fleet::WireEvent::Detached { machine, computer })) => {
+                Ok(Some(experimental_fleet::WireEvent::Detached {
+                    machine,
+                    computer,
+                    timers,
+                })) => {
                     f.detached.insert(machine, computer);
-                    let mut bytes = vec![6];
+                    let mut bytes = vec![if timers.is_empty() { 6 } else { 16 }];
                     bytes.extend_from_slice(&machine.to_le_bytes());
+                    if !timers.is_empty() {
+                        bytes.extend_from_slice(&(timers.len() as u32).to_le_bytes());
+                        for timer in timers {
+                            bytes.extend_from_slice(&timer.task.to_le_bytes());
+                            bytes.extend_from_slice(&timer.request.to_le_bytes());
+                            bytes.extend_from_slice(&timer.scope.to_le_bytes());
+                            bytes.extend_from_slice(&timer.duration.to_le_bytes());
+                            bytes.extend_from_slice(&timer.remaining.to_le_bytes());
+                        }
+                    }
                     Some(bytes)
                 }
                 Ok(Some(experimental_fleet::WireEvent::DetachRejected { machine })) => {
@@ -940,6 +954,90 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         fleet.sessions.insert(machine, metadata);
         write_handle(env, &output, machine)?;
         Ok(code(FfiStatus::Ok))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_attachSessionWithTimers<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    session: jlong,
+    tick: jlong,
+    packed: JByteArray<'a>,
+    output: JLongArray<'a>,
+) -> jint {
+    status(&mut env, |env| {
+        if tick < 0 || output.len(env)? != 1 || packed.len(env)? > 256 * 32 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let data = bytes(env, &packed)?;
+        if data.len() % 32 != 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let timers = data
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|item| FleetTimer {
+                task: u32::from_le_bytes(item[0..4].try_into().unwrap()),
+                request: u64::from_le_bytes(item[4..12].try_into().unwrap()),
+                scope: u64::from_le_bytes(item[12..20].try_into().unwrap()),
+                duration: u32::from_le_bytes(item[20..24].try_into().unwrap()),
+                remaining: u64::from_le_bytes(item[24..32].try_into().unwrap()),
+            })
+            .collect();
+        let mut map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fleet) = map.get_mut(&(handle as u64)) else {
+            return Ok(code(FfiStatus::StaleHandle));
+        };
+        if fleet.sessions.try_reserve(1).is_err() || fleet.detached.try_reserve(1).is_err() {
+            return Ok(code(FfiStatus::Internal));
+        }
+        let (machine, metadata) = match experimental_fleet::attach_session_with_timers(
+            &fleet.scheduler,
+            session as u64,
+            tick as u64,
+            timers,
+        ) {
+            Ok(value) => value,
+            Err(status) => return Ok(code(status)),
+        };
+        fleet.sessions.insert(machine, metadata);
+        write_handle(env, &output, machine)?;
+        Ok(code(FfiStatus::Ok))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_detachWithTimers<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    tick: jlong,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0 || tick < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |fleet| {
+                if !fleet.sessions.contains_key(&(machine as u64)) {
+                    return code(FfiStatus::InvalidArgument);
+                }
+                submit(
+                    fleet
+                        .scheduler
+                        .detach_with_timers(machine as u64, tick as u64),
+                )
+            }))
     })
 }
 

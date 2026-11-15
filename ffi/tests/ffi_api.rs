@@ -196,7 +196,9 @@ fn stored_session_can_transfer_to_fleet_and_return_with_checkpoint_identity() {
             Some(WireEvent::Detached {
                 machine: actual,
                 computer,
+                timers,
             }) => {
+                assert!(timers.is_empty());
                 assert_eq!(actual, machine);
                 break computer;
             }

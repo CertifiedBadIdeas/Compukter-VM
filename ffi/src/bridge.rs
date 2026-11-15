@@ -119,6 +119,8 @@ pub(crate) struct FleetSessionMetadata {
 pub(crate) fn attach_fleet_session(
     fleet: &compukter_vm::experimental_fleet_scheduler::FleetScheduler,
     handle: u64,
+    base_tick: u64,
+    timers: Vec<compukter_vm::experimental_fleet_scheduler::FleetTimer>,
 ) -> Result<(u64, FleetSessionMetadata), crate::FfiStatus> {
     use compukter_vm::experimental_fleet_scheduler::SubmitError;
     sessions()
@@ -142,7 +144,7 @@ pub(crate) fn attach_fleet_session(
                     },
                 ));
             }
-            match fleet.attach(Box::new(computer)) {
+            match fleet.attach_with_timers(Box::new(computer), base_tick, timers) {
                 Ok(machine) => Ok((
                     machine,
                     FleetSessionMetadata {

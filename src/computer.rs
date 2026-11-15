@@ -394,20 +394,72 @@ struct CompilationTransaction {
 
 impl ComputerMachine {
     #[cfg(feature = "experimental-fleet-scheduler")]
-    pub(crate) fn fleet_attachable(&self) -> bool {
-        !self.sessions.is_empty()
-            && self.external_requests.is_empty()
-            && self.pending_compilation.is_none()
-            && self.sessions.iter().enumerate().all(|(index, frame)| {
-                frame.session.fleet_quiescent(|task, request| {
-                    let identity = Some((task, request));
-                    frame.pending_process == identity
-                        || frame.pending_terminal_event == identity
-                        || frame.pending_stdio_read == identity
-                        || (index + 1 == self.sessions.len()
-                            && self.redstone.contains_waiter(task, request))
-                })
+    pub(crate) fn fleet_attachable_with_timers(
+        &self,
+        timers: &[crate::experimental_fleet_scheduler::FleetTimer],
+    ) -> bool {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        if self.sessions.is_empty()
+            || self.pending_compilation.is_some()
+            || timers.len() != self.external_requests.len()
+            || timers.len() > 256
+        {
+            return false;
+        }
+        for timer in timers {
+            if timer.remaining > u64::from(timer.duration).max(1)
+                || !seen.insert((timer.task, timer.request))
+            {
+                return false;
+            }
+            let Some(route) = self.external_requests.iter().find(|route| {
+                route.task_id == timer.task
+                    && route.external_id == timer.request
+                    && route.scope_id == timer.scope
+            }) else {
+                return false;
+            };
+            let Some(frame) = self
+                .sessions
+                .iter()
+                .find(|frame| frame.scope_id == route.scope_id)
+            else {
+                return false;
+            };
+            let (Some(task), Some(request)) = (
+                TaskId::new(route.task_id),
+                RequestId::new(route.internal_id),
+            ) else {
+                return false;
+            };
+            let Some(pending) = frame.session.pending_host_request_for(task, request) else {
+                return false;
+            };
+            if !is_timer(pending)
+                || pending.operation() != 0
+                || pending.arguments().len() != 1
+                || pending.arguments().get(0) != Some(HostValueView::I32(timer.duration as i32))
+                || timer.duration > i32::MAX as u32
+            {
+                return false;
+            }
+        }
+        self.sessions.iter().enumerate().all(|(index, frame)| {
+            frame.session.fleet_quiescent(|task, request| {
+                let identity = Some((task, request));
+                frame.pending_process == identity
+                    || frame.pending_terminal_event == identity
+                    || frame.pending_stdio_read == identity
+                    || (index + 1 == self.sessions.len()
+                        && self.redstone.contains_waiter(task, request))
+                    || self.external_requests.iter().any(|route| {
+                        route.scope_id == frame.scope_id
+                            && route.task_id == task.get()
+                            && route.internal_id == request.get()
+                    })
             })
+        })
     }
 
     #[cfg(feature = "experimental-fleet-scheduler")]
@@ -6349,8 +6401,12 @@ mod tests {
         }
     }
 
-    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 12] {
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 13] {
         [
+            (
+                "fleet-timer.cpkt",
+                crate::execution::fixtures::timer_unit_artifact(2),
+            ),
             (
                 "fleet-redstone-input.cpkt",
                 crate::execution::fixtures::redstone_i32_artifact(0, false, &[2]),

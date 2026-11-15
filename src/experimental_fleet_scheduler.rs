@@ -49,6 +49,22 @@ impl RequestInspection {
     }
 }
 
+/// Timer state transferred with an exclusively owned machine at detachment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FleetTimer {
+    pub task: u32,
+    pub request: u64,
+    pub scope: u64,
+    pub duration: u32,
+    pub remaining: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledTimer {
+    due: u64,
+    duration: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FleetConfig {
     pub workers: usize,
@@ -182,6 +198,7 @@ pub enum FleetEvent {
     Detached {
         machine: u64,
         computer: Box<ComputerMachine>,
+        timers: Vec<FleetTimer>,
     },
     /// Detachment is only allowed after host requests have been settled.
     DetachRejected {
@@ -241,6 +258,8 @@ enum Command {
     Add {
         machine: u64,
         computer: Box<ComputerMachine>,
+        timers: Vec<FleetTimer>,
+        base_tick: u64,
     },
     Tick {
         machine: u64,
@@ -259,6 +278,7 @@ enum Command {
     },
     Detach {
         machine: u64,
+        preserve_timers_at: Option<u64>,
     },
     TerminalKey {
         machine: u64,
@@ -329,7 +349,7 @@ struct Actor {
     scopes: Vec<u64>,
     request_scopes: HashMap<(u32, u64), u64>,
     inspected: HashMap<(u32, u64), u32>,
-    timers: HashMap<(u32, u64), u64>,
+    timers: HashMap<(u32, u64), ScheduledTimer>,
 }
 
 impl Actor {
@@ -495,7 +515,21 @@ impl FleetScheduler {
         &self,
         computer: Box<ComputerMachine>,
     ) -> Result<u64, (SubmitError, Box<ComputerMachine>)> {
-        if !computer.fleet_attachable() {
+        self.attach_with_timers(computer, 0, Vec::new())
+    }
+
+    /// Restores timers only when every identity and duration matches the machine's pending requests.
+    pub fn attach_with_timers(
+        &self,
+        computer: Box<ComputerMachine>,
+        base_tick: u64,
+        timers: Vec<FleetTimer>,
+    ) -> Result<u64, (SubmitError, Box<ComputerMachine>)> {
+        if timers
+            .iter()
+            .any(|timer| base_tick.checked_add(timer.remaining).is_none())
+            || !computer.fleet_attachable_with_timers(&timers)
+        {
             return Err((SubmitError::InvalidMachine, computer));
         }
         if self.stopped.load(Ordering::Acquire) {
@@ -512,6 +546,8 @@ impl FleetScheduler {
         match self.lanes[lane].try_send(Command::Add {
             machine: id,
             computer,
+            timers,
+            base_tick,
         }) {
             Ok(()) => {
                 owners.next_id = id.checked_add(1);
@@ -777,7 +813,26 @@ impl FleetScheduler {
 
     /// Returns the intact machine asynchronously after all pending requests settle.
     pub fn detach(&self, machine: u64) -> Result<(), SubmitError> {
-        self.send_action(machine, Command::Detach { machine }, true)
+        self.send_action(
+            machine,
+            Command::Detach {
+                machine,
+                preserve_timers_at: None,
+            },
+            true,
+        )
+    }
+
+    /// Atomically returns a machine and its timer state at the given simulation tick.
+    pub fn detach_with_timers(&self, machine: u64, tick: u64) -> Result<(), SubmitError> {
+        self.send_action(
+            machine,
+            Command::Detach {
+                machine,
+                preserve_timers_at: Some(tick),
+            },
+            true,
+        )
     }
 
     /// Requests asynchronous removal. Completion is reported by `Stopped`.
@@ -1098,10 +1153,27 @@ fn run_worker(
                         return;
                     }
                 }
-                Command::Add { machine, computer } => {
-                    assert!(actors
-                        .insert(machine, Actor::new(*computer, config.host_budget))
-                        .is_none());
+                Command::Add {
+                    machine,
+                    computer,
+                    timers,
+                    base_tick,
+                } => {
+                    let mut actor = Actor::new(*computer, config.host_budget);
+                    for timer in timers {
+                        let key = (timer.task, timer.request);
+                        actor.pending.insert(key);
+                        actor.request_scopes.insert(key, timer.scope);
+                        actor.timers.insert(
+                            key,
+                            ScheduledTimer {
+                                due: base_tick.saturating_add(timer.remaining),
+                                duration: timer.duration,
+                            },
+                        );
+                    }
+                    actor.tick = base_tick;
+                    assert!(actors.insert(machine, actor).is_none());
                 }
                 Command::Tick {
                     machine,
@@ -1112,7 +1184,7 @@ fn run_worker(
                     let Some(actor) = actors.get_mut(&machine) else {
                         continue;
                     };
-                    if actor.tick_initialized && tick < actor.tick {
+                    if tick < actor.tick {
                         continue;
                     }
                     if !actor.tick_initialized || tick > actor.tick {
@@ -1140,7 +1212,7 @@ fn run_worker(
                     let mut due: Vec<_> = actor
                         .timers
                         .iter()
-                        .filter_map(|(key, due)| (*due <= tick).then_some(*key))
+                        .filter_map(|(key, timer)| (timer.due <= tick).then_some(*key))
                         .collect();
                     due.sort_unstable();
                     for (task, request) in due {
@@ -1222,11 +1294,19 @@ fn run_worker(
                     actor.parked = false;
                     ready(machine, actor, &mut queue);
                 }
-                Command::Detach { machine } => {
+                Command::Detach {
+                    machine,
+                    preserve_timers_at,
+                } => {
                     let Some(actor) = actors.get_mut(&machine) else {
                         continue;
                     };
-                    if !actor.pending.is_empty()
+                    if actor
+                        .pending
+                        .iter()
+                        .any(|key| preserve_timers_at.is_none() || !actor.timers.contains_key(key))
+                        || preserve_timers_at
+                            .is_some_and(|tick| actor.tick_initialized && tick < actor.tick)
                         || !actor.inspecting.is_empty()
                         || !actor.inspected.is_empty()
                         || actor.compilation_token.is_some()
@@ -1252,6 +1332,20 @@ fn run_worker(
                         return;
                     }
                     let actor = actors.remove(&machine).expect("checked actor");
+                    let mut timers: Vec<_> = actor
+                        .timers
+                        .iter()
+                        .map(|(&(task, request), timer)| FleetTimer {
+                            task,
+                            request,
+                            scope: actor.request_scopes[&(task, request)],
+                            duration: timer.duration,
+                            remaining: timer
+                                .due
+                                .saturating_sub(preserve_timers_at.expect("timers require a tick")),
+                        })
+                        .collect();
+                    timers.sort_unstable_by_key(|timer| (timer.task, timer.request));
                     if !publish(
                         &events,
                         &stopped,
@@ -1259,6 +1353,7 @@ fn run_worker(
                         FleetEvent::Detached {
                             machine,
                             computer: Box::new(actor.machine),
+                            timers,
                         },
                     ) {
                         return;
@@ -1747,9 +1842,13 @@ fn run_worker(
                     {
                         match request.arguments.as_ref() {
                             [ComputerValue::I32(delay)] if *delay >= 0 => {
-                                actor
-                                    .timers
-                                    .insert(key, actor.tick.saturating_add((*delay as u64).max(1)));
+                                actor.timers.insert(
+                                    key,
+                                    ScheduledTimer {
+                                        due: actor.tick.saturating_add((*delay as u64).max(1)),
+                                        duration: *delay as u32,
+                                    },
+                                );
                             }
                             _ => {
                                 actor.stopped = true;
@@ -2369,7 +2468,9 @@ mod tests {
         ));
         fleet.detach(id).unwrap();
         let mut machine = match next(&fleet) {
-            FleetEvent::Detached { machine, computer } if machine == id => computer,
+            FleetEvent::Detached {
+                machine, computer, ..
+            } if machine == id => computer,
             event => panic!("{event:?}"),
         };
         assert!(machine.resource_snapshot().retired_instructions > 0);
@@ -2561,7 +2662,9 @@ mod tests {
         let first = fleet.attach(Box::new(machine)).unwrap();
         fleet.detach(first).unwrap();
         let machine = match next(&fleet) {
-            FleetEvent::Detached { machine, computer } if machine == first => computer,
+            FleetEvent::Detached {
+                machine, computer, ..
+            } if machine == first => computer,
             other => panic!("{other:?}"),
         };
         let second = fleet.attach(machine).unwrap();
@@ -3183,6 +3286,73 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         assert_eq!(fleet.metrics().advances, 2);
         fleet.grant(1, 3, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn detached_timer_preserves_remaining_ticks_and_rejects_invalid_metadata() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::timer_unit_artifact(2),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(1, machine)], config()).unwrap();
+        fleet.grant(1, 1, 64).unwrap();
+        wait_advances(&fleet, 2);
+        fleet.detach_with_timers(1, 2).unwrap();
+        let (machine, timers) = match next(&fleet) {
+            FleetEvent::Detached {
+                computer, timers, ..
+            } => (computer, timers),
+            event => panic!("unexpected event {event:?}"),
+        };
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers[0].duration, 2);
+        assert_eq!(timers[0].remaining, 1);
+        let mut invalid = timers.clone();
+        invalid[0].duration = 3;
+        let (reason, machine) = fleet.attach_with_timers(machine, 100, invalid).unwrap_err();
+        assert_eq!(reason, SubmitError::InvalidMachine);
+        let id = fleet.attach_with_timers(machine, 100, timers).unwrap();
+        fleet.grant(id, 100, 64).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert!(fleet.try_event().is_none());
+        fleet.grant(id, 101, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn detach_with_timers_refuses_a_tick_earlier_than_the_last_grant() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::timer_unit_artifact(2),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(1, machine)], config()).unwrap();
+        fleet.grant(1, 10, 64).unwrap();
+        wait_advances(&fleet, 2);
+        fleet.detach_with_timers(1, 9).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::DetachRejected { machine: 1 }
+        ));
+        fleet.grant(1, 12, 64).unwrap();
         assert!(matches!(
             next(&fleet),
             FleetEvent::Boundary {
