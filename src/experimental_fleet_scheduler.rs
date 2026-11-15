@@ -622,9 +622,10 @@ impl FleetScheduler {
         base_tick: u64,
         timers: Vec<FleetTimer>,
     ) -> Result<u64, (SubmitError, Box<ComputerMachine>)> {
-        if timers
-            .iter()
-            .any(|timer| base_tick.checked_add(timer.remaining).is_none())
+        if timers.len() > MAXIMUM_PENDING_TIMERS
+            || timers
+                .iter()
+                .any(|timer| base_tick.checked_add(timer.remaining).is_none())
             || !computer.fleet_attachable_with_timers(&timers)
         {
             return Err((SubmitError::InvalidMachine, computer));
@@ -2408,7 +2409,16 @@ mod tests {
         for tick in 2..300 {
             fleet.grant(machine, tick, 512).unwrap();
             thread::sleep(Duration::from_millis(1));
-            if let Some(event) = fleet.try_event() {
+            while let Some(event) = fleet.try_event() {
+                if matches!(
+                    event,
+                    FleetEvent::Boundary {
+                        outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                        ..
+                    }
+                ) {
+                    continue;
+                }
                 return event;
             }
         }
