@@ -30,22 +30,22 @@ pub fn create_with_request_inspections(
     config: FleetConfig,
     inspections: Vec<RequestInspection>,
 ) -> Result<FleetScheduler, String> {
-    create_with_reporting(artifact, schemas, count, config, inspections, false)
+    create_with_coordinated_turns(artifact, schemas, count, config, inspections, false)
 }
 
-pub fn create_with_reporting(
+pub fn create_with_coordinated_turns(
     artifact: &[u8],
     schemas: &[u8],
     count: usize,
     config: FleetConfig,
     inspections: Vec<RequestInspection>,
-    report_turns: bool,
+    coordinated_turns: bool,
 ) -> Result<FleetScheduler, String> {
-    FleetScheduler::new_with_turn_reporting(
+    FleetScheduler::new_with_coordinated_turns(
         create_machines(artifact, schemas, count)?,
         config,
         inspections,
-        report_turns,
+        coordinated_turns,
     )
     .map_err(str::to_owned)
 }

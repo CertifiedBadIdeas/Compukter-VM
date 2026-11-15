@@ -203,9 +203,9 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         }
         let mut c = [0; 7];
         config.get_region(env, 0, &mut c)?;
-        let mut report_turns = [0];
+        let mut coordinated_turns = [0];
         if config.len(env)? == 8 {
-            config.get_region(env, 7, &mut report_turns)?;
+            config.get_region(env, 7, &mut coordinated_turns)?;
         }
         if c[0] <= 0
             || c[0] > 64
@@ -217,7 +217,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             || c[4] < 0
             || c[5] <= 0
             || c[6] <= 0
-            || !(0..=1).contains(&report_turns[0])
+            || !(0..=1).contains(&coordinated_turns[0])
         {
             return Ok(code(FfiStatus::InvalidArgument));
         }
@@ -267,13 +267,13 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                 over_budget_detail: dt.into_boxed_str(),
             }]
         };
-        let scheduler = match experimental_fleet::create_with_reporting(
+        let scheduler = match experimental_fleet::create_with_coordinated_turns(
             &bytes(env, &artifact)?,
             &bytes(env, &schemas)?,
             count as usize,
             cfg,
             inspections,
-            report_turns[0] == 1,
+            coordinated_turns[0] == 1,
         ) {
             Ok(f) => f,
             Err(_) => return Ok(code(FfiStatus::InvalidArgument)),

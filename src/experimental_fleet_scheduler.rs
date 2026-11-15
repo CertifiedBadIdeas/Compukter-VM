@@ -270,6 +270,7 @@ struct Actor {
     remaining: u32,
     tick_retired: u64,
     reported_retired: Option<u64>,
+    awaiting_grant: bool,
     compilation_token: Option<u64>,
     requests_left: u32,
     advances_left: u32,
@@ -295,6 +296,7 @@ impl Actor {
             remaining: 0,
             tick_retired: 0,
             reported_retired: None,
+            awaiting_grant: false,
             compilation_token: None,
             requests_left: host_budget,
             advances_left: 0,
@@ -342,15 +344,16 @@ impl FleetScheduler {
         config: FleetConfig,
         inspections: Vec<RequestInspection>,
     ) -> Result<Self, &'static str> {
-        Self::new_with_turn_reporting(machines, config, inspections, false)
+        Self::new_with_coordinated_turns(machines, config, inspections, false)
     }
 
-    /// Enable per-machine tick accounting for embedders that need to settle reservations.
-    pub fn new_with_turn_reporting(
+    /// With reporting enabled, every quiescent report ends the current turn. The host
+    /// must grant again before a reply or input may execute Guest instructions.
+    pub fn new_with_coordinated_turns(
         machines: Vec<(u64, ComputerMachine)>,
         config: FleetConfig,
         inspections: Vec<RequestInspection>,
-        report_turns: bool,
+        coordinated_turns: bool,
     ) -> Result<Self, &'static str> {
         if machines.len() > 4096 {
             return Err("fleet size exceeds maximum");
@@ -401,7 +404,7 @@ impl FleetScheduler {
                         waiting,
                         config,
                         inspections,
-                        report_turns,
+                        coordinated_turns,
                     )
                 }) {
                 Ok(worker) => worker,
@@ -730,6 +733,7 @@ fn publish(
 fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
     if !actor.queued
         && !actor.stopped
+        && !actor.awaiting_grant
         && actor.compilation_token.is_none()
         && actor.remaining > 0
         && actor.advances_left > 0
@@ -752,6 +756,7 @@ fn report_quiescent(
         return true;
     }
     actor.reported_retired = Some(actor.tick_retired);
+    actor.awaiting_grant = true;
     publish(
         events,
         stopped,
@@ -773,7 +778,7 @@ fn run_worker(
     waiters: Arc<AtomicUsize>,
     config: FleetConfig,
     inspections: Arc<Vec<RequestInspection>>,
-    report_turns: bool,
+    coordinated_turns: bool,
 ) {
     let mut queue = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
@@ -808,7 +813,7 @@ fn run_worker(
                             &events,
                             &stopped,
                             &waiters,
-                            report_turns,
+                            coordinated_turns,
                         ) {
                             return;
                         }
@@ -821,6 +826,8 @@ fn run_worker(
                         actor.advances_left = config.maximum_advances_per_tick;
                         actor.deadline = deadline;
                     }
+                    actor.awaiting_grant = false;
+                    actor.reported_retired = None;
                     let mut due: Vec<_> = actor
                         .timers
                         .iter()
@@ -862,7 +869,7 @@ fn run_worker(
                             &events,
                             &stopped,
                             &waiters,
-                            report_turns,
+                            coordinated_turns,
                         )
                     {
                         return;
@@ -925,8 +932,14 @@ fn run_worker(
                         }
                         continue;
                     }
-                    if !report_quiescent(machine, actor, &events, &stopped, &waiters, report_turns)
-                    {
+                    if !report_quiescent(
+                        machine,
+                        actor,
+                        &events,
+                        &stopped,
+                        &waiters,
+                        coordinated_turns,
+                    ) {
                         return;
                     }
                     let actor = actors.remove(&machine).expect("checked actor");
@@ -950,7 +963,7 @@ fn run_worker(
                             &events,
                             &stopped,
                             &waiters,
-                            report_turns,
+                            coordinated_turns,
                         ) {
                             return;
                         }
@@ -1201,7 +1214,7 @@ fn run_worker(
         };
         actor.queued = false;
         if actor.stopped || actor.remaining == 0 || actor.advances_left == 0 {
-            if !report_quiescent(id, actor, &events, &stopped, &waiters, report_turns) {
+            if !report_quiescent(id, actor, &events, &stopped, &waiters, coordinated_turns) {
                 return;
             }
             continue;
@@ -1210,7 +1223,7 @@ fn run_worker(
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            if !report_quiescent(id, actor, &events, &stopped, &waiters, report_turns) {
+            if !report_quiescent(id, actor, &events, &stopped, &waiters, coordinated_turns) {
                 return;
             }
             continue;
@@ -1568,7 +1581,8 @@ fn run_worker(
                 }
             }
         }
-        if !actor.queued && !report_quiescent(id, actor, &events, &stopped, &waiters, report_turns)
+        if !actor.queued
+            && !report_quiescent(id, actor, &events, &stopped, &waiters, coordinated_turns)
         {
             return;
         }
@@ -2851,7 +2865,7 @@ mod tests {
             )
             .unwrap()
         };
-        let fleet = FleetScheduler::new_with_turn_reporting(
+        let fleet = FleetScheduler::new_with_coordinated_turns(
             vec![(1, make()), (2, make())],
             config(),
             Vec::new(),
@@ -2898,9 +2912,13 @@ mod tests {
             &[],
         )
         .unwrap();
-        let fleet =
-            FleetScheduler::new_with_turn_reporting(vec![(7, machine)], config(), Vec::new(), true)
-                .unwrap();
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            vec![(7, machine)],
+            config(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
         fleet.grant(7, 1, 64).unwrap();
         let request = match next(&fleet) {
             FleetEvent::Requests { requests, .. } => requests[0].clone(),
@@ -2917,6 +2935,17 @@ mod tests {
         fleet
             .reply(7, request.task_id, request.id, ReplyValue::Unit)
             .unwrap();
+        fleet.terminal_update(7, 99, u64::MAX).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::TerminalUpdate {
+                machine: 7,
+                request: 99,
+                ..
+            }
+        ));
+        assert_eq!(fleet.metrics().retired, before);
+        fleet.grant(7, 1, 64).unwrap();
         assert!(matches!(
             next(&fleet),
             FleetEvent::Boundary {
@@ -2943,9 +2972,13 @@ mod tests {
             &[],
         )
         .unwrap();
-        let fleet =
-            FleetScheduler::new_with_turn_reporting(vec![(1, machine)], config(), Vec::new(), true)
-                .unwrap();
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            vec![(1, machine)],
+            config(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
         fleet.grant_until(1, 1, 10, Some(Instant::now())).unwrap();
         assert!(matches!(
             next(&fleet),
