@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+static NEXT_FLEET_DEPLOYMENT_CANDIDATE: AtomicU64 = AtomicU64::new(1);
+
 use crate::{
     ComputerAdvanceOutcome, ComputerHostRequest, ComputerMachine, ComputerValue, HostFailure,
     HostFailureKind, HostResponse, HostValueInput,
@@ -494,7 +496,6 @@ impl FleetScheduler {
         let metrics = Arc::new(Metrics::default());
         let waiting_publishers = Arc::new(AtomicUsize::new(0));
         let inspections = Arc::new(inspections);
-        let next_deployment_candidate = Arc::new(AtomicU64::new(1));
         let mut lanes = Vec::new();
         let mut workers: Vec<JoinHandle<()>> = Vec::new();
         for (lane, actors) in partitions.into_iter().enumerate() {
@@ -505,7 +506,6 @@ impl FleetScheduler {
             let worker_metrics = Arc::clone(&metrics);
             let waiting = Arc::clone(&waiting_publishers);
             let inspections = Arc::clone(&inspections);
-            let next_deployment_candidate = Arc::clone(&next_deployment_candidate);
             let worker = match thread::Builder::new()
                 .name(format!("experimental-vm-{lane}"))
                 .spawn(move || {
@@ -519,7 +519,6 @@ impl FleetScheduler {
                         config,
                         inspections,
                         coordinated_turns,
-                        next_deployment_candidate,
                     )
                 }) {
                 Ok(worker) => worker,
@@ -1213,7 +1212,6 @@ fn run_worker(
     config: FleetConfig,
     inspections: Arc<Vec<RequestInspection>>,
     coordinated_turns: bool,
-    next_deployment_candidate: Arc<AtomicU64>,
 ) {
     let mut queue = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
@@ -1242,7 +1240,7 @@ fn run_worker(
                             } else {
                                 match actor.machine.verify_for_deploy(bytes) {
                                     Ok(candidate) => {
-                                        match next_deployment_candidate.fetch_update(
+                                        match NEXT_FLEET_DEPLOYMENT_CANDIDATE.fetch_update(
                                             Ordering::Relaxed,
                                             Ordering::Relaxed,
                                             |value| (value < i64::MAX as u64).then_some(value + 1),
@@ -2676,6 +2674,42 @@ mod tests {
         assert!(matches!(
             next(&fleet),
             FleetEvent::Detached { machine: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn deployment_candidate_identity_is_not_reused_between_fleets() {
+        let artifact = crate::execution::fixtures::two_block_artifact(1, 1);
+        let bytes: Arc<[u8]> =
+            Arc::from(crate::test_encode::encode_artifact(artifact.decoded()).unwrap());
+        let machine = || ComputerMachine::start(artifact.clone(), profile(), &[], &[]).unwrap();
+        let first = FleetScheduler::new(vec![(1, machine())], config()).unwrap();
+        first.prepare_deployment(1, 1, Arc::clone(&bytes)).unwrap();
+        let original = match next(&first) {
+            FleetEvent::Deployment {
+                result: Ok(DeploymentResult::Prepared(token)),
+                ..
+            } => token,
+            event => panic!("unexpected event {event:?}"),
+        };
+        drop(first);
+        let second = FleetScheduler::new(vec![(1, machine())], config()).unwrap();
+        second.prepare_deployment(1, 1, bytes).unwrap();
+        let replacement = match next(&second) {
+            FleetEvent::Deployment {
+                result: Ok(DeploymentResult::Prepared(token)),
+                ..
+            } => token,
+            event => panic!("unexpected event {event:?}"),
+        };
+        assert_ne!(original, replacement);
+        second.discard_deployment(1, 2, original).unwrap();
+        assert!(matches!(
+            next(&second),
+            FleetEvent::Deployment {
+                result: Err(DeploymentError::InvalidCandidate),
+                ..
+            }
         ));
     }
 
