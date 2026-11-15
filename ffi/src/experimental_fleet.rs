@@ -252,19 +252,27 @@ pub fn encode_event(event: &WireEvent) -> Vec<u8> {
             }
         }
         WireEvent::Detached {
-            machine, timers, ..
+            machine,
+            computer,
+            timers,
         } => {
-            bytes.push(if timers.is_empty() { 6 } else { 16 });
+            // Capture from the returned machine, never from possibly undelivered observations.
+            // At most 32 scopes and 256 timers; encoded once and retained across copy retries.
+            bytes.push(18);
             bytes.extend_from_slice(&machine.to_le_bytes());
-            if !timers.is_empty() {
-                bytes.extend_from_slice(&(timers.len() as u32).to_le_bytes());
-                for timer in timers {
-                    bytes.extend_from_slice(&timer.task.to_le_bytes());
-                    bytes.extend_from_slice(&timer.request.to_le_bytes());
-                    bytes.extend_from_slice(&timer.scope.to_le_bytes());
-                    bytes.extend_from_slice(&timer.duration.to_le_bytes());
-                    bytes.extend_from_slice(&timer.remaining.to_le_bytes());
-                }
+            bytes.extend_from_slice(&computer.fleet_confirmed_redstone_output().to_le_bytes());
+            let scopes = computer.fleet_process_scopes();
+            bytes.extend_from_slice(&(scopes.len() as u32).to_le_bytes());
+            for scope in scopes {
+                bytes.extend_from_slice(&scope.to_le_bytes());
+            }
+            bytes.extend_from_slice(&(timers.len() as u32).to_le_bytes());
+            for timer in timers {
+                bytes.extend_from_slice(&timer.task.to_le_bytes());
+                bytes.extend_from_slice(&timer.request.to_le_bytes());
+                bytes.extend_from_slice(&timer.scope.to_le_bytes());
+                bytes.extend_from_slice(&timer.duration.to_le_bytes());
+                bytes.extend_from_slice(&timer.remaining.to_le_bytes());
             }
         }
         WireEvent::DetachRejected { machine } => {

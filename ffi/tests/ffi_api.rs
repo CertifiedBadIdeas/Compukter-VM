@@ -63,6 +63,10 @@ fn checkpoint_detach_selector_preserves_session_until_terminal_delivery() {
         FfiStatus::Ok
     );
     assert_eq!(
+        compukter_experimental_fleet_redstone(fleet, machine, 1, 0x123456),
+        FfiStatus::Ok
+    );
+    assert_eq!(
         compukter_experimental_fleet_request_lifecycle(fleet, machine, 3, 0),
         FfiStatus::Ok
     );
@@ -103,7 +107,15 @@ fn checkpoint_detach_selector_preserves_session_until_terminal_delivery() {
         },
         FfiStatus::Ok
     );
-    assert_eq!(output[0], 6);
+    assert_eq!(output[0], 18);
+    assert_eq!(written, 29);
+    assert_eq!(
+        u32::from_le_bytes(output[9..13].try_into().unwrap()),
+        0x123456
+    );
+    assert_eq!(u32::from_le_bytes(output[13..17].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(output[17..25].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(output[25..29].try_into().unwrap()), 0);
     assert_eq!(
         unsafe { compukter_experimental_fleet_recover(fleet, machine, &mut restored) },
         FfiStatus::Ok
@@ -237,7 +249,7 @@ fn independent_lifecycle_retries_preserve_both_poll_streams_and_session_ownershi
             FfiStatus::Ok
         );
         assert_eq!(u64::from_le_bytes(event[1..9].try_into().unwrap()), b);
-        if event[0] == 6 {
+        if event[0] == 18 {
             break;
         }
         assert_eq!(event[0], 11);
@@ -351,12 +363,12 @@ fn fleet_c_abi_transfers_session_and_retries_event_without_losing_ownership() {
             status => panic!("unexpected status {status:?}"),
         }
     }
-    assert_eq!(written, 9);
+    assert_eq!(written, 29);
     let mut event = vec![0; written];
     assert_eq!(FfiStatus::Ok, unsafe {
         compukter_experimental_fleet_poll(fleet, event.as_mut_ptr(), event.len(), &mut written)
     });
-    assert_eq!(event[0], 6);
+    assert_eq!(event[0], 18);
     assert_eq!(u64::from_le_bytes(event[1..9].try_into().unwrap()), machine);
     let mut recovered = 0;
     assert_eq!(FfiStatus::Ok, unsafe {

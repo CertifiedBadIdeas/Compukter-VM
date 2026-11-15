@@ -4172,6 +4172,18 @@ mod tests {
         }
         let fleet = FleetScheduler::new(vec![], config()).unwrap();
         let id = fleet.attach(Box::new(machine)).unwrap();
+        fleet.confirm_redstone_output(id, 0x123456).unwrap();
+        fleet.detach_for_checkpoint(id, 0).unwrap();
+        wait_lifecycle(&fleet, id);
+        let FleetDetachResult::Detached { computer, timers } =
+            fleet.try_detached(id).unwrap().result
+        else {
+            panic!("expected detached child");
+        };
+        assert_eq!(computer.fleet_process_scopes(), vec![0, 1]);
+        assert_eq!(computer.fleet_confirmed_redstone_output(), 0x123456);
+        assert!(timers.is_empty());
+        let id = fleet.attach(computer).unwrap();
         fleet.grant(id, 1, 512).unwrap();
         assert!(matches!(
             next(&fleet),

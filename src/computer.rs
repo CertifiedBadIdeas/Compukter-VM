@@ -463,8 +463,14 @@ impl ComputerMachine {
     }
 
     #[cfg(feature = "experimental-fleet-scheduler")]
-    pub(crate) fn fleet_process_scopes(&self) -> Vec<u64> {
+    pub fn fleet_process_scopes(&self) -> Vec<u64> {
         self.sessions.iter().map(|frame| frame.scope_id).collect()
+    }
+
+    /// Confirmed world output after accepted fleet commands have drained.
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    pub fn fleet_confirmed_redstone_output(&self) -> u32 {
+        self.redstone.confirmed_output()
     }
 
     #[cfg(feature = "program-sharing-benchmark")]
