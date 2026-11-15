@@ -224,6 +224,14 @@ enum Command {
         request: u64,
         base_revision: u64,
     },
+    RedstoneInput {
+        machine: u64,
+        packet: u32,
+    },
+    RedstoneOutput {
+        machine: u64,
+        packed: u32,
+    },
     Cost {
         machine: u64,
         task: u32,
@@ -512,6 +520,20 @@ impl FleetScheduler {
                 base_revision,
             },
         )
+    }
+
+    pub fn redstone_input(&self, machine: u64, packet: u32) -> Result<(), SubmitError> {
+        if packet & !0x3fff_ffff != 0 {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(machine, Command::RedstoneInput { machine, packet })
+    }
+
+    pub fn confirm_redstone_output(&self, machine: u64, packed: u32) -> Result<(), SubmitError> {
+        if packed & !0x3fff_ffff != 0 {
+            return Err(SubmitError::InvalidInput);
+        }
+        self.send(machine, Command::RedstoneOutput { machine, packed })
     }
 
     pub fn reply(
@@ -1011,6 +1033,45 @@ fn run_worker(
                         },
                     ) {
                         return;
+                    }
+                }
+                Command::RedstoneInput { machine, packet } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    if let Err(error) = actor.machine.submit_redstone_input(packet) {
+                        if !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::Error {
+                                machine,
+                                message: format!("redstone input: {error:?}"),
+                            },
+                        ) {
+                            return;
+                        }
+                    } else {
+                        actor.parked = false;
+                        ready(machine, actor, &mut queue);
+                    }
+                }
+                Command::RedstoneOutput { machine, packed } => {
+                    let Some(actor) = actors.get_mut(&machine) else {
+                        continue;
+                    };
+                    if let Err(error) = actor.machine.confirm_redstone_output(packed) {
+                        if !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::Error {
+                                machine,
+                                message: format!("redstone output: {error:?}"),
+                            },
+                        ) {
+                            return;
+                        }
                     }
                 }
                 Command::Cost {
@@ -2100,6 +2161,80 @@ mod tests {
         assert!(
             matches!(next(&fleet), FleetEvent::TerminalUpdate { machine: 7, request: 6, update: crate::TerminalUpdate::Unchanged { revision: r } } if r == revision)
         );
+    }
+
+    #[test]
+    fn redstone_input_and_confirmed_output_are_ordered_before_execution() {
+        let start = |artifact| ComputerMachine::start(artifact, profile(), &[], &[]).unwrap();
+        let input = start(crate::execution::fixtures::redstone_i32_artifact(
+            0,
+            false,
+            &[2],
+        ));
+        let output = start(crate::execution::fixtures::redstone_i32_artifact(
+            5,
+            false,
+            &[],
+        ));
+        let fleet = FleetScheduler::new(vec![(1, input), (2, output)], config()).unwrap();
+        assert_eq!(
+            fleet.redstone_input(1, 1 << 30),
+            Err(SubmitError::InvalidInput)
+        );
+        fleet
+            .redstone_input(1, 1 << 2 | (11 << (6 + 2 * 4)))
+            .unwrap();
+        fleet.confirm_redstone_output(2, 0x1234_5678).unwrap();
+        fleet.grant(1, 1, 512).unwrap();
+        fleet.grant(2, 1, 512).unwrap();
+        let mut outcomes = HashMap::new();
+        for _ in 0..2 {
+            match next(&fleet) {
+                FleetEvent::Boundary {
+                    machine,
+                    outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(value))),
+                    ..
+                } => {
+                    outcomes.insert(machine, value);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(outcomes.get(&1), Some(&11));
+        assert_eq!(outcomes.get(&2), Some(&0x1234_5678));
+    }
+
+    #[test]
+    fn redstone_input_wakes_a_waiting_guest() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::redstone_i32_artifact(1, true, &[0]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(1, machine)], config()).unwrap();
+        fleet.grant(1, 1, 512).unwrap();
+        wait_advances(&fleet, 2);
+        fleet.redstone_input(1, 1 | (9 << 6)).unwrap();
+        for tick in 2..300 {
+            fleet.grant(1, tick, 512).unwrap();
+            thread::sleep(Duration::from_millis(1));
+            if let Some(event) = fleet.try_event() {
+                assert!(
+                    matches!(
+                        event,
+                        FleetEvent::Boundary {
+                            outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(9))),
+                            ..
+                        }
+                    ),
+                    "{event:?}"
+                );
+                return;
+            }
+        }
+        panic!("redstone wait did not resume");
     }
 
     #[test]

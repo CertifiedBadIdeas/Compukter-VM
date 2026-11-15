@@ -6338,8 +6338,16 @@ mod tests {
         }
     }
 
-    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 10] {
+    fn filesystem_game_test_artifacts() -> [(&'static str, VerifiedArtifact); 12] {
         [
+            (
+                "fleet-redstone-input.cpkt",
+                crate::execution::fixtures::redstone_i32_artifact(0, false, &[2]),
+            ),
+            (
+                "fleet-redstone-output.cpkt",
+                crate::execution::fixtures::redstone_i32_artifact(5, false, &[]),
+            ),
             (
                 "fleet-terminal.cpkt",
                 crate::execution::fixtures::stdio_conformance_artifact(&[]),

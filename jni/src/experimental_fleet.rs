@@ -44,6 +44,55 @@ fn submit(result: Result<(), SubmitError>) -> jint {
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_redstoneInput<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    packet: jint,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(f.scheduler.redstone_input(machine as u64, packet as u32))
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_confirmRedstoneOutput<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    packed: jint,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0 {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(
+                    f.scheduler
+                        .confirm_redstone_output(machine as u64, packed as u32),
+                )
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_terminalUpdate<
     'a,
 >(
