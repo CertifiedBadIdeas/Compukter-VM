@@ -63,7 +63,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
 ) -> jint {
     status(&mut env, |env| {
         if output.len(env)? != 1
-            || config.len(env)? != 7
+            || !(7..=8).contains(&config.len(env)?)
             || !(0..=4096).contains(&count)
             || artifact.len(env)? > compukter_vm::ArtifactLimits::default().artifact_bytes
             || schemas.len(env)? > 65536
@@ -75,6 +75,10 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         }
         let mut c = [0; 7];
         config.get_region(env, 0, &mut c)?;
+        let mut report_turns = [0];
+        if config.len(env)? == 8 {
+            config.get_region(env, 7, &mut report_turns)?;
+        }
         if c[0] <= 0
             || c[0] > 64
             || c[1] <= 0
@@ -85,6 +89,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             || c[4] < 0
             || c[5] <= 0
             || c[6] <= 0
+            || !(0..=1).contains(&report_turns[0])
         {
             return Ok(code(FfiStatus::InvalidArgument));
         }
@@ -134,12 +139,13 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                 over_budget_detail: dt.into_boxed_str(),
             }]
         };
-        let scheduler = match experimental_fleet::create_with_request_inspections(
+        let scheduler = match experimental_fleet::create_with_reporting(
             &bytes(env, &artifact)?,
             &bytes(env, &schemas)?,
             count as usize,
             cfg,
             inspections,
+            report_turns[0] == 1,
         ) {
             Ok(f) => f,
             Err(_) => return Ok(code(FfiStatus::InvalidArgument)),
@@ -328,6 +334,17 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         if f.pending.is_none() {
             f.pending = match experimental_fleet::poll_event(&f.scheduler) {
                 Ok(None) => None,
+                Ok(Some(experimental_fleet::WireEvent::Quiescent {
+                    machine,
+                    tick,
+                    retired,
+                })) => {
+                    let mut bytes = vec![8];
+                    bytes.extend_from_slice(&machine.to_le_bytes());
+                    bytes.extend_from_slice(&tick.to_le_bytes());
+                    bytes.extend_from_slice(&retired.to_le_bytes());
+                    Some(bytes)
+                }
                 Ok(Some(experimental_fleet::WireEvent::Outcome(b))) => Some([vec![0], b].concat()),
                 Ok(Some(experimental_fleet::WireEvent::Inspection(b))) => {
                     Some([vec![1], b].concat())

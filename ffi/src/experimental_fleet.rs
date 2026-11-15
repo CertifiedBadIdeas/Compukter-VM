@@ -30,10 +30,22 @@ pub fn create_with_request_inspections(
     config: FleetConfig,
     inspections: Vec<RequestInspection>,
 ) -> Result<FleetScheduler, String> {
-    FleetScheduler::new_with_request_inspections(
+    create_with_reporting(artifact, schemas, count, config, inspections, false)
+}
+
+pub fn create_with_reporting(
+    artifact: &[u8],
+    schemas: &[u8],
+    count: usize,
+    config: FleetConfig,
+    inspections: Vec<RequestInspection>,
+    report_turns: bool,
+) -> Result<FleetScheduler, String> {
+    FleetScheduler::new_with_turn_reporting(
         create_machines(artifact, schemas, count)?,
         config,
         inspections,
+        report_turns,
     )
     .map_err(str::to_owned)
 }
@@ -66,6 +78,11 @@ fn create_machines(
 }
 
 pub enum WireEvent {
+    Quiescent {
+        machine: u64,
+        tick: u64,
+        retired: u64,
+    },
     Outcome(Vec<u8>),
     Inspection(Vec<u8>),
     Detached {
@@ -96,6 +113,17 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
         return Ok(None);
     };
     let (machine, tick, outcome, inspection) = match event {
+        FleetEvent::Quiescent {
+            machine,
+            tick,
+            retired,
+        } => {
+            return Ok(Some(WireEvent::Quiescent {
+                machine,
+                tick,
+                retired,
+            }))
+        }
         FleetEvent::Inspect {
             machine,
             tick,

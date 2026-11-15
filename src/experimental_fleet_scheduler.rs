@@ -98,6 +98,13 @@ impl ReplyValue {
 
 #[derive(Debug)]
 pub enum FleetEvent {
+    /// Cumulative retirement count when this tick has no immediately runnable work.
+    /// A host completion can make the same tick runnable again and produce another report.
+    Quiescent {
+        machine: u64,
+        tick: u64,
+        retired: u64,
+    },
     Inspect {
         machine: u64,
         tick: u64,
@@ -205,6 +212,8 @@ struct Actor {
     tick: u64,
     tick_initialized: bool,
     remaining: u32,
+    tick_retired: u64,
+    reported_retired: Option<u64>,
     requests_left: u32,
     advances_left: u32,
     deadline: Option<Instant>,
@@ -227,6 +236,8 @@ impl Actor {
             tick: 0,
             tick_initialized: false,
             remaining: 0,
+            tick_retired: 0,
+            reported_retired: None,
             requests_left: host_budget,
             advances_left: 0,
             deadline: None,
@@ -272,6 +283,16 @@ impl FleetScheduler {
         machines: Vec<(u64, ComputerMachine)>,
         config: FleetConfig,
         inspections: Vec<RequestInspection>,
+    ) -> Result<Self, &'static str> {
+        Self::new_with_turn_reporting(machines, config, inspections, false)
+    }
+
+    /// Enable per-machine tick accounting for embedders that need to settle reservations.
+    pub fn new_with_turn_reporting(
+        machines: Vec<(u64, ComputerMachine)>,
+        config: FleetConfig,
+        inspections: Vec<RequestInspection>,
+        report_turns: bool,
     ) -> Result<Self, &'static str> {
         if machines.len() > 4096 {
             return Err("fleet size exceeds maximum");
@@ -322,6 +343,7 @@ impl FleetScheduler {
                         waiting,
                         config,
                         inspections,
+                        report_turns,
                     )
                 }) {
                 Ok(worker) => worker,
@@ -574,8 +596,33 @@ fn publish(
 fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
     if !actor.queued && !actor.stopped && actor.remaining > 0 && actor.advances_left > 0 {
         actor.queued = true;
+        actor.reported_retired = None;
         queue.push_back(id);
     }
+}
+
+fn report_quiescent(
+    id: u64,
+    actor: &mut Actor,
+    events: &SyncSender<FleetEvent>,
+    stopped: &AtomicBool,
+    waiters: &AtomicUsize,
+    enabled: bool,
+) -> bool {
+    if !enabled || !actor.tick_initialized || actor.reported_retired == Some(actor.tick_retired) {
+        return true;
+    }
+    actor.reported_retired = Some(actor.tick_retired);
+    publish(
+        events,
+        stopped,
+        waiters,
+        FleetEvent::Quiescent {
+            machine: id,
+            tick: actor.tick,
+            retired: actor.tick_retired,
+        },
+    )
 }
 
 fn run_worker(
@@ -587,6 +634,7 @@ fn run_worker(
     waiters: Arc<AtomicUsize>,
     config: FleetConfig,
     inspections: Arc<Vec<RequestInspection>>,
+    report_turns: bool,
 ) {
     let mut queue = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
@@ -615,9 +663,21 @@ fn run_worker(
                         continue;
                     }
                     if !actor.tick_initialized || tick > actor.tick {
+                        if !report_quiescent(
+                            machine,
+                            actor,
+                            &events,
+                            &stopped,
+                            &waiters,
+                            report_turns,
+                        ) {
+                            return;
+                        }
                         actor.tick_initialized = true;
                         actor.tick = tick;
                         actor.remaining = retirements;
+                        actor.tick_retired = 0;
+                        actor.reported_retired = None;
                         actor.requests_left = config.host_budget;
                         actor.advances_left = config.maximum_advances_per_tick;
                         actor.deadline = deadline;
@@ -655,6 +715,18 @@ fn run_worker(
                     }
                     if !actor.parked {
                         ready(machine, actor, &mut queue);
+                    }
+                    if !actor.queued
+                        && !report_quiescent(
+                            machine,
+                            actor,
+                            &events,
+                            &stopped,
+                            &waiters,
+                            report_turns,
+                        )
+                    {
+                        return;
                     }
                 }
                 Command::Reply {
@@ -696,7 +768,7 @@ fn run_worker(
                     ready(machine, actor, &mut queue);
                 }
                 Command::Detach { machine } => {
-                    let Some(actor) = actors.get(&machine) else {
+                    let Some(actor) = actors.get_mut(&machine) else {
                         continue;
                     };
                     if !actor.pending.is_empty()
@@ -713,6 +785,10 @@ fn run_worker(
                         }
                         continue;
                     }
+                    if !report_quiescent(machine, actor, &events, &stopped, &waiters, report_turns)
+                    {
+                        return;
+                    }
                     let actor = actors.remove(&machine).expect("checked actor");
                     if !publish(
                         &events,
@@ -727,7 +803,17 @@ fn run_worker(
                     }
                 }
                 Command::Stop { machine } => {
-                    if let Some(actor) = actors.remove(&machine) {
+                    if let Some(mut actor) = actors.remove(&machine) {
+                        if !report_quiescent(
+                            machine,
+                            &mut actor,
+                            &events,
+                            &stopped,
+                            &waiters,
+                            report_turns,
+                        ) {
+                            return;
+                        }
                         let mut pending: Vec<_> = actor
                             .pending
                             .iter()
@@ -799,12 +885,18 @@ fn run_worker(
         };
         actor.queued = false;
         if actor.stopped || actor.remaining == 0 || actor.advances_left == 0 {
+            if !report_quiescent(id, actor, &events, &stopped, &waiters, report_turns) {
+                return;
+            }
             continue;
         }
         if actor
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
+            if !report_quiescent(id, actor, &events, &stopped, &waiters, report_turns) {
+                return;
+            }
             continue;
         }
         actor.advances_left -= 1;
@@ -837,6 +929,7 @@ fn run_worker(
         };
         metrics.advances.fetch_add(1, Ordering::Relaxed);
         metrics.retired.fetch_add(retired, Ordering::Relaxed);
+        actor.tick_retired += retired;
         actor.remaining = actor.remaining.saturating_sub(retired as u32);
         match outcome {
             ComputerAdvanceOutcome::SliceExhausted => {
@@ -1142,6 +1235,10 @@ fn run_worker(
                     return;
                 }
             }
+        }
+        if !actor.queued && !report_quiescent(id, actor, &events, &stopped, &waiters, report_turns)
+        {
+            return;
         }
     }
 }
@@ -2186,5 +2283,131 @@ mod tests {
         fleet.grant(1, 1, 1).unwrap();
         wait_advances(&fleet, 2);
         assert_eq!(fleet.metrics().retired, 2);
+    }
+
+    #[test]
+    fn retirement_reports_are_per_machine_and_per_tick() {
+        let make = || {
+            ComputerMachine::start(
+                crate::execution::fixtures::empty_loop_artifact(1),
+                profile(),
+                &[],
+                &[],
+            )
+            .unwrap()
+        };
+        let fleet = FleetScheduler::new_with_turn_reporting(
+            vec![(1, make()), (2, make())],
+            config(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        fleet.grant(1, 3, 2).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                machine: 1,
+                tick: 3,
+                retired: 2
+            }
+        ));
+        fleet.grant(2, 3, 1).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                machine: 2,
+                tick: 3,
+                retired: 1
+            }
+        ));
+        fleet.grant(1, 4, 1).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                machine: 1,
+                tick: 4,
+                retired: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn retirement_reports_include_continuation_in_the_same_tick() {
+        let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 2, &ops);
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::capability_artifact(true, true, 1, 0),
+            profile(),
+            &[binding],
+            &[],
+        )
+        .unwrap();
+        let fleet =
+            FleetScheduler::new_with_turn_reporting(vec![(7, machine)], config(), Vec::new(), true)
+                .unwrap();
+        fleet.grant(7, 1, 64).unwrap();
+        let request = match next(&fleet) {
+            FleetEvent::Requests { requests, .. } => requests[0].clone(),
+            other => panic!("{other:?}"),
+        };
+        let before = match next(&fleet) {
+            FleetEvent::Quiescent {
+                machine: 7,
+                tick: 1,
+                retired,
+            } => retired,
+            other => panic!("{other:?}"),
+        };
+        fleet
+            .reply(7, request.task_id, request.id, ReplyValue::Unit)
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+        match next(&fleet) {
+            FleetEvent::Quiescent {
+                machine: 7,
+                tick: 1,
+                retired,
+            } => assert!(retired > before),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn expired_deadline_reports_zero_retirements() {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::empty_loop_artifact(1),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet =
+            FleetScheduler::new_with_turn_reporting(vec![(1, machine)], config(), Vec::new(), true)
+                .unwrap();
+        fleet.grant_until(1, 1, 10, Some(Instant::now())).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                machine: 1,
+                tick: 1,
+                retired: 0
+            }
+        ));
+        fleet.grant(1, 2, 1).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent {
+                machine: 1,
+                tick: 2,
+                retired: 1
+            }
+        ));
     }
 }

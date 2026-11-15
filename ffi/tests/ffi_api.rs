@@ -78,6 +78,7 @@ fn experimental_fleet_exposes_typed_stop_events() {
             }
             Some(WireEvent::Outcome(_)) => panic!("unexpected outcome"),
             Some(WireEvent::Inspection(_)) => panic!("unexpected inspection"),
+            Some(WireEvent::Quiescent { .. }) => panic!("unexpected accounting report"),
             Some(WireEvent::Detached { .. }) | Some(WireEvent::DetachRejected { .. }) => {
                 panic!("unexpected detach")
             }
