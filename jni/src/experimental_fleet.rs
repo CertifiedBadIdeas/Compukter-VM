@@ -396,10 +396,16 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
     handle: jlong,
 ) -> jint {
     status(&mut env, |_| {
-        let removed = fleets()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&(handle as u64));
+        let removed = {
+            let mut map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+            if map
+                .get(&(handle as u64))
+                .is_some_and(|fleet| !fleet.sessions.is_empty())
+            {
+                return Ok(code(FfiStatus::BusyHandle));
+            }
+            map.remove(&(handle as u64))
+        };
         match removed {
             Some(f) => {
                 drop(f);
