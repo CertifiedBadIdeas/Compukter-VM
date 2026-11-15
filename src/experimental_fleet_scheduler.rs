@@ -1982,7 +1982,7 @@ mod tests {
         let limits = FileSystemLimits::testing();
         let home = VirtualPath::parse_utf8("/home", &limits).unwrap();
         let owner = FileCapability::new(home, FileRights::OWNER);
-        let mut filesystem = ComputerFileSystem::with_limits(limits.clone());
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
         let child = crate::execution::fixtures::two_block_artifact(1, 1);
         let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
         let path = VirtualPath::parse_utf8("/home/child", &limits).unwrap();
@@ -2029,7 +2029,7 @@ mod tests {
             VirtualPath::parse_utf8("/home", &limits).unwrap(),
             FileRights::OWNER,
         );
-        let mut filesystem = ComputerFileSystem::with_limits(limits.clone());
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
         let launcher = crate::execution::fixtures::process_v3_exec_artifact(
             &"/home/replacement".encode_utf16().collect::<Vec<_>>(),
             &[0, 0],
@@ -2101,7 +2101,7 @@ mod tests {
             VirtualPath::parse_utf8("/home", &limits).unwrap(),
             FileRights::OWNER,
         );
-        let mut filesystem = ComputerFileSystem::with_limits(limits.clone());
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
         let child = crate::execution::fixtures::two_block_artifact(1, 1);
         let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
         filesystem
@@ -2156,7 +2156,7 @@ mod tests {
             VirtualPath::parse_utf8("/home", &limits).unwrap(),
             FileRights::OWNER,
         );
-        let mut filesystem = ComputerFileSystem::with_limits(limits.clone());
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
         let child = crate::execution::fixtures::capability_artifact(true, true, 1, 0);
         let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
         filesystem
