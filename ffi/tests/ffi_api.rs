@@ -78,6 +78,9 @@ fn experimental_fleet_exposes_typed_stop_events() {
             }
             Some(WireEvent::Outcome(_)) => panic!("unexpected outcome"),
             Some(WireEvent::Inspection(_)) => panic!("unexpected inspection"),
+            Some(WireEvent::Detached { .. }) | Some(WireEvent::DetachRejected { .. }) => {
+                panic!("unexpected detach")
+            }
             Some(WireEvent::Error { .. }) => panic!("unexpected fleet error"),
             Some(WireEvent::ScopeStopped { .. }) => panic!("unexpected scope stop"),
             None => {
@@ -117,8 +120,11 @@ fn experimental_fleet_validates_schemas_and_publishes_wire_outcomes() {
     fleet.grant(0, 1, 64).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let event = loop {
-        if let Some(event) = compukter_ffi::experimental_fleet::poll(&fleet).unwrap() {
-            break event;
+        if let Some(event) = compukter_ffi::experimental_fleet::poll_event(&fleet).unwrap() {
+            match event {
+                compukter_ffi::experimental_fleet::WireEvent::Outcome(bytes) => break bytes,
+                _ => panic!("unexpected fleet event"),
+            }
         }
         assert!(Instant::now() < deadline);
         std::thread::yield_now();

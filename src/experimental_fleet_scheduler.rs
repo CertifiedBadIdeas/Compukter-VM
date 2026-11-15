@@ -113,6 +113,15 @@ pub enum FleetEvent {
         tick: u64,
         outcome: ComputerAdvanceOutcome,
     },
+    /// Ownership has returned to the receiver, with the VM state intact.
+    Detached {
+        machine: u64,
+        computer: Box<ComputerMachine>,
+    },
+    /// Detachment is only allowed after host requests have been settled.
+    DetachRejected {
+        machine: u64,
+    },
     /// The machine was removed. Pending identities identify host actions that
     /// the embedder must cancel or discard; late replies are ignored.
     Stopped {
@@ -174,6 +183,9 @@ enum Command {
         value: ReplyValue,
     },
     Stop {
+        machine: u64,
+    },
+    Detach {
         machine: u64,
     },
     TerminalKey {
@@ -434,6 +446,11 @@ impl FleetScheduler {
         )
     }
 
+    /// Returns the intact machine asynchronously after all pending requests settle.
+    pub fn detach(&self, machine: u64) -> Result<(), SubmitError> {
+        self.send(machine, Command::Detach { machine })
+    }
+
     /// Requests asynchronous removal. Completion is reported by `Stopped`.
     pub fn stop(&self, machine: u64) -> Result<(), SubmitError> {
         self.send(machine, Command::Stop { machine })
@@ -483,7 +500,9 @@ impl FleetScheduler {
 
     pub fn try_event(&self) -> Option<FleetEvent> {
         let result = self.events.try_recv().ok();
-        if let Some(FleetEvent::Stopped { machine, .. }) = &result {
+        if let Some(FleetEvent::Stopped { machine, .. } | FleetEvent::Detached { machine, .. }) =
+            &result
+        {
             self.owners
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -674,6 +693,37 @@ fn run_worker(
                     }
                     actor.parked = false;
                     ready(machine, actor, &mut queue);
+                }
+                Command::Detach { machine } => {
+                    let Some(actor) = actors.get(&machine) else {
+                        continue;
+                    };
+                    if !actor.pending.is_empty()
+                        || !actor.inspecting.is_empty()
+                        || !actor.inspected.is_empty()
+                    {
+                        if !publish(
+                            &events,
+                            &stopped,
+                            &waiters,
+                            FleetEvent::DetachRejected { machine },
+                        ) {
+                            return;
+                        }
+                        continue;
+                    }
+                    let actor = actors.remove(&machine).expect("checked actor");
+                    if !publish(
+                        &events,
+                        &stopped,
+                        &waiters,
+                        FleetEvent::Detached {
+                            machine,
+                            computer: Box::new(actor.machine),
+                        },
+                    ) {
+                        return;
+                    }
                 }
                 Command::Stop { machine } => {
                     if let Some(actor) = actors.remove(&machine) {
@@ -1395,6 +1445,83 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn detached_machine_keeps_its_execution_and_filesystem_state() {
+        let fleet = FleetScheduler::new(vec![], config()).unwrap();
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let home = VirtualPath::parse_utf8("/home", &limits).unwrap();
+        let file = VirtualPath::parse_utf8("/home/note", &limits).unwrap();
+        let owner = FileCapability::new(home, FileRights::OWNER);
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(&owner, &file, b"preserved", false)
+            .unwrap();
+        let machine = ComputerMachine::start_in_filesystem(
+            crate::execution::fixtures::two_block_artifact(1, 1),
+            profile(),
+            &[],
+            &[],
+            filesystem,
+            owner,
+        )
+        .unwrap();
+        let id = fleet.attach(Box::new(machine)).unwrap();
+        fleet.grant(id, 1, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(_),
+                ..
+            }
+        ));
+        fleet.detach(id).unwrap();
+        let mut machine = match next(&fleet) {
+            FleetEvent::Detached { machine, computer } if machine == id => computer,
+            event => panic!("{event:?}"),
+        };
+        assert!(machine.resource_snapshot().retired_instructions > 0);
+        assert!(machine.filesystem_stat(&file).is_ok());
+        assert!(matches!(
+            machine.advance(64, 64, 64).unwrap(),
+            ComputerAdvanceOutcome::Halted(_)
+        ));
+        assert_eq!(fleet.grant(id, 2, 64), Err(SubmitError::UnknownMachine));
+    }
+
+    #[test]
+    fn detach_rejects_pending_host_work_without_losing_the_machine() {
+        let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &ops);
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::two_unit_capability_calls_artifact(),
+            profile(),
+            &[binding],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 64).unwrap();
+        let request = match next(&fleet) {
+            FleetEvent::Requests { requests, .. } => requests[0].clone(),
+            event => panic!("{event:?}"),
+        };
+        fleet.detach(7).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::DetachRejected { machine: 7 }
+        ));
+        fleet
+            .reply(7, request.task_id, request.id, ReplyValue::Unit)
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Requests { machine: 7, .. }
+        ));
     }
 
     #[test]

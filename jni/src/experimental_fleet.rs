@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 struct Fleet {
     scheduler: FleetScheduler,
     pending: Option<Vec<u8>>,
+    detached: HashMap<u64, Box<compukter_vm::ComputerMachine>>,
 }
 static FLEETS: OnceLock<Mutex<HashMap<u64, Fleet>>> = OnceLock::new();
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -160,6 +161,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             Fleet {
                 scheduler,
                 pending: None,
+                detached: HashMap::new(),
             },
         );
         Ok(code(FfiStatus::Ok))
@@ -349,6 +351,19 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                         b.extend_from_slice(&request.to_le_bytes());
                     }
                     Some(b)
+                }
+                Ok(Some(experimental_fleet::WireEvent::Detached { machine, computer })) => {
+                    f.detached.insert(machine, computer);
+                    let mut bytes = vec![3];
+                    bytes.extend_from_slice(&machine.to_le_bytes());
+                    bytes.extend_from_slice(b"unexpected detached machine");
+                    Some(bytes)
+                }
+                Ok(Some(experimental_fleet::WireEvent::DetachRejected { machine })) => {
+                    let mut bytes = vec![3];
+                    bytes.extend_from_slice(&machine.to_le_bytes());
+                    bytes.extend_from_slice(b"detach rejected: pending host requests");
+                    Some(bytes)
                 }
                 Ok(Some(experimental_fleet::WireEvent::Error { machine, message })) => {
                     let mut bytes = vec![3];

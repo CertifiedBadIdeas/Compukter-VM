@@ -62,26 +62,16 @@ fn create_machines(
     Ok(machines)
 }
 
-/// Encodes a single event with the normal outcome wire format after its machine
-/// and tick. Experimental errors are returned separately and never encoded as a
-/// successful VM outcome.
-pub fn poll(fleet: &FleetScheduler) -> Result<Option<Vec<u8>>, String> {
-    match poll_event(fleet)? {
-        Some(WireEvent::Outcome(bytes)) => Ok(Some(bytes)),
-        Some(WireEvent::Stopped { .. }) | Some(WireEvent::ScopeStopped { .. }) => {
-            Err("stop requires the typed fleet event API".into())
-        }
-        Some(WireEvent::Inspection(_)) => {
-            Err("inspection requires the typed fleet event API".into())
-        }
-        Some(WireEvent::Error { machine, message }) => Err(format!("machine {machine}: {message}")),
-        None => Ok(None),
-    }
-}
-
 pub enum WireEvent {
     Outcome(Vec<u8>),
     Inspection(Vec<u8>),
+    Detached {
+        machine: u64,
+        computer: Box<ComputerMachine>,
+    },
+    DetachRejected {
+        machine: u64,
+    },
     Error {
         machine: u64,
         message: String,
@@ -115,6 +105,12 @@ pub fn poll_event(fleet: &FleetScheduler) -> Result<Option<WireEvent>, String> {
             }),
             true,
         ),
+        FleetEvent::Detached { machine, computer } => {
+            return Ok(Some(WireEvent::Detached { machine, computer }))
+        }
+        FleetEvent::DetachRejected { machine } => {
+            return Ok(Some(WireEvent::DetachRejected { machine }))
+        }
         FleetEvent::ScopeStopped {
             machine,
             scope,
