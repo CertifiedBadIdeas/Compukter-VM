@@ -592,6 +592,7 @@ struct Actor {
     reported_retired: Option<u64>,
     awaiting_grant: bool,
     compilation_token: Option<u64>,
+    needs_compilation_replay: bool,
     requests_left: u32,
     advances_left: u32,
     deadline: Option<Instant>,
@@ -621,6 +622,7 @@ impl Actor {
             reported_retired: None,
             awaiting_grant: false,
             compilation_token: None,
+            needs_compilation_replay: true,
             requests_left: host_budget,
             advances_left: 0,
             deadline: None,
@@ -2554,16 +2556,30 @@ fn run_worker(
             continue;
         }
         actor.advances_left -= 1;
-        let (outcome, retired) = match actor.machine.advance_with_retirement_count(
-            config.guest_budget,
-            config.maintenance_budget,
-            actor
-                .requests_left
-                .saturating_add(actor.pending.len() as u32)
-                .saturating_add(actor.inspecting.len() as u32)
-                .saturating_add(actor.inspected.len() as u32),
-            actor.remaining,
-        ) {
+        // Reconstruct the adoption event lazily, under normal frame/output budgets, without
+        // retaining another source snapshot per parked machine. Host interrupts take priority.
+        let replay = if std::mem::take(&mut actor.needs_compilation_replay)
+            && !actor.machine.has_pending_termination()
+        {
+            actor.machine.pending_compilation_request()
+        } else {
+            None
+        };
+        let advanced = if let Some(request) = replay {
+            Ok((ComputerAdvanceOutcome::CompilationRequested(request), 0))
+        } else {
+            actor.machine.advance_with_retirement_count(
+                config.guest_budget,
+                config.maintenance_budget,
+                actor
+                    .requests_left
+                    .saturating_add(actor.pending.len() as u32)
+                    .saturating_add(actor.inspecting.len() as u32)
+                    .saturating_add(actor.inspected.len() as u32),
+                actor.remaining,
+            )
+        };
+        let (outcome, retired) = match advanced {
             Ok(value) => value,
             Err(error) => {
                 actor.stopped = true;
@@ -6845,6 +6861,90 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn adopting_pending_compilation_replays_once_under_a_frame_grant() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        for initial in [false, true] {
+            let limits = FileSystemLimits::testing();
+            let owner = FileCapability::new(
+                VirtualPath::parse_utf8("/home", &limits).unwrap(),
+                FileRights::OWNER,
+            );
+            let mut filesystem = ComputerFileSystem::with_limits(limits);
+            filesystem
+                .write_file(
+                    &owner,
+                    &VirtualPath::parse_utf8("/home/main.kt", &limits).unwrap(),
+                    b"fun main() {}",
+                    false,
+                )
+                .unwrap();
+            let artifact = crate::execution::fixtures::compiler_compile_artifact(
+                &"/home/main.kt".encode_utf16().collect::<Vec<_>>(),
+                &"/home/main".encode_utf16().collect::<Vec<_>>(),
+            );
+            let mut computer = ComputerMachine::start_in_filesystem(
+                artifact,
+                profile(),
+                &[],
+                &[],
+                filesystem,
+                owner,
+            )
+            .unwrap();
+            let expected = loop {
+                match computer.advance(64, 64, 64).unwrap() {
+                    ComputerAdvanceOutcome::CompilationRequested(request) => break request,
+                    ComputerAdvanceOutcome::SliceExhausted => {}
+                    event => panic!("{event:?}"),
+                }
+            };
+            let (fleet, machine) = if initial {
+                (
+                    FleetScheduler::new(vec![(7, computer)], config()).unwrap(),
+                    7,
+                )
+            } else {
+                let fleet = FleetScheduler::new(Vec::new(), config()).unwrap();
+                let machine = fleet
+                    .attach(Box::new(computer))
+                    .unwrap_or_else(|(error, _)| panic!("adoption: {error:?}"));
+                (fleet, machine)
+            };
+            assert!(fleet.try_event().is_none());
+            fleet.grant(machine, 1, 512).unwrap();
+            match next(&fleet) {
+                FleetEvent::Boundary {
+                    outcome: ComputerAdvanceOutcome::CompilationRequested(request),
+                    ..
+                } => {
+                    assert_eq!(request.token, expected.token);
+                    assert_eq!(
+                        request.sources[0].utf8.as_ref(),
+                        expected.sources[0].utf8.as_ref()
+                    );
+                }
+                event => panic!("{event:?}"),
+            }
+            fleet
+                .complete_compilation(
+                    machine,
+                    expected.token,
+                    CompilationResult::Failure("declined".into()),
+                )
+                .unwrap();
+            assert!(matches!(
+                next(&fleet),
+                FleetEvent::Boundary {
+                    outcome: ComputerAdvanceOutcome::Halted(_),
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

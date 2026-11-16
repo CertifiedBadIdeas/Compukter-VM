@@ -401,7 +401,6 @@ impl ComputerMachine {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         if self.sessions.is_empty()
-            || self.pending_compilation.is_some()
             || timers.len() != self.external_requests.len()
             || timers.len() > 256
         {
@@ -451,6 +450,11 @@ impl ComputerMachine {
                 frame.pending_process == identity
                     || frame.pending_terminal_event == identity
                     || frame.pending_stdio_read == identity
+                    || self.pending_compilation.as_ref().is_some_and(|pending| {
+                        pending.owner_depth == index + 1
+                            && pending.task == task
+                            && pending.request == request
+                    })
                     || (index + 1 == self.sessions.len()
                         && self.redstone.contains_waiter(task, request))
                     || self.external_requests.iter().any(|route| {
