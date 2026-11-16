@@ -39,7 +39,6 @@ impl<'a> WorkerOutput<'a> {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn has_pending(&self) -> bool {
         !self.pending.borrow().is_empty() || !self.headroom.load(Ordering::Acquire)
     }

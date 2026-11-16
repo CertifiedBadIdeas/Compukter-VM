@@ -2482,7 +2482,13 @@ fn run_worker(
                 .unwrap_or_else(|e| e.into_inner())
                 .has_eligible(|id| events.blocks_machine(id))
             {
-                thread::park_timeout(Duration::from_millis(1));
+                if queue.is_empty() && !events.has_pending() {
+                    // Producers publish before unpark; the park token also covers a
+                    // command arriving between the eligibility check and this wait.
+                    thread::park();
+                } else {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
             }
             continue;
         };
@@ -4475,6 +4481,8 @@ mod tests {
             )
             .unwrap()
         };
+        // Let an empty worker enter its indefinite idle wait before attachment.
+        thread::sleep(Duration::from_millis(20));
         let first = fleet.attach(Box::new(make())).unwrap();
         fleet.grant(first, 1, 64).unwrap();
         assert!(
@@ -4482,6 +4490,7 @@ mod tests {
         );
         fleet.stop(first).unwrap();
         assert!(matches!(next(&fleet), FleetEvent::Stopped { machine, .. } if machine == first));
+        thread::sleep(Duration::from_millis(20));
         let second = fleet.attach(Box::new(make())).unwrap();
         assert_ne!(first, second);
         assert_eq!(fleet.grant(first, 2, 64), Err(SubmitError::UnknownMachine));
