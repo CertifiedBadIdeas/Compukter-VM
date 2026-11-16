@@ -1112,6 +1112,11 @@ impl ComputerMachine {
         self.terminal.push_key(event)
     }
 
+    /// A host interrupt must progress even while an external compiler is still running.
+    pub(crate) fn has_pending_termination(&self) -> bool {
+        self.pending_termination.is_some()
+    }
+
     pub fn terminal_mut(&mut self) -> &mut TerminalDevice {
         &mut self.terminal
     }

@@ -2275,6 +2275,10 @@ fn run_worker(
                         .submit_terminal_key(event)
                         .map_err(InputFailure::Terminal);
                     if result.is_ok() {
+                        if actor.machine.has_pending_termination() {
+                            // Invalidate late compiler replies before allowing the control unwind.
+                            actor.compilation_token = None;
+                        }
                         actor.parked = false;
                         ready(machine, actor, &mut queue);
                     }
@@ -6756,6 +6760,90 @@ mod tests {
         assert!(matches!(
             computer.advance(64, 64, 64).unwrap(),
             ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(1)))
+        ));
+    }
+
+    #[test]
+    fn terminating_compilation_resumes_parent_and_ignores_late_result() {
+        use crate::{
+            ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, VirtualPath,
+        };
+        let limits = FileSystemLimits::testing();
+        let owner = FileCapability::new(
+            VirtualPath::parse_utf8("/home", &limits).unwrap(),
+            FileRights::OWNER,
+        );
+        let mut filesystem = ComputerFileSystem::with_limits(limits);
+        filesystem
+            .write_file(
+                &owner,
+                &VirtualPath::parse_utf8("/home/main.kt", &limits).unwrap(),
+                b"fun main() {}",
+                false,
+            )
+            .unwrap();
+        let child = crate::execution::fixtures::compiler_compile_artifact(
+            &"/home/main.kt".encode_utf16().collect::<Vec<_>>(),
+            &"/home/main".encode_utf16().collect::<Vec<_>>(),
+        );
+        let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+        filesystem
+            .write_file(
+                &owner,
+                &VirtualPath::parse_utf8("/home/child", &limits).unwrap(),
+                &bytes,
+                true,
+            )
+            .unwrap();
+        let parent = crate::execution::fixtures::process_v2_run_artifact(
+            &"/home/child".encode_utf16().collect::<Vec<_>>(),
+            &[0, 0],
+        );
+        let machine =
+            ComputerMachine::start_in_filesystem(parent, profile(), &[], &[], filesystem, owner)
+                .unwrap();
+        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
+        fleet.grant(7, 1, 4096).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessEntered(1),
+                ..
+            }
+        ));
+        let token = match next(&fleet) {
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::CompilationRequested(request),
+                ..
+            } => request.token,
+            event => panic!("{event:?}"),
+        };
+        fleet
+            .terminal_key(
+                7,
+                crate::TerminalKeyEvent::new(
+                    crate::TerminalKey::C,
+                    crate::TerminalKeyAction::Press,
+                    crate::TerminalModifiers::new(crate::TerminalModifiers::CONTROL).unwrap(),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::ProcessExited(1),
+                ..
+            }
+        ));
+        fleet
+            .complete_compilation(7, token, CompilationResult::Failure("obsolete".into()))
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(130))),
+                ..
+            }
         ));
     }
 
