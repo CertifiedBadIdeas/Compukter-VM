@@ -1669,6 +1669,9 @@ fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
         && !actor.stopped
         && !actor.awaiting_grant
         && actor.compilation_token.is_none()
+        // Cost classification is an execution boundary, not an extra Guest scheduling slice.
+        // Control unwinding must still cancel the inspected scope without waiting for its cost.
+        && (actor.inspecting.is_empty() || actor.machine.has_pending_termination())
         && actor.remaining > 0
         && actor.advances_left > 0
     {
@@ -4248,85 +4251,108 @@ mod tests {
             ComputerFileSystem, FileCapability, FileRights, FileSystemLimits, TerminalKey,
             TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, VirtualPath,
         };
-        let limits = FileSystemLimits::testing();
-        let owner = FileCapability::new(
-            VirtualPath::parse_utf8("/home", &limits).unwrap(),
-            FileRights::OWNER,
-        );
-        let mut filesystem = ComputerFileSystem::with_limits(limits);
-        let child = crate::execution::fixtures::capability_artifact(true, true, 1, 0);
-        let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
-        filesystem
-            .write_file(
-                &owner,
-                &VirtualPath::parse_utf8("/home/child", &limits).unwrap(),
-                &bytes,
-                true,
+        for inspected in [false, true] {
+            let limits = FileSystemLimits::testing();
+            let owner = FileCapability::new(
+                VirtualPath::parse_utf8("/home", &limits).unwrap(),
+                FileRights::OWNER,
+            );
+            let mut filesystem = ComputerFileSystem::with_limits(limits);
+            let child = crate::execution::fixtures::capability_artifact(true, true, 1, 0);
+            let bytes = crate::test_encode::encode_artifact(child.decoded()).unwrap();
+            filesystem
+                .write_file(
+                    &owner,
+                    &VirtualPath::parse_utf8("/home/child", &limits).unwrap(),
+                    &bytes,
+                    true,
+                )
+                .unwrap();
+            let parent = crate::execution::fixtures::process_v2_run_artifact(
+                &"/home/child".encode_utf16().collect::<Vec<_>>(),
+                &[0, 0],
+            );
+            let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+            let binding = CapabilityBinding::new("app", "entry", 1, 2, &ops);
+            let machine = ComputerMachine::start_in_filesystem(
+                parent,
+                profile(),
+                &[binding],
+                &[],
+                filesystem,
+                owner,
             )
             .unwrap();
-        let parent = crate::execution::fixtures::process_v2_run_artifact(
-            &"/home/child".encode_utf16().collect::<Vec<_>>(),
-            &[0, 0],
-        );
-        let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
-        let binding = CapabilityBinding::new("app", "entry", 1, 2, &ops);
-        let machine = ComputerMachine::start_in_filesystem(
-            parent,
-            profile(),
-            &[binding],
-            &[],
-            filesystem,
-            owner,
-        )
-        .unwrap();
-        let fleet = FleetScheduler::new(vec![(7, machine)], config()).unwrap();
-        fleet.grant(7, 1, 512).unwrap();
-        assert!(matches!(
-            next(&fleet),
-            FleetEvent::Boundary {
-                outcome: ComputerAdvanceOutcome::ProcessEntered(1),
-                ..
+            let rules = if inspected {
+                vec![RequestInspection {
+                    namespace: "app".into(),
+                    name: "entry".into(),
+                    abi_major: 1,
+                    abi_minor: 2,
+                    operation: 0,
+                    over_budget_detail: "group exceeds budget".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let fleet =
+                FleetScheduler::new_with_request_inspections(vec![(7, machine)], config(), rules)
+                    .unwrap();
+            fleet.grant(7, 1, 512).unwrap();
+            assert!(matches!(
+                next(&fleet),
+                FleetEvent::Boundary {
+                    outcome: ComputerAdvanceOutcome::ProcessEntered(1),
+                    ..
+                }
+            ));
+            let request = match next(&fleet) {
+                FleetEvent::Requests { requests, .. } if !inspected => requests[0].clone(),
+                FleetEvent::Inspect { request, .. } if inspected => request,
+                event => panic!("{event:?}"),
+            };
+            fleet
+                .terminal_key(
+                    7,
+                    TerminalKeyEvent::new(
+                        TerminalKey::C,
+                        TerminalKeyAction::Press,
+                        TerminalModifiers::new(TerminalModifiers::CONTROL).unwrap(),
+                    ),
+                )
+                .unwrap();
+            match next(&fleet) {
+                FleetEvent::ScopeStopped {
+                    machine: 7,
+                    scope: 1,
+                    pending,
+                } => assert_eq!(pending, vec![(request.task_id, request.id)]),
+                event => panic!("{event:?}"),
             }
-        ));
-        let request = match next(&fleet) {
-            FleetEvent::Requests { requests, .. } => requests[0].clone(),
-            event => panic!("{event:?}"),
-        };
-        fleet
-            .terminal_key(
-                7,
-                TerminalKeyEvent::new(
-                    TerminalKey::C,
-                    TerminalKeyAction::Press,
-                    TerminalModifiers::new(TerminalModifiers::CONTROL).unwrap(),
-                ),
-            )
-            .unwrap();
-        match next(&fleet) {
-            FleetEvent::ScopeStopped {
-                machine: 7,
-                scope: 1,
-                pending,
-            } => assert_eq!(pending, vec![(request.task_id, request.id)]),
-            event => panic!("{event:?}"),
+            if inspected {
+                fleet
+                    .resolve_cost(7, request.task_id, request.id, 1)
+                    .unwrap();
+            } else {
+                fleet
+                    .reply(7, request.task_id, request.id, ReplyValue::Unit)
+                    .unwrap();
+            }
+            assert!(matches!(
+                next(&fleet),
+                FleetEvent::Boundary {
+                    outcome: ComputerAdvanceOutcome::ProcessExited(1),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                next(&fleet),
+                FleetEvent::Boundary {
+                    outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(130))),
+                    ..
+                }
+            ));
         }
-        fleet
-            .reply(7, request.task_id, request.id, ReplyValue::Unit)
-            .unwrap();
-        assert!(matches!(
-            next(&fleet),
-            FleetEvent::Boundary {
-                outcome: ComputerAdvanceOutcome::ProcessExited(1),
-                ..
-            }
-        ));
-        assert!(matches!(
-            next(&fleet),
-            FleetEvent::Boundary {
-                outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::I32(130))),
-                ..
-            }
-        ));
     }
 
     #[test]
@@ -5299,6 +5325,65 @@ mod tests {
     }
 
     #[test]
+    fn inspection_wait_is_a_machine_execution_boundary_across_grants() {
+        let operations = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
+        let binding = CapabilityBinding::new("app", "entry", 1, 0, &operations);
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::two_unit_capability_calls_artifact(),
+            profile(),
+            &[binding],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new_with_coordinated_turns(
+            vec![(7, machine)],
+            config(),
+            vec![RequestInspection {
+                namespace: "app".into(),
+                name: "entry".into(),
+                abi_major: 1,
+                abi_minor: 0,
+                operation: 0,
+                over_budget_detail: "group exceeds budget".into(),
+            }],
+            true,
+        )
+        .unwrap();
+        fleet.grant(7, 1, 64).unwrap();
+        let request = match next(&fleet) {
+            FleetEvent::Inspect { request, .. } => request,
+            event => panic!("{event:?}"),
+        };
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent { tick: 1, .. }
+        ));
+        // Discovering the unclassified request must be the final advance, even if another
+        // cooperative task or internal process operation could run on the following slice.
+        assert_eq!(1, fleet.metrics().advances);
+        let retired = fleet.metrics().retired;
+        fleet.grant(7, 2, 64).unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent { tick: 2, .. }
+        ));
+        assert_eq!(1, fleet.metrics().advances);
+        assert_eq!(retired, fleet.metrics().retired);
+        fleet
+            .resolve_cost(7, request.task_id, request.id, 2)
+            .unwrap();
+        fleet.grant(7, 2, 64).unwrap();
+        match next(&fleet) {
+            FleetEvent::Requests { requests, .. } => assert_eq!(request.id, requests[0].id),
+            event => panic!("{event:?}"),
+        }
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Quiescent { tick: 2, .. }
+        ));
+    }
+
+    #[test]
     fn inspection_does_not_block_other_machines_and_stop_discards_late_cost() {
         let ops = [OperationSchema::asynchronous(&[], HostValueType::Unit)];
         let binding = CapabilityBinding::new("app", "entry", 1, 0, &ops);
@@ -5401,7 +5486,7 @@ mod tests {
             fleet.resolve_cost(7, first.task_id, first.id, 0),
             Err(SubmitError::InvalidCost)
         );
-        wait_advances(&fleet, 2);
+        assert_eq!(1, fleet.metrics().advances);
         assert!(fleet.try_event().is_none());
         fleet.resolve_cost(7, first.task_id, first.id, 2).unwrap();
         match next(&fleet) {
