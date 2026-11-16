@@ -132,18 +132,8 @@ pub(crate) fn attach_fleet_session(
                 store_identity,
                 restored_host_state,
             } = session;
-            if compilation.is_some() {
-                return Err((
-                    crate::FfiStatus::InvalidArgument,
-                    BridgeSession {
-                        computer,
-                        compilation,
-                        filesystem_limits,
-                        store_identity,
-                        restored_host_state,
-                    },
-                ));
-            }
+            // The scheduler replays a pending compiler transaction on its first granted turn.
+            // Keep this cached bridge event only on refused adoption, alongside the returned machine.
             match fleet.attach_with_timers(Box::new(computer), base_tick, timers) {
                 Ok(machine) => Ok((
                     machine,
