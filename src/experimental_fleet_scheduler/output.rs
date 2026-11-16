@@ -11,7 +11,7 @@ use std::sync::mpsc::TrySendError;
 use std::sync::Arc;
 
 use super::memory::{observation_bytes, ByteBudget, OutputHeadroom, Reservation};
-use super::pending::PendingOutput;
+use super::pending::{FlushResult, PendingOutput};
 use super::{
     CloseRequest, EventSender, FleetDetachCompletion, FleetDetachRejection, FleetDetachResult,
     FleetEvent, FleetQuiescent, FleetStopCompletion, LifecycleCompletion,
@@ -39,6 +39,7 @@ impl<'a> WorkerOutput<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn has_pending(&self) -> bool {
         !self.pending.borrow().is_empty() || !self.headroom.load(Ordering::Acquire)
     }
@@ -58,7 +59,7 @@ impl<'a> WorkerOutput<'a> {
         self.pending.borrow().contains(machine)
     }
 
-    pub(super) fn flush(&self) -> bool {
+    pub(super) fn flush(&self) -> FlushResult {
         self.pending
             .borrow_mut()
             .flush(&self.transport, self.waiters)
@@ -262,6 +263,120 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn wait_rechecks_space_freed_before_publisher_registration() {
+        let (sender, receiver) = super::super::event_queue::channel(
+            1,
+            FleetMemoryLimits::default().event_bytes,
+            FleetMemoryLimits::default().event_bytes_per_machine,
+        );
+        let waiters = AtomicUsize::new(0);
+        let output = WorkerOutput::new(
+            EventSender {
+                sender,
+                signal: Arc::new(FleetEventSignal::default()),
+                completions: Arc::new(Mutex::new(BTreeMap::new())),
+                pending: super::super::pending::PendingCapacity::new(
+                    FleetMemoryLimits::default(),
+                    64,
+                ),
+                detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
+                detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
+                detach_headroom: Arc::new(AtomicUsize::new(0)),
+            },
+            &waiters,
+        );
+        assert!(output.emit(FleetEvent::Error {
+            machine: 0,
+            message: "occupied".into()
+        }));
+        let Err(TrySendError::Full(deferred)) =
+            output.transport.sender.try_send(FleetEvent::Error {
+                machine: 1,
+                message: "deferred".into(),
+            })
+        else {
+            panic!("queue should be full")
+        };
+        assert!(receiver.try_recv().is_ok());
+        assert_eq!(waiters.load(Ordering::SeqCst), 0); // Consumer would skip unpark here.
+        output
+            .pending
+            .borrow_mut()
+            .push(deferred, &output.transport, &waiters);
+        // Make a broken implementation fail an assertion rather than hang the suite.
+        std::thread::current().unpark();
+        assert!(super::super::wait_for_worker_progress(&output));
+        std::thread::park_timeout(std::time::Duration::ZERO);
+        assert!(
+            !output.has_pending(),
+            "space freed before registration was not observed"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(FleetEvent::Error { machine: 1, .. })
+        ));
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn successful_bounded_flush_keeps_draining_without_another_consumer_signal() {
+        let (sender, receiver) = super::super::event_queue::channel(
+            4,
+            FleetMemoryLimits::default().event_bytes,
+            FleetMemoryLimits::default().event_bytes_per_machine,
+        );
+        let waiters = AtomicUsize::new(0);
+        let output = WorkerOutput::new(
+            EventSender {
+                sender,
+                signal: Arc::new(FleetEventSignal::default()),
+                completions: Arc::new(Mutex::new(BTreeMap::new())),
+                pending: super::super::pending::PendingCapacity::new(
+                    FleetMemoryLimits::default(),
+                    64,
+                ),
+                detach_memory: ByteBudget::new(FleetMemoryLimits::default().detach_output_bytes),
+                detach_machine_limit: FleetMemoryLimits::default().detach_output_bytes_per_machine,
+                detach_headroom: Arc::new(AtomicUsize::new(0)),
+            },
+            &waiters,
+        );
+        for _ in 0..4 {
+            assert!(output.emit(FleetEvent::Error {
+                machine: 0,
+                message: "occupied".into()
+            }));
+        }
+        for sequence in 0..3 {
+            assert!(output.emit(FleetEvent::Error {
+                machine: 1,
+                message: sequence.to_string().into()
+            }));
+        }
+        assert_eq!(output.flush(), FlushResult::Blocked);
+        for _ in 0..4 {
+            assert!(receiver.try_recv().is_ok());
+        }
+        for _ in 0..3 {
+            std::thread::current().unpark();
+            assert!(super::super::wait_for_worker_progress(&output));
+            std::thread::park_timeout(std::time::Duration::ZERO);
+        }
+        assert!(!output.has_pending());
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+        for sequence in 0..3 {
+            let FleetEvent::Error {
+                machine: 1,
+                message,
+            } = receiver.try_recv().unwrap()
+            else {
+                panic!("lost output")
+            };
+            assert_eq!(message.as_ref(), sequence.to_string());
+        }
+    }
+
+    #[test]
     fn detach_charges_large_payloads_without_copying_and_releases_all_reservations() {
         for (global_limit, local_limit, overflow) in [
             (64 * 1024, 512 * 1024, true),
@@ -408,12 +523,12 @@ mod tests {
             prior_reports: VecDeque::new(),
             report_pending: false,
         });
-        assert!(output.flush());
+        assert_ne!(output.flush(), FlushResult::Disconnected);
         assert!(matches!(
             receiver.try_recv(),
             Ok(FleetEvent::Error { machine: 0, .. })
         ));
-        assert!(output.flush());
+        assert_ne!(output.flush(), FlushResult::Disconnected);
         let FleetEvent::Boundary {
             machine: 1,
             outcome: ComputerAdvanceOutcome::Halted(Some(ComputerValue::ByteArray(bytes))),
@@ -423,7 +538,7 @@ mod tests {
             panic!("payload was lost or reordered");
         };
         assert_eq!(bytes.as_ptr(), backing, "delivery copied the payload");
-        assert!(output.flush());
+        assert_ne!(output.flush(), FlushResult::Disconnected);
         assert!(matches!(
             receiver.try_recv(),
             Ok(FleetEvent::Quiescent {
@@ -489,7 +604,7 @@ mod tests {
         assert!(!output.blocks_machine(2));
         assert_eq!(receiver.try_recv().unwrap().machine(), 1);
         assert_eq!(receiver.try_recv().unwrap().machine(), 2);
-        assert!(output.flush());
+        assert_ne!(output.flush(), FlushResult::Disconnected);
         let FleetEvent::Error {
             machine: 1,
             message,
@@ -525,7 +640,7 @@ mod tests {
         assert!(output.emit(observation(1, "third")));
         assert!(output.emit(observation(2, "other")));
         assert_eq!(receiver.try_recv().unwrap().machine(), 0);
-        assert!(output.flush());
+        assert_ne!(output.flush(), FlushResult::Disconnected);
         assert!(output.blocks_machine(1));
         assert!(
             !output.blocks_machine(2),
@@ -534,7 +649,7 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap().machine(), 1);
         assert_eq!(receiver.try_recv().unwrap().machine(), 2);
         for expected in ["second", "third"] {
-            assert!(output.flush());
+            assert_ne!(output.flush(), FlushResult::Disconnected);
             let FleetEvent::Error {
                 machine: 1,
                 message,
@@ -597,7 +712,7 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap().machine(), 0);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..9 {
-            assert!(output.flush());
+            assert_ne!(output.flush(), FlushResult::Disconnected);
             assert!(
                 seen.insert(receiver.try_recv().unwrap().machine()),
                 "duplicate owner delivery"

@@ -21,6 +21,7 @@ use event_queue::{EventReceiver, EventSender as QueueSender};
 mod output;
 mod pending;
 use output::WorkerOutput;
+use pending::FlushResult;
 mod memory;
 use memory::{ByteBudget, Reservation};
 mod lifecycle;
@@ -1766,6 +1767,22 @@ fn report_quiescent(
     )
 }
 
+/// Recheck publication after pending output registered its waiter. A receiver
+/// that freed space before registration may have skipped unpark; this retry
+/// observes that space. Later receives see the registration and leave a park
+/// token, including when they race this wait. Command and lifecycle producers
+/// likewise publish their state before unpark.
+fn wait_for_worker_progress(events: &WorkerOutput<'_>) -> bool {
+    match events.flush() {
+        FlushResult::Disconnected => false,
+        FlushResult::Published => true,
+        FlushResult::Blocked => {
+            thread::park();
+            true
+        }
+    }
+}
+
 fn run_worker(
     mut actors: HashMap<u64, Actor>,
     mailbox: Arc<Mutex<LaneMailbox>>,
@@ -1780,7 +1797,7 @@ fn run_worker(
     let events = WorkerOutput::new(events, &waiters);
     let mut queue = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
-        if !events.flush() {
+        if events.flush() == FlushResult::Disconnected {
             return;
         }
         for _ in 0..4 {
@@ -2472,23 +2489,21 @@ fn run_worker(
             continue;
         }
         if events.blocks_worker() {
-            thread::park_timeout(Duration::from_millis(1));
+            if !wait_for_worker_progress(&events) {
+                return;
+            }
             continue;
         }
         let ready_index = queue.iter().position(|id| !events.blocks_machine(*id));
         let Some(id) = ready_index.and_then(|index| queue.remove(index)) else {
-            if !mailbox
+            // Drop the mailbox guard before a wait: command producers need it
+            // to publish the work that wakes this thread.
+            let eligible = mailbox
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .has_eligible(|id| events.blocks_machine(id))
-            {
-                if queue.is_empty() && !events.has_pending() {
-                    // Producers publish before unpark; the park token also covers a
-                    // command arriving between the eligibility check and this wait.
-                    thread::park();
-                } else {
-                    thread::park_timeout(Duration::from_millis(1));
-                }
+                .has_eligible(|id| events.blocks_machine(id));
+            if !eligible && !wait_for_worker_progress(&events) {
+                return;
             }
             continue;
         };
@@ -2500,7 +2515,7 @@ fn run_worker(
             if !fence.load(Ordering::Acquire) {
                 actor.queued = true;
                 queue.push_back(id);
-                if queue.iter().all(|id| {
+                let all_blocked = queue.iter().all(|id| {
                     events.blocks_machine(*id)
                         || actors.get(id).is_none_or(|actor| {
                             actor
@@ -2511,9 +2526,9 @@ fn run_worker(
                 }) && !mailbox
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .has_eligible(|id| events.blocks_machine(id))
-                {
-                    thread::park_timeout(Duration::from_millis(1));
+                    .has_eligible(|id| events.blocks_machine(id));
+                if all_blocked && !wait_for_worker_progress(&events) {
+                    return;
                 }
                 continue;
             }

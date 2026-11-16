@@ -17,6 +17,15 @@ use std::sync::Arc;
 use super::memory::{observation_bytes, ByteBudget, Reservation};
 use super::{EventSender, FleetEvent, FleetMemoryLimits};
 
+/// Only a stalled flush may park; successful bounded publication can leave more
+/// events ready even if the receiver has not had a chance to signal again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlushResult {
+    Published,
+    Blocked,
+    Disconnected,
+}
+
 pub(super) struct PendingCapacity {
     pub(super) memory: Arc<ByteBudget>,
     pub(super) entries: Arc<ByteBudget>,
@@ -152,14 +161,16 @@ impl PendingOutput {
 
     /// One event from each of at most four machines per worker turn. A local
     /// admission refusal must not prevent publication by another machine.
-    pub(super) fn flush(&mut self, transport: &EventSender, waiters: &AtomicUsize) -> bool {
+    pub(super) fn flush(&mut self, transport: &EventSender, waiters: &AtomicUsize) -> FlushResult {
         let was_empty = self.is_empty();
+        let mut published = false;
         for _ in 0..self.ready.len().min(4) {
             let machine = self.ready.pop_front().expect("pending owner");
             let batch = self.batches.get_mut(&machine).expect("pending batch");
             let PendingEvent { event, lease } = batch.events.pop_front().expect("pending event");
             match transport.sender.try_send(event) {
                 Ok(()) => {
+                    published = true;
                     drop(lease);
                     transport.signal.notify();
                 }
@@ -171,7 +182,7 @@ impl PendingOutput {
                     batch.events.push_front(PendingEvent { event, lease });
                     self.ready.push_back(machine);
                     if disconnected {
-                        return false;
+                        return FlushResult::Disconnected;
                     }
                     continue;
                 }
@@ -188,7 +199,11 @@ impl PendingOutput {
         if !was_empty && self.is_empty() {
             waiters.fetch_sub(1, Ordering::SeqCst);
         }
-        true
+        if published {
+            FlushResult::Published
+        } else {
+            FlushResult::Blocked
+        }
     }
 
     pub(super) fn drain_machine(
