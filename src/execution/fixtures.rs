@@ -5495,6 +5495,14 @@ pub(super) fn object_allocation_artifact(field_count: u32) -> VerifiedArtifact {
 }
 
 pub(super) fn gc_retry_artifact() -> VerifiedArtifact {
+    gc_retry_with_result(false)
+}
+
+pub(crate) fn gc_retry_unit_artifact() -> VerifiedArtifact {
+    gc_retry_with_result(true)
+}
+
+fn gc_retry_with_result(unit: bool) -> VerifiedArtifact {
     verified_mutated(|artifact| {
         let reference = ValueType {
             kind: 7,
@@ -5504,7 +5512,7 @@ pub(super) fn gc_retry_artifact() -> VerifiedArtifact {
         artifact.modules[0].types[0] = NominalType::Function {
             name: 1,
             flags: 0,
-            result: reference,
+            result: if unit { primitive(0) } else { reference },
             parameters: Vec::new(),
         };
         artifact.modules[0]
@@ -5544,7 +5552,9 @@ pub(super) fn gc_retry_artifact() -> VerifiedArtifact {
                     },
                     Instruction::Jump { target: 3 },
                 ],
-                vec![Instruction::Return { value: 0 }],
+                vec![Instruction::Return {
+                    value: if unit { u16::MAX } else { 0 },
+                }],
             ],
         );
         configure_stack(artifact, 1, 1);

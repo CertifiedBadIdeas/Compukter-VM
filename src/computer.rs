@@ -244,6 +244,16 @@ pub enum ComputerFileReadError {
     LimitExceeded,
 }
 
+/// Constant-size work counters for worker scheduling; no heap/resource traversal.
+#[cfg(feature = "experimental-fleet-scheduler")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ComputerExecutionWork {
+    scope: u64,
+    fixed: u64,
+    dynamic: u64,
+    maintenance: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ComputerResourceSnapshot {
     pub fixed_guest_units: u64,
@@ -1243,6 +1253,18 @@ impl ComputerMachine {
             retirement_limit,
             &mut 0,
         )
+    }
+
+    #[cfg(feature = "experimental-fleet-scheduler")]
+    pub(crate) fn execution_work(&self) -> ComputerExecutionWork {
+        let frame = self.active_frame();
+        let accounting = frame.session.accounting();
+        ComputerExecutionWork {
+            scope: frame.scope_id,
+            fixed: accounting.fixed_guest_units,
+            dynamic: accounting.dynamic_guest_units,
+            maintenance: accounting.maintenance_units,
+        }
     }
 
     /// Advances the computer and returns the retired instruction count for this call.

@@ -2686,6 +2686,7 @@ fn run_worker(
         } else {
             None
         };
+        let work_before = actor.machine.execution_work();
         let advanced = if let Some(request) = replay {
             Ok((ComputerAdvanceOutcome::CompilationRequested(request), 0))
         } else {
@@ -2717,6 +2718,7 @@ fn run_worker(
                 continue;
             }
         };
+        let progressed = retired != 0 || actor.machine.execution_work() != work_before;
         metrics.advances.fetch_add(1, Ordering::Relaxed);
         metrics.retired.fetch_add(retired, Ordering::Relaxed);
         actor.tick_retired += retired;
@@ -2738,9 +2740,8 @@ fn run_worker(
                 }
             }
             ComputerAdvanceOutcome::SliceExhausted => {
-                if retired == 0 {
-                    // Maintenance can make progress without retiring instructions.
-                    // Yield until a new tick instead of treating it as a host wait.
+                if !progressed {
+                    // A genuinely empty slice must not spin through the frame.
                     actor.remaining = 0;
                 } else {
                     ready(id, actor, &mut queue);
@@ -2949,7 +2950,7 @@ fn run_worker(
                 if budget_exhausted {
                     actor.remaining = 0;
                     actor.parked = false;
-                } else if retired == 0 && !discovered {
+                } else if !progressed && !discovered {
                     actor.parked = true;
                 } else {
                     ready(id, actor, &mut queue);
@@ -6716,6 +6717,81 @@ mod tests {
         let start = Instant::now();
         drop(fleet);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    fn collecting_machine() -> ComputerMachine {
+        let mut limits = profile();
+        limits.heap_bytes = 32;
+        let mut machine = ComputerMachine::start(
+            crate::execution::fixtures::gc_retry_unit_artifact(),
+            limits,
+            &[],
+            &[],
+        )
+        .unwrap();
+        // Reach allocation retry with the collector active but no maintenance credit.
+        for _ in 0..32 {
+            let (outcome, retired) = machine
+                .advance_with_retirement_count(64, 0, 64, 64)
+                .unwrap();
+            assert!(matches!(outcome, ComputerAdvanceOutcome::SliceExhausted));
+            if retired == 0 {
+                return machine;
+            }
+        }
+        panic!("fixture did not reach collection");
+    }
+
+    #[test]
+    fn collection_progress_continues_within_the_frame() {
+        let machine = collecting_machine();
+        let fleet = FleetScheduler::new(
+            vec![(1, machine)],
+            FleetConfig {
+                maintenance_budget: 1,
+                maximum_advances_per_tick: 256,
+                ..config()
+            },
+        )
+        .unwrap();
+        fleet.grant(1, 1, 1024).unwrap();
+        // Collection and the pending allocation must finish without another world tick.
+        let event = next(&fleet);
+        assert!(
+            matches!(
+                event,
+                FleetEvent::Boundary {
+                    machine: 1,
+                    tick: 1,
+                    outcome: ComputerAdvanceOutcome::Halted(_),
+                }
+            ),
+            "{event:?}"
+        );
+    }
+
+    #[test]
+    fn collection_respects_advance_limit_and_empty_slices_yield() {
+        for (maintenance_budget, maximum_advances, expected) in [(1, 2, 2), (0, 32, 1)] {
+            let fleet = FleetScheduler::new_with_coordinated_turns(
+                vec![(1, collecting_machine())],
+                FleetConfig {
+                    maintenance_budget,
+                    maximum_advances_per_tick: maximum_advances,
+                    ..config()
+                },
+                Vec::new(),
+                true,
+            )
+            .unwrap();
+            for tick in 1..=2 {
+                fleet.grant(1, tick, 1024).unwrap();
+                assert!(matches!(next(&fleet), FleetEvent::Quiescent {
+                    machine: 1, tick: observed, retired: 0, ..
+                } if observed == tick));
+                assert_eq!(fleet.metrics().advances, expected * tick);
+            }
+        }
     }
 
     #[test]
