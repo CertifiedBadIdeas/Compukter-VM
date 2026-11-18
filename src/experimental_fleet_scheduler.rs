@@ -16,6 +16,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod frame_budget;
+use frame_budget::WorkerFrameBudget;
+
 mod event_queue;
 use event_queue::{EventReceiver, EventSender as QueueSender};
 mod output;
@@ -65,6 +68,29 @@ impl RequestInspection {
             && self.abi_minor == request.abi_minor
             && self.operation == request.operation
     }
+}
+
+/// Scheduling authority is selected explicitly; legacy grants retain their old semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutionPolicy {
+    Independent,
+    CoordinatedTurns,
+    AutonomousFrames,
+}
+
+impl From<bool> for ExecutionPolicy {
+    fn from(coordinated: bool) -> Self {
+        if coordinated {
+            Self::CoordinatedTurns
+        } else {
+            Self::Independent
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameGrant {
+    execution_time: Duration,
 }
 
 /// Timer state transferred with an exclusively owned machine at detachment.
@@ -330,6 +356,7 @@ impl ScalarCommand {
                 tick,
                 retirements,
                 deadline,
+                frame: None,
             },
             Self::Cost {
                 machine,
@@ -438,6 +465,7 @@ enum Command {
         tick: u64,
         retirements: u32,
         deadline: Option<Instant>,
+        frame: Option<FrameGrant>,
     },
     Reply {
         machine: u64,
@@ -774,6 +802,7 @@ struct EventSender {
 }
 
 pub struct FleetScheduler {
+    policy: ExecutionPolicy,
     lanes: Vec<Arc<Mutex<LaneMailbox>>>,
     owners: Mutex<Owners>,
     events: EventReceiver,
@@ -828,6 +857,38 @@ impl FleetScheduler {
         config: FleetConfig,
         inspections: Vec<RequestInspection>,
         coordinated_turns: bool,
+        memory_limits: FleetMemoryLimits,
+    ) -> Result<Self, &'static str> {
+        Self::with_policy(
+            machines,
+            config,
+            inspections,
+            coordinated_turns.into(),
+            memory_limits,
+        )
+    }
+
+    /// Workers resume after replies/classification while the current frame retains credit.
+    pub fn new_with_autonomous_frames(
+        machines: Vec<(u64, ComputerMachine)>,
+        config: FleetConfig,
+        inspections: Vec<RequestInspection>,
+        memory_limits: FleetMemoryLimits,
+    ) -> Result<Self, &'static str> {
+        Self::with_policy(
+            machines,
+            config,
+            inspections,
+            ExecutionPolicy::AutonomousFrames,
+            memory_limits,
+        )
+    }
+
+    fn with_policy(
+        machines: Vec<(u64, ComputerMachine)>,
+        config: FleetConfig,
+        inspections: Vec<RequestInspection>,
+        policy: ExecutionPolicy,
         memory_limits: FleetMemoryLimits,
     ) -> Result<Self, &'static str> {
         if memory_limits.command_bytes == 0
@@ -920,7 +981,7 @@ impl FleetScheduler {
                         waiting,
                         config,
                         inspections,
-                        coordinated_turns,
+                        policy,
                     )
                 }) {
                 Ok(worker) => worker,
@@ -943,6 +1004,7 @@ impl FleetScheduler {
         };
         let next_lane = owners.len() % config.workers;
         Ok(Self {
+            policy,
             lanes,
             owners: Mutex::new(Owners {
                 lanes: owners,
@@ -1039,6 +1101,29 @@ impl FleetScheduler {
                 tick,
                 retirements,
                 deadline,
+                frame: None,
+            },
+        )
+    }
+
+    /// Time credit is shared across all machines on a worker for this tick. The
+    /// authorization deadline bounds server pause/shutdown independently of spent time.
+    pub fn grant_frame(
+        &self,
+        machine: u64,
+        tick: u64,
+        retirements: u32,
+        execution_time: Duration,
+        authorized_until: Instant,
+    ) -> Result<(), SubmitError> {
+        self.send(
+            machine,
+            Command::Tick {
+                machine,
+                tick,
+                retirements,
+                deadline: Some(authorized_until),
+                frame: Some(FrameGrant { execution_time }),
             },
         )
     }
@@ -1523,6 +1608,11 @@ impl FleetScheduler {
         command: Command,
         reader: Option<LifecycleReader>,
     ) -> Result<usize, SubmitError> {
+        if let Command::Tick { frame, .. } = &command {
+            if frame.is_some() != (self.policy == ExecutionPolicy::AutonomousFrames) {
+                return Err(SubmitError::InvalidInput);
+            }
+        }
         if self.stopped.load(Ordering::Acquire) {
             return Err(SubmitError::Closed);
         }
@@ -1871,13 +1961,16 @@ fn report_quiescent(
     actor: &mut Actor,
     events: &WorkerOutput<'_>,
     stopped: &AtomicBool,
-    enabled: bool,
+    policy: ExecutionPolicy,
 ) -> bool {
-    if !enabled || !actor.tick_initialized || actor.reported_retired == Some(actor.tick_retired) {
+    if policy == ExecutionPolicy::Independent
+        || !actor.tick_initialized
+        || actor.reported_retired == Some(actor.tick_retired)
+    {
         return true;
     }
     actor.reported_retired = Some(actor.tick_retired);
-    actor.awaiting_grant = true;
+    actor.awaiting_grant = policy == ExecutionPolicy::CoordinatedTurns;
     publish(
         events,
         stopped,
@@ -1915,8 +2008,10 @@ fn run_worker(
     waiters: Arc<AtomicUsize>,
     config: FleetConfig,
     inspections: Arc<Vec<RequestInspection>>,
-    coordinated_turns: bool,
+    policy: impl Into<ExecutionPolicy>,
 ) {
+    let policy = policy.into();
+    let mut frame_budget = WorkerFrameBudget::default();
     let events = WorkerOutput::new(events, &waiters);
     let mut queue = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
@@ -2153,6 +2248,7 @@ fn run_worker(
                     tick,
                     retirements,
                     deadline,
+                    frame,
                 } => {
                     let Some(actor) = actors.get_mut(&machine) else {
                         continue;
@@ -2160,8 +2256,15 @@ fn run_worker(
                     if tick < actor.tick {
                         continue;
                     }
+                    if let Some(frame) = frame {
+                        if !frame_budget.grant(tick, frame.execution_time)
+                            || (actor.tick_initialized && tick == actor.tick)
+                        {
+                            continue;
+                        }
+                    }
                     if !actor.tick_initialized || tick > actor.tick {
-                        if !report_quiescent(machine, actor, &events, &stopped, coordinated_turns) {
+                        if !report_quiescent(machine, actor, &events, &stopped, policy) {
                             return;
                         }
                         actor.tick_initialized = true;
@@ -2208,8 +2311,7 @@ fn run_worker(
                     if !actor.parked {
                         ready(machine, actor, &mut queue);
                     }
-                    if !actor.queued
-                        && !report_quiescent(machine, actor, &events, &stopped, coordinated_turns)
+                    if !actor.queued && !report_quiescent(machine, actor, &events, &stopped, policy)
                     {
                         return;
                     }
@@ -2322,7 +2424,7 @@ fn run_worker(
                         actor.deployment_bytes = 0;
                         // The computer retains the exact compilation transaction for checkpoint replay.
                     }
-                    if !report_quiescent(machine, actor, &events, &stopped, coordinated_turns) {
+                    if !report_quiescent(machine, actor, &events, &stopped, policy) {
                         return;
                     }
                     let actor = remove_actor(&mut actors, &mut queue, &mailbox, machine)
@@ -2352,15 +2454,16 @@ fn run_worker(
                 }
                 Command::Stop { machine } => {
                     if let Some(actor) = remove_actor(&mut actors, &mut queue, &mailbox, machine) {
-                        let quiescent = if coordinated_turns && actor.tick_initialized {
-                            Some(FleetQuiescent {
-                                tick: actor.tick,
-                                retired: actor.tick_retired,
-                                timers_pending: !actor.timers.is_empty(),
-                            })
-                        } else {
-                            None
-                        };
+                        let quiescent =
+                            if policy != ExecutionPolicy::Independent && actor.tick_initialized {
+                                Some(FleetQuiescent {
+                                    tick: actor.tick,
+                                    retired: actor.tick_retired,
+                                    timers_pending: !actor.timers.is_empty(),
+                                })
+                            } else {
+                                None
+                            };
                         let report_pending = quiescent.is_some()
                             && actor.reported_retired != Some(actor.tick_retired);
                         let mut pending: Vec<_> = actor
@@ -2661,8 +2764,13 @@ fn run_worker(
             }
             actor.detach_fence = None;
         }
-        if actor.stopped || actor.remaining == 0 || actor.advances_left == 0 {
-            if !report_quiescent(id, actor, &events, &stopped, coordinated_turns) {
+        if actor.stopped
+            || actor.remaining == 0
+            || actor.advances_left == 0
+            || (policy == ExecutionPolicy::AutonomousFrames
+                && !frame_budget.can_execute(actor.tick))
+        {
+            if !report_quiescent(id, actor, &events, &stopped, policy) {
                 return;
             }
             continue;
@@ -2671,7 +2779,7 @@ fn run_worker(
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            if !report_quiescent(id, actor, &events, &stopped, coordinated_turns) {
+            if !report_quiescent(id, actor, &events, &stopped, policy) {
                 return;
             }
             continue;
@@ -2686,6 +2794,7 @@ fn run_worker(
         } else {
             None
         };
+        let slice_started = (policy == ExecutionPolicy::AutonomousFrames).then(Instant::now);
         let work_before = actor.machine.execution_work();
         let advanced = if let Some(request) = replay {
             Ok((ComputerAdvanceOutcome::CompilationRequested(request), 0))
@@ -2701,6 +2810,9 @@ fn run_worker(
                 actor.remaining,
             )
         };
+        if let Some(started) = slice_started {
+            frame_budget.charge(actor.tick, started.elapsed());
+        }
         let (outcome, retired) = match advanced {
             Ok(value) => value,
             Err(error) => {
@@ -3066,7 +3178,7 @@ fn run_worker(
                 }
             }
         }
-        if !actor.queued && !report_quiescent(id, actor, &events, &stopped, coordinated_turns) {
+        if !actor.queued && !report_quiescent(id, actor, &events, &stopped, policy) {
             return;
         }
     }
@@ -3074,6 +3186,8 @@ fn run_worker(
 
 #[cfg(test)]
 mod tests {
+    mod autonomous;
+
     use super::*;
     use crate::{
         CapabilityBinding, EntryArgumentLimits, ExecutionProfile, HostValueType, OperationSchema,
@@ -4137,6 +4251,7 @@ mod tests {
                     tick,
                     retirements: 1,
                     deadline: None,
+                    frame: None,
                 })
                 .is_ok());
         }
@@ -5870,6 +5985,7 @@ mod tests {
                 tick: 1,
                 retirements: 64,
                 deadline: None,
+                frame: None,
             })
             .is_ok());
         worker.thread().unpark();
@@ -6195,6 +6311,7 @@ mod tests {
                         tick: 6,
                         retirements: 64,
                         deadline: None,
+                        frame: None,
                     })
                     .is_ok());
                 assert!(mailbox
@@ -6205,6 +6322,7 @@ mod tests {
                         tick: 7,
                         retirements: 64,
                         deadline: None,
+                        frame: None,
                     })
                     .is_ok());
             }
@@ -6254,6 +6372,7 @@ mod tests {
             });
             let command_memory = Arc::clone(&mailbox.lock().unwrap().memory);
             let fleet = FleetScheduler {
+                policy: ExecutionPolicy::CoordinatedTurns,
                 lanes: vec![mailbox],
                 owners: Mutex::new(Owners {
                     lanes: HashMap::from([(1, 0)]),
@@ -6356,6 +6475,7 @@ mod tests {
                     tick,
                     retirements: 64,
                     deadline: None,
+                    frame: None,
                 })
                 .is_ok());
         }
