@@ -9,9 +9,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Barrier;
 
-fn pin(cpu: usize) {
+fn pin(_cpu: usize) {
     #[cfg(target_os = "linux")]
     {
+        let cpu = _cpu;
         unsafe extern "C" {
             fn sched_setaffinity(pid: i32, size: usize, mask: *const usize) -> i32;
         }
