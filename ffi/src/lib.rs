@@ -26,7 +26,7 @@ pub mod experimental_fleet;
 #[cfg(feature = "experimental-fleet-scheduler")]
 pub mod experimental_fleet_abi;
 
-pub const COMPUKTER_FFI_ABI_VERSION: u32 = 28;
+pub const COMPUKTER_FFI_ABI_VERSION: u32 = 29;
 
 pub use ffi_api::{
     compukter_abi_version, compukter_advance, compukter_advance_with_retirement_limit,

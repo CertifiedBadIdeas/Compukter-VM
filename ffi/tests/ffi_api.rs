@@ -604,7 +604,7 @@ fn stored_session_can_transfer_to_fleet_and_return_with_checkpoint_identity() {
 
 #[test]
 fn c_abi_publishes_its_exact_version() {
-    assert_eq!(28, COMPUKTER_FFI_ABI_VERSION);
+    assert_eq!(29, COMPUKTER_FFI_ABI_VERSION);
     assert_eq!(COMPUKTER_FFI_ABI_VERSION, compukter_abi_version());
 }
 

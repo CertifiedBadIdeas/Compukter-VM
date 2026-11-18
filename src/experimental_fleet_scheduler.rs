@@ -327,6 +327,13 @@ pub enum ScalarCommand {
         retirements: u32,
         deadline: Option<Instant>,
     },
+    FrameGrant {
+        machine: u64,
+        tick: u64,
+        retirements: u32,
+        execution_time: Duration,
+        authorized_until: Instant,
+    },
     Cost {
         machine: u64,
         task: u32,
@@ -357,6 +364,19 @@ impl ScalarCommand {
                 retirements,
                 deadline,
                 frame: None,
+            },
+            Self::FrameGrant {
+                machine,
+                tick,
+                retirements,
+                execution_time,
+                authorized_until,
+            } => Command::Tick {
+                machine,
+                tick,
+                retirements,
+                deadline: Some(authorized_until),
+                frame: Some(FrameGrant { execution_time }),
             },
             Self::Cost {
                 machine,

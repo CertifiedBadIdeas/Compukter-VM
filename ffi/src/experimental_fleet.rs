@@ -51,6 +51,30 @@ pub fn create_with_coordinated_turns(
     .map_err(str::to_owned)
 }
 
+/// Explicit mode: 0 independent, 1 coordinated turns, 2 autonomous frames.
+pub fn create_with_execution_mode(
+    artifact: &[u8],
+    schemas: &[u8],
+    count: usize,
+    config: FleetConfig,
+    inspections: Vec<RequestInspection>,
+    mode: u32,
+) -> Result<FleetScheduler, String> {
+    if mode == 2 {
+        FleetScheduler::new_with_autonomous_frames(
+            create_machines(artifact, schemas, count)?,
+            config,
+            inspections,
+            compukter_vm::experimental_fleet_scheduler::FleetMemoryLimits::default(),
+        )
+        .map_err(str::to_owned)
+    } else if mode <= 1 {
+        create_with_coordinated_turns(artifact, schemas, count, config, inspections, mode == 1)
+    } else {
+        Err("invalid execution mode".into())
+    }
+}
+
 fn create_machines(
     artifact: &[u8],
     schemas: &[u8],

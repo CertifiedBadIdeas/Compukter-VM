@@ -377,7 +377,7 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
             || c[4] < 0
             || c[5] <= 0
             || c[6] <= 0
-            || !(0..=1).contains(&coordinated_turns[0])
+            || !(0..=2).contains(&coordinated_turns[0])
         {
             return Ok(code(FfiStatus::InvalidArgument));
         }
@@ -427,13 +427,13 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                 over_budget_detail: dt.into_boxed_str(),
             }]
         };
-        let scheduler = match experimental_fleet::create_with_coordinated_turns(
+        let scheduler = match experimental_fleet::create_with_execution_mode(
             &bytes(env, &artifact)?,
             &bytes(env, &schemas)?,
             count as usize,
             cfg,
             inspections,
-            coordinated_turns[0] == 1,
+            coordinated_turns[0] as u32,
         ) {
             Ok(f) => f,
             Err(_) => return Ok(code(FfiStatus::InvalidArgument)),
@@ -488,6 +488,48 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
                     tick as u64,
                     retirements as u32,
                     deadline,
+                ))
+            }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_grantFrame<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    machine: jlong,
+    tick: jlong,
+    retirements: jint,
+    execution_nanos: jlong,
+    authorization_nanos: jlong,
+) -> jint {
+    status(&mut env, |_| {
+        if machine < 0
+            || tick < 0
+            || retirements < 0
+            || execution_nanos < 0
+            || authorization_nanos < 0
+        {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let Some(until) =
+            Instant::now().checked_add(Duration::from_nanos(authorization_nanos as u64))
+        else {
+            return Ok(code(FfiStatus::InvalidArgument));
+        };
+        let map = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .get(&(handle as u64))
+            .map_or(code(FfiStatus::StaleHandle), |f| {
+                submit(f.scheduler.grant_frame(
+                    machine as u64,
+                    tick as u64,
+                    retirements as u32,
+                    Duration::from_nanos(execution_nanos as u64),
+                    until,
                 ))
             }))
     })

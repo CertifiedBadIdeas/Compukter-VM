@@ -60,7 +60,7 @@ unsafe fn create_fleet(
         || c[3] == 0
         || c[5] == 0
         || c[6] == 0
-        || c[7] > 1
+        || c[7] > 2
     {
         return FfiStatus::InvalidArgument;
     }
@@ -73,13 +73,13 @@ unsafe fn create_fleet(
         host_budget: c[5],
         maximum_advances_per_tick: c[6],
     };
-    let scheduler = match experimental_fleet::create_with_coordinated_turns(
+    let scheduler = match experimental_fleet::create_with_execution_mode(
         &[],
         &[1, 0],
         0,
         config,
         inspections,
-        c[7] == 1,
+        c[7],
     ) {
         Ok(fleet) => fleet,
         Err(_) => return FfiStatus::InvalidArgument,
@@ -261,6 +261,44 @@ pub extern "C" fn compukter_experimental_fleet_grant(
                     .scheduler
                     .grant_until(machine, tick, retired, deadline),
             )
+        })
+    })
+}
+
+/// Grants an autonomous frame. Both durations are nonnegative nanoseconds;
+/// authorization is relative to admission and distinct from execution credit.
+#[unsafe(no_mangle)]
+pub extern "C" fn compukter_experimental_fleet_grant_frame(
+    handle: u64,
+    machine: u64,
+    tick: u64,
+    retired: u32,
+    execution_nanos: i64,
+    authorization_nanos: i64,
+) -> FfiStatus {
+    guarded(|| {
+        if execution_nanos < 0
+            || authorization_nanos < 0
+            || machine > i64::MAX as u64
+            || tick > i64::MAX as u64
+            || retired > i32::MAX as u32
+        {
+            return FfiStatus::InvalidArgument;
+        }
+        let Some(until) =
+            Instant::now().checked_add(Duration::from_nanos(authorization_nanos as u64))
+        else {
+            return FfiStatus::InvalidArgument;
+        };
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&handle).map_or(FfiStatus::StaleHandle, |fleet| {
+            submission(fleet.scheduler.grant_frame(
+                machine,
+                tick,
+                retired,
+                Duration::from_nanos(execution_nanos as u64),
+                until,
+            ))
         })
     })
 }

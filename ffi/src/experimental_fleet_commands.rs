@@ -45,7 +45,9 @@ fn decode(bytes: &[u8]) -> Option<([ScalarCommand; COMMAND_BATCH_CAPACITY], usiz
         let argument = u32_at(at + 12)?;
         let value = u64_at(16)?;
         let extra = u64_at(24)? as i64;
-        if machine > i64::MAX as u64 || value > i64::MAX as u64 || u64_at(32)? != 0 {
+        let authorization = u64_at(32)?;
+        if machine > i64::MAX as u64 || value > i64::MAX as u64 || (kind != 4 && authorization != 0)
+        {
             return None;
         }
         *command = match kind {
@@ -80,6 +82,15 @@ fn decode(bytes: &[u8]) -> Option<([ScalarCommand; COMMAND_BATCH_CAPACITY], usiz
                 ScalarCommand::Output {
                     machine,
                     packed: argument,
+                }
+            }
+            4 if argument <= i32::MAX as u32 && extra >= 0 && authorization <= i64::MAX as u64 => {
+                ScalarCommand::FrameGrant {
+                    machine,
+                    tick: value,
+                    retirements: argument,
+                    execution_time: Duration::from_nanos(extra as u64),
+                    authorized_until: now.checked_add(Duration::from_nanos(authorization))?,
                 }
             }
             _ => return None,
@@ -131,17 +142,43 @@ mod tests {
         bytes
     }
     #[test]
+    fn frame_grants_distinguish_compute_duration_from_authorization() {
+        let mut bytes = record(4, 4096, 12, 2000000);
+        bytes[40..48].copy_from_slice(&50000000u64.to_le_bytes());
+        let before = Instant::now();
+        let (commands, count) = decode(&bytes).unwrap();
+        assert_eq!(count, 1);
+        let ScalarCommand::FrameGrant {
+            tick,
+            retirements,
+            execution_time,
+            authorized_until,
+            ..
+        } = commands[0]
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!((tick, retirements), (12, 4096));
+        assert_eq!(execution_time, Duration::from_millis(2));
+        assert!(authorized_until >= before + Duration::from_millis(50));
+        bytes[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode(&bytes).is_none());
+        assert!(decode(&record(4, 1, 1, -1)).is_none());
+    }
+
+    #[test]
     fn fixed_records_validate_tags_lengths_ranges_and_reserved_bytes() {
         for bytes in [
             record(0, 4096, 1, -1),
             record(1, 1, 1, 1),
             record(2, 123, 0, 0),
             record(3, 123, 0, 0),
+            record(4, 4096, 1, 1000000),
         ] {
             assert!(decode(&bytes).is_some());
         }
         for bytes in [
-            record(4, 0, 0, 0),
+            record(5, 0, 0, 0),
             record(0, 1, 1, -2),
             record(1, 0, 1, 1),
             record(1, 1, 0, 1),
