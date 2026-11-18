@@ -1061,13 +1061,15 @@ impl FleetScheduler {
                 .spawn(move || {
                     run_worker(
                         actors,
-                        mailbox,
-                        events,
-                        stop,
-                        worker_metrics,
-                        waiting,
-                        config,
-                        inspections,
+                        WorkerContext {
+                            mailbox,
+                            events,
+                            stopped: stop,
+                            metrics: worker_metrics,
+                            waiters: waiting,
+                            config,
+                            inspections,
+                        },
                         policy,
                     )
                 }) {
@@ -2090,8 +2092,7 @@ fn wait_for_worker_progress(events: &WorkerOutput<'_>) -> bool {
     }
 }
 
-fn run_worker(
-    mut actors: HashMap<u64, Actor>,
+struct WorkerContext {
     mailbox: Arc<Mutex<LaneMailbox>>,
     events: EventSender,
     stopped: Arc<AtomicBool>,
@@ -2099,8 +2100,22 @@ fn run_worker(
     waiters: Arc<AtomicUsize>,
     config: FleetConfig,
     inspections: Arc<Vec<RequestInspection>>,
+}
+
+fn run_worker(
+    mut actors: HashMap<u64, Actor>,
+    context: WorkerContext,
     policy: impl Into<ExecutionPolicy>,
 ) {
+    let WorkerContext {
+        mailbox,
+        events,
+        stopped,
+        metrics,
+        waiters,
+        config,
+        inspections,
+    } = context;
     let policy = policy.into();
     let mut frame_budget = WorkerFrameBudget::default();
     let events = WorkerOutput::new(events, &waiters);
@@ -6072,24 +6087,29 @@ mod tests {
         let worker = thread::spawn(move || {
             run_worker(
                 HashMap::from([(1, actor)]),
-                worker_commands,
-                EventSender {
-                    sender,
-                    signal: Arc::new(FleetEventSignal::default()),
-                    completions: Arc::new(Mutex::new(BTreeMap::new())),
-                    pending: super::pending::PendingCapacity::new(FleetMemoryLimits::default(), 64),
-                    detach_memory: ByteBudget::new(
-                        FleetMemoryLimits::default().detach_output_bytes,
-                    ),
-                    detach_machine_limit: FleetMemoryLimits::default()
-                        .detach_output_bytes_per_machine,
-                    detach_headroom: Arc::new(AtomicUsize::new(0)),
+                WorkerContext {
+                    mailbox: worker_commands,
+                    events: EventSender {
+                        sender,
+                        signal: Arc::new(FleetEventSignal::default()),
+                        completions: Arc::new(Mutex::new(BTreeMap::new())),
+                        pending: super::pending::PendingCapacity::new(
+                            FleetMemoryLimits::default(),
+                            64,
+                        ),
+                        detach_memory: ByteBudget::new(
+                            FleetMemoryLimits::default().detach_output_bytes,
+                        ),
+                        detach_machine_limit: FleetMemoryLimits::default()
+                            .detach_output_bytes_per_machine,
+                        detach_headroom: Arc::new(AtomicUsize::new(0)),
+                    },
+                    stopped: worker_stopped,
+                    metrics: Arc::new(Metrics::default()),
+                    waiters: Arc::new(AtomicUsize::new(0)),
+                    config: config(),
+                    inspections: Arc::new(Vec::new()),
                 },
-                worker_stopped,
-                Arc::new(Metrics::default()),
-                Arc::new(AtomicUsize::new(0)),
-                config(),
-                Arc::new(Vec::new()),
                 false,
             )
         });
@@ -6476,13 +6496,15 @@ mod tests {
             let worker = thread::spawn(move || {
                 run_worker(
                     actors,
-                    worker_mailbox,
-                    sender,
-                    worker_stopped,
-                    worker_metrics,
-                    worker_waiters,
-                    config(),
-                    Arc::new(Vec::new()),
+                    WorkerContext {
+                        mailbox: worker_mailbox,
+                        events: sender,
+                        stopped: worker_stopped,
+                        metrics: worker_metrics,
+                        waiters: worker_waiters,
+                        config: config(),
+                        inspections: Arc::new(Vec::new()),
+                    },
                     true,
                 )
             });
@@ -6618,13 +6640,15 @@ mod tests {
         let worker = thread::spawn(move || {
             run_worker(
                 HashMap::from([(1, Actor::new(machine, config().host_budget))]),
-                mailbox,
-                sender,
-                worker_stopped,
-                worker_metrics,
-                Arc::new(AtomicUsize::new(0)),
-                config(),
-                Arc::new(Vec::new()),
+                WorkerContext {
+                    mailbox,
+                    events: sender,
+                    stopped: worker_stopped,
+                    metrics: worker_metrics,
+                    waiters: Arc::new(AtomicUsize::new(0)),
+                    config: config(),
+                    inspections: Arc::new(Vec::new()),
+                },
                 true,
             )
         });

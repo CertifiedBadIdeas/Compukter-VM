@@ -30,6 +30,11 @@ mod decode;
 mod deployment;
 mod diagnostic;
 mod execution;
+#[cfg(all(
+    feature = "program-sharing-benchmark",
+    feature = "experimental-fleet-scheduler"
+))]
+mod experimental_fleet_scheduler;
 #[cfg(feature = "program-sharing-benchmark")]
 mod filesystem;
 mod limits;
@@ -57,6 +62,11 @@ use limits::ArtifactLimits;
 #[cfg(feature = "program-sharing-benchmark")]
 use process::*;
 use std::{fs, path::Path, sync::Arc, time::Instant};
+#[cfg(all(
+    feature = "program-sharing-benchmark",
+    feature = "experimental-fleet-scheduler"
+))]
+use stdio::CanonicalLineSubmissionError;
 #[cfg(feature = "program-sharing-benchmark")]
 use terminal::*;
 use verify::verify_artifact;

@@ -47,6 +47,10 @@ public final class JniNative {
         }
         System.out.println("JNI Runtime exports ABI " + actual);
         verifyJavaFileSystemRoot();
+        if (JniExperimentalFleet.commandBatchVersion() != 1) {
+            throw new IllegalStateException("JNI fleet command transport is unavailable");
+        }
+        System.out.println("JNI fleet command transport is available");
     }
 
     private static void verifyJavaFileSystemRoot() throws Exception {
@@ -106,4 +110,11 @@ public final class JniNative {
             throw new IllegalStateException("JNI store-close status=" + status);
         }
     }
+}
+
+final class JniExperimentalFleet {
+    private JniExperimentalFleet() {
+    }
+
+    static native int commandBatchVersion();
 }

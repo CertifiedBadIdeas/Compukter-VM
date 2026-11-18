@@ -20,7 +20,7 @@ case "$target" in
 esac
 
 cargo xtask check
-cargo build -p compukter-ffi -p compukter-jni --release --locked --offline
+cargo build -p compukter-ffi -p compukter-jni --features experimental-fleet-scheduler --release --locked --offline
 cargo run -p runtime-bundler --locked --offline -- smoke --library "$ffi_library" --abi "$RUNTIME_ABI"
 javac -d target/runtime-release-smoke tools/runtime-bundler/fixtures/ru/lazyhat/compukters/lang/runtime/vm/JniNative.java
 java --enable-native-access=ALL-UNNAMED -cp target/runtime-release-smoke \

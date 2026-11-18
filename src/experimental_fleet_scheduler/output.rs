@@ -352,7 +352,7 @@ mod tests {
         for sequence in 0..3 {
             assert!(output.emit(FleetEvent::Error {
                 machine: 1,
-                message: sequence.to_string().into()
+                message: sequence.to_string()
             }));
         }
         assert_eq!(output.flush(), FlushResult::Blocked);
