@@ -1122,3 +1122,47 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
         }
     })
 }
+
+/// The JVM owns one reusable direct buffer; the synchronous call retains no pointer.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_commandsV1<
+    'a,
+>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    handle: jlong,
+    buffer: jni::objects::JByteBuffer<'a>,
+    length: jint,
+) -> jint {
+    status(&mut env, |env| {
+        let offset = experimental_fleet::COMMAND_BATCH_BYTES;
+        let capacity = experimental_fleet::COMMAND_BATCH_CAPACITY;
+        if length < 0
+            || length as usize > offset
+            || env.get_direct_buffer_capacity(&buffer)? != offset + capacity
+        {
+            return Ok(code(FfiStatus::InvalidArgument));
+        }
+        let address = env.get_direct_buffer_address(&buffer)?;
+        let bytes = unsafe { std::slice::from_raw_parts(address, length as usize) };
+        let output = unsafe { std::slice::from_raw_parts_mut(address.add(offset), capacity) };
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        Ok(code(
+            all.get(&(handle as u64))
+                .map_or(FfiStatus::StaleHandle, |fleet| {
+                    experimental_fleet::submit_commands_v1(fleet, bytes, output)
+                }),
+        ))
+    })
+}
+
+/// Resolve the versioned capability before creating any fleet or worker.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimentalFleet_commandBatchVersion<
+    'a,
+>(
+    _: EnvUnowned<'a>,
+    _: JClass<'a>,
+) -> jint {
+    experimental_fleet::COMMAND_BATCH_VERSION as jint
+}

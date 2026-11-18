@@ -292,6 +292,77 @@ pub enum SubmitError {
     IdentityExhausted,
 }
 
+/// Small copyable commands admitted together without allocating a mailbox batch.
+#[derive(Clone, Copy, Debug)]
+pub enum ScalarCommand {
+    Grant {
+        machine: u64,
+        tick: u64,
+        retirements: u32,
+        deadline: Option<Instant>,
+    },
+    Cost {
+        machine: u64,
+        task: u32,
+        request: u64,
+        units: u32,
+    },
+    Input {
+        machine: u64,
+        packet: u32,
+    },
+    Output {
+        machine: u64,
+        packed: u32,
+    },
+}
+
+impl ScalarCommand {
+    fn into_command(self) -> Result<Command, SubmitError> {
+        Ok(match self {
+            Self::Grant {
+                machine,
+                tick,
+                retirements,
+                deadline,
+            } => Command::Tick {
+                machine,
+                tick,
+                retirements,
+                deadline,
+            },
+            Self::Cost {
+                machine,
+                task,
+                request,
+                units,
+            } => {
+                if units == 0 {
+                    return Err(SubmitError::InvalidCost);
+                }
+                Command::Cost {
+                    machine,
+                    task,
+                    request,
+                    units,
+                }
+            }
+            Self::Input { machine, packet } => {
+                if packet & !0x3fff_ffff != 0 {
+                    return Err(SubmitError::InvalidInput);
+                }
+                Command::RedstoneInput { machine, packet }
+            }
+            Self::Output { machine, packed } => {
+                if packed & !0x3fff_ffff != 0 {
+                    return Err(SubmitError::InvalidInput);
+                }
+                Command::RedstoneOutput { machine, packed }
+            }
+        })
+    }
+}
+
 impl FleetEvent {
     fn machine(&self) -> u64 {
         match self {
@@ -1401,10 +1472,60 @@ impl FleetScheduler {
         command: Command,
         reader: Option<LifecycleReader>,
     ) -> Result<(), SubmitError> {
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        let lane = self.enqueue_action(&mut owners, machine, command, reader)?;
+        drop(owners);
+        self.workers[lane].thread().unpark();
+        Ok(())
+    }
+
+    /// Bounded caller-owned records; every result is published before waking each affected lane once.
+    /// Repeated machines are rejected so mailbox pressure cannot reorder their commands.
+    pub fn submit_scalar_batch(
+        &self,
+        commands: &[ScalarCommand],
+        results: &mut [Result<(), SubmitError>],
+    ) -> Result<(), SubmitError> {
+        if commands.is_empty() || commands.len() > 16 || results.len() != commands.len() {
+            return Err(SubmitError::InvalidInput);
+        }
+        for (index, command) in commands.iter().enumerate() {
+            let current = command.into_command()?;
+            for previous in &commands[..index] {
+                if previous.into_command()?.machine() == current.machine() {
+                    return Err(SubmitError::InvalidInput);
+                }
+            }
+        }
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        let mut wake = 0u64;
+        for (command, result) in commands.iter().zip(results.iter_mut()) {
+            let command = command.into_command()?;
+            *result = self
+                .enqueue_action(&mut owners, command.machine(), command, None)
+                .map(|lane| {
+                    wake |= 1u64 << lane;
+                });
+        }
+        drop(owners);
+        for (lane, worker) in self.workers.iter().enumerate() {
+            if wake & (1u64 << lane) != 0 {
+                worker.thread().unpark();
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_action(
+        &self,
+        owners: &mut Owners,
+        machine: u64,
+        command: Command,
+        reader: Option<LifecycleReader>,
+    ) -> Result<usize, SubmitError> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(SubmitError::Closed);
         }
-        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         if owners.closing.contains_key(&machine) {
             return Err(SubmitError::UnknownMachine);
         }
@@ -1432,10 +1553,7 @@ impl FleetScheduler {
         if let Some(reader) = reader {
             owners.closing.insert(machine, reader);
         }
-        drop(mailbox);
-        drop(owners);
-        self.workers[lane].thread().unpark();
-        Ok(())
+        Ok(lane)
     }
 
     pub fn try_event(&self) -> Option<FleetEvent> {
@@ -3091,6 +3209,61 @@ mod tests {
             thread::yield_now();
         }
         fleet
+    }
+
+    #[test]
+    fn scalar_batch_preserves_full_mailbox_and_rejects_invalid_or_duplicate_suffix_atomically() {
+        let fleet = saturated_fleet(FleetMemoryLimits::default(), false);
+        fleet.redstone_input(0, 1).unwrap();
+        fleet.redstone_input(0, 2).unwrap();
+        let mut results = [Ok(()); 2];
+        fleet
+            .submit_scalar_batch(
+                &[
+                    ScalarCommand::Input {
+                        machine: 0,
+                        packet: 3,
+                    },
+                    ScalarCommand::Input {
+                        machine: 99,
+                        packet: 4,
+                    },
+                ],
+                &mut results,
+            )
+            .unwrap();
+        assert_eq!(
+            results,
+            [Err(SubmitError::Full), Err(SubmitError::UnknownMachine)]
+        );
+        assert_eq!(fleet.lanes[0].lock().unwrap().commands.len(), 2);
+        let before = results;
+        for second in [
+            ScalarCommand::Input {
+                machine: 0,
+                packet: 5,
+            },
+            ScalarCommand::Input {
+                machine: 1,
+                packet: 1 << 30,
+            },
+        ] {
+            assert_eq!(
+                fleet.submit_scalar_batch(
+                    &[
+                        ScalarCommand::Input {
+                            machine: 0,
+                            packet: 3
+                        },
+                        second,
+                    ],
+                    &mut results
+                ),
+                Err(SubmitError::InvalidInput)
+            );
+            assert_eq!(results, before);
+            assert_eq!(fleet.lanes[0].lock().unwrap().commands.len(), 2);
+        }
     }
 
     fn two_machine_output_fleet(config: FleetConfig, limits: FleetMemoryLimits) -> FleetScheduler {

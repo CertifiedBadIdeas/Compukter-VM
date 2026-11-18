@@ -944,3 +944,31 @@ pub unsafe extern "C" fn compukter_experimental_fleet_deployment(
         })
     })
 }
+
+/// Version-one bounded scalar commands. Input and output must be disjoint caller-owned regions.
+/// # Safety
+/// Input names length readable bytes; output names capacity writable bytes, neither retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compukter_experimental_fleet_commands_v1(
+    handle: u64,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> FfiStatus {
+    guarded(|| {
+        if input.is_null()
+            || output.is_null()
+            || length > experimental_fleet::COMMAND_BATCH_BYTES
+            || capacity > experimental_fleet::COMMAND_BATCH_CAPACITY
+        {
+            return FfiStatus::InvalidArgument;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(input, length) };
+        let results = unsafe { std::slice::from_raw_parts_mut(output, capacity) };
+        let all = fleets().lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&handle).map_or(FfiStatus::StaleHandle, |fleet| {
+            experimental_fleet::submit_commands_v1(fleet, bytes, results)
+        })
+    })
+}

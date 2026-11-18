@@ -788,3 +788,9 @@ mod reply_tests {
         }
     }
 }
+
+#[path = "experimental_fleet_commands.rs"]
+mod commands;
+pub use commands::{
+    submit_commands_v1, COMMAND_BATCH_BYTES, COMMAND_BATCH_CAPACITY, COMMAND_BATCH_VERSION,
+};
