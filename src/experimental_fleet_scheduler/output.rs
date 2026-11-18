@@ -234,6 +234,7 @@ impl ClosingOutput {
                     tick,
                     retired,
                     timers_pending,
+                    frame,
                     ..
                 } = event
                 {
@@ -241,6 +242,7 @@ impl ClosingOutput {
                         tick,
                         retired,
                         timers_pending,
+                        frame,
                     });
                 }
             }
@@ -503,7 +505,8 @@ mod tests {
             machine: 1,
             tick: 7,
             retired: 9,
-            timers_pending: false
+            timers_pending: false,
+            frame: None,
         }));
         assert_eq!(waiters.load(Ordering::SeqCst), 1);
         assert!(

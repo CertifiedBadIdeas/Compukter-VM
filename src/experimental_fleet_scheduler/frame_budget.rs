@@ -27,6 +27,10 @@ impl WorkerFrameBudget {
         }
     }
 
+    pub(super) fn is_current(&self, tick: u64) -> bool {
+        self.tick == Some(tick)
+    }
+
     pub(super) fn can_execute(&self, tick: u64) -> bool {
         self.tick == Some(tick) && !self.remaining.is_zero()
     }

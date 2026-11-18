@@ -427,3 +427,19 @@ distinguish published waits from fresh calls; no new state or checkpoint fields 
 Already published requests retain their positions in the bounded external allowance prefix; fresh calls
 cannot reuse those occupied slots. Each advance retains its existing work and host-request allowances,
 including internal progress when the external request allowance is zero.
+
+## Autonomous fleet frame grants (C ABI 29)
+
+The opt-in fleet execution mode 2 owns execution within a server frame. GrantFrame carries instruction
+credit, one accumulated execution-duration allowance shared by all actors on a worker in that tick,
+and a separate bounded authorization lifetime. Native workers charge monotonic elapsed slice time,
+including maintenance and possible OS descheduling, while host/queue waits consume none. A newer tick
+replaces unused credit; duplicate or stale grants and host replies do not refill it. Legacy fleet grants
+retain their original deadline semantics and cannot be used with this mode.
+
+Autonomous quiescent observations use fleet wire tag 19: the tag-8 fields (machine, tick, cumulative
+retirements, timers pending), then execution nanoseconds u64, instructions left u32, requests left u32,
+advances left u32, and wait reason u8. Reasons 0..11 are runnable, instructions, requests, advances,
+execution time, authorization, host, inspection, input, compilation, stopped, and replaced frame.
+Counters are cumulative within the tick; waiting observations do not revoke execution credit. Stop and
+detach accounting retain the same progress fields through the bounded lifecycle observation stream.

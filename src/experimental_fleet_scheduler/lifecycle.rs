@@ -46,6 +46,7 @@ pub struct FleetQuiescent {
     pub tick: u64,
     pub retired: u64,
     pub timers_pending: bool,
+    pub frame: Option<super::FleetFrameProgress>,
 }
 
 /// Output produced before detachment remains owned by this completion, including
@@ -218,6 +219,7 @@ impl LifecycleCompletion {
                     tick: report.tick,
                     retired: report.retired,
                     timers_pending: report.timers_pending,
+                    frame: report.frame,
                 })
             }
             Self::Detach(completion) => completion.observations.pop_front(),

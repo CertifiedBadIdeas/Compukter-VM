@@ -93,6 +93,33 @@ struct FrameGrant {
     execution_time: Duration,
 }
 
+/// Why an autonomous frame currently cannot make progress.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FleetWaitReason {
+    Runnable = 0,
+    Instructions = 1,
+    Requests = 2,
+    Advances = 3,
+    ExecutionTime = 4,
+    Authorization = 5,
+    Host = 6,
+    Inspection = 7,
+    Input = 8,
+    Compilation = 9,
+    Stopped = 10,
+    FrameReplaced = 11,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FleetFrameProgress {
+    pub execution_nanos: u64,
+    pub instructions_left: u32,
+    pub requests_left: u32,
+    pub advances_left: u32,
+    pub reason: FleetWaitReason,
+}
+
 /// Timer state transferred with an exclusively owned machine at detachment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FleetTimer {
@@ -259,6 +286,7 @@ pub enum FleetEvent {
         tick: u64,
         retired: u64,
         timers_pending: bool,
+        frame: Option<FleetFrameProgress>,
     },
     Inspect {
         machine: u64,
@@ -708,6 +736,8 @@ struct Actor {
     tick_initialized: bool,
     remaining: u32,
     tick_retired: u64,
+    execution_nanos: u64,
+    request_budget_exhausted: bool,
     reported_retired: Option<u64>,
     awaiting_grant: bool,
     compilation_token: Option<u64>,
@@ -730,6 +760,41 @@ struct Actor {
 }
 
 impl Actor {
+    fn frame_progress(&self, budget: &WorkerFrameBudget) -> FleetFrameProgress {
+        let reason = if self.stopped {
+            FleetWaitReason::Stopped
+        } else if self.compilation_token.is_some() {
+            FleetWaitReason::Compilation
+        } else if !self.inspecting.is_empty() {
+            FleetWaitReason::Inspection
+        } else if self.deadline.is_some_and(|until| Instant::now() >= until) {
+            FleetWaitReason::Authorization
+        } else if self.request_budget_exhausted {
+            FleetWaitReason::Requests
+        } else if self.remaining == 0 {
+            FleetWaitReason::Instructions
+        } else if self.advances_left == 0 {
+            FleetWaitReason::Advances
+        } else if !budget.is_current(self.tick) {
+            FleetWaitReason::FrameReplaced
+        } else if !budget.can_execute(self.tick) {
+            FleetWaitReason::ExecutionTime
+        } else if !self.pending.is_empty() {
+            FleetWaitReason::Host
+        } else if self.parked {
+            FleetWaitReason::Input
+        } else {
+            FleetWaitReason::Runnable
+        };
+        FleetFrameProgress {
+            execution_nanos: self.execution_nanos,
+            instructions_left: self.remaining,
+            requests_left: self.requests_left,
+            advances_left: self.advances_left,
+            reason,
+        }
+    }
+
     fn new(machine: ComputerMachine, host_budget: u32) -> Self {
         let scopes = machine.fleet_process_scopes();
         Self {
@@ -738,6 +803,8 @@ impl Actor {
             tick_initialized: false,
             remaining: 0,
             tick_retired: 0,
+            execution_nanos: 0,
+            request_budget_exhausted: false,
             reported_retired: None,
             awaiting_grant: false,
             compilation_token: None,
@@ -1900,6 +1967,7 @@ fn ready(id: u64, actor: &mut Actor, queue: &mut VecDeque<u64>) {
         // Cost classification is an execution boundary, not an extra Guest scheduling slice.
         // Control unwinding must still cancel the inspected scope without waiting for its cost.
         && (actor.inspecting.is_empty() || actor.machine.has_pending_termination())
+        && !actor.request_budget_exhausted
         && actor.remaining > 0
         && actor.advances_left > 0
     {
@@ -1982,6 +2050,7 @@ fn report_quiescent(
     events: &WorkerOutput<'_>,
     stopped: &AtomicBool,
     policy: ExecutionPolicy,
+    budget: &WorkerFrameBudget,
 ) -> bool {
     if policy == ExecutionPolicy::Independent
         || !actor.tick_initialized
@@ -1999,6 +2068,8 @@ fn report_quiescent(
             tick: actor.tick,
             retired: actor.tick_retired,
             timers_pending: !actor.timers.is_empty(),
+            frame: (policy == ExecutionPolicy::AutonomousFrames)
+                .then(|| actor.frame_progress(budget)),
         },
     )
 }
@@ -2284,13 +2355,22 @@ fn run_worker(
                         }
                     }
                     if !actor.tick_initialized || tick > actor.tick {
-                        if !report_quiescent(machine, actor, &events, &stopped, policy) {
+                        if !report_quiescent(
+                            machine,
+                            actor,
+                            &events,
+                            &stopped,
+                            policy,
+                            &frame_budget,
+                        ) {
                             return;
                         }
                         actor.tick_initialized = true;
                         actor.tick = tick;
                         actor.remaining = retirements;
                         actor.tick_retired = 0;
+                        actor.execution_nanos = 0;
+                        actor.request_budget_exhausted = false;
                         actor.reported_retired = None;
                         actor.requests_left = config.host_budget;
                         actor.advances_left = config.maximum_advances_per_tick;
@@ -2331,7 +2411,15 @@ fn run_worker(
                     if !actor.parked {
                         ready(machine, actor, &mut queue);
                     }
-                    if !actor.queued && !report_quiescent(machine, actor, &events, &stopped, policy)
+                    if !actor.queued
+                        && !report_quiescent(
+                            machine,
+                            actor,
+                            &events,
+                            &stopped,
+                            policy,
+                            &frame_budget,
+                        )
                     {
                         return;
                     }
@@ -2444,7 +2532,7 @@ fn run_worker(
                         actor.deployment_bytes = 0;
                         // The computer retains the exact compilation transaction for checkpoint replay.
                     }
-                    if !report_quiescent(machine, actor, &events, &stopped, policy) {
+                    if !report_quiescent(machine, actor, &events, &stopped, policy, &frame_budget) {
                         return;
                     }
                     let actor = remove_actor(&mut actors, &mut queue, &mailbox, machine)
@@ -2480,6 +2568,8 @@ fn run_worker(
                                     tick: actor.tick,
                                     retired: actor.tick_retired,
                                     timers_pending: !actor.timers.is_empty(),
+                                    frame: (policy == ExecutionPolicy::AutonomousFrames)
+                                        .then(|| actor.frame_progress(&frame_budget)),
                                 })
                             } else {
                                 None
@@ -2785,12 +2875,13 @@ fn run_worker(
             actor.detach_fence = None;
         }
         if actor.stopped
+            || actor.request_budget_exhausted
             || actor.remaining == 0
             || actor.advances_left == 0
             || (policy == ExecutionPolicy::AutonomousFrames
                 && !frame_budget.can_execute(actor.tick))
         {
-            if !report_quiescent(id, actor, &events, &stopped, policy) {
+            if !report_quiescent(id, actor, &events, &stopped, policy, &frame_budget) {
                 return;
             }
             continue;
@@ -2799,7 +2890,7 @@ fn run_worker(
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            if !report_quiescent(id, actor, &events, &stopped, policy) {
+            if !report_quiescent(id, actor, &events, &stopped, policy, &frame_budget) {
                 return;
             }
             continue;
@@ -2831,7 +2922,11 @@ fn run_worker(
             )
         };
         if let Some(started) = slice_started {
-            frame_budget.charge(actor.tick, started.elapsed());
+            let elapsed = started.elapsed();
+            frame_budget.charge(actor.tick, elapsed);
+            actor.execution_nanos = actor
+                .execution_nanos
+                .saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
         }
         let (outcome, retired) = match advanced {
             Ok(value) => value,
@@ -2880,7 +2975,7 @@ fn run_worker(
                 }
             }
             ComputerAdvanceOutcome::WaitingForHostQuota => {
-                actor.remaining = 0;
+                actor.request_budget_exhausted = true;
                 actor.parked = false;
             }
             ComputerAdvanceOutcome::WaitingForTerminalEvent => {
@@ -3080,7 +3175,7 @@ fn run_worker(
                 }
                 // Probe once after a newly observed request: another cooperative task may be runnable.
                 if budget_exhausted {
-                    actor.remaining = 0;
+                    actor.request_budget_exhausted = true;
                     actor.parked = false;
                 } else if !progressed && !discovered {
                     actor.parked = true;
@@ -3198,7 +3293,7 @@ fn run_worker(
                 }
             }
         }
-        if !actor.queued && !report_quiescent(id, actor, &events, &stopped, policy) {
+        if !actor.queued && !report_quiescent(id, actor, &events, &stopped, policy, &frame_budget) {
             return;
         }
     }
@@ -4352,6 +4447,7 @@ mod tests {
                 tick: 2,
                 retired: 3,
                 timers_pending: false,
+                frame: None,
             }
         ));
         assert!(signal.wait(generation, Duration::ZERO));

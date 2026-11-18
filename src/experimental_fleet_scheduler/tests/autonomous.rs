@@ -270,3 +270,52 @@ fn automatic_frames_preserve_retirement_limit() {
         assert_eq!(fleet.metrics().retired, tick);
     }
 }
+
+#[test]
+fn progress_explains_budget_exhaustion_and_waiting_without_losing_unused_credit() {
+    let fleet = fleet(config(), false);
+    fleet
+        .grant_frame(
+            1,
+            1,
+            64,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    let FleetEvent::Quiescent {
+        frame: Some(progress),
+        ..
+    } = next(&fleet)
+    else {
+        panic!("missing frame accounting");
+    };
+    assert_eq!(
+        progress,
+        FleetFrameProgress {
+            execution_nanos: 0,
+            instructions_left: 64,
+            requests_left: 64,
+            advances_left: 32,
+            reason: FleetWaitReason::ExecutionTime,
+        }
+    );
+    grant(&fleet, 2);
+    request(&fleet);
+    let FleetEvent::Quiescent {
+        frame: Some(progress),
+        ..
+    } = next(&fleet)
+    else {
+        panic!("missing frame accounting");
+    };
+    assert_eq!(progress.reason, FleetWaitReason::Host);
+    assert!(progress.instructions_left > 0);
+    assert_eq!(progress.requests_left, 63);
+    assert!(progress.execution_nanos > 0);
+    fleet.stop_with_lifecycle_poll(1).unwrap();
+    wait_lifecycle(&fleet, 1);
+    let stopped = fleet.try_stopped(1).unwrap();
+    let final_progress = stopped.quiescent.unwrap().frame.unwrap();
+    assert_eq!(final_progress.execution_nanos, progress.execution_nanos);
+}

@@ -135,6 +135,7 @@ pub enum WireEvent {
         tick: u64,
         retired: u64,
         timers_pending: bool,
+        frame: Option<compukter_vm::experimental_fleet_scheduler::FleetFrameProgress>,
     },
     Outcome(Vec<u8>),
     Inspection(Vec<u8>),
@@ -232,12 +233,20 @@ pub fn encode_event(event: &WireEvent) -> Vec<u8> {
             tick,
             retired,
             timers_pending,
+            frame,
         } => {
-            bytes.push(8);
+            bytes.push(if frame.is_some() { 19 } else { 8 });
             bytes.extend_from_slice(&machine.to_le_bytes());
             bytes.extend_from_slice(&tick.to_le_bytes());
             bytes.extend_from_slice(&retired.to_le_bytes());
             bytes.push(u8::from(*timers_pending));
+            if let Some(frame) = frame {
+                bytes.extend_from_slice(&frame.execution_nanos.to_le_bytes());
+                bytes.extend_from_slice(&frame.instructions_left.to_le_bytes());
+                bytes.extend_from_slice(&frame.requests_left.to_le_bytes());
+                bytes.extend_from_slice(&frame.advances_left.to_le_bytes());
+                bytes.push(frame.reason as u8);
+            }
         }
         WireEvent::Outcome(body) => {
             bytes.push(0);
@@ -629,12 +638,14 @@ fn convert_event(event: FleetEvent) -> Result<WireEvent, String> {
             tick,
             retired,
             timers_pending,
+            frame,
         } => {
             return Ok(WireEvent::Quiescent {
                 machine,
                 tick,
                 retired,
                 timers_pending,
+                frame,
             })
         }
         FleetEvent::Inspect {
