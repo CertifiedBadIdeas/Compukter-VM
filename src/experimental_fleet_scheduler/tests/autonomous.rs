@@ -223,7 +223,7 @@ fn host_wait_does_not_spend_execution_time() {
 }
 
 #[test]
-fn automatic_resumption_preserves_advance_limit() {
+fn reply_is_retained_without_execution_credit_until_a_fresh_frame() {
     let mut config = config();
     config.maximum_advances_per_tick = 1;
     let fleet = fleet(config, false);
@@ -233,11 +233,36 @@ fn automatic_resumption_preserves_advance_limit() {
     fleet
         .reply(1, first.task_id, first.id, ReplyValue::Unit)
         .unwrap();
+    // The query is an ordered mailbox barrier: the reply has been accepted,
+    // but it must not authorize another native slice.
     fleet.terminal_update(1, 99, u64::MAX).unwrap();
     assert!(matches!(next(&fleet), FleetEvent::TerminalUpdate { .. }));
+    let retired = fleet.metrics().retired;
+    thread::sleep(Duration::from_millis(20));
     assert_eq!(fleet.metrics().advances, 1);
+    assert_eq!(fleet.metrics().retired, retired);
+    assert!(fleet.try_event().is_none());
+
+    // A new Grant wakes the worker; the reply must not need retransmission.
     grant(&fleet, 2);
-    assert_ne!(request(&fleet).id, first.id);
+    let second = request(&fleet);
+    assert_ne!(second.id, first.id);
+    quiescent(&fleet);
+    fleet
+        .reply(1, second.task_id, second.id, ReplyValue::Unit)
+        .unwrap();
+    fleet.terminal_update(1, 100, u64::MAX).unwrap();
+    assert!(matches!(next(&fleet), FleetEvent::TerminalUpdate { .. }));
+    assert_eq!(fleet.metrics().advances, 2);
+    grant(&fleet, 3);
+    assert!(matches!(
+        next(&fleet),
+        FleetEvent::Boundary {
+            outcome: ComputerAdvanceOutcome::Halted(_),
+            tick: 3,
+            ..
+        }
+    ));
 }
 
 #[test]
