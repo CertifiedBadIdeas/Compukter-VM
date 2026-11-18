@@ -244,7 +244,9 @@ pub enum ComputerFileReadError {
     LimitExceeded,
 }
 
-/// Constant-size work counters for worker scheduling; no heap/resource traversal.
+/// Constant-size work counters and internal input waits for worker scheduling.
+/// Completing a wait is progress even when that advance retires no instructions.
+/// No heap/resource traversal.
 #[cfg(feature = "experimental-fleet-scheduler")]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ComputerExecutionWork {
@@ -252,6 +254,8 @@ pub(crate) struct ComputerExecutionWork {
     fixed: u64,
     dynamic: u64,
     maintenance: u64,
+    pending_stdio_read: Option<(TaskId, RequestId)>,
+    pending_terminal_event: Option<(TaskId, RequestId)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1264,6 +1268,8 @@ impl ComputerMachine {
             fixed: accounting.fixed_guest_units,
             dynamic: accounting.dynamic_guest_units,
             maintenance: accounting.maintenance_units,
+            pending_stdio_read: frame.pending_stdio_read,
+            pending_terminal_event: frame.pending_terminal_event,
         }
     }
 

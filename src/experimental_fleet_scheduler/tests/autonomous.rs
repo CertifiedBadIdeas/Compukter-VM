@@ -344,3 +344,87 @@ fn progress_explains_budget_exhaustion_and_waiting_without_losing_unused_credit(
     let final_progress = stopped.quiescent.unwrap().frame.unwrap();
     assert_eq!(final_progress.execution_nanos, progress.execution_nanos);
 }
+
+#[test]
+fn terminal_input_resumes_the_same_frame() {
+    use crate::{TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers};
+    for canonical in [false, true] {
+        let machine = ComputerMachine::start(
+            crate::execution::fixtures::stdio_conformance_artifact(&[]),
+            profile(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fleet = FleetScheduler::new_with_autonomous_frames(
+            vec![(1, machine)],
+            config(),
+            Vec::new(),
+            FleetMemoryLimits::default(),
+        )
+        .unwrap();
+        fleet
+            .grant_frame(
+                1,
+                1,
+                100_000,
+                Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(matches!(
+            next(&fleet),
+            FleetEvent::Boundary {
+                outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                ..
+            }
+        ));
+        quiescent(&fleet);
+        if canonical {
+            fleet
+                .canonical_line(1, "hello".encode_utf16().collect())
+                .unwrap();
+        } else {
+            fleet.terminal_text(1, "hello".into()).unwrap();
+            fleet.terminal_update(1, 99, u64::MAX).unwrap();
+            loop {
+                if matches!(next(&fleet), FleetEvent::TerminalUpdate { request: 99, .. }) {
+                    break;
+                }
+            }
+            fleet
+                .terminal_key(
+                    1,
+                    TerminalKeyEvent::new(
+                        TerminalKey::Enter,
+                        TerminalKeyAction::Press,
+                        TerminalModifiers::default(),
+                    ),
+                )
+                .unwrap();
+        }
+        loop {
+            match next(&fleet) {
+                FleetEvent::Boundary {
+                    outcome: ComputerAdvanceOutcome::Halted(_),
+                    tick: 1,
+                    ..
+                } => break,
+                FleetEvent::Quiescent {
+                    frame: Some(progress),
+                    ..
+                } => {
+                    assert!(
+                        progress.instructions_left > 0 && progress.advances_left > 0,
+                        "canonical={canonical}: {progress:?}"
+                    );
+                }
+                FleetEvent::Boundary {
+                    outcome: ComputerAdvanceOutcome::WaitingForTerminalEvent,
+                    ..
+                } => {}
+                other => panic!("canonical={canonical}: {other:?}"),
+            }
+        }
+    }
+}
