@@ -35,13 +35,16 @@ mod tests {
     use crate::{limits::ArtifactLimits, verify_artifact};
     use std::sync::{OnceLock, Weak};
 
-    fn candidate(marker: u16) -> Arc<VerifiedArtifactInner> {
+    fn candidate(namespace: u8, marker: u16) -> Arc<VerifiedArtifactInner> {
         let mut decoded = crate::decode::records::decode_artifact(
             crate::test_support::minimal_vector().into(),
             &ArtifactLimits::default(),
         )
         .unwrap();
-        // Deliberately collide the digest, as headers can vary independently.
+        // Deliberately collide the digest within a test, as headers can vary
+        // independently. Separate tests must not temporarily pin each other's
+        // owners while inspecting the same registry bucket in parallel.
+        decoded.content_hash = [namespace; 32];
         let mut bytes = decoded.bytes.to_vec();
         bytes.extend_from_slice(&marker.to_le_bytes());
         decoded.bytes = bytes.into();
@@ -55,28 +58,28 @@ mod tests {
 
     #[test]
     fn weak_identity_checks_complete_bytes_and_does_not_own_artifacts() {
-        let first = intern(candidate(1));
-        let same = intern(candidate(1));
-        let changed = intern(candidate(2));
+        let first = intern(candidate(1, 1));
+        let same = intern(candidate(1, 1));
+        let changed = intern(candidate(1, 2));
         assert!(Arc::ptr_eq(&first, &same));
         assert!(!Arc::ptr_eq(&first, &changed));
         let weak = Arc::downgrade(&first);
         drop(first);
         drop(same);
         assert!(weak.upgrade().is_none());
-        let replacement = intern(candidate(1));
+        let replacement = intern(candidate(1, 1));
         assert!(!Weak::ptr_eq(&weak, &Arc::downgrade(&replacement)));
     }
 
     #[test]
     fn all_live_images_remain_canonical_beyond_the_old_capacity() {
         let owners: Vec<_> = (1000..=2023)
-            .map(|marker| intern(candidate(marker)))
+            .map(|marker| intern(candidate(2, marker)))
             .collect();
         for marker in 1000..=2023 {
             assert!(Arc::ptr_eq(
                 &owners[usize::from(marker - 1000)],
-                &intern(candidate(marker))
+                &intern(candidate(2, marker))
             ));
         }
     }
@@ -147,7 +150,7 @@ mod tests {
                 .map(|_| {
                     let barrier = &barrier;
                     scope.spawn(move || {
-                        let candidate = candidate(9);
+                        let candidate = candidate(3, 9);
                         barrier.wait();
                         intern(candidate)
                     })
