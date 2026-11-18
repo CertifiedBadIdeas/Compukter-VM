@@ -466,7 +466,8 @@ pub extern "system" fn Java_ru_lazyhat_compukters_lang_runtime_vm_JniExperimenta
     nanos: jlong,
 ) -> jint {
     status(&mut env, |_| {
-        if machine < 0 || tick < 0 || retirements <= 0 || nanos < -1 {
+        // A zero budget advances frame/timer observations without executing Guest code.
+        if machine < 0 || tick < 0 || retirements < 0 || nanos < -1 {
             return Ok(code(FfiStatus::InvalidArgument));
         }
         let deadline = if nanos == -1 {
